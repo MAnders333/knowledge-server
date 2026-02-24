@@ -37,18 +37,15 @@ export function createApp(
   // -- Auth helper --
 
   // Pre-encode the expected token once so timingSafeEqual can compare buffers.
+  // "Bearer " + 48-char hex = a public constant length, so the early length
+  // check leaks nothing meaningful while keeping the comparison simple.
   const expectedToken = Buffer.from(`Bearer ${adminToken}`);
 
   function requireAdminToken(c: Context): boolean {
     const auth = c.req.header("Authorization") ?? "";
     const provided = Buffer.from(auth);
-    // timingSafeEqual requires equal-length buffers — pad/truncate to prevent
-    // length leakage. If lengths differ the check still fails after comparison.
-    const a = Buffer.alloc(expectedToken.length);
-    const b = Buffer.alloc(expectedToken.length);
-    expectedToken.copy(a);
-    provided.copy(b, 0, 0, expectedToken.length);
-    return timingSafeEqual(a, b) && provided.length === expectedToken.length;
+    if (provided.length !== expectedToken.length) return false;
+    return timingSafeEqual(provided, expectedToken);
   }
 
   // -- Activation --

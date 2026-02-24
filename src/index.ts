@@ -80,10 +80,8 @@ async function main() {
   console.log("  GET  /review          — Review entries");
   console.log("  GET  /status          — Health check");
   console.log("  GET  /entries         — List entries");
-  console.log("\n┌─ Admin token (keep this private) ──────────────────────────────┐");
-  console.log(`│  ${adminToken}  │`);
-  console.log("└────────────────────────────────────────────────────────────────┘");
-  console.log(`  curl -X POST -H "Authorization: Bearer ${adminToken}" http://${config.host}:${config.port}/consolidate`);
+  console.log(`\n  Admin token (keep this private): ${adminToken}`);
+  console.log(`  curl -X POST -H "Authorization: Bearer <token>" http://${config.host}:${config.port}/consolidate`);
 
   // Background consolidation loop — runs after server is listening
   // so the server is available immediately while consolidation proceeds.
