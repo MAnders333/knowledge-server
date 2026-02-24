@@ -239,17 +239,6 @@ export class KnowledgeDB {
   }
 
   /**
-   * Get all entries (including non-active) for stats/review.
-   */
-  getAllEntries(): KnowledgeEntry[] {
-    const rows = this.db
-      .prepare("SELECT * FROM knowledge_entry ORDER BY created_at DESC")
-      .all() as RawEntryRow[];
-
-    return rows.map((r) => this.rowToEntry(r));
-  }
-
-  /**
    * Get entries with optional server-side filtering — pushes status/type/scope
    * filters to SQL so we don't load the full table into memory just to slice it.
    */

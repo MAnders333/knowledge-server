@@ -49,7 +49,7 @@ if [ ! -f "$PROJECT_DIR/.env" ]; then
   echo ""
   echo "Creating .env from template..."
   cp "$PROJECT_DIR/.env.template" "$PROJECT_DIR/.env"
-  echo "  ⚠ Created .env — you need to set EMBEDDING_API_KEY"
+  echo "  ⚠ Created .env — you need to set LLM_API_KEY and LLM_BASE_ENDPOINT"
   echo "    Edit: $PROJECT_DIR/.env"
 else
   echo "  ✓ .env already exists"
@@ -76,12 +76,9 @@ mkdir -p "$COMMAND_DIR"
 for cmd_file in "$PROJECT_DIR/opencode/command/"*.md; do
   cmd_name=$(basename "$cmd_file")
   cmd_target="$COMMAND_DIR/$cmd_name"
-  if [ -L "$cmd_target" ] || [ -f "$cmd_target" ]; then
-    echo "  ✓ Command $cmd_name already installed"
-  else
-    ln -s "$cmd_file" "$cmd_target"
-    echo "  ✓ Symlinked command: $cmd_name"
-  fi
+  # Always force-recreate symlink to keep it in sync (matches plugin behaviour)
+  ln -sf "$cmd_file" "$cmd_target"
+  echo "  ✓ Symlinked command: $cmd_name"
 done
 
 # 7. Add MCP config hint
@@ -93,7 +90,7 @@ echo '    "type": "local",'
 echo "    \"command\": [\"bun\", \"run\", \"$PROJECT_DIR/src/mcp/index.ts\"],"
 echo '    "enabled": true,'
 echo '    "environment": {'
-echo '      "EMBEDDING_API_KEY": "your-key-here"'
+echo '      "LLM_API_KEY": "your-key-here"'
 echo '    }'
 echo '  }'
 echo ""
@@ -114,6 +111,6 @@ echo ""
 echo "Next steps:"
 echo "  1. Set LLM_API_KEY in $PROJECT_DIR/.env"
 echo "  2. Start the server:  cd $PROJECT_DIR && bun run start"
-echo "  3. Run initial consolidation:  curl -X POST http://127.0.0.1:3179/consolidate"
+echo "  3. Run initial consolidation:  curl -X POST -H \"Authorization: Bearer <token>\" http://127.0.0.1:3179/consolidate"
 echo "  4. Check status:  curl http://127.0.0.1:3179/status"
 echo ""

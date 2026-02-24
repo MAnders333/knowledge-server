@@ -74,13 +74,14 @@ export class ConsolidationEngine {
    *
    * This is the main entry point — called by HTTP API or CLI.
    *
-   * Incremental within-session consolidation (Option D):
-   * 1. Load already-processed episode ranges from consolidated_episode
-   * 2. Fetch sessions since the session-level cursor, then filter out
-   *    already-processed (startMessageId, endMessageId) ranges per session
-   * 3. Process only the new episodes
-   * 4. Record each episode to consolidated_episode immediately after processing
-   * 5. Advance the session-level cursor to cover fully-processed sessions
+   * Per-run steps:
+   * 1. Fetch candidate sessions since the cursor
+   * 2. Load already-processed episode ranges to determine new work
+   * 3. Segment sessions into episodes, skipping already-processed ranges
+   * 4. For each chunk: extract → reconsolidate → contradiction scan → record episodes
+   * 5. Apply decay to all active entries
+   * 6. Generate embeddings for new/updated entries
+   * 7. Advance the session cursor past all fetched candidates
    */
   async consolidate(): Promise<ConsolidationResult> {
     const startTime = Date.now();

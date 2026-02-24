@@ -274,14 +274,12 @@ Respond with one of:
    *
    * Uses the contradiction model (Sonnet — nuanced semantic reasoning).
    *
-   * Resolution outcomes:
-   * - "no_conflict"  — no genuine contradiction, nothing to do
-   * - "supersede_new" — the existing entry is more correct; new entry should be
-   *                     downgraded (caller handles)
-   * - "supersede_old" — the new entry is more correct; existing entry should be
-   *                     marked superseded (caller handles)
-   * - "merge"        — the apparent contradiction resolves into a unified entry
-   * - "irresolvable" — genuine tie; mark existing as conflicted for human review
+   * Returns only genuine contradictions — `no_conflict` results are filtered
+   * before returning. Possible resolutions in the returned array:
+   * - "supersede_old" — new entry is more correct; existing entry marked superseded
+   * - "supersede_new" — existing entry is more correct; new entry marked superseded
+   * - "merge"         — contradiction resolves into a unified entry
+   * - "irresolvable"  — genuine tie; both entries flagged for human review
    */
   async detectAndResolveContradiction(
     newEntry: { id: string; content: string; type: string; topics: string[]; confidence: number; createdAt: number },

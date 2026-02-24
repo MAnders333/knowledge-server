@@ -7,6 +7,8 @@ import { createApp } from "../src/api/server";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+// @ts-ignore — Bun supports JSON imports natively
+import pkg from "../package.json" with { type: "json" };
 
 // Intentionally static string — production uses a random token generated at startup.
 const TEST_ADMIN_TOKEN = "test-admin-token-abc123";
@@ -48,7 +50,7 @@ describe("HTTP API", () => {
 
     const data = await res.json();
     expect(data.status).toBe("ok");
-    expect(data.version).toBe("0.2.0");
+    expect(data.version).toBe(pkg.version);
     expect(data.knowledge).toBeDefined();
     expect(data.consolidation).toBeDefined();
   });

@@ -10,12 +10,14 @@ export class EmbeddingClient {
   private endpoint: string;
   private apiKey: string;
   private model: string;
+  private dimensions: number;
 
   constructor() {
     // Embeddings always go through the OpenAI-compatible path
     this.endpoint = `${config.llm.baseEndpoint}/openai/v1`;
     this.apiKey = config.llm.apiKey;
     this.model = config.embedding.model;
+    this.dimensions = config.embedding.dimensions;
   }
 
   /**
@@ -47,6 +49,7 @@ export class EmbeddingClient {
         body: JSON.stringify({
           model: this.model,
           input: chunk,
+          dimensions: this.dimensions,
         }),
       });
 

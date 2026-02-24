@@ -495,31 +495,6 @@ export class EpisodeReader {
       .join("\n");
   }
 
-  /**
-   * Get total session count and time range for status reporting.
-   */
-  getSessionStats(): {
-    totalSessions: number;
-    earliest: number;
-    latest: number;
-  } {
-    const row = this.db
-      .prepare(
-        `SELECT COUNT(*) as total, 
-                MIN(time_created) as earliest, 
-                MAX(time_created) as latest
-         FROM session 
-         WHERE parent_id IS NULL`
-      )
-      .get() as { total: number; earliest: number; latest: number };
-
-    return {
-      totalSessions: row.total,
-      earliest: row.earliest,
-      latest: row.latest,
-    };
-  }
-
   close(): void {
     this.db.close();
   }

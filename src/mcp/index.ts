@@ -3,6 +3,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { KnowledgeDB } from "../db/database.js";
 import { ActivationEngine } from "../activation/activate.js";
+// @ts-ignore — Bun supports JSON imports natively
+import pkg from "../../package.json" with { type: "json" };
 
 /**
  * MCP server interface for the knowledge system.
@@ -22,7 +24,7 @@ async function main() {
 
   const server = new McpServer({
     name: "knowledge-server",
-    version: "0.1.0",
+    version: pkg.version,
   });
 
   server.tool(
