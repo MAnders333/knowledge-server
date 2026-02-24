@@ -8,6 +8,7 @@
  * - decision: A choice made with rationale ("we chose BigQuery over Snowflake because...")
  * - procedure: A learned workflow or process ("to deploy to prod, first run X then Y")
  */
+/** Single source of truth for valid entry types — mirrors the SQLite CHECK constraint in schema.ts. */
 export const KNOWLEDGE_TYPES = ["fact", "principle", "pattern", "decision", "procedure"] as const;
 export type KnowledgeType = typeof KNOWLEDGE_TYPES[number];
 

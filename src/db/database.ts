@@ -401,20 +401,21 @@ export class KnowledgeDB {
           break;
 
         case "merge": {
-          // Merge into the new entry, supersede the old one
+          // Merge into the new entry, supersede the old one.
+          // If mergedData is absent (LLM truncation), newEntryId keeps its
+          // original content — still a valid state, just unrefined.
           if (!mergedData) {
             console.warn(
               `[db] merge resolution missing mergedData — existingEntryId ${existingEntryId} ` +
               `will be superseded but newEntryId ${newEntryId} content unchanged`
             );
-          }
-          if (mergedData) {
+          } else {
             // Clamp type to valid enum values — LLM occasionally returns something
             // outside the schema CHECK constraint (e.g. "fact/principle"), causing a
             // SQLITE_CONSTRAINT_CHECK error that aborts the entire batch.
             const safeType = (KNOWLEDGE_TYPES as readonly string[]).includes(mergedData.type) ? mergedData.type : "fact";
             if (safeType !== mergedData.type) {
-              console.warn(`[db] merge: invalid type "${mergedData.type}" from LLM — falling back to "fact"`);
+              console.warn(`[db] merge: invalid type "${mergedData.type}" — falling back to "fact"`);
             }
             this.db
               .prepare(
@@ -667,6 +668,15 @@ export class KnowledgeDB {
       ...new Set([...existing.derivedFrom, ...updates.additionalSources]),
     ];
 
+    // Clamp type — same guard as applyContradictionResolution; LLM output may not
+    // match the CHECK constraint and would abort the transaction.
+    const safeType = (KNOWLEDGE_TYPES as readonly string[]).includes(updates.type)
+      ? updates.type
+      : "fact";
+    if (safeType !== updates.type) {
+      console.warn(`[db] mergeEntry: invalid type "${updates.type}" — falling back to "fact"`);
+    }
+
     const now = Date.now();
     this.db
       .prepare(
@@ -678,7 +688,7 @@ export class KnowledgeDB {
       )
       .run(
         updates.content,
-        updates.type,
+        safeType,
         JSON.stringify(updates.topics),
         updates.confidence,
         JSON.stringify(mergedSources),
