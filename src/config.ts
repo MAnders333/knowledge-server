@@ -82,6 +82,13 @@ export function validateConfig(): string[] {
     errors.push("LLM_BASE_ENDPOINT is required. Set it in .env or environment.");
   }
 
+  const loopbackHosts = ["127.0.0.1", "::1", "localhost"];
+  if (!loopbackHosts.includes(config.host)) {
+    errors.push(
+      `KNOWLEDGE_HOST is set to "${config.host}", which exposes the server on non-loopback interfaces with no authentication. Only use 127.0.0.1 unless you have added authentication and understand the security implications.`
+    );
+  }
+
   if (!existsSync(config.opencodeDbPath)) {
     errors.push(
       `OpenCode database not found at ${config.opencodeDbPath}. Set OPENCODE_DB_PATH if it's elsewhere.`

@@ -27,6 +27,21 @@ import type { Plugin } from "@opencode-ai/plugin";
 const KNOWLEDGE_SERVER_URL =
   process.env.KNOWLEDGE_SERVER_URL || "http://127.0.0.1:3179";
 
+// Guard against KNOWLEDGE_SERVER_URL being redirected to an external host.
+// The plugin sends user message content to this URL — it must stay on loopback.
+const _parsedUrl = (() => {
+  try {
+    return new URL(KNOWLEDGE_SERVER_URL);
+  } catch {
+    return null;
+  }
+})();
+const KNOWLEDGE_SERVER_URL_SAFE =
+  _parsedUrl !== null &&
+  (_parsedUrl.hostname === "127.0.0.1" ||
+    _parsedUrl.hostname === "localhost" ||
+    _parsedUrl.hostname === "::1");
+
 const safeLog = async (
   client: Parameters<Plugin>[0]["client"],
   level: "debug" | "info" | "warn" | "error",
@@ -42,6 +57,17 @@ const safeLog = async (
 };
 
 export const KnowledgePlugin: Plugin = async (ctx) => {
+  // Refuse to operate if KNOWLEDGE_SERVER_URL points to a non-loopback host.
+  // The plugin sends user message content to this URL — external hosts are not allowed.
+  if (!KNOWLEDGE_SERVER_URL_SAFE) {
+    await safeLog(
+      ctx.client,
+      "error",
+      `Knowledge plugin disabled: KNOWLEDGE_SERVER_URL "${KNOWLEDGE_SERVER_URL}" points to a non-loopback host. Only 127.0.0.1 / localhost / ::1 are allowed.`
+    );
+    return {};
+  }
+
   // Verify server is reachable on plugin load — but never throw
   try {
     const health = await fetch(`${KNOWLEDGE_SERVER_URL}/status`, {

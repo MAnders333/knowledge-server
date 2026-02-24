@@ -1,4 +1,5 @@
 import { serve } from "bun";
+import { randomBytes } from "node:crypto";
 import { KnowledgeDB } from "./db/database.js";
 import { ActivationEngine } from "./activation/activate.js";
 import { ConsolidationEngine } from "./consolidation/consolidate.js";
@@ -57,8 +58,13 @@ async function main() {
     console.log("\n✓ Knowledge graph is up to date.");
   }
 
+  // Generate a random admin token for this process lifetime.
+  // Required on POST /consolidate and POST /reinitialize.
+  // Printed once to the console — store it if you need to call those endpoints manually.
+  const adminToken = randomBytes(24).toString("hex");
+
   // Create HTTP app
-  const app = createApp(db, activation, consolidation);
+  const app = createApp(db, activation, consolidation, adminToken);
 
   // Start server
   const server = serve({
@@ -70,10 +76,12 @@ async function main() {
 
   console.log(`\n✓ HTTP API listening on http://${config.host}:${config.port}`);
   console.log("  GET  /activate?q=...  — Activate knowledge");
-  console.log("  POST /consolidate     — Run consolidation");
+  console.log("  POST /consolidate     — Run consolidation   [admin token required]");
   console.log("  GET  /review          — Review entries");
   console.log("  GET  /status          — Health check");
   console.log("  GET  /entries         — List entries");
+  console.log(`\n  Admin token: ${adminToken}`);
+  console.log("  Usage: curl -X POST -H \"Authorization: Bearer <token>\" http://127.0.0.1:3179/consolidate");
 
   // Background consolidation loop — runs after server is listening
   // so the server is available immediately while consolidation proceeds.

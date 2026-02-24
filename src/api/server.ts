@@ -9,19 +9,37 @@ import { config } from "../config.js";
  *
  * Endpoints:
  * - GET  /activate?q=...     -- Activate knowledge entries by query (used by plugin)
- * - POST /consolidate         -- Run consolidation cycle
- * - POST /reinitialize        -- Wipe knowledge DB and reset consolidation cursor
+ * - POST /consolidate         -- Run consolidation cycle          [requires admin token]
+ * - POST /reinitialize        -- Wipe knowledge DB and reset cursor [requires admin token]
  * - GET  /review              -- List entries needing attention
  * - GET  /status              -- Server health and stats
  * - GET  /entries             -- List all entries (with filters)
  * - GET  /entries/:id         -- Get a specific entry
+ *
+ * Admin token:
+ * A random token is generated at startup and printed to the console once.
+ * Pass it as `Authorization: Bearer <token>` on protected endpoints.
+ * This guards against CSRF and other local-process abuse of destructive operations.
  */
 export function createApp(
   db: KnowledgeDB,
   activation: ActivationEngine,
-  consolidation: ConsolidationEngine
+  consolidation: ConsolidationEngine,
+  adminToken: string
 ): Hono {
   const app = new Hono();
+
+  // Concurrency guard — only one consolidation run at a time
+  let isConsolidating = false;
+
+  // -- Auth helper --
+
+  function requireAdminToken(
+    c: Parameters<Parameters<Hono["post"]>[1]>[0]
+  ): boolean {
+    const auth = c.req.header("Authorization");
+    return auth === `Bearer ${adminToken}`;
+  }
 
   // -- Activation --
 
@@ -36,25 +54,40 @@ export function createApp(
       return c.json(result);
     } catch (e) {
       console.error("[activate] Error:", e);
-      return c.json({ error: String(e) }, 500);
+      return c.json({ error: "Internal server error" }, 500);
     }
   });
 
   // -- Consolidation --
 
   app.post("/consolidate", async (c) => {
+    if (!requireAdminToken(c)) {
+      return c.json({ error: "Unauthorized" }, 401);
+    }
+
+    if (isConsolidating) {
+      return c.json({ error: "Consolidation already in progress" }, 409);
+    }
+
+    isConsolidating = true;
     try {
       const result = await consolidation.consolidate();
       return c.json(result);
     } catch (e) {
       console.error("[consolidate] Error:", e);
-      return c.json({ error: String(e) }, 500);
+      return c.json({ error: "Internal server error" }, 500);
+    } finally {
+      isConsolidating = false;
     }
   });
 
   // -- Re-initialization --
 
   app.post("/reinitialize", async (c) => {
+    if (!requireAdminToken(c)) {
+      return c.json({ error: "Unauthorized" }, 401);
+    }
+
     try {
       const confirm = c.req.query("confirm");
       if (confirm !== "yes") {
@@ -77,7 +110,7 @@ export function createApp(
       });
     } catch (e) {
       console.error("[reinitialize] Error:", e);
-      return c.json({ error: String(e) }, 500);
+      return c.json({ error: "Internal server error" }, 500);
     }
   });
 
@@ -181,6 +214,6 @@ export function createApp(
  * Embeddings are large (3072 floats) and not useful to consumers.
  */
 function stripEmbedding(entry: { embedding?: number[]; [key: string]: unknown }) {
-  const { embedding, ...rest } = entry;
+  const { embedding: _embedding, ...rest } = entry;
   return rest;
 }

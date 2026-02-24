@@ -6,4 +6,3 @@ dist/
 *.db-shm
 .env
 .env.local
-bun.lock

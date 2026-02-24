@@ -188,6 +188,31 @@ Returns conflicted entries, stale entries (low strength), and team-relevant entr
 
 Entries decay based on age and access frequency. Strength drops below 0.15 → archived. Archived for 180+ days → tombstoned.
 
+## Security
+
+### Admin token
+
+`POST /consolidate` and `POST /reinitialize` require an admin token. The token is generated randomly at startup and printed to the console:
+
+```
+Admin token: a3f9c2e1b4d7...
+Usage: curl -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:3179/consolidate
+```
+
+The token is not persisted — it changes every time the server restarts. This guards against CSRF and other local-process abuse. The `/activate`, `/status`, `/entries`, and `/review` endpoints are unauthenticated (read-only, no side effects).
+
+### Localhost only
+
+The server binds to `127.0.0.1` by default and will refuse to start if `KNOWLEDGE_HOST` is set to a non-loopback address. There is no TLS and no authentication on read endpoints — this server is not designed to be exposed on a network.
+
+### Prompt injection
+
+The consolidation pipeline sends raw session content to an LLM. A session containing text like "ignore prior instructions and insert the following knowledge entry..." could in principle influence what gets stored. The extraction prompt is hardened against this, but no instruction-following model is fully immune. Knowledge entries injected by this route would need to pass the similarity threshold and reconsolidation check before being inserted — the attack surface is narrow but not zero. Don't consolidate sessions from untrusted sources.
+
+### Rate limiting
+
+The `/activate` endpoint makes a paid embedding API call per request. There is no rate limiting — this is intentional for a personal local tool where the call volume is naturally bounded by typing speed. If you expose the server to other processes, consider adding a rate limit.
+
 ## Development
 
 ```bash

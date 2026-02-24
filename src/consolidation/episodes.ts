@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { dirname } from "node:path";
 import { config } from "../config.js";
 import type { Episode, EpisodeMessage } from "../types.js";
 
@@ -30,6 +31,13 @@ function approxTokens(text: string): number {
  * - For sessions WITHOUT compactions: the whole session is 1 episode,
  *   chunked by message boundaries if it exceeds the token budget.
  */
+/**
+ * Directory of the knowledge DB — used to exclude knowledge-server's own sessions
+ * from consolidation. Using the actual config path is robust to the project being
+ * cloned under any directory name (avoids fragile %knowledge-server% string match).
+ */
+const KNOWLEDGE_DB_DIR = dirname(config.dbPath);
+
 export class EpisodeReader {
   private db: Database;
 
@@ -47,9 +55,9 @@ export class EpisodeReader {
         `SELECT COUNT(*) as n FROM session
          WHERE time_created > ?
            AND parent_id IS NULL
-           AND directory NOT LIKE '%knowledge-server%'`
+           AND directory NOT LIKE ?`
       )
-      .get(afterTimeCreated) as { n: number };
+      .get(afterTimeCreated, `${KNOWLEDGE_DB_DIR}%`) as { n: number };
     return row.n;
   }
 
@@ -68,12 +76,12 @@ export class EpisodeReader {
          FROM session s
          LEFT JOIN project p ON s.project_id = p.id
          WHERE s.time_created > ?
-           AND s.parent_id IS NULL
-           AND s.directory NOT LIKE '%knowledge-server%'
+            AND s.parent_id IS NULL
+            AND s.directory NOT LIKE ?
          ORDER BY s.time_created ASC
          LIMIT ?`
       )
-      .all(afterTimeCreated, limit) as Array<{
+      .all(afterTimeCreated, `${KNOWLEDGE_DB_DIR}%`, limit) as Array<{
       id: string;
       title: string;
       directory: string;

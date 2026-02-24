@@ -1,11 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { KnowledgeDB } from "../src/db/database";
+import type { KnowledgeDB } from "../src/db/database";
+import { KnowledgeDB as KnowledgeDBImpl } from "../src/db/database";
 import { ActivationEngine } from "../src/activation/activate";
-import { ConsolidationEngine } from "../src/consolidation/consolidate";
+import type { ConsolidationEngine } from "../src/consolidation/consolidate";
 import { createApp } from "../src/api/server";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+
+const TEST_ADMIN_TOKEN = "test-admin-token-abc123";
 
 describe("HTTP API", () => {
   let db: KnowledgeDB;
@@ -14,21 +17,23 @@ describe("HTTP API", () => {
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "knowledge-api-test-"));
-    db = new KnowledgeDB(join(tempDir, "test.db"));
+    db = new KnowledgeDBImpl(join(tempDir, "test.db"));
     const activation = new ActivationEngine(db);
     // We pass a mock consolidation engine — not testing consolidation via API here
     const consolidation = {
       consolidate: async () => ({
         sessionsProcessed: 0,
+        segmentsProcessed: 0,
         entriesCreated: 0,
         entriesUpdated: 0,
         entriesArchived: 0,
         conflictsDetected: 0,
+        conflictsResolved: 0,
         duration: 0,
       }),
       close: () => {},
     } as unknown as ConsolidationEngine;
-    app = createApp(db, activation, consolidation);
+    app = createApp(db, activation, consolidation, TEST_ADMIN_TOKEN);
   });
 
   afterEach(() => {
@@ -160,5 +165,49 @@ describe("HTTP API", () => {
     expect(data.conflicted).toEqual([]);
     expect(data.stale).toEqual([]);
     expect(data.teamRelevant).toEqual([]);
+  });
+
+  it("POST /consolidate should return 401 without token", async () => {
+    const res = await app.request("/consolidate", { method: "POST" });
+    expect(res.status).toBe(401);
+  });
+
+  it("POST /consolidate should return 401 with wrong token", async () => {
+    const res = await app.request("/consolidate", {
+      method: "POST",
+      headers: { Authorization: "Bearer wrong-token" },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("POST /consolidate should succeed with correct token", async () => {
+    const res = await app.request("/consolidate", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("POST /reinitialize should return 401 without token", async () => {
+    const res = await app.request("/reinitialize?confirm=yes", { method: "POST" });
+    expect(res.status).toBe(401);
+  });
+
+  it("POST /reinitialize should require confirm=yes even with token", async () => {
+    const res = await app.request("/reinitialize", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("POST /reinitialize should succeed with token and confirm=yes", async () => {
+    const res = await app.request("/reinitialize?confirm=yes", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
+    });
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.status).toBe("reinitialized");
   });
 });
