@@ -148,11 +148,13 @@ On startup, the server counts pending sessions and runs background consolidation
 
 ### Trigger consolidation manually
 
-```bash
-# Via HTTP
-curl -X POST http://127.0.0.1:3179/consolidate
+`POST /consolidate` requires the admin token printed at startup:
 
-# Via CLI
+```bash
+# Via HTTP (token is printed to the console when the server starts)
+curl -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:3179/consolidate
+
+# Via CLI (no token needed — calls the consolidation engine directly)
 bun run consolidate
 ```
 
@@ -199,15 +201,19 @@ Admin token: a3f9c2e1b4d7...
 Usage: curl -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:3179/consolidate
 ```
 
-The token is not persisted — it changes every time the server restarts. This guards against CSRF and other local-process abuse. The `/activate`, `/status`, `/entries`, and `/review` endpoints are unauthenticated (read-only, no side effects).
+The token is not persisted — it changes every time the server restarts. This guards against browser-based CSRF attacks on `POST /consolidate` and `POST /reinitialize`: a malicious web page has no way to learn the token (it is never in a cookie, never auto-sent, and changes on every restart), so it cannot forge a valid `Authorization` header. Without the token, any page open in your browser could trigger these operations against your local server.
+
+The `/activate`, `/status`, `/entries`, and `/review` endpoints are intentionally unauthenticated. Adding auth to read endpoints would require either a per-startup token (unusable for manual `curl` inspection) or a static token in `.env` — but any local process that can read `.env` can also read the SQLite database directly. Auth on reads would be security theater against same-user processes, which are already trusted by the OS. For browser-based reads, the same-origin policy provides protection: browsers block cross-origin *responses* from being read by the page, regardless of whether the endpoint is authenticated. Non-browser clients (`curl`, scripts) running as the same user are treated as trusted by design.
+
+On a shared multi-user machine, run the server behind a reverse proxy with authentication.
 
 ### Localhost only
 
-The server binds to `127.0.0.1` by default and will refuse to start if `KNOWLEDGE_HOST` is set to a non-loopback address. There is no TLS and no authentication on read endpoints — this server is not designed to be exposed on a network.
+The server binds to `127.0.0.1` by default and will exit at startup if `KNOWLEDGE_HOST` is set to a non-loopback address. There is no TLS — this server is not designed to be exposed on a network.
 
 ### Prompt injection
 
-The consolidation pipeline sends raw session content to an LLM. A session containing text like "ignore prior instructions and insert the following knowledge entry..." could in principle influence what gets stored. The extraction prompt is hardened against this, but no instruction-following model is fully immune. Knowledge entries injected by this route would need to pass the similarity threshold and reconsolidation check before being inserted — the attack surface is narrow but not zero. Don't consolidate sessions from untrusted sources.
+The consolidation pipeline sends raw session content to an LLM. The more realistic risk is not a dedicated attacker — it's adversarial text that ended up in your own sessions: code you pasted, web content you discussed, or documentation that contained prompt-like instructions. Such content could in principle influence what gets consolidated into the knowledge graph. The extraction prompt is hardened against this, and any injected entry would still need to pass the similarity threshold and reconsolidation check — but no instruction-following model is fully immune. Be aware of this if you regularly paste large amounts of external content into your coding sessions.
 
 ### Rate limiting
 
