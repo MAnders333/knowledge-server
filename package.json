@@ -1,0 +1,30 @@
+{
+  "name": "knowledge-server",
+  "version": "0.1.0",
+  "description": "A consolidation-aware knowledge system that distills episodic memory from OpenCode sessions into retrievable knowledge, with embedding-based associative activation.",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --watch src/index.ts",
+    "start": "bun run src/index.ts",
+    "start:mcp": "bun run src/mcp/index.ts",
+    "consolidate": "bun run src/cli.ts consolidate",
+    "test": "bun test",
+    "test:watch": "bun test --watch",
+    "setup": "bash scripts/setup.sh",
+    "lint": "bunx biome check src/ tests/",
+    "format": "bunx biome format --write src/ tests/"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.0",
+    "@ai-sdk/google": "^3.0.0",
+    "@ai-sdk/openai-compatible": "^2.0.0",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "ai": "^6.0.0",
+    "hono": "^4.7.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.0",
+    "@types/bun": "latest"
+  }
+}
