@@ -148,11 +148,12 @@ On startup, the server counts pending sessions and runs background consolidation
 
 ### Trigger consolidation manually
 
-`POST /consolidate` requires the admin token printed at startup:
+`POST /consolidate` and `POST /reinitialize` require the admin token printed at startup:
 
 ```bash
 # Via HTTP (token is printed to the console when the server starts)
 curl -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:3179/consolidate
+curl -X POST -H "Authorization: Bearer <token>" 'http://127.0.0.1:3179/reinitialize?confirm=yes'
 
 # Via CLI (no token needed — calls the consolidation engine directly)
 bun run consolidate
@@ -203,7 +204,7 @@ Usage: curl -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:3179/con
 
 The token is not persisted — it changes every time the server restarts. This guards against browser-based CSRF attacks on `POST /consolidate` and `POST /reinitialize`: a malicious web page has no way to learn the token (it is never in a cookie, never auto-sent, and changes on every restart), so it cannot forge a valid `Authorization` header. Without the token, any page open in your browser could trigger these operations against your local server.
 
-The `/activate`, `/status`, `/entries`, and `/review` endpoints are intentionally unauthenticated. Adding auth to read endpoints would require either a per-startup token (unusable for manual `curl` inspection) or a static token in `.env` — but any local process that can read `.env` can also read the SQLite database directly. Auth on reads would be security theater against same-user processes, which are already trusted by the OS. For browser-based reads, the same-origin policy provides protection: browsers block cross-origin *responses* from being read by the page, regardless of whether the endpoint is authenticated. Non-browser clients (`curl`, scripts) running as the same user are treated as trusted by design.
+The `/activate`, `/status`, `/entries`, and `/review` endpoints are intentionally unauthenticated. Adding auth to read endpoints would require either a per-startup token (unusable for manual `curl` inspection) or a static token in `.env` — but any local process that can read `.env` can also read the SQLite database directly. Auth on reads would be security theater against same-user processes, which are already trusted by the OS. For browser-based reads, a cross-origin page can still *send* requests to these endpoints, but the browser's same-origin policy prevents the page's JavaScript from reading the response body — so the knowledge graph content cannot be exfiltrated that way. Non-browser clients (`curl`, scripts) running as the same user are treated as trusted by design.
 
 On a shared multi-user machine, run the server behind a reverse proxy with authentication.
 
