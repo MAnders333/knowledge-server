@@ -8,12 +8,8 @@
  * - decision: A choice made with rationale ("we chose BigQuery over Snowflake because...")
  * - procedure: A learned workflow or process ("to deploy to prod, first run X then Y")
  */
-export type KnowledgeType =
-  | "fact"
-  | "principle"
-  | "pattern"
-  | "decision"
-  | "procedure";
+export const KNOWLEDGE_TYPES = ["fact", "principle", "pattern", "decision", "procedure"] as const;
+export type KnowledgeType = typeof KNOWLEDGE_TYPES[number];
 
 /**
  * Lifecycle status of a knowledge entry.

@@ -4,13 +4,14 @@ import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { config } from "../config.js";
 import { CREATE_TABLES, SCHEMA_VERSION, CONSOLIDATED_EPISODE_DDL } from "./schema.js";
+import { KNOWLEDGE_TYPES } from "../types.js";
 import type {
   KnowledgeEntry,
   KnowledgeRelation,
   KnowledgeStatus,
   ConsolidationState,
+  ProcessedRange,
 } from "../types.js";
-import type { ProcessedRange } from "../types.js";
 
 /**
  * Database layer for the knowledge graph.
@@ -401,7 +402,6 @@ export class KnowledgeDB {
 
         case "merge": {
           // Merge into the new entry, supersede the old one
-          const VALID_TYPES = ["fact", "principle", "pattern", "decision", "procedure"];
           if (!mergedData) {
             console.warn(
               `[db] merge resolution missing mergedData — existingEntryId ${existingEntryId} ` +
@@ -410,9 +410,9 @@ export class KnowledgeDB {
           }
           if (mergedData) {
             // Clamp type to valid enum values — LLM occasionally returns something
-            // outside the schema constraint (e.g. "fact/principle"), causing a
+            // outside the schema CHECK constraint (e.g. "fact/principle"), causing a
             // SQLITE_CONSTRAINT_CHECK error that aborts the entire batch.
-            const safeType = VALID_TYPES.includes(mergedData.type) ? mergedData.type : "fact";
+            const safeType = (KNOWLEDGE_TYPES as readonly string[]).includes(mergedData.type) ? mergedData.type : "fact";
             if (safeType !== mergedData.type) {
               console.warn(`[db] merge: invalid type "${mergedData.type}" from LLM — falling back to "fact"`);
             }
