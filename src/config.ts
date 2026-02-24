@@ -41,7 +41,13 @@ export const config = {
   // Embedding (always OpenAI-compatible, always through /openai/v1)
   embedding: {
     model: process.env.EMBEDDING_MODEL || "text-embedding-3-large",
-    dimensions: Number.parseInt(process.env.EMBEDDING_DIMENSIONS || "3072", 10),
+    // Only defined when EMBEDDING_DIMENSIONS is explicitly set.
+    // Forwarded to the API only when present — the `dimensions` parameter is
+    // only valid for text-embedding-3-* models; sending it to other models
+    // (ada-002, Ollama, etc.) causes a 400 error.
+    dimensions: process.env.EMBEDDING_DIMENSIONS
+      ? Number.parseInt(process.env.EMBEDDING_DIMENSIONS, 10)
+      : undefined,
   },
 
   // Decay parameters

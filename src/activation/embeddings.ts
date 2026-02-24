@@ -10,7 +10,7 @@ export class EmbeddingClient {
   private endpoint: string;
   private apiKey: string;
   private model: string;
-  private dimensions: number;
+  private dimensions: number | undefined;
 
   constructor() {
     // Embeddings always go through the OpenAI-compatible path
@@ -49,7 +49,9 @@ export class EmbeddingClient {
         body: JSON.stringify({
           model: this.model,
           input: chunk,
-          dimensions: this.dimensions,
+          // Only sent when explicitly configured — `dimensions` is only valid for
+          // text-embedding-3-* models; omitting it lets the model use its default.
+          ...(this.dimensions !== undefined && { dimensions: this.dimensions }),
         }),
       });
 

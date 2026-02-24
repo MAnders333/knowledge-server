@@ -90,7 +90,8 @@ echo '    "type": "local",'
 echo "    \"command\": [\"bun\", \"run\", \"$PROJECT_DIR/src/mcp/index.ts\"],"
 echo '    "enabled": true,'
 echo '    "environment": {'
-echo '      "LLM_API_KEY": "your-key-here"'
+echo '      "LLM_API_KEY": "your-key-here",'
+echo '      "LLM_BASE_ENDPOINT": "https://your-llm-endpoint.example.com"'
 echo '    }'
 echo '  }'
 echo ""
