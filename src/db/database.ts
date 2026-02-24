@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { config } from "../config.js";
-import { CREATE_TABLES, SCHEMA_VERSION } from "./schema.js";
+import { CREATE_TABLES, SCHEMA_VERSION, CONSOLIDATED_EPISODE_DDL } from "./schema.js";
 import type {
   KnowledgeEntry,
   KnowledgeRelation,
@@ -94,25 +94,12 @@ export class KnowledgeDB {
       // DB in a state where the table is dropped but not yet recreated.
       // Use db.transaction() (Bun's idiomatic API) rather than manual BEGIN/COMMIT
       // to avoid issues when called inside an existing transaction.
+      // CONSOLIDATED_EPISODE_DDL is the single source of truth for this schema —
+      // shared with CREATE_TABLES in schema.ts to prevent drift.
       this.db.transaction(() => {
         this.db.exec("DROP TABLE IF EXISTS consolidated_episode");
-        this.db.exec(`
-          CREATE TABLE consolidated_episode (
-            session_id       TEXT    NOT NULL,
-            start_message_id TEXT    NOT NULL,
-            end_message_id   TEXT    NOT NULL,
-            content_type     TEXT    NOT NULL,
-            processed_at     INTEGER NOT NULL,
-            entries_created  INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (session_id, start_message_id, end_message_id)
-          )
-        `);
-        this.db.exec(
-          "CREATE INDEX idx_episode_session ON consolidated_episode(session_id)"
-        );
-        this.db.exec(
-          "CREATE INDEX idx_episode_processed ON consolidated_episode(processed_at)"
-        );
+        // CONSOLIDATED_EPISODE_DDL uses CREATE TABLE IF NOT EXISTS — safe after the drop above.
+        this.db.exec(CONSOLIDATED_EPISODE_DDL);
       })();
     }
   }

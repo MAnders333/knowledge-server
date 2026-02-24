@@ -10,6 +10,35 @@
 
 export const SCHEMA_VERSION = 3;
 
+/**
+ * DDL for the consolidated_episode table (v3 schema).
+ * Exported as a standalone constant so the runtime migration in database.ts
+ * can reference the same definition — preventing the two copies from drifting.
+ *
+ * An episode is uniquely identified by (session_id, start_message_id, end_message_id).
+ * Message IDs are stable UUIDs from the OpenCode DB — they never shift even as a
+ * session grows with new messages, unlike the old segment_index approach where
+ * token-chunk boundaries could move when new messages were appended.
+ *
+ * This allows running consolidate() twice in the same session:
+ *   1st run: records episodes up to the last message at that point
+ *   2nd run: only new messages (after the last processed end_message_id) are picked up
+ */
+export const CONSOLIDATED_EPISODE_DDL = `
+  CREATE TABLE IF NOT EXISTS consolidated_episode (
+    session_id       TEXT    NOT NULL,
+    start_message_id TEXT    NOT NULL,       -- first message ID in this episode (inclusive)
+    end_message_id   TEXT    NOT NULL,       -- last message ID in this episode (inclusive)
+    content_type     TEXT    NOT NULL,       -- 'compaction_summary' | 'messages'
+    processed_at     INTEGER NOT NULL,       -- unix ms when this episode was consolidated
+    entries_created  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, start_message_id, end_message_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_episode_session ON consolidated_episode(session_id);
+  CREATE INDEX IF NOT EXISTS idx_episode_processed ON consolidated_episode(processed_at);
+`;
+
 export const CREATE_TABLES = `
   -- Schema version tracking
   CREATE TABLE IF NOT EXISTS schema_version (
@@ -81,28 +110,6 @@ export const CREATE_TABLES = `
   VALUES (1, 0, 0, 0, 0, 0);
 
   -- Per-episode processing log — enables incremental within-session consolidation.
-  --
-  -- An episode is uniquely identified by (session_id, start_message_id, end_message_id).
-  -- Message IDs are stable UUIDs from the OpenCode DB — they never shift even as a
-  -- session grows with new messages, unlike the old segment_index approach where
-  -- token-chunk boundaries could move when new messages were appended.
-  --
-  -- This allows running consolidate() twice in the same session:
-  --   1st run: records episodes up to the last message at that point
-  --   2nd run: only new messages (after the last processed end_message_id) are picked up
-  --
-  -- The session-level cursor (last_session_time_created) still limits which sessions
-  -- are candidates — this table provides the finer-grained within-session tracking.
-  CREATE TABLE IF NOT EXISTS consolidated_episode (
-    session_id       TEXT    NOT NULL,
-    start_message_id TEXT    NOT NULL,       -- first message ID in this episode (inclusive)
-    end_message_id   TEXT    NOT NULL,       -- last message ID in this episode (inclusive)
-    content_type     TEXT    NOT NULL,       -- 'compaction_summary' | 'messages'
-    processed_at     INTEGER NOT NULL,       -- unix ms when this episode was consolidated
-    entries_created  INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (session_id, start_message_id, end_message_id)
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_episode_session ON consolidated_episode(session_id);
-  CREATE INDEX IF NOT EXISTS idx_episode_processed ON consolidated_episode(processed_at);
+  -- See CONSOLIDATED_EPISODE_DDL for the table definition (shared with the v3 migration).
+  ${CONSOLIDATED_EPISODE_DDL}
 `;

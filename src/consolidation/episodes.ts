@@ -313,10 +313,13 @@ export class EpisodeReader {
     sessionId: string,
     compactionTime: number
   ): EpisodeMessage[] {
-    // Find the continuation summary message (first assistant message after compaction)
+    // Find the continuation summary message (first assistant message after compaction).
+    // We fetch its ID so we can exclude it by ID rather than by timestamp — excluding
+    // by timestamp (m.time_created > summaryMsg.time_created) would silently drop any
+    // subsequent message that shares the exact same millisecond timestamp.
     const summaryMsg = this.db
       .prepare(
-        `SELECT m.time_created
+        `SELECT m.id, m.time_created
          FROM message m
          WHERE m.session_id = ?
            AND m.time_created > ?
@@ -324,14 +327,14 @@ export class EpisodeReader {
          ORDER BY m.time_created ASC
          LIMIT 1`
       )
-      .get(sessionId, compactionTime) as { time_created: number } | null;
+      .get(sessionId, compactionTime) as { id: string; time_created: number } | null;
 
-    // Start from after the summary message
-    const startTime = summaryMsg
-      ? summaryMsg.time_created
-      : compactionTime;
-
-    return this.getMessagesInRange(sessionId, startTime, Number.MAX_SAFE_INTEGER);
+    // Fetch all messages after the compaction point, then exclude the summary itself by ID.
+    const afterTime = summaryMsg ? summaryMsg.time_created - 1 : compactionTime;
+    const allAfter = this.getMessagesInRange(sessionId, afterTime, Number.MAX_SAFE_INTEGER);
+    return summaryMsg
+      ? allAfter.filter((m) => m.messageId !== summaryMsg.id)
+      : allAfter;
   }
 
   /**
@@ -378,6 +381,10 @@ export class EpisodeReader {
 
   /**
    * Chunk messages into groups that fit within a token budget.
+   *
+   * Note: `maxTokens` is a soft limit. A single message that individually exceeds
+   * the budget is never split — it is placed alone in its own chunk. This means
+   * an individual chunk may exceed `maxTokens` when a single message is very large.
    */
   private chunkByTokenBudget(
     messages: EpisodeMessage[],
