@@ -399,8 +399,9 @@ export class KnowledgeDB {
             .run(randomUUID(), existingEntryId, newEntryId, now);
           break;
 
-        case "merge":
-          // Merge into the new entry, tombstone the old one
+        case "merge": {
+          // Merge into the new entry, supersede the old one
+          const VALID_TYPES = ["fact", "principle", "pattern", "decision", "procedure"];
           if (!mergedData) {
             console.warn(
               `[db] merge resolution missing mergedData — existingEntryId ${existingEntryId} ` +
@@ -408,6 +409,13 @@ export class KnowledgeDB {
             );
           }
           if (mergedData) {
+            // Clamp type to valid enum values — LLM occasionally returns something
+            // outside the schema constraint (e.g. "fact/principle"), causing a
+            // SQLITE_CONSTRAINT_CHECK error that aborts the entire batch.
+            const safeType = VALID_TYPES.includes(mergedData.type) ? mergedData.type : "fact";
+            if (safeType !== mergedData.type) {
+              console.warn(`[db] merge: invalid type "${mergedData.type}" from LLM — falling back to "fact"`);
+            }
             this.db
               .prepare(
                 `UPDATE knowledge_entry
@@ -417,7 +425,7 @@ export class KnowledgeDB {
               )
               .run(
                 mergedData.content,
-                mergedData.type,
+                safeType,
                 JSON.stringify(mergedData.topics),
                 mergedData.confidence,
                 now,
@@ -439,6 +447,7 @@ export class KnowledgeDB {
             )
             .run(randomUUID(), newEntryId, existingEntryId, now);
           break;
+        }
 
         case "irresolvable":
           // Genuine tie — insert contradicts relation, mark BOTH entries as conflicted.
