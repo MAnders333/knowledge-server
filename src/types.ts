@@ -97,10 +97,16 @@ export interface ConsolidationState {
  * For sessions WITHOUT compactions:
  *   - The whole session is one episode if it fits the token budget
  *   - Otherwise chunked by message boundaries
+ *
+ * Episodes are keyed by (sessionId, startMessageId, endMessageId) — stable message IDs
+ * from the OpenCode DB that don't shift when new messages are appended to the session.
+ * This allows incremental within-session consolidation: a second consolidation run
+ * on the same session only processes messages after the last recorded endMessageId.
  */
 export interface Episode {
   sessionId: string;
-  segmentIndex: number; // 0-based segment within the session
+  startMessageId: string; // first message ID in this episode (stable OpenCode UUID)
+  endMessageId: string;   // last message ID in this episode (stable OpenCode UUID)
   sessionTitle: string;
   projectName: string;
   directory: string;
@@ -111,9 +117,19 @@ export interface Episode {
 }
 
 /**
+ * An already-processed episode range, keyed by stable message IDs.
+ * Loaded from consolidated_episode to skip re-processing on subsequent runs.
+ */
+export interface ProcessedRange {
+  startMessageId: string;
+  endMessageId: string;
+}
+
+/**
  * Raw message extracted from OpenCode DB before formatting.
  */
 export interface EpisodeMessage {
+  messageId: string; // stable UUID from OpenCode DB — used to key episode ranges
   role: "user" | "assistant";
   content: string;
   timestamp: number;

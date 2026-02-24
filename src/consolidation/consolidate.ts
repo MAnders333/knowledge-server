@@ -66,6 +66,14 @@ export class ConsolidationEngine {
    * Run a consolidation cycle.
    *
    * This is the main entry point — called by HTTP API or CLI.
+   *
+   * Incremental within-session consolidation (Option D):
+   * 1. Load already-processed episode ranges from consolidated_episode
+   * 2. Fetch sessions since the session-level cursor, then filter out
+   *    already-processed (startMessageId, endMessageId) ranges per session
+   * 3. Process only the new episodes
+   * 4. Record each episode to consolidated_episode immediately after processing
+   * 5. Advance the session-level cursor to cover fully-processed sessions
    */
   async consolidate(): Promise<ConsolidationResult> {
     const startTime = Date.now();
@@ -75,13 +83,17 @@ export class ConsolidationEngine {
       `[consolidation] Starting. Last run: ${state.lastConsolidatedAt ? new Date(state.lastConsolidatedAt).toISOString() : "never"}`
     );
 
-    // 1. Read new episodes since cursor (sessions are segmented into episodes)
-    const episodes = this.episodes.getNewEpisodes(
-      state.lastSessionTimeCreated
+    // 1. Fetch candidate sessions (id + time_created) up to the batch limit.
+    //    We need time_created for ALL fetched sessions — not just ones that produce
+    //    episodes — so the cursor always advances past the full batch, even when
+    //    sessions are skipped due to minSessionMessages filtering.
+    const candidateSessions = this.episodes.getCandidateSessions(
+      state.lastSessionTimeCreated,
+      config.consolidation.maxSessionsPerRun
     );
 
-    if (episodes.length === 0) {
-      console.log("[consolidation] No new episodes to process.");
+    if (candidateSessions.length === 0) {
+      console.log("[consolidation] No new sessions to process.");
       return {
         sessionsProcessed: 0,
         segmentsProcessed: 0,
@@ -94,17 +106,41 @@ export class ConsolidationEngine {
       };
     }
 
-    // Count unique sessions
+    // The cursor will advance to the max time_created of ALL fetched sessions —
+    // this ensures sessions with too few messages don't stall the cursor.
+    const maxCandidateTime = candidateSessions.reduce((max, s) => s.timeCreated > max ? s.timeCreated : max, 0);
+    const candidateIds = candidateSessions.map((s) => s.id);
+
+    // 2. Load already-processed episode ranges for this batch of sessions.
+    const processedRanges = this.db.getProcessedEpisodeRanges(candidateIds);
+
+    // 3. Segment sessions into episodes, skipping already-processed ranges.
+    const episodes = this.episodes.getNewEpisodes(candidateIds, processedRanges);
+
+    // Count unique sessions that produced at least one new episode
     const uniqueSessionIds = new Set(episodes.map((e) => e.sessionId));
 
+    // Directly classify each skipped session rather than computing by subtraction
+    // (subtraction can go negative for partially-processed sessions that still have new episodes).
+    let alreadyDone = 0; // had prior episodes recorded, nothing new
+    let tooFew = 0;      // no prior episodes, didn't pass minSessionMessages filter
+    for (const id of candidateIds) {
+      if (uniqueSessionIds.has(id)) continue; // produced new episodes — not skipped
+      if (processedRanges.has(id)) {
+        alreadyDone++;  // some episodes were previously recorded; no new tail
+      } else {
+        tooFew++;       // never produced episodes — below minSessionMessages
+      }
+    }
+
     console.log(
-      `[consolidation] Found ${episodes.length} episodes from ${uniqueSessionIds.size} sessions to process.`
+      `[consolidation] Found ${episodes.length} episodes from ${uniqueSessionIds.size} sessions to process` +
+      ` (${tooFew} skipped — too few messages, ${alreadyDone} skipped — already processed).`
     );
 
-    // 2. Process episodes in chunks
+    // 4. Process episodes in chunks
     let totalCreated = 0;
     let totalUpdated = 0;
-    let maxSessionTime = state.lastSessionTimeCreated;
 
     const chunkSize = config.consolidation.chunkSize;
 
@@ -148,49 +184,63 @@ export class ConsolidationEngine {
       // chunk see the newly inserted/updated entries.
       const sessionIds = [...new Set(chunk.map((e) => e.sessionId))];
       let cachedEntries = this.db.getActiveEntriesWithEmbeddings();
+      let chunkCreated = 0;
+      let chunkUpdated = 0;
 
       for (const entry of extracted) {
         await this.reconsolidate(entry, sessionIds, cachedEntries, {
           onInsert: () => {
             totalCreated++;
+            chunkCreated++;
             cachedEntries = this.db.getActiveEntriesWithEmbeddings();
           },
           onUpdate: () => {
             totalUpdated++;
+            chunkUpdated++;
             cachedEntries = this.db.getActiveEntriesWithEmbeddings();
           },
           onKeep: () => {},
         });
       }
 
-      // Track the highest session timestamp in this chunk
+      // 4. Record each episode in this chunk as processed.
+      //    This happens after the LLM call and DB writes succeed, making
+      //    consolidation idempotent on crash/retry at the episode level.
+      //    entriesCreated is split evenly across episodes in the chunk as an approximation
+      //    (we don't track which entries came from which specific episode).
+      const entriesPerEp = chunk.length > 0 ? Math.round((chunkCreated + chunkUpdated) / chunk.length) : 0;
       for (const ep of chunk) {
-        if (ep.timeCreated > maxSessionTime) {
-          maxSessionTime = ep.timeCreated;
-        }
+        this.db.recordEpisode(
+          ep.sessionId,
+          ep.startMessageId,
+          ep.endMessageId,
+          ep.contentType,
+          entriesPerEp
+        );
       }
     }
 
-    // 4. Apply decay to ALL active entries
+    // 5. Apply decay to ALL active entries
     const archived = this.applyDecay();
 
-    // 5. Generate embeddings for new entries
+    // 6. Generate embeddings for new entries
     const embeddedCount = await this.activation.ensureEmbeddings();
     console.log(
       `[consolidation] Generated embeddings for ${embeddedCount} entries.`
     );
 
-    // 6. Update consolidation cursor
+    // 7. Advance cursor past ALL fetched candidate sessions (not just episode-producing ones).
+    //    This prevents sessions with too few messages from stalling the cursor.
     this.db.updateConsolidationState({
       lastConsolidatedAt: Date.now(),
-      lastSessionTimeCreated: maxSessionTime,
-      totalSessionsProcessed: state.totalSessionsProcessed + uniqueSessionIds.size,
+      lastSessionTimeCreated: maxCandidateTime,
+      totalSessionsProcessed: state.totalSessionsProcessed + candidateSessions.length,
       totalEntriesCreated: state.totalEntriesCreated + totalCreated,
       totalEntriesUpdated: state.totalEntriesUpdated + totalUpdated,
     });
 
     const result: ConsolidationResult = {
-      sessionsProcessed: uniqueSessionIds.size,
+      sessionsProcessed: candidateSessions.length,
       segmentsProcessed: episodes.length,
       entriesCreated: totalCreated,
       entriesUpdated: totalUpdated,
@@ -450,14 +500,11 @@ export class ConsolidationEngine {
   private formatEpisodes(episodes: Episode[]): string {
     return episodes
       .map((ep) => {
-        const segmentLabel = ep.segmentIndex > 0
-          ? ` [segment ${ep.segmentIndex}]`
-          : "";
         const typeLabel = ep.contentType === "compaction_summary"
           ? " (compaction summary)"
           : "";
 
-        return `### Session: "${ep.sessionTitle}"${segmentLabel}${typeLabel} (${new Date(ep.timeCreated).toISOString().split("T")[0]}, project: ${ep.projectName})
+        return `### Session: "${ep.sessionTitle}"${typeLabel} (${new Date(ep.timeCreated).toISOString().split("T")[0]}, project: ${ep.projectName})
 ${ep.content}`;
       })
       .join("\n\n---\n\n");

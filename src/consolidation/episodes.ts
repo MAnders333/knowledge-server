@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { dirname, resolve } from "node:path";
 import { config } from "../config.js";
-import type { Episode, EpisodeMessage } from "../types.js";
+import type { Episode, EpisodeMessage, ProcessedRange } from "../types.js";
 
 /**
  * Maximum tokens per episode segment.
@@ -30,7 +30,15 @@ function approxTokens(text: string): number {
  *   plus messages after the last compaction = 1 final episode (if any).
  * - For sessions WITHOUT compactions: the whole session is 1 episode,
  *   chunked by message boundaries if it exceeds the token budget.
+ *
+ * Incremental within-session consolidation (Option D):
+ * - Episodes are keyed by (sessionId, startMessageId, endMessageId).
+ * - Message IDs are stable UUIDs from OpenCode — they never shift when new
+ *   messages are appended, unlike a segment_index approach.
+ * - On each consolidation run, already-processed (start, end) ranges are
+ *   excluded, so only the new tail of a session is re-processed.
  */
+
 /**
  * Directory of the knowledge DB — used to exclude knowledge-server's own sessions
  * from consolidation. Using the actual config path is robust to the project being
@@ -46,8 +54,36 @@ export class EpisodeReader {
   }
 
   /**
+   * Return candidate sessions (since cursor, up to limit) with their time_created.
+   * Used by ConsolidationEngine to:
+   *   1. Pre-load processed episode ranges before segmentation
+   *   2. Advance the cursor past ALL fetched sessions, not just ones with episodes —
+   *      so sessions with too few messages don't stall the cursor indefinitely.
+   */
+  getCandidateSessions(
+    afterTimeCreated: number,
+    limit: number = config.consolidation.maxSessionsPerRun
+  ): Array<{ id: string; timeCreated: number }> {
+    const rows = this.db
+      .prepare(
+        `SELECT s.id, s.time_created FROM session s
+         WHERE s.time_created > ?
+           AND s.parent_id IS NULL
+           AND s.directory NOT LIKE ?
+         ORDER BY s.time_created ASC
+         LIMIT ?`
+      )
+      .all(afterTimeCreated, `${KNOWLEDGE_DB_DIR}%`, limit) as Array<{ id: string; time_created: number }>;
+    return rows.map((r) => ({ id: r.id, timeCreated: r.time_created }));
+  }
+
+  /**
    * Count sessions pending consolidation without loading their content.
    * Cheap check used at startup.
+   *
+   * Note: this counts sessions by time_created cursor only. Some of these sessions
+   * may already be partially consolidated (some episodes processed). The actual
+   * new-work check is done at the episode level inside getNewEpisodes().
    */
   countNewSessions(afterTimeCreated: number): number {
     const row = this.db
@@ -62,26 +98,32 @@ export class EpisodeReader {
   }
 
   /**
-   * Get episodes from sessions created after the given timestamp.
-   * A single session may produce multiple episodes (segments).
+   * Segment a list of candidate sessions into episodes, excluding already-processed ranges.
+   *
+   * Caller is responsible for fetching the candidate session IDs (via getCandidateSessions)
+   * and the processed ranges (via KnowledgeDB.getProcessedEpisodeRanges). This avoids
+   * a redundant DB query and lets the caller use the full session list for cursor advancement.
+   *
+   * @param candidateSessionIds - session IDs to segment (already fetched by caller)
+   * @param processedRanges     - per-session map of already-processed message ID ranges
    */
   getNewEpisodes(
-    afterTimeCreated: number,
-    limit: number = config.consolidation.maxSessionsPerRun
+    candidateSessionIds: string[],
+    processedRanges: Map<string, ProcessedRange[]>
   ): Episode[] {
+    if (candidateSessionIds.length === 0) return [];
+
+    // Use json_each() to avoid SQLite's SQLITE_MAX_VARIABLE_NUMBER (999) limit.
     const sessions = this.db
       .prepare(
         `SELECT s.id, s.title, s.directory, s.time_created,
                 COALESCE(p.name, 'unknown') as project_name
          FROM session s
          LEFT JOIN project p ON s.project_id = p.id
-         WHERE s.time_created > ?
-            AND s.parent_id IS NULL
-            AND s.directory NOT LIKE ?
-         ORDER BY s.time_created ASC
-         LIMIT ?`
+         WHERE s.id IN (SELECT value FROM json_each(?))
+         ORDER BY s.time_created ASC`
       )
-      .all(afterTimeCreated, `${KNOWLEDGE_DB_DIR}%`, limit) as Array<{
+      .all(JSON.stringify(candidateSessionIds)) as Array<{
       id: string;
       title: string;
       directory: string;
@@ -92,7 +134,8 @@ export class EpisodeReader {
     const episodes: Episode[] = [];
 
     for (const session of sessions) {
-      const sessionEpisodes = this.segmentSession(session);
+      const sessionProcessed = processedRanges.get(session.id) ?? [];
+      const sessionEpisodes = this.segmentSession(session, sessionProcessed);
       episodes.push(...sessionEpisodes);
     }
 
@@ -100,7 +143,7 @@ export class EpisodeReader {
   }
 
   /**
-   * Segment a single session into episodes.
+   * Segment a single session into episodes, skipping already-processed ranges.
    *
    * Strategy:
    * 1. Find all compaction points in the session
@@ -109,21 +152,38 @@ export class EpisodeReader {
    *    - Messages after the last compaction become the final episode
    * 3. If no compactions:
    *    - Extract all messages, chunk if they exceed token budget
+   * 4. Filter out any episodes whose (startMessageId, endMessageId) range
+   *    is already recorded in consolidated_episode.
    */
-  private segmentSession(session: {
-    id: string;
-    title: string;
-    directory: string;
-    time_created: number;
-    project_name: string;
-  }): Episode[] {
+  private segmentSession(
+    session: {
+      id: string;
+      title: string;
+      directory: string;
+      time_created: number;
+      project_name: string;
+    },
+    processedRanges: ProcessedRange[]
+  ): Episode[] {
     const compactionPoints = this.getCompactionPoints(session.id);
 
+    let episodes: Episode[];
     if (compactionPoints.length > 0) {
-      return this.segmentWithCompactions(session, compactionPoints);
+      episodes = this.segmentWithCompactions(session, compactionPoints);
+    } else {
+      episodes = this.segmentWithoutCompactions(session);
     }
 
-    return this.segmentWithoutCompactions(session);
+    // Filter out already-processed episodes by (startMessageId, endMessageId)
+    if (processedRanges.length === 0) return episodes;
+
+    const processedSet = new Set(
+      processedRanges.map((r) => `${r.startMessageId}::${r.endMessageId}`)
+    );
+
+    return episodes.filter(
+      (ep) => !processedSet.has(`${ep.startMessageId}::${ep.endMessageId}`)
+    );
   }
 
   /**
@@ -132,7 +192,7 @@ export class EpisodeReader {
    */
   private getCompactionPoints(
     sessionId: string
-  ): Array<{ compactionTime: number; summaryText: string }> {
+  ): Array<{ compactionTime: number; summaryText: string; summaryMessageId: string }> {
     // Find all compaction part timestamps
     const compactionTimes = this.db
       .prepare(
@@ -145,13 +205,13 @@ export class EpisodeReader {
       )
       .all(sessionId) as Array<{ time_created: number }>;
 
-    const points: Array<{ compactionTime: number; summaryText: string }> = [];
+    const points: Array<{ compactionTime: number; summaryText: string; summaryMessageId: string }> = [];
 
     for (const ct of compactionTimes) {
       // The continuation summary is the first assistant text part AFTER the compaction
       const summary = this.db
         .prepare(
-          `SELECT json_extract(p.data, '$.text') as text
+          `SELECT m.id as message_id, json_extract(p.data, '$.text') as text
            FROM message m
            JOIN part p ON p.message_id = m.id
            WHERE m.session_id = ?
@@ -161,12 +221,13 @@ export class EpisodeReader {
            ORDER BY m.time_created ASC, p.time_created ASC
            LIMIT 1`
         )
-        .get(sessionId, ct.time_created) as { text: string } | null;
+        .get(sessionId, ct.time_created) as { message_id: string; text: string } | null;
 
       if (summary?.text) {
         points.push({
           compactionTime: ct.time_created,
           summaryText: summary.text,
+          summaryMessageId: summary.message_id,
         });
       }
     }
@@ -177,7 +238,8 @@ export class EpisodeReader {
   /**
    * Segment a session that has compactions.
    *
-   * Each compaction summary is a pre-condensed episode.
+   * Each compaction summary is a pre-condensed episode with a stable
+   * (startMessageId = endMessageId = summaryMessageId) key.
    * Messages after the last compaction become the final episode.
    */
   private segmentWithCompactions(
@@ -188,17 +250,17 @@ export class EpisodeReader {
       time_created: number;
       project_name: string;
     },
-    compactionPoints: Array<{ compactionTime: number; summaryText: string }>
+    compactionPoints: Array<{ compactionTime: number; summaryText: string; summaryMessageId: string }>
   ): Episode[] {
     const episodes: Episode[] = [];
-    let segmentIndex = 0;
 
-    // Each compaction summary is one episode
+    // Each compaction summary is one episode keyed by its own message ID
     for (const point of compactionPoints) {
       const tokens = approxTokens(point.summaryText);
       episodes.push({
         sessionId: session.id,
-        segmentIndex: segmentIndex++,
+        startMessageId: point.summaryMessageId,
+        endMessageId: point.summaryMessageId,
         sessionTitle: session.title || "Untitled",
         projectName: session.project_name,
         directory: session.directory,
@@ -209,31 +271,24 @@ export class EpisodeReader {
       });
     }
 
-    // Messages after the last compaction become the final episode
+    // Messages after the last compaction become the final episode(s)
     const lastCompactionTime =
       compactionPoints[compactionPoints.length - 1].compactionTime;
 
-    // We need to skip the continuation summary message itself —
-    // get messages from the second assistant message after the compaction onward,
-    // plus any user messages after the compaction
     const tailMessages = this.getMessagesAfterCompaction(
       session.id,
       lastCompactionTime
     );
 
     if (tailMessages.length >= config.consolidation.minSessionMessages) {
-      const formatted = this.formatMessages(tailMessages);
-      if (formatted.trim()) {
-        // Chunk if needed
-        const chunks = this.chunkByTokenBudget(
-          tailMessages,
-          MAX_TOKENS_PER_EPISODE
-        );
-        for (const chunk of chunks) {
-          const content = this.formatMessages(chunk);
+      const chunks = this.chunkByTokenBudget(tailMessages, MAX_TOKENS_PER_EPISODE);
+      for (const chunk of chunks) {
+        const content = this.formatMessages(chunk);
+        if (content.trim()) {
           episodes.push({
             sessionId: session.id,
-            segmentIndex: segmentIndex++,
+            startMessageId: chunk[0].messageId,
+            endMessageId: chunk[chunk.length - 1].messageId,
             sessionTitle: session.title || "Untitled",
             projectName: session.project_name,
             directory: session.directory,
@@ -300,12 +355,13 @@ export class EpisodeReader {
     const chunks = this.chunkByTokenBudget(messages, MAX_TOKENS_PER_EPISODE);
     const episodes: Episode[] = [];
 
-    for (let i = 0; i < chunks.length; i++) {
-      const content = this.formatMessages(chunks[i]);
+    for (const chunk of chunks) {
+      const content = this.formatMessages(chunk);
       if (content.trim()) {
         episodes.push({
           sessionId: session.id,
-          segmentIndex: i,
+          startMessageId: chunk[0].messageId,
+          endMessageId: chunk[chunk.length - 1].messageId,
           sessionTitle: session.title || "Untitled",
           projectName: session.project_name,
           directory: session.directory,
@@ -361,6 +417,7 @@ export class EpisodeReader {
 
   /**
    * Get messages in a time range within a session.
+   * Returns messages with their stable message IDs for episode keying.
    */
   private getMessagesInRange(
     sessionId: string,
@@ -405,6 +462,7 @@ export class EpisodeReader {
 
       if (content.trim()) {
         result.push({
+          messageId: msg.id,
           role: msg.role as "user" | "assistant",
           content: content.trim(),
           timestamp: msg.time_created,

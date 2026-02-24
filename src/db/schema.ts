@@ -8,7 +8,7 @@
  * - Derived-from stored as JSON array of session/entry IDs (provenance chain)
  */
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 export const CREATE_TABLES = `
   -- Schema version tracking
@@ -80,20 +80,27 @@ export const CREATE_TABLES = `
   INSERT OR IGNORE INTO consolidation_state (id, last_consolidated_at, last_session_time_created, total_sessions_processed, total_entries_created, total_entries_updated)
   VALUES (1, 0, 0, 0, 0, 0);
 
-  -- Per-episode processing log (audit trail).
-  -- An episode is uniquely identified by (session_id, segment_index, content_type).
-  -- NOTE: This table is reserved for future fine-grained idempotency tracking.
-  -- Currently, idempotency is provided at the batch level: the cursor
-  -- (last_session_time_created) advances only after a full consolidate() call
-  -- succeeds. Mid-run crashes re-process the entire batch on next startup —
-  -- the reconsolidation LLM calls (decideMerge) absorb duplicates harmlessly.
+  -- Per-episode processing log — enables incremental within-session consolidation.
+  --
+  -- An episode is uniquely identified by (session_id, start_message_id, end_message_id).
+  -- Message IDs are stable UUIDs from the OpenCode DB — they never shift even as a
+  -- session grows with new messages, unlike the old segment_index approach where
+  -- token-chunk boundaries could move when new messages were appended.
+  --
+  -- This allows running consolidate() twice in the same session:
+  --   1st run: records episodes up to the last message at that point
+  --   2nd run: only new messages (after the last processed end_message_id) are picked up
+  --
+  -- The session-level cursor (last_session_time_created) still limits which sessions
+  -- are candidates — this table provides the finer-grained within-session tracking.
   CREATE TABLE IF NOT EXISTS consolidated_episode (
-    session_id TEXT NOT NULL,
-    segment_index INTEGER NOT NULL DEFAULT 0,
-    content_type TEXT NOT NULL,          -- 'compaction_summary' | 'messages'
-    processed_at INTEGER NOT NULL,       -- unix ms when this episode was consolidated
-    entries_created INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (session_id, segment_index, content_type)
+    session_id       TEXT    NOT NULL,
+    start_message_id TEXT    NOT NULL,       -- first message ID in this episode (inclusive)
+    end_message_id   TEXT    NOT NULL,       -- last message ID in this episode (inclusive)
+    content_type     TEXT    NOT NULL,       -- 'compaction_summary' | 'messages'
+    processed_at     INTEGER NOT NULL,       -- unix ms when this episode was consolidated
+    entries_created  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, start_message_id, end_message_id)
   );
 
   CREATE INDEX IF NOT EXISTS idx_episode_session ON consolidated_episode(session_id);

@@ -9,6 +9,7 @@ import type {
   KnowledgeStatus,
   ConsolidationState,
 } from "../types.js";
+import type { ProcessedRange } from "../types.js";
 
 /**
  * Database layer for the knowledge graph.
@@ -72,26 +73,47 @@ export class KnowledgeDB {
       // Column already exists — no-op
     }
 
-    // v2: add consolidated_episode table (reserved for future fine-grained idempotency)
-    try {
-      this.db.exec(`
-        CREATE TABLE IF NOT EXISTS consolidated_episode (
-          session_id TEXT NOT NULL,
-          segment_index INTEGER NOT NULL DEFAULT 0,
-          content_type TEXT NOT NULL,
-          processed_at INTEGER NOT NULL,
-          entries_created INTEGER NOT NULL DEFAULT 0,
-          PRIMARY KEY (session_id, segment_index, content_type)
-        )
-      `);
-      this.db.exec(
-        "CREATE INDEX IF NOT EXISTS idx_episode_session ON consolidated_episode(session_id)"
-      );
-      this.db.exec(
-        "CREATE INDEX IF NOT EXISTS idx_episode_processed ON consolidated_episode(processed_at)"
-      );
-    } catch {
-      // Table already exists — no-op
+    // v2→v3: replace old consolidated_episode table (keyed by segment_index) with
+    // the new message-ID-based schema (keyed by start_message_id, end_message_id).
+    // Only runs once: we detect whether the migration is needed by checking for the
+    // presence of the new start_message_id column. If it's absent, the old schema
+    // is in place and we drop + recreate. Old data was never actively written so
+    // there is nothing to preserve.
+    const hasNewSchema = (() => {
+      // PRAGMA table_info returns 0 rows (not an error) when the table doesn't exist,
+      // so this should never throw under normal conditions. Re-throw anything unexpected
+      // rather than silently swallowing it and proceeding to DROP the table.
+      const cols = this.db
+        .prepare("PRAGMA table_info(consolidated_episode)")
+        .all() as Array<{ name: string }>;
+      return cols.some((c) => c.name === "start_message_id");
+    })();
+
+    if (!hasNewSchema) {
+      // Wrap the DDL in a transaction so a mid-migration crash doesn't leave the
+      // DB in a state where the table is dropped but not yet recreated.
+      // Use db.transaction() (Bun's idiomatic API) rather than manual BEGIN/COMMIT
+      // to avoid issues when called inside an existing transaction.
+      this.db.transaction(() => {
+        this.db.exec("DROP TABLE IF EXISTS consolidated_episode");
+        this.db.exec(`
+          CREATE TABLE consolidated_episode (
+            session_id       TEXT    NOT NULL,
+            start_message_id TEXT    NOT NULL,
+            end_message_id   TEXT    NOT NULL,
+            content_type     TEXT    NOT NULL,
+            processed_at     INTEGER NOT NULL,
+            entries_created  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (session_id, start_message_id, end_message_id)
+          )
+        `);
+        this.db.exec(
+          "CREATE INDEX idx_episode_session ON consolidated_episode(session_id)"
+        );
+        this.db.exec(
+          "CREATE INDEX idx_episode_processed ON consolidated_episode(processed_at)"
+        );
+      })();
     }
   }
 
@@ -306,6 +328,63 @@ export class KnowledgeDB {
     }));
   }
 
+  // ── Episode Tracking ──
+
+  /**
+   * Record a processed episode by its stable message ID range.
+   * Called after the LLM call and DB writes for that episode succeed.
+   * Uses INSERT OR IGNORE to be idempotent on retry.
+   */
+  recordEpisode(
+    sessionId: string,
+    startMessageId: string,
+    endMessageId: string,
+    contentType: "compaction_summary" | "messages",
+    entriesCreated: number
+  ): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO consolidated_episode
+         (session_id, start_message_id, end_message_id, content_type, processed_at, entries_created)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(sessionId, startMessageId, endMessageId, contentType, Date.now(), entriesCreated);
+  }
+
+  /**
+   * Load already-processed message ID ranges for a set of session IDs.
+   * Returns a Map<sessionId, ProcessedRange[]> for O(1) lookup during segmentation.
+   *
+   * Uses json_each() to pass IDs as a single JSON array parameter, avoiding the
+   * SQLite SQLITE_MAX_VARIABLE_NUMBER limit (999) that a spread IN(?,?,...) would hit.
+   */
+  getProcessedEpisodeRanges(sessionIds: string[]): Map<string, ProcessedRange[]> {
+    if (sessionIds.length === 0) return new Map();
+
+    const rows = this.db
+      .prepare(
+        `SELECT session_id, start_message_id, end_message_id
+         FROM consolidated_episode
+         WHERE session_id IN (SELECT value FROM json_each(?))`
+      )
+      .all(JSON.stringify(sessionIds)) as Array<{
+      session_id: string;
+      start_message_id: string;
+      end_message_id: string;
+    }>;
+
+    const result = new Map<string, ProcessedRange[]>();
+    for (const row of rows) {
+      const existing = result.get(row.session_id);
+      if (existing) {
+        existing.push({ startMessageId: row.start_message_id, endMessageId: row.end_message_id });
+      } else {
+        result.set(row.session_id, [{ startMessageId: row.start_message_id, endMessageId: row.end_message_id }]);
+      }
+    }
+    return result;
+  }
+
   // ── Consolidation State ──
 
   getConsolidationState(): ConsolidationState {
@@ -441,6 +520,7 @@ export class KnowledgeDB {
   reinitialize(): void {
     this.db.exec("DELETE FROM knowledge_relation");
     this.db.exec("DELETE FROM knowledge_entry");
+    this.db.exec("DELETE FROM consolidated_episode");
     this.db.exec(
       `UPDATE consolidation_state SET 
         last_consolidated_at = 0,
