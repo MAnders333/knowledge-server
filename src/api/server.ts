@@ -1,4 +1,6 @@
 import { Hono } from "hono";
+import type { Context } from "hono";
+import { timingSafeEqual } from "node:crypto";
 import type { KnowledgeDB } from "../db/database.js";
 import type { ActivationEngine } from "../activation/activate.js";
 import type { ConsolidationEngine } from "../consolidation/consolidate.js";
@@ -34,11 +36,19 @@ export function createApp(
 
   // -- Auth helper --
 
-  function requireAdminToken(
-    c: Parameters<Parameters<Hono["post"]>[1]>[0]
-  ): boolean {
-    const auth = c.req.header("Authorization");
-    return auth === `Bearer ${adminToken}`;
+  // Pre-encode the expected token once so timingSafeEqual can compare buffers.
+  const expectedToken = Buffer.from(`Bearer ${adminToken}`);
+
+  function requireAdminToken(c: Context): boolean {
+    const auth = c.req.header("Authorization") ?? "";
+    const provided = Buffer.from(auth);
+    // timingSafeEqual requires equal-length buffers — pad/truncate to prevent
+    // length leakage. If lengths differ the check still fails after comparison.
+    const a = Buffer.alloc(expectedToken.length);
+    const b = Buffer.alloc(expectedToken.length);
+    expectedToken.copy(a);
+    provided.copy(b, 0, 0, expectedToken.length);
+    return timingSafeEqual(a, b) && provided.length === expectedToken.length;
   }
 
   // -- Activation --

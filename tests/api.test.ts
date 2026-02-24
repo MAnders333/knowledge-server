@@ -8,6 +8,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
+// Intentionally static string — production uses a random token generated at startup.
 const TEST_ADMIN_TOKEN = "test-admin-token-abc123";
 
 describe("HTTP API", () => {

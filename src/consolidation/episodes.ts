@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 import { config } from "../config.js";
 import type { Episode, EpisodeMessage } from "../types.js";
 
@@ -36,7 +36,7 @@ function approxTokens(text: string): number {
  * from consolidation. Using the actual config path is robust to the project being
  * cloned under any directory name (avoids fragile %knowledge-server% string match).
  */
-const KNOWLEDGE_DB_DIR = dirname(config.dbPath);
+const KNOWLEDGE_DB_DIR = dirname(resolve(config.dbPath));
 
 export class EpisodeReader {
   private db: Database;
