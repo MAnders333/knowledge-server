@@ -1,17 +1,31 @@
 # knowledge-server
 
-A consolidation-aware knowledge system that distills episodic memory from [OpenCode](https://opencode.ai) sessions into retrievable knowledge entries — modeled after how human memory works.
+Persistent semantic memory for [OpenCode](https://opencode.ai) agents — fully local, no external service required.
+
+Your agents forget everything between sessions. This fixes that. It reads your OpenCode session history, distills what's worth keeping into a local knowledge graph, and automatically surfaces relevant entries whenever you start a new conversation.
+
+## The approach
+
+Most "memory" systems for AI agents work like a notebook: everything gets written in, everything gets retrieved. The result is noise — every session dumps its raw content into the store, retrieval floods the context window with marginally-related facts, and the store grows without bound.
+
+This system is modeled on how human memory actually works. The key insight from cognitive science is that episodic memory (what happened) and semantic memory (what you know) are distinct systems — and the brain doesn't store episodes, it consolidates them. During sleep it replays the day's experiences and extracts only what's worth encoding into long-term memory: facts confirmed, patterns recognized, decisions made, procedures learned.
+
+Three properties make this different from a naive memory store:
+
+**High extraction bar.** The LLM reads session transcripts and asks: would this still be useful six months from now? Most sessions produce nothing. The store only grows when something genuinely new was learned.
+
+**Reconsolidation instead of accumulation.** Before any new entry is inserted, it's embedded and compared to the nearest existing entry. If they're similar enough (cosine similarity ≥ 0.82), a focused LLM call decides whether to keep the existing, update it, replace it, or insert both as distinct. Memory updates rather than accumulates — the same way a person's understanding of a topic changes rather than appends.
+
+**Cue-dependent activation.** Nothing is retrieved proactively. When a new message arrives, the query is embedded and matched against the knowledge graph. Only semantically relevant entries activate. The user's message is the retrieval cue — just like human recall requires a prompt to surface a memory.
+
+The result is a compact, high-signal knowledge graph that gets better over time. Entries that keep proving relevant strengthen; entries that become stale decay and eventually disappear.
 
 ## How it works
 
-Human memory has two modes: episodic (things that happened) and semantic (things you know). During sleep, the brain replays episodes and consolidates the useful parts into long-term semantic memory.
-
-This system does the same for AI agents:
-
 1. **Episodes** — OpenCode session logs are the raw material. Each conversation is an episode.
-2. **Consolidation** — An LLM reads new sessions and extracts what's genuinely worth remembering: decisions made, patterns observed, facts confirmed, procedures learned. The bar is high — most sessions produce nothing.
-3. **Reconsolidation** — Before inserting, each new entry is embedded and compared to the nearest existing entry. If similarity ≥ 0.82, a focused LLM call decides whether to keep, update, replace, or insert both. This prevents duplicates and models how human memory updates rather than accumulates.
-4. **Activation** — When a new query arrives, it's embedded and matched against all knowledge entries. Only semantically relevant entries activate. This is cue-dependent retrieval: the query is the cue.
+2. **Consolidation** — An LLM reads new sessions and extracts what's genuinely worth remembering. The bar is high — most sessions produce nothing. Runs automatically on server startup.
+3. **Reconsolidation** — Each new entry is embedded and compared to the nearest existing entry. If similarity ≥ 0.82, a focused LLM call decides whether to keep, update, replace, or insert both. The store updates rather than accumulates.
+4. **Activation** — When a query arrives, it's embedded and matched against all entries. Only semantically relevant entries activate. This is cue-dependent retrieval: the query is the cue.
 5. **Decay** — Entries that aren't accessed decay over time. Entries that are repeatedly relevant strengthen. Eventually unused entries are archived, then tombstoned.
 
 ## Architecture
