@@ -7,7 +7,7 @@ import { ConsolidationLLM } from "./llm.js";
 import { computeStrength } from "./decay.js";
 import { config } from "../config.js";
 import type { Episode, ConsolidationResult, KnowledgeEntry } from "../types.js";
-import type { ExtractedKnowledge } from "./llm.js";
+import type { ExtractedKnowledge, ContradictionResult } from "./llm.js";
 
 /**
  * Maximum number of existing knowledge entries to include as context
@@ -43,6 +43,13 @@ export class ConsolidationEngine {
   private embeddings: EmbeddingClient;
   private episodes: EpisodeReader;
   private llm: ConsolidationLLM;
+
+  /**
+   * Concurrency guard — only one consolidation run at a time, regardless of
+   * whether it was triggered by the startup background loop or an API call.
+   * Lives here (not in the API closure) so both paths share the same flag.
+   */
+  isConsolidating = false;
 
   constructor(db: KnowledgeDB, activation: ActivationEngine) {
     this.db = db;
@@ -94,12 +101,16 @@ export class ConsolidationEngine {
 
     if (candidateSessions.length === 0) {
       console.log("[consolidation] No new sessions to process.");
+      // Still run decay — entries must age even during quiet periods where no
+      // new sessions arrive. Without this, the forgetting curve stops ticking.
+      const archived = this.applyDecay();
+      await this.activation.ensureEmbeddings();
       return {
         sessionsProcessed: 0,
         segmentsProcessed: 0,
         entriesCreated: 0,
         entriesUpdated: 0,
-        entriesArchived: 0,
+        entriesArchived: archived,
         conflictsDetected: 0,
         conflictsResolved: 0,
         duration: Date.now() - startTime,
@@ -141,6 +152,8 @@ export class ConsolidationEngine {
     // 4. Process episodes in chunks
     let totalCreated = 0;
     let totalUpdated = 0;
+    let totalConflictsDetected = 0;
+    let totalConflictsResolved = 0;
 
     const chunkSize = config.consolidation.chunkSize;
 
@@ -152,9 +165,14 @@ export class ConsolidationEngine {
         `[consolidation] Processing chunk ${Math.floor(i / chunkSize) + 1}/${Math.ceil(episodes.length / chunkSize)} (${chunk.length} episodes)`
       );
 
+      // Load entries once for this chunk — used both for relevance selection
+      // (prompt context) and reconsolidation (dedup). Loaded here so getRelevantKnowledge
+      // doesn't make a second DB call when we immediately need the same data below.
+      const allEntriesForChunk = this.db.getActiveEntriesWithEmbeddings();
+
       // Retrieve only RELEVANT existing knowledge for this chunk
       // (instead of dumping the entire knowledge base into the prompt)
-      const relevantKnowledge = await this.getRelevantKnowledge(chunkSummary);
+      const relevantKnowledge = await this.getRelevantKnowledge(chunkSummary, allEntriesForChunk);
       const existingKnowledgeSummary = this.formatExistingKnowledge(relevantKnowledge);
 
       console.log(
@@ -179,31 +197,56 @@ export class ConsolidationEngine {
       //      keep / update / replace / insert
       //   4. Act on the decision
       //
-      // Performance: load all entries with embeddings ONCE per chunk (not per entry).
-      // Refresh the cache after each insert/update so later entries in the same
-      // chunk see the newly inserted/updated entries.
+      // Performance: load all entries with embeddings ONCE per chunk into an in-memory
+      // Map. On insert/update, mutate the Map in place rather than reloading from DB.
+      // This avoids an O(n × m) reload — previously ~9.7 MB × m reads per chunk.
       const sessionIds = [...new Set(chunk.map((e) => e.sessionId))];
-      let cachedEntries = this.db.getActiveEntriesWithEmbeddings();
+      // Reuse the entries already loaded for getRelevantKnowledge — no second DB read.
+      const entriesMap = new Map(allEntriesForChunk.map((e) => [e.id, e]));
       let chunkCreated = 0;
       let chunkUpdated = 0;
 
+      // Track IDs that were inserted or updated this chunk — only these are
+      // eligible for the contradiction scan (pre-existing entries were already
+      // checked in a previous consolidation run).
+      const changedIds = new Set<string>();
+
       for (const entry of extracted) {
-        await this.reconsolidate(entry, sessionIds, cachedEntries, {
-          onInsert: () => {
+        await this.reconsolidate(entry, sessionIds, entriesMap, {
+          onInsert: (inserted) => {
             totalCreated++;
             chunkCreated++;
-            cachedEntries = this.db.getActiveEntriesWithEmbeddings();
+            changedIds.add(inserted.id);
+            // Add to cache so subsequent entries in this chunk can deduplicate against it.
+            // Embedding is available immediately since insertNewEntry stores it.
+            if (inserted.embedding) {
+              entriesMap.set(inserted.id, inserted as KnowledgeEntry & { embedding: number[] });
+            }
           },
-          onUpdate: () => {
+          onUpdate: (id, _updated) => {
             totalUpdated++;
             chunkUpdated++;
-            cachedEntries = this.db.getActiveEntriesWithEmbeddings();
+            changedIds.add(id);
+            // Remove from cache — mergeEntry sets embedding = NULL in the DB.
+            // The re-embedded version is visible on the next consolidation run.
+            // Removing here prevents a later extracted entry in this chunk from
+            // matching the stale (embedding-cleared) version.
+            entriesMap.delete(id);
           },
           onKeep: () => {},
         });
       }
 
-      // 4. Record each episode in this chunk as processed.
+      // 5. Post-extraction contradiction scan.
+      //    For each newly inserted/updated entry, find topic-overlapping entries
+      //    in the mid-similarity band (contradictionMinSimilarity–RECONSOLIDATION_THRESHOLD).
+      //    Entries above the upper bound were already handled by decideMerge.
+      //    Entries below the lower bound are too dissimilar to plausibly contradict.
+      const chunkContradictions = await this.runContradictionScan(entriesMap, changedIds);
+      totalConflictsDetected += chunkContradictions.detected;
+      totalConflictsResolved += chunkContradictions.resolved;
+
+      // 6. Record each episode in this chunk as processed.
       //    This happens after the LLM call and DB writes succeed, making
       //    consolidation idempotent on crash/retry at the episode level.
       //    entriesCreated is split evenly across episodes in the chunk as an approximation
@@ -220,16 +263,16 @@ export class ConsolidationEngine {
       }
     }
 
-    // 5. Apply decay to ALL active entries
+    // 7. Apply decay to ALL active entries
     const archived = this.applyDecay();
 
-    // 6. Generate embeddings for new entries
+    // 8. Generate embeddings for new entries
     const embeddedCount = await this.activation.ensureEmbeddings();
     console.log(
       `[consolidation] Generated embeddings for ${embeddedCount} entries.`
     );
 
-    // 7. Advance cursor past ALL fetched candidate sessions (not just episode-producing ones).
+    // 9. Advance cursor past ALL fetched candidate sessions (not just episode-producing ones).
     //    This prevents sessions with too few messages from stalling the cursor.
     this.db.updateConsolidationState({
       lastConsolidatedAt: Date.now(),
@@ -245,8 +288,8 @@ export class ConsolidationEngine {
       entriesCreated: totalCreated,
       entriesUpdated: totalUpdated,
       entriesArchived: archived,
-      conflictsDetected: 0,
-      conflictsResolved: 0,
+      conflictsDetected: totalConflictsDetected,
+      conflictsResolved: totalConflictsResolved,
       duration: Date.now() - startTime,
     };
 
@@ -274,32 +317,29 @@ export class ConsolidationEngine {
     entry: ExtractedKnowledge,
     sessionIds: string[],
     /**
-     * Pre-loaded active entries with embeddings — callers must pass this in
-     * to avoid an N+1 DB query per extracted entry. Callers should refresh
-     * this cache after each insert/update so later entries in the same chunk
-     * see newly added entries.
+     * Live in-memory cache of active entries with embeddings.
+     * Passed as a Map so callers can mutate it in place on insert/update,
+     * avoiding a full DB reload (which was O(n × m) per chunk).
      *
-     * Note: after an "update"/"replace" decision, the matched entry's embedding
-     * is cleared (mergeEntry sets embedding = NULL). If a later extracted entry
-     * in the same chunk is similar to the same existing entry, it won't find it
-     * via embedding lookup and will be inserted as novel. This is acceptable —
-     * the re-embedded version will be available for the next consolidation run.
+     * After an "update"/"replace" decision, the matched entry is removed from
+     * the Map (its embedding is cleared in the DB by mergeEntry). This prevents
+     * a later extracted entry in the same chunk from matching a stale version.
      */
-    existingEntries: Array<KnowledgeEntry & { embedding: number[] }>,
+    entriesMap: Map<string, KnowledgeEntry & { embedding: number[] }>,
     callbacks: {
-      onInsert: () => void;
-      onUpdate: () => void;
+      onInsert: (inserted: KnowledgeEntry & { embedding?: number[] }) => void;
+      onUpdate: (id: string, updated: Partial<KnowledgeEntry>) => void;
       onKeep: () => void;
     }
   ): Promise<void> {
     // Embed the extracted entry content
     const entryEmbedding = await this.embeddings.embed(entry.content);
 
-    // Find nearest existing entry from the pre-loaded cache
+    // Find nearest existing entry from the in-memory cache
     let nearestEntry: KnowledgeEntry | null = null;
     let nearestSimilarity = 0;
 
-    for (const existing of existingEntries) {
+    for (const existing of entriesMap.values()) {
       const sim = cosineSimilarity(entryEmbedding, existing.embedding);
       if (sim > nearestSimilarity) {
         nearestSimilarity = sim;
@@ -309,8 +349,8 @@ export class ConsolidationEngine {
 
     // Below threshold → clearly novel, insert directly
     if (!nearestEntry || nearestSimilarity < RECONSOLIDATION_THRESHOLD) {
-      this.insertNewEntry(entry, sessionIds, entryEmbedding);
-      callbacks.onInsert();
+      const inserted = this.insertNewEntry(entry, sessionIds, entryEmbedding);
+      callbacks.onInsert(inserted);
       console.log(
         `[consolidation] Insert (novel, sim=${nearestSimilarity.toFixed(3)}): "${entry.content.slice(0, 60)}..."`
       );
@@ -344,24 +384,27 @@ export class ConsolidationEngine {
         break;
 
       case "update":
-      case "replace":
-        this.db.mergeEntry(nearestEntry.id, {
+      case "replace": {
+        const mergeUpdates = {
           content: decision.content,
           type: decision.type,
           topics: decision.topics,
           confidence: Math.max(0, Math.min(1, decision.confidence)),
           additionalSources: sessionIds,
-        });
+        };
+        this.db.mergeEntry(nearestEntry.id, mergeUpdates);
         // mergeEntry clears the embedding — ensureEmbeddings will regenerate it
         console.log(`[consolidation] ${decision.action === "update" ? "Updated" : "Replaced"}: "${nearestEntry.content.slice(0, 60)}..." → "${decision.content.slice(0, 60)}..."`);
-        callbacks.onUpdate();
+        callbacks.onUpdate(nearestEntry.id, mergeUpdates);
         break;
+      }
 
-      case "insert":
-        this.insertNewEntry(entry, sessionIds, entryEmbedding);
+      case "insert": {
+        const inserted = this.insertNewEntry(entry, sessionIds, entryEmbedding);
         console.log(`[consolidation] Insert (distinct despite similarity): "${entry.content.slice(0, 60)}..."`);
-        callbacks.onInsert();
+        callbacks.onInsert(inserted);
         break;
+      }
     }
   }
 
@@ -373,9 +416,9 @@ export class ConsolidationEngine {
     entry: ExtractedKnowledge,
     sessionIds: string[],
     embedding?: number[]
-  ): void {
+  ): KnowledgeEntry & { embedding?: number[] } {
     const now = Date.now();
-    const newEntry: Omit<KnowledgeEntry, "embedding"> & { embedding?: number[] } = {
+    const newEntry: KnowledgeEntry & { embedding?: number[] } = {
       id: randomUUID(),
       type: entry.type,
       content: entry.content,
@@ -394,6 +437,7 @@ export class ConsolidationEngine {
       embedding,
     };
     this.db.insertEntry(newEntry);
+    return newEntry;
   }
 
   /**
@@ -407,10 +451,9 @@ export class ConsolidationEngine {
    * - Scales to thousands of entries without degradation
    */
   private async getRelevantKnowledge(
-    chunkSummary: string
+    chunkSummary: string,
+    allEntries: Array<KnowledgeEntry & { embedding: number[] }>
   ): Promise<KnowledgeEntry[]> {
-    const allEntries = this.db.getActiveEntriesWithEmbeddings();
-
     if (allEntries.length === 0) return [];
 
     // If the knowledge base is small enough, just return everything
@@ -432,6 +475,145 @@ export class ConsolidationEngine {
       .slice(0, MAX_RELEVANT_KNOWLEDGE);
 
     return scored.map((s) => s.entry);
+  }
+
+  /**
+   * Post-extraction contradiction scan.
+   *
+   * Only scans entries that were inserted or updated during this chunk (changedIds).
+   * Pre-existing entries were already checked in a prior consolidation run.
+   *
+   * For each changed entry, finds topic-overlapping candidates in the mid-similarity
+   * band (contradictionMinSimilarity–RECONSOLIDATION_THRESHOLD) and asks the LLM
+   * to detect and resolve any genuine contradictions.
+   *
+   * Returns counts of detected and resolved contradictions.
+   */
+  private async runContradictionScan(
+    entriesMap: Map<string, KnowledgeEntry & { embedding: number[] }>,
+    changedIds: Set<string>
+  ): Promise<{ detected: number; resolved: number }> {
+    let detected = 0;
+    let resolved = 0;
+
+    if (changedIds.size === 0) return { detected, resolved };
+
+    const minSim = config.consolidation.contradictionMinSimilarity;
+
+    // Track entries superseded during this scan pass to avoid double-processing
+    // a candidate that was already resolved by an earlier entry in the same pass.
+    const supersededInThisScan = new Set<string>();
+
+    // Iterate changedIds directly — O(k) where k = changed entries, not O(n) map size
+    for (const id of changedIds) {
+      const entry = entriesMap.get(id);
+      if (!entry) continue; // was deleted from map (superseded during reconsolidation)
+      // Skip if this entry was itself superseded by a previous scan iteration
+      if (supersededInThisScan.has(entry.id)) continue;
+      if (!entry.topics.length || !entry.embedding) continue;
+
+      // Find topic-overlapping active entries, excluding only entries changed this chunk.
+      // Pre-existing entries NOT changed this chunk are valid contradiction candidates.
+      // Changed entries are excluded because decideMerge already handled them (sim ≥ 0.82
+      // paths) or they're the entry we're checking right now.
+      const candidates = this.db.getEntriesWithOverlappingTopics(
+        entry.topics,
+        [...changedIds] // only exclude chunk-changed entries, not all of entriesMap
+      );
+
+      if (candidates.length === 0) continue;
+
+      // Filter to the mid-similarity band: low enough to have been missed by
+      // decideMerge, high enough to be plausibly related (not just same topic word)
+      const entryEmbedding = entry.embedding;
+      const midBandCandidates = candidates.filter((c) => {
+        if (supersededInThisScan.has(c.id)) return false; // skip already-resolved candidates
+        const sim = cosineSimilarity(entryEmbedding, c.embedding);
+        return sim >= minSim && sim < RECONSOLIDATION_THRESHOLD;
+      });
+
+      if (midBandCandidates.length === 0) continue;
+
+      console.log(
+        `[contradiction] Checking ${midBandCandidates.length} candidates for "${entry.content.slice(0, 60)}..."`
+      );
+
+      const results = await this.llm.detectAndResolveContradiction(
+        {
+          id: entry.id,
+          content: entry.content,
+          type: entry.type,
+          topics: entry.topics,
+          confidence: entry.confidence,
+          createdAt: entry.createdAt,
+        },
+        midBandCandidates.map((c) => ({
+          id: c.id,
+          content: c.content,
+          type: c.type,
+          topics: c.topics,
+          confidence: c.confidence,
+          createdAt: c.createdAt,
+        }))
+      );
+
+      let entrySuperseded = false;
+      for (const result of results) {
+        detected++;
+        console.log(
+          `[contradiction] ${result.resolution}: "${entry.content.slice(0, 50)}..." vs candidate ${result.candidateId.slice(0, 8)}... — ${result.reason}`
+        );
+
+        const mergedData =
+          result.resolution === "merge" &&
+          result.mergedContent &&
+          result.mergedType &&
+          result.mergedTopics &&
+          result.mergedConfidence !== undefined
+            ? {
+                content: result.mergedContent,
+                type: result.mergedType,
+                topics: result.mergedTopics,
+                confidence: result.mergedConfidence,
+              }
+            : undefined;
+
+        this.db.applyContradictionResolution(
+          result.resolution,
+          entry.id,
+          result.candidateId,
+          mergedData
+        );
+
+        // supersede_old, supersede_new, and merge are all "resolved" — irresolvable needs human
+        if (result.resolution !== "irresolvable") {
+          resolved++;
+        }
+
+        if (result.resolution === "supersede_old" || result.resolution === "merge") {
+          // Candidate is now superseded — don't let later entries re-process it
+          supersededInThisScan.add(result.candidateId);
+        }
+
+        if (result.resolution === "supersede_new") {
+          // This entry lost — remove from map and stop checking its other candidates
+          supersededInThisScan.add(entry.id);
+          entriesMap.delete(entry.id);
+          entrySuperseded = true;
+          break;
+        }
+      }
+
+      if (entrySuperseded) continue;
+    }
+
+    if (detected > 0) {
+      console.log(
+        `[contradiction] Scan complete: ${detected} contradictions found, ${resolved} resolved, ${detected - resolved} flagged for review.`
+      );
+    }
+
+    return { detected, resolved };
   }
 
   /**

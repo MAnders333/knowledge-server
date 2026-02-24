@@ -8,11 +8,14 @@ import { config } from "../config.js";
  * LLM interface for consolidation.
  *
  * Uses the Vercel AI SDK to abstract across providers.
- * The model string (e.g., "google/gemini-2.5-flash") determines:
+ * The model string (e.g., "anthropic/claude-haiku-4-5") determines:
  * - Which provider SDK to use (Anthropic, Google, OpenAI-compatible)
  * - Which base URL suffix on the unified endpoint
  *
- * All providers share the same API key (unified endpoint handles routing).
+ * Three independent model slots (all configurable via env vars):
+ * - extractionModel   — episode → knowledge extraction   (LLM_EXTRACTION_MODEL)
+ * - mergeModel        — near-duplicate merge decision     (LLM_MERGE_MODEL)
+ * - contradictionModel — contradiction detect + resolve   (LLM_CONTRADICTION_MODEL)
  */
 
 /**
@@ -56,26 +59,68 @@ function createModel(modelString: string) {
   }
 }
 
+/**
+ * Send a prompt to a specific model. All LLM calls go through here.
+ */
+async function complete(
+  modelString: string,
+  systemPrompt: string,
+  userPrompt: string,
+  maxTokens = 8192
+): Promise<string> {
+  const { text } = await generateText({
+    model: createModel(modelString),
+    system: systemPrompt,
+    prompt: userPrompt,
+    temperature: 0.2,
+    maxOutputTokens: maxTokens,
+  });
+  return text;
+}
+
+/**
+ * Parse JSON from an LLM response. Handles markdown code fences and stray
+ * text before/after the JSON block.
+ *
+ * Tries multiple strategies in order:
+ * 1. Direct parse (model returned clean JSON)
+ * 2. Extract from ```json ... ``` fence
+ * 3. Greedy bracket match (last resort)
+ */
+function parseJSON<T>(response: string, arrayMode: boolean): T | null {
+  const strategies = [
+    // Strategy 1: direct parse
+    () => response.trim(),
+    // Strategy 2: extract from code fence
+    () => {
+      const fence = response.match(/```(?:json)?\s*([\s\S]*?)```/);
+      return fence ? fence[1].trim() : null;
+    },
+    // Strategy 3: greedy bracket match
+    () => {
+      const bracket = arrayMode
+        ? response.match(/\[[\s\S]*\]/)
+        : response.match(/\{[\s\S]*\}/);
+      return bracket ? bracket[0] : null;
+    },
+  ];
+
+  for (const strategy of strategies) {
+    const candidate = strategy();
+    if (!candidate) continue;
+    try {
+      return JSON.parse(candidate) as T;
+    } catch {
+      // try next strategy
+    }
+  }
+  return null;
+}
+
 export class ConsolidationLLM {
   /**
-   * Send a prompt to the configured consolidation model.
-   * Returns the text response.
-   */
-  async complete(systemPrompt: string, userPrompt: string): Promise<string> {
-    const { text } = await generateText({
-      model: createModel(config.llm.model),
-      system: systemPrompt,
-      prompt: userPrompt,
-      temperature: 0.2,
-      maxOutputTokens: 8192,
-    });
-
-    return text;
-  }
-
-  /**
    * Extract knowledge entries from a batch of episodes.
-   * Returns structured JSON that we parse into knowledge entries.
+   * Uses the extraction model (highest quality — complex reasoning task).
    */
   async extractKnowledge(
     episodeSummaries: string,
@@ -113,12 +158,9 @@ DO NOT ENCODE if:
 - The session was mostly back-and-forth clarification with no concrete outcome
 
 KNOWLEDGE EVOLUTION — when existing knowledge should be upgraded:
-- If a new episode reinforces an existing "fact" into a recurring pattern, extract the generalized version and set conflicts_with to the existing fact's content.
+- If a new episode reinforces an existing "fact" into a recurring pattern, extract the generalized version.
 - Example: fact "User X preferred a dashboard" + new episode → pattern "Stakeholders consistently prefer visual formats over raw exports"
-
-CONFLICT HANDLING:
-- If a new entry contradicts an existing one, set conflicts_with to the EXACT content string of the existing entry.
-- The new entry replaces the old understanding. Be precise — the old entry will be superseded.
+- Near-duplicate or contradictory entries are handled by the reconsolidation step after extraction — you don't need to signal conflicts here.
 
 FORMAT:
 - Each entry: 1-3 sentences, self-contained, no assumed context.
@@ -140,42 +182,31 @@ Extract knowledge entries as a JSON array:
     "topics": ["topic1", "topic2"],
     "confidence": 0.5-1.0,
     "scope": "personal|team",
-    "source": "Brief provenance (e.g., 'session: Churn Analysis, Feb 2026')",
-    "conflicts_with": null or "exact content string of the existing entry this supersedes"
+    "source": "Brief provenance (e.g., 'session: Churn Analysis, Feb 2026')"
   }
 ]
 
 If there is nothing new worth extracting, return an empty array: []`;
 
-    const response = await this.complete(systemPrompt, userPrompt);
+    const response = await complete(config.llm.extractionModel, systemPrompt, userPrompt);
 
-    try {
-      // Extract JSON from response (handle potential markdown wrapping)
-      const jsonMatch = response.match(/\[[\s\S]*\]/);
-      if (!jsonMatch) return [];
-
-      const parsed = JSON.parse(jsonMatch[0]) as ExtractedKnowledge[];
-      return parsed.filter(
-        (entry) =>
-          entry.content &&
-          entry.type &&
-          ["fact", "principle", "pattern", "decision", "procedure"].includes(
-            entry.type
-          )
-      );
-    } catch (e) {
-      console.error("Failed to parse LLM extraction response:", e);
-      console.error("Raw response:", response.slice(0, 500));
+    const parsed = parseJSON<ExtractedKnowledge[]>(response, true);
+    if (!parsed) {
+      console.error("[llm] Failed to parse extraction response:", response.slice(0, 500));
       return [];
     }
+
+    return parsed.filter(
+      (entry) =>
+        entry.content &&
+        entry.type &&
+        ["fact", "principle", "pattern", "decision", "procedure"].includes(entry.type)
+    );
   }
 
   /**
-   * Focused reconsolidation decision.
-   *
-   * Given one existing knowledge entry and one newly extracted observation,
-   * decide what to do. Models how recalled memories become labile (editable)
-   * when new related information is encountered.
+   * Focused reconsolidation decision for near-duplicate entries (sim ≥ 0.82).
+   * Uses the merge model (cheaper — this is essentially a classification task).
    *
    * Returns one of:
    * - "keep"    — existing entry is correct and complete, discard the new observation
@@ -224,20 +255,108 @@ Respond with one of:
 {"action": "replace", "content": "...", "type": "...", "topics": [...], "confidence": 0.0}
 {"action": "insert"}`;
 
-    const response = await this.complete(systemPrompt, userPrompt);
+    const response = await complete(config.llm.mergeModel, systemPrompt, userPrompt, 1024);
 
-    try {
-      const jsonMatch = response.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) return { action: "insert" };
-      const parsed = JSON.parse(jsonMatch[0]) as MergeDecision;
-      if (!["keep", "update", "replace", "insert"].includes(parsed.action)) {
-        return { action: "insert" };
-      }
-      return parsed;
-    } catch {
-      // On parse failure, default to insert (safe — no data loss)
-      return { action: "insert" };
+    const parsed = parseJSON<MergeDecision>(response, false);
+    if (!parsed || !["keep", "update", "replace", "insert"].includes(parsed.action)) {
+      console.warn("[llm] decideMerge parse failure — defaulting to insert:", response.slice(0, 200));
+      return { action: "insert" }; // safe default — no data loss
     }
+    return parsed;
+  }
+
+  /**
+   * Post-extraction contradiction scan.
+   *
+   * For a newly inserted/updated entry, checks a set of topic-overlapping
+   * candidates (in the 0.4–0.82 similarity band — too dissimilar for decideMerge,
+   * but related enough to potentially contradict) and attempts resolution.
+   *
+   * Uses the contradiction model (Sonnet — nuanced semantic reasoning).
+   *
+   * Resolution outcomes:
+   * - "no_conflict"  — no genuine contradiction, nothing to do
+   * - "supersede_new" — the existing entry is more correct; new entry should be
+   *                     downgraded (caller handles)
+   * - "supersede_old" — the new entry is more correct; existing entry should be
+   *                     marked superseded (caller handles)
+   * - "merge"        — the apparent contradiction resolves into a unified entry
+   * - "irresolvable" — genuine tie; mark existing as conflicted for human review
+   */
+  async detectAndResolveContradiction(
+    newEntry: { id: string; content: string; type: string; topics: string[]; confidence: number; createdAt: number },
+    candidates: Array<{ id: string; content: string; type: string; topics: string[]; confidence: number; createdAt: number }>
+  ): Promise<ContradictionResult[]> {
+    if (candidates.length === 0) return [];
+
+    const candidateList = candidates
+      .map((c, i) =>
+        `[${i + 1}] id: ${c.id}
+type: ${c.type} | confidence: ${c.confidence} | created: ${new Date(c.createdAt).toISOString().split("T")[0]}
+topics: ${c.topics.join(", ")}
+content: ${c.content}`
+      )
+      .join("\n\n");
+
+    const systemPrompt = `You are a knowledge integrity checker. You will be shown a NEWLY ADDED knowledge entry and a list of EXISTING entries that share related topics.
+
+Your job is to check each existing entry for genuine contradiction with the new entry, and if a contradiction exists, determine how to resolve it.
+
+CONTRADICTION means the two entries make mutually exclusive claims about the same subject. Examples:
+- "The server runs on port 8080" vs "The server port was changed to 9090" → contradiction
+- "Always pre-aggregate before joining" vs "Pre-aggregation caused wrong results in campaign analysis" → contradiction
+- "User prefers dark mode" vs "User prefers light mode" → contradiction
+
+NOT a contradiction:
+- Two entries about different aspects of the same topic
+- One entry being more specific than the other (that's refinement, not contradiction)
+- Temporal statements that don't overlap ("In Q1 we used X" vs "In Q3 we switched to Y")
+
+For each existing entry, respond with one of these resolutions:
+- "no_conflict"   — no genuine contradiction
+- "supersede_old" — new entry is more correct/recent; existing entry should be superseded
+- "supersede_new" — existing entry is more correct; new entry should be downgraded
+- "merge"         — apparent contradiction resolves into a unified truth; provide merged content
+- "irresolvable"  — genuine tie (equal evidence, equal recency); needs human review
+
+Respond ONLY with a JSON array — one object per candidate, in the same order.`;
+
+    const userPrompt = `NEW ENTRY (just added):
+id: ${newEntry.id}
+type: ${newEntry.type} | confidence: ${newEntry.confidence} | created: ${new Date(newEntry.createdAt).toISOString().split("T")[0]}
+topics: ${newEntry.topics.join(", ")}
+content: ${newEntry.content}
+
+EXISTING CANDIDATES to check:
+${candidateList}
+
+Respond with a JSON array (one result per candidate, same order):
+[
+  {
+    "candidateId": "...",
+    "resolution": "no_conflict|supersede_old|supersede_new|merge|irresolvable",
+    "reason": "one sentence explaining why",
+    "mergedContent": "only if resolution is merge — the unified entry content",
+    "mergedType": "only if resolution is merge",
+    "mergedTopics": [],
+    "mergedConfidence": 0.0
+  }
+]`;
+
+    const response = await complete(config.llm.contradictionModel, systemPrompt, userPrompt, 2048);
+
+    const parsed = parseJSON<ContradictionResult[]>(response, true);
+    if (!parsed) {
+      console.error("[llm] Failed to parse contradiction response:", response.slice(0, 500));
+      return [];
+    }
+
+    // Filter to only genuine contradictions (skip no_conflict)
+    return parsed.filter(
+      (r) =>
+        r.candidateId &&
+        ["supersede_old", "supersede_new", "merge", "irresolvable"].includes(r.resolution)
+    );
   }
 }
 
@@ -248,7 +367,6 @@ export interface ExtractedKnowledge {
   confidence: number;
   scope: "personal" | "team";
   source: string;
-  conflicts_with: string | null;
 }
 
 export type MergeDecision =
@@ -256,3 +374,13 @@ export type MergeDecision =
   | { action: "update"; content: string; type: string; topics: string[]; confidence: number }
   | { action: "replace"; content: string; type: string; topics: string[]; confidence: number }
   | { action: "insert" };
+
+export interface ContradictionResult {
+  candidateId: string;
+  resolution: "supersede_old" | "supersede_new" | "merge" | "irresolvable";
+  reason: string;
+  mergedContent?: string;
+  mergedType?: string;
+  mergedTopics?: string[];
+  mergedConfidence?: number;
+}

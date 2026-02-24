@@ -5,6 +5,8 @@ import { ActivationEngine } from "./activation/activate.js";
 import { ConsolidationEngine } from "./consolidation/consolidate.js";
 import { createApp } from "./api/server.js";
 import { config, validateConfig } from "./config.js";
+// @ts-ignore — Bun supports JSON imports natively
+import pkg from "../package.json" with { type: "json" };
 
 /**
  * Knowledge Server — main entry point.
@@ -17,7 +19,7 @@ import { config, validateConfig } from "./config.js";
  */
 async function main() {
   console.log("┌─────────────────────────────────────┐");
-  console.log("│  Knowledge Server v0.1.0            │");
+  console.log(`│  Knowledge Server v${pkg.version.padEnd(17)}│`);
   console.log("│  Consolidation-aware knowledge       │");
   console.log("│  system for OpenCode agents          │");
   console.log("└─────────────────────────────────────┘");
@@ -58,10 +60,9 @@ async function main() {
     console.log("\n✓ Knowledge graph is up to date.");
   }
 
-  // Generate a random admin token for this process lifetime.
-  // Required on POST /consolidate and POST /reinitialize.
-  // Printed once to the console — store it if you need to call those endpoints manually.
-  const adminToken = randomBytes(24).toString("hex");
+  // Admin token: use KNOWLEDGE_ADMIN_TOKEN env var if set (stable, useful for scripting),
+  // otherwise generate a random token per process lifetime (more secure for interactive use).
+  const adminToken = config.adminToken ?? randomBytes(24).toString("hex");
 
   // Create HTTP app
   const app = createApp(db, activation, consolidation, adminToken);
@@ -85,17 +86,34 @@ async function main() {
 
   // Background consolidation loop — runs after server is listening
   // so the server is available immediately while consolidation proceeds.
+  // Promise is stored so SIGTERM can await it before closing the DB.
+  let shutdownRequested = false;
+  let startupLoopDone: Promise<void> = Promise.resolve();
+
   if (pending.pendingSessions > 0) {
-    (async () => {
+    startupLoopDone = (async () => {
       let batch = 1;
       let consecutiveErrors = 0;
       const MAX_CONSECUTIVE_ERRORS = 3;
       const BASE_RETRY_DELAY_MS = 5_000;
 
-      while (true) {
+      while (!shutdownRequested) {
         try {
+          // Claim the flag synchronously (no await between check and set) so an
+          // API call cannot slip in between and start a concurrent consolidation.
+          if (consolidation.isConsolidating) {
+            // Another path (API) already holds the flag — yield and retry.
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+            continue;
+          }
+          consolidation.isConsolidating = true; // set synchronously — no await above this line
           console.log(`\n[startup consolidation] Batch ${batch}...`);
-          const result = await consolidation.consolidate();
+          let result: Awaited<ReturnType<typeof consolidation.consolidate>>;
+          try {
+            result = await consolidation.consolidate();
+          } finally {
+            consolidation.isConsolidating = false;
+          }
           consecutiveErrors = 0; // reset on success
           if (result.sessionsProcessed === 0) {
             console.log("[startup consolidation] Complete — all sessions processed.");
@@ -127,19 +145,26 @@ async function main() {
     })();
   }
 
-  // Graceful shutdown
-  process.on("SIGINT", () => {
-    console.log("\nShutting down...");
+  // Graceful shutdown — signal the loop to stop, wait up to 30s for it to finish
+  // the current batch before closing the DB. Prevents losing in-flight LLM results.
+  async function shutdown(signal: string) {
+    console.log(`\n[${signal}] Shutting down gracefully...`);
+    shutdownRequested = true;
+    const TIMED_OUT = Symbol("timed_out");
+    const result = await Promise.race([
+      startupLoopDone.then(() => null),
+      new Promise<typeof TIMED_OUT>((r) => setTimeout(() => r(TIMED_OUT), 30_000)),
+    ]);
+    if (result === TIMED_OUT) {
+      console.warn("[shutdown] 30s timeout reached — in-flight consolidation batch abandoned.");
+    }
     consolidation.close();
     db.close();
     process.exit(0);
-  });
+  }
 
-  process.on("SIGTERM", () => {
-    consolidation.close();
-    db.close();
-    process.exit(0);
-  });
+  process.on("SIGINT", () => { shutdown("SIGINT").catch(console.error); });
+  process.on("SIGTERM", () => { shutdown("SIGTERM").catch(console.error); });
 }
 
 main().catch((e) => {

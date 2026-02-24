@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
+import { randomUUID } from "node:crypto";
 import { config } from "../config.js";
 import { CREATE_TABLES, SCHEMA_VERSION, CONSOLIDATED_EPISODE_DDL } from "./schema.js";
 import type {
@@ -30,6 +31,9 @@ export class KnowledgeDB {
 
     this.db = new Database(path);
     this.db.exec("PRAGMA journal_mode = WAL");
+    // With WAL mode, NORMAL synchronous is safe and ~3x faster than FULL.
+    // FULL is only needed for non-WAL journals.
+    this.db.exec("PRAGMA synchronous = NORMAL");
     this.db.exec("PRAGMA foreign_keys = ON");
     this.initialize();
   }
@@ -246,6 +250,35 @@ export class KnowledgeDB {
   }
 
   /**
+   * Get entries with optional server-side filtering — pushes status/type/scope
+   * filters to SQL so we don't load the full table into memory just to slice it.
+   */
+  getEntries(filters: { status?: string; type?: string; scope?: string }): KnowledgeEntry[] {
+    const conditions: string[] = [];
+    const values: string[] = [];
+
+    if (filters.status) {
+      conditions.push("status = ?");
+      values.push(filters.status);
+    }
+    if (filters.type) {
+      conditions.push("type = ?");
+      values.push(filters.type);
+    }
+    if (filters.scope) {
+      conditions.push("scope = ?");
+      values.push(filters.scope);
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(`SELECT * FROM knowledge_entry ${where} ORDER BY created_at DESC`)
+      .all(...values) as RawEntryRow[];
+
+    return rows.map((r) => this.rowToEntry(r));
+  }
+
+  /**
    * Record an access (bump access count and last_accessed_at).
    */
   recordAccess(id: string): void {
@@ -281,6 +314,163 @@ export class KnowledgeDB {
       stats.total += row.count;
     }
     return stats;
+  }
+
+  // ── Contradiction detection ──
+
+  /**
+   * Find active entries that share at least one topic with the given topics list.
+   * Returns only entries that have embeddings (needed for similarity filtering).
+   *
+   * Used by the post-extraction contradiction scan to find candidates in the
+   * mid-similarity band (0.4–0.82) — entries that are topic-related but not
+   * similar enough to have been caught by the reconsolidation threshold.
+   *
+   * Uses json_each() on both sides to avoid variable-limit issues.
+   * Excludes a set of IDs already handled (e.g. the new entry itself, entries
+   * already processed by decideMerge in this chunk).
+   */
+  getEntriesWithOverlappingTopics(
+    topics: string[],
+    excludeIds: string[]
+  ): Array<KnowledgeEntry & { embedding: number[] }> {
+    if (topics.length === 0) return [];
+
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT ke.*
+         FROM knowledge_entry ke, json_each(ke.topics) t
+         WHERE ke.status = 'active'
+           AND t.value IN (SELECT value FROM json_each(?))
+           AND ke.id NOT IN (SELECT value FROM json_each(?))
+         ORDER BY ke.strength DESC`
+      )
+      .all(JSON.stringify(topics), JSON.stringify(excludeIds)) as RawEntryRow[];
+
+    // Filter to entries with embeddings — similarity scoring in the contradiction scan
+    // requires embeddings. Entries without embeddings are skipped (they'll get embeddings
+    // on the next ensureEmbeddings pass and be checked on the next consolidation run).
+    return rows
+      .map((r) => this.rowToEntry(r))
+      .filter((e): e is KnowledgeEntry & { embedding: number[] } => !!e.embedding);
+  }
+
+  /**
+   * Record the outcome of a contradiction resolution between two entries.
+   *
+   * - "supersede_old": newEntryId wins — mark existingEntryId as superseded
+   * - "supersede_new": existingEntryId wins — mark newEntryId as superseded
+   * - "merge":         replace newEntryId content with merged, mark existingEntryId as superseded
+   * - "irresolvable":  insert a contradicts relation, mark BOTH entries as conflicted for human review
+   */
+  applyContradictionResolution(
+    resolution: "supersede_old" | "supersede_new" | "merge" | "irresolvable",
+    newEntryId: string,
+    existingEntryId: string,
+    mergedData?: { content: string; type: string; topics: string[]; confidence: number }
+  ): void {
+    const now = Date.now();
+
+    this.db.transaction(() => {
+      switch (resolution) {
+        case "supersede_old":
+          // New entry wins — mark existing as superseded
+          this.db
+            .prepare(
+              `UPDATE knowledge_entry
+               SET status = 'superseded', superseded_by = ?, updated_at = ?
+               WHERE id = ?`
+            )
+            .run(newEntryId, now, existingEntryId);
+          // Record the supersedes relation
+          this.db
+            .prepare(
+              `INSERT OR IGNORE INTO knowledge_relation
+               (id, source_id, target_id, type, created_at)
+               VALUES (?, ?, ?, 'supersedes', ?)`
+            )
+            .run(randomUUID(), newEntryId, existingEntryId, now);
+          break;
+
+        case "supersede_new":
+          // Existing entry wins — mark new entry as superseded
+          this.db
+            .prepare(
+              `UPDATE knowledge_entry
+               SET status = 'superseded', superseded_by = ?, updated_at = ?
+               WHERE id = ?`
+            )
+            .run(existingEntryId, now, newEntryId);
+          this.db
+            .prepare(
+              `INSERT OR IGNORE INTO knowledge_relation
+               (id, source_id, target_id, type, created_at)
+               VALUES (?, ?, ?, 'supersedes', ?)`
+            )
+            .run(randomUUID(), existingEntryId, newEntryId, now);
+          break;
+
+        case "merge":
+          // Merge into the new entry, tombstone the old one
+          if (!mergedData) {
+            console.warn(
+              `[db] merge resolution missing mergedData — existingEntryId ${existingEntryId} ` +
+              `will be superseded but newEntryId ${newEntryId} content unchanged`
+            );
+          }
+          if (mergedData) {
+            this.db
+              .prepare(
+                `UPDATE knowledge_entry
+                 SET content = ?, type = ?, topics = ?, confidence = ?,
+                     embedding = NULL, updated_at = ?
+                 WHERE id = ?`
+              )
+              .run(
+                mergedData.content,
+                mergedData.type,
+                JSON.stringify(mergedData.topics),
+                mergedData.confidence,
+                now,
+                newEntryId
+              );
+          }
+          this.db
+            .prepare(
+              `UPDATE knowledge_entry
+               SET status = 'superseded', superseded_by = ?, updated_at = ?
+               WHERE id = ?`
+            )
+            .run(newEntryId, now, existingEntryId);
+          this.db
+            .prepare(
+              `INSERT OR IGNORE INTO knowledge_relation
+               (id, source_id, target_id, type, created_at)
+               VALUES (?, ?, ?, 'supersedes', ?)`
+            )
+            .run(randomUUID(), newEntryId, existingEntryId, now);
+          break;
+
+        case "irresolvable":
+          // Genuine tie — insert contradicts relation, mark BOTH entries as conflicted.
+          // The /review endpoint surfaces all conflicted entries, so both halves of the
+          // conflict must be visible there.
+          this.db
+            .prepare(
+              `INSERT OR IGNORE INTO knowledge_relation
+               (id, source_id, target_id, type, created_at)
+               VALUES (?, ?, ?, 'contradicts', ?)`
+            )
+            .run(randomUUID(), newEntryId, existingEntryId, now);
+          this.db
+            .prepare(
+              `UPDATE knowledge_entry SET status = 'conflicted', updated_at = ?
+               WHERE id IN (?, ?)`
+            )
+            .run(now, newEntryId, existingEntryId);
+          break;
+      }
+    })();
   }
 
   // ── Relations ──
@@ -505,18 +695,22 @@ export class KnowledgeDB {
    * Used during development/iteration to start fresh with improved extraction.
    */
   reinitialize(): void {
-    this.db.exec("DELETE FROM knowledge_relation");
-    this.db.exec("DELETE FROM knowledge_entry");
-    this.db.exec("DELETE FROM consolidated_episode");
-    this.db.exec(
-      `UPDATE consolidation_state SET 
-        last_consolidated_at = 0,
-        last_session_time_created = 0,
-        total_sessions_processed = 0,
-        total_entries_created = 0,
-        total_entries_updated = 0
-       WHERE id = 1`
-    );
+    // All four operations must succeed atomically — a crash mid-wipe would
+    // leave entries deleted but the cursor not reset (or vice versa).
+    this.db.transaction(() => {
+      this.db.exec("DELETE FROM knowledge_relation");
+      this.db.exec("DELETE FROM knowledge_entry");
+      this.db.exec("DELETE FROM consolidated_episode");
+      this.db.exec(
+        `UPDATE consolidation_state SET 
+          last_consolidated_at = 0,
+          last_session_time_created = 0,
+          total_sessions_processed = 0,
+          total_entries_created = 0,
+          total_entries_updated = 0
+         WHERE id = 1`
+      );
+    })();
   }
 
   close(): void {

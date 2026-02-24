@@ -4,8 +4,12 @@ import { join } from "node:path";
 
 export const config = {
   // Server
-  port: Number.parseInt(process.env.KNOWLEDGE_PORT || "3179"),
+  port: Number.parseInt(process.env.KNOWLEDGE_PORT || "3179", 10),
   host: process.env.KNOWLEDGE_HOST || "127.0.0.1",
+  // Optional fixed admin token — set KNOWLEDGE_ADMIN_TOKEN to use a stable token
+  // instead of a random one generated at startup. Useful for scripted/automated use.
+  // Leave unset in production for better security (random token per process lifetime).
+  adminToken: process.env.KNOWLEDGE_ADMIN_TOKEN || null,
 
   // Database
   dbPath:
@@ -21,16 +25,23 @@ export const config = {
   // Set LLM_BASE_ENDPOINT in .env. No default is provided since this is
   // deployment-specific; the server will fail config validation if not set
   // when LLM_API_KEY is present but the endpoint is wrong.
+  //
+  // Three model slots with independent defaults — tune cost vs quality per task:
+  //   extractionModel   — full episode → knowledge extraction (complex reasoning)
+  //   mergeModel        — decideMerge near-duplicate comparison (structured, cheap)
+  //   contradictionModel — detect + resolve contradictions (nuanced, fires rarely)
   llm: {
     baseEndpoint: process.env.LLM_BASE_ENDPOINT || "",
     apiKey: process.env.LLM_API_KEY || "",
-    model: process.env.LLM_MODEL || "anthropic/claude-sonnet-4-6",
+    extractionModel: process.env.LLM_EXTRACTION_MODEL || "anthropic/claude-sonnet-4-6",
+    mergeModel: process.env.LLM_MERGE_MODEL || "anthropic/claude-haiku-4-5",
+    contradictionModel: process.env.LLM_CONTRADICTION_MODEL || "anthropic/claude-sonnet-4-6",
   },
 
   // Embedding (always OpenAI-compatible, always through /openai/v1)
   embedding: {
     model: process.env.EMBEDDING_MODEL || "text-embedding-3-large",
-    dimensions: Number.parseInt(process.env.EMBEDDING_DIMENSIONS || "3072"),
+    dimensions: Number.parseInt(process.env.EMBEDDING_DIMENSIONS || "3072", 10),
   },
 
   // Decay parameters
@@ -39,7 +50,7 @@ export const config = {
       process.env.DECAY_ARCHIVE_THRESHOLD || "0.15"
     ),
     tombstoneAfterDays: Number.parseInt(
-      process.env.DECAY_TOMBSTONE_DAYS || "180"
+      process.env.DECAY_TOMBSTONE_DAYS || "180", 10
     ),
     // Type-specific decay rates (higher = slower decay)
     typeHalfLife: {
@@ -53,18 +64,25 @@ export const config = {
 
   // Consolidation
   consolidation: {
-    chunkSize: Number.parseInt(process.env.CONSOLIDATION_CHUNK_SIZE || "10"),
+    chunkSize: Number.parseInt(process.env.CONSOLIDATION_CHUNK_SIZE || "10", 10),
     maxSessionsPerRun: Number.parseInt(
-      process.env.CONSOLIDATION_MAX_SESSIONS || "50"
+      process.env.CONSOLIDATION_MAX_SESSIONS || "50", 10
     ),
     minSessionMessages: Number.parseInt(
-      process.env.CONSOLIDATION_MIN_MESSAGES || "4"
+      process.env.CONSOLIDATION_MIN_MESSAGES || "4", 10
+    ),
+    // Similarity band for post-extraction contradiction scan.
+    // Entries above RECONSOLIDATION_THRESHOLD (0.82) are already handled by decideMerge.
+    // Entries below contradictionMinSimilarity are too dissimilar to plausibly contradict.
+    // The band in between gets the contradiction LLM call.
+    contradictionMinSimilarity: Number.parseFloat(
+      process.env.CONTRADICTION_MIN_SIMILARITY || "0.4"
     ),
   },
 
   // Activation
   activation: {
-    maxResults: Number.parseInt(process.env.ACTIVATION_MAX_RESULTS || "10"),
+    maxResults: Number.parseInt(process.env.ACTIVATION_MAX_RESULTS || "10", 10),
     similarityThreshold: Number.parseFloat(
       process.env.ACTIVATION_SIMILARITY_THRESHOLD || "0.3"
     ),

@@ -14,7 +14,7 @@ Three properties make this different from a naive memory store:
 
 **High extraction bar.** The LLM reads session transcripts and asks: would this still be useful six months from now? Most sessions produce nothing. The store only grows when something genuinely new was learned.
 
-**Reconsolidation instead of accumulation.** Before any new entry is inserted, it's embedded and compared to the nearest existing entry. If they're similar enough (cosine similarity ≥ 0.82), a focused LLM call decides whether to keep the existing, update it, replace it, or insert both as distinct. Memory updates rather than accumulates — the same way a person's understanding of a topic changes rather than appends.
+**Reconsolidation instead of accumulation.** Before any new entry is inserted, it's embedded and compared to the nearest existing entry. If they're similar enough (cosine similarity ≥ 0.82), a focused LLM call decides whether to keep the existing, update it, replace it, or insert both as distinct. Entries in the 0.4–0.82 mid-band get a separate contradiction scan: if two topic-related entries make mutually exclusive claims, the system resolves it (supersede, merge, or flag for review). Memory updates rather than accumulates — the same way a person's understanding of a topic changes rather than appends.
 
 **Cue-dependent activation.** Nothing is retrieved proactively. When a new message arrives, the query is embedded and matched against the knowledge graph. Only semantically relevant entries activate. The user's message is the retrieval cue — just like human recall requires a prompt to surface a memory.
 
@@ -22,11 +22,12 @@ The result is a compact, high-signal knowledge graph that gets better over time.
 
 ## How it works
 
-1. **Episodes** — OpenCode session logs are the raw material. Each conversation is an episode.
-2. **Consolidation** — An LLM reads new sessions and extracts what's genuinely worth remembering. The bar is high — most sessions produce nothing. Runs automatically on server startup.
-3. **Reconsolidation** — Each new entry is embedded and compared to the nearest existing entry. If similarity ≥ 0.82, a focused LLM call decides whether to keep, update, replace, or insert both. The store updates rather than accumulates.
-4. **Activation** — When a query arrives, it's embedded and matched against all entries. Only semantically relevant entries activate. This is cue-dependent retrieval: the query is the cue.
-5. **Decay** — Entries that aren't accessed decay over time. Entries that are repeatedly relevant strengthen. Eventually unused entries are archived, then tombstoned.
+  1. **Episodes** — OpenCode session logs are the raw material. Each conversation is an episode.
+  2. **Consolidation** — An LLM reads new sessions and extracts what's genuinely worth remembering. The bar is high — most sessions produce nothing. Runs automatically on server startup.
+  3. **Reconsolidation** — Each new entry is embedded and compared to the nearest existing entry. If similarity ≥ 0.82, a focused LLM call decides whether to keep, update, replace, or insert both. The store updates rather than accumulates.
+  4. **Contradiction scan** — Entries in the 0.4–0.82 similarity band (related but not near-duplicate) are checked for genuine contradictions. Contradictions are resolved: the newer entry wins (`supersede_old`), the existing wins (`supersede_new`), both collapse into one (`merge`), or the conflict is flagged for human review (`irresolvable` → `conflicted` status).
+  5. **Activation** — When a query arrives, it's embedded and matched against all entries. Only semantically relevant entries activate. This is cue-dependent retrieval: the query is the cue.
+  6. **Decay** — Entries that aren't accessed decay over time. Entries that are repeatedly relevant strengthen. Eventually unused entries are archived, then tombstoned.
 
 ## Architecture
 
@@ -38,12 +39,18 @@ OpenCode session DB (read-only)
         │
         ▼
   ConsolidationLLM       extracts knowledge entries (high bar: most sessions → [])
+  [extractionModel]
         │
         ▼
   Reconsolidation        embed → nearest-neighbor → LLM merge decision
+  [mergeModel]           (sim ≥ 0.82 → keep/update/replace/insert)
         │
         ▼
-  KnowledgeDB (SQLite)   persistent graph with embeddings, strength, decay
+  Contradiction scan     topic overlap → mid-band similarity filter → LLM resolution
+  [contradictionModel]   (0.4 ≤ sim < 0.82 → supersede/merge/flag)
+        │
+        ▼
+  KnowledgeDB (SQLite)   persistent graph with embeddings, strength, decay, relations
         │
         ▼
   ActivationEngine       cosine similarity search over embeddings
@@ -97,8 +104,8 @@ Install by symlinking to `~/.config/opencode/plugins/knowledge.ts`.
 ### Consolidation engine (`src/consolidation/`)
 
 - `episodes.ts` — reads OpenCode's SQLite session DB, segments long sessions, respects compaction summaries
-- `llm.ts` — two LLM calls: `extractKnowledge` (batch extraction) and `decideMerge` (focused reconsolidation)
-- `consolidate.ts` — orchestrates the full cycle: read → extract → reconsolidate → decay → embed → advance cursor
+- `llm.ts` — three LLM calls across two model slots: `extractKnowledge` (extraction model), `decideMerge` (merge model — cheaper), `detectAndResolveContradiction` (contradiction model)
+- `consolidate.ts` — orchestrates the full cycle: read → extract → reconsolidate → contradiction scan → decay → embed → advance cursor
 - `decay.ts` — forgetting curve with type-specific half-lives (facts decay faster than procedures)
 
 ## Installation
@@ -124,15 +131,19 @@ All config is via environment variables in `.env`. Defaults are sensible for loc
 |---|---|---|
 | `LLM_API_KEY` | — | **Required.** API key for the LLM endpoint |
 | `LLM_BASE_ENDPOINT` | — | **Required.** Base URL for LLM API. Provider-specific paths are appended automatically (`/anthropic/v1`, `/openai/v1`, etc.) |
-| `LLM_MODEL` | `anthropic/claude-sonnet-4-6` | Model for consolidation. Prefix routes the provider: `anthropic/`, `google/`, `openai/` |
+| `LLM_EXTRACTION_MODEL` | `anthropic/claude-sonnet-4-6` | Model for episode → knowledge extraction. Prefix routes the provider: `anthropic/`, `google/`, `openai/` |
+| `LLM_MERGE_MODEL` | `anthropic/claude-haiku-4-5` | Model for near-duplicate merge decisions (cheaper — essentially a classification call) |
+| `LLM_CONTRADICTION_MODEL` | `anthropic/claude-sonnet-4-6` | Model for contradiction detection and resolution (nuanced — fires rarely) |
 | `EMBEDDING_MODEL` | `text-embedding-3-large` | Embedding model (OpenAI-compatible API) |
 | `EMBEDDING_DIMENSIONS` | `3072` | Embedding dimensions |
 | `KNOWLEDGE_PORT` | `3179` | HTTP port |
 | `KNOWLEDGE_HOST` | `127.0.0.1` | HTTP host |
 | `KNOWLEDGE_DB_PATH` | `~/.local/share/knowledge-server/knowledge.db` | Knowledge database path |
+| `KNOWLEDGE_ADMIN_TOKEN` | *(random)* | Fixed admin token for scripted use. If unset, a random token is generated per process lifetime and printed at startup |
 | `OPENCODE_DB_PATH` | `~/.local/share/opencode/opencode.db` | OpenCode session database (read-only) |
 | `CONSOLIDATION_MAX_SESSIONS` | `50` | Sessions per consolidation batch |
 | `CONSOLIDATION_CHUNK_SIZE` | `10` | Episodes per LLM extraction call |
+| `CONTRADICTION_MIN_SIMILARITY` | `0.4` | Lower bound of the contradiction scan similarity band (upper bound is always 0.82) |
 | `ACTIVATION_MAX_RESULTS` | `10` | Max entries returned by activation |
 | `ACTIVATION_SIMILARITY_THRESHOLD` | `0.3` | Minimum cosine similarity to activate |
 
@@ -177,7 +188,10 @@ curl "http://127.0.0.1:3179/activate?q=how+do+we+handle+auth"
 curl http://127.0.0.1:3179/review
 ```
 
-Returns conflicted entries, stale entries (low strength), and team-relevant entries that may warrant external documentation.
+Returns:
+- **conflicted** — entries flagged as `irresolvable` by the contradiction scan, needing human resolution
+- **stale** — active entries with low strength (haven't been accessed recently)
+- **team-relevant** — high-confidence `team`-scoped entries that may warrant external documentation
 
 ## Knowledge entry types
 
@@ -202,7 +216,7 @@ Admin token: a3f9c2e1b4d7...
 Usage: curl -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:3179/consolidate
 ```
 
-The token is not persisted — it changes every time the server restarts. This guards against browser-based CSRF attacks on `POST /consolidate` and `POST /reinitialize`: a malicious web page has no way to learn the token (it is never in a cookie, never auto-sent, and changes on every restart), so it cannot forge a valid `Authorization` header. Without the token, any page open in your browser could trigger these operations against your local server.
+By default the token is not persisted — it changes every time the server restarts. Set `KNOWLEDGE_ADMIN_TOKEN` in `.env` to use a stable token instead (useful for scripted/automated use). This guards against browser-based CSRF attacks on `POST /consolidate` and `POST /reinitialize`: a malicious web page has no way to learn the token (it is never in a cookie, never auto-sent, and changes on every restart), so it cannot forge a valid `Authorization` header. Without the token, any page open in your browser could trigger these operations against your local server.
 
 The `/activate`, `/status`, `/entries`, and `/review` endpoints are intentionally unauthenticated. Adding auth to read endpoints would require either a per-startup token (unusable for manual `curl` inspection) or a static token in `.env` — but any local process that can read `.env` can also read the SQLite database directly. Auth on reads would be security theater against same-user processes, which are already trusted by the OS. For browser-based reads, a cross-origin page can still *send* requests to these endpoints, but the browser's same-origin policy prevents the page's JavaScript from reading the response body — so the knowledge graph content cannot be exfiltrated that way. Non-browser clients (`curl`, scripts) running as the same user are treated as trusted by design.
 
@@ -224,7 +238,7 @@ The `/activate` endpoint makes a paid embedding API call per request. There is n
 
 ```bash
 bun run dev          # Watch mode
-bun test             # Run tests (29 tests)
+bun test             # Run tests (50 tests)
 bun run lint         # Biome lint
 bun run format       # Biome format
 ```

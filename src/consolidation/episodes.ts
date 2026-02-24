@@ -4,9 +4,8 @@ import { config } from "../config.js";
 import type { Episode, EpisodeMessage, ProcessedRange } from "../types.js";
 
 /**
- * Maximum tokens per episode segment.
- * Gemini 3.1 Pro supports 1M tokens, but we want consolidation prompts
- * to be manageable. The LLM sees: system prompt + existing knowledge + episode batch.
+ * Maximum tokens per episode segment (soft limit — see chunkByTokenBudget).
+ * The LLM sees: system prompt + existing knowledge + episode batch.
  * Keeping each episode under 50K tokens means a chunk of 10 episodes
  * stays well within context limits even with a large existing knowledge base.
  */

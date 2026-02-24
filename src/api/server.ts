@@ -5,6 +5,8 @@ import type { KnowledgeDB } from "../db/database.js";
 import type { ActivationEngine } from "../activation/activate.js";
 import type { ConsolidationEngine } from "../consolidation/consolidate.js";
 import { config } from "../config.js";
+// @ts-ignore — Bun supports JSON imports natively; tsc may warn without resolveJsonModule
+import pkg from "../../package.json" with { type: "json" };
 
 /**
  * HTTP API for the knowledge server.
@@ -30,9 +32,6 @@ export function createApp(
   adminToken: string
 ): Hono {
   const app = new Hono();
-
-  // Concurrency guard — only one consolidation run at a time
-  let isConsolidating = false;
 
   // -- Auth helper --
 
@@ -72,11 +71,11 @@ export function createApp(
       return c.json({ error: "Unauthorized" }, 401);
     }
 
-    if (isConsolidating) {
+    if (consolidation.isConsolidating) {
       return c.json({ error: "Consolidation already in progress" }, 409);
     }
 
-    isConsolidating = true;
+    consolidation.isConsolidating = true;
     try {
       const result = await consolidation.consolidate();
       return c.json(result);
@@ -84,7 +83,7 @@ export function createApp(
       console.error("[consolidate] Error:", e);
       return c.json({ error: "Internal server error" }, 500);
     } finally {
-      isConsolidating = false;
+      consolidation.isConsolidating = false;
     }
   });
 
@@ -157,7 +156,7 @@ export function createApp(
 
     return c.json({
       status: "ok",
-      version: "0.2.0",
+      version: pkg.version,
       knowledge: stats,
       consolidation: {
         lastRun: consolidationState.lastConsolidatedAt
@@ -170,7 +169,9 @@ export function createApp(
       config: {
         port: config.port,
         embeddingModel: config.embedding.model,
-        consolidationModel: config.llm.model,
+        extractionModel: config.llm.extractionModel,
+        mergeModel: config.llm.mergeModel,
+        contradictionModel: config.llm.contradictionModel,
       },
     });
   });
@@ -178,21 +179,12 @@ export function createApp(
   // -- Entries CRUD --
 
   app.get("/entries", (c) => {
-    const status = c.req.query("status");
-    const type = c.req.query("type");
-    const scope = c.req.query("scope");
+    const status = c.req.query("status") || undefined;
+    const type = c.req.query("type") || undefined;
+    const scope = c.req.query("scope") || undefined;
 
-    let entries = db.getAllEntries();
-
-    if (status) {
-      entries = entries.filter((e) => e.status === status);
-    }
-    if (type) {
-      entries = entries.filter((e) => e.type === type);
-    }
-    if (scope) {
-      entries = entries.filter((e) => e.scope === scope);
-    }
+    // Filtering is pushed to SQL — no full-table load + JS filter
+    const entries = db.getEntries({ status, type, scope });
 
     return c.json({
       entries: entries.map(stripEmbedding),
