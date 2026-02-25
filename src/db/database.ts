@@ -798,11 +798,11 @@ export class KnowledgeDB {
       this.db.exec("DELETE FROM knowledge_relation");
       this.db.exec("DELETE FROM knowledge_entry");
       this.db.exec("DELETE FROM consolidated_episode");
+      // last_message_cursor_seeded intentionally NOT reset — v4 migration does not need to re-run after a dev wipe.
       this.db.exec(
         `UPDATE consolidation_state SET 
           last_consolidated_at = 0,
           last_message_time_created = 0,
-          -- last_message_cursor_seeded intentionally not reset: v4 migration does not need to re-run after a dev wipe
           total_sessions_processed = 0,
           total_entries_created = 0,
           total_entries_updated = 0
