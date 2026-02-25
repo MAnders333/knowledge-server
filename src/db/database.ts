@@ -24,7 +24,7 @@ function clampKnowledgeType(type: string): KnowledgeType {
   if ((KNOWLEDGE_TYPES as readonly string[]).includes(type)) {
     return type as KnowledgeType;
   }
-  console.warn(`[db] invalid knowledge type "${type}" from LLM — falling back to "fact"`);
+  console.warn(`[db] invalid knowledge type "${type}" — falling back to "fact"`);
   return "fact";
 }
 
@@ -38,7 +38,7 @@ function clampKnowledgeType(type: string): KnowledgeType {
 export class KnowledgeDB {
   private db: Database;
 
-  constructor(dbPath?: string) {
+  constructor(dbPath?: string, opencodeDbPath?: string) {
     const path = dbPath || config.dbPath;
     const dir = dirname(path);
     if (!existsSync(dir)) {
@@ -51,16 +51,16 @@ export class KnowledgeDB {
     // FULL is only needed for non-WAL journals.
     this.db.exec("PRAGMA synchronous = NORMAL");
     this.db.exec("PRAGMA foreign_keys = ON");
-    this.initialize();
+    this.initialize(opencodeDbPath || config.opencodeDbPath);
   }
 
-  private initialize(): void {
+  private initialize(opencodeDbPath: string): void {
     this.db.exec(CREATE_TABLES);
 
     // Apply incremental migrations for existing databases.
     // ALTER TABLE is idempotent via try/catch — SQLite throws if the column
     // already exists, which we safely ignore.
-    this.runMigrations();
+    this.runMigrations(opencodeDbPath);
 
     // Record schema version if not present
     const row = this.db
@@ -83,7 +83,7 @@ export class KnowledgeDB {
    * Each migration is wrapped in try/catch so it's safe to run on every startup —
    * if the column/table already exists, SQLite throws and we ignore it.
    */
-  private runMigrations(): void {
+  private runMigrations(opencodeDbPath: string): void {
     // v2: add total_entries_updated to consolidation_state
     try {
       this.db.exec(
@@ -95,6 +95,8 @@ export class KnowledgeDB {
 
     // v2→v3: replace old consolidated_episode table (keyed by segment_index) with
     // the new message-ID-based schema (keyed by start_message_id, end_message_id).
+    // Must run BEFORE v4 — v4 seeds last_message_time_created from consolidated_episode,
+    // so the table must be in its correct schema before that query runs.
     // Only runs once: we detect whether the migration is needed by checking for the
     // presence of the new start_message_id column. If it's absent, the old schema
     // is in place and we drop + recreate. Old data was never actively written so
@@ -121,6 +123,92 @@ export class KnowledgeDB {
         // CONSOLIDATED_EPISODE_DDL uses CREATE TABLE IF NOT EXISTS — safe after the drop above.
         this.db.exec(CONSOLIDATED_EPISODE_DDL);
       })();
+    }
+
+    // v4: replace last_session_time_created with last_message_time_created.
+    //
+    // Must run AFTER v3 so consolidated_episode is in the correct schema before
+    // we query it to seed the cursor value.
+    //
+    // We seed the new column to the max time_created of messages in the OpenCode DB
+    // that belong to sessions already recorded in consolidated_episode. This avoids
+    // a wasteful re-scan of all previously-consolidated sessions on the first post-
+    // upgrade run: the cursor starts right where the old cursor effectively was, just
+    // measured in message timestamps instead of session timestamps.
+    //
+    // If the OpenCode DB is unavailable (e.g. path misconfigured), we fall back to 0
+    // and accept the one-time re-scan churn rather than failing startup.
+    // v4 migration is two-phase because SQLite cannot roll back ALTER TABLE.
+    // We track completion with a separate sentinel column so a crash between
+    // ALTER TABLE and the seed UPDATE is recoverable on next startup:
+    //   - Phase A: add last_message_time_created (idempotent ALTER TABLE)
+    //   - Phase B: seed the value and mark completion via last_message_cursor_seeded
+    // needsV4A and needsV4B are checked independently.
+    const v4Cols = (() => {
+      const cols = this.db
+        .prepare("PRAGMA table_info(consolidation_state)")
+        .all() as Array<{ name: string }>;
+      return new Set(cols.map((c) => c.name));
+    })();
+
+    // Phase A: add the cursor column (safe to re-run — ALTER TABLE throws if column exists)
+    if (!v4Cols.has("last_message_time_created")) {
+      this.db.exec(
+        "ALTER TABLE consolidation_state ADD COLUMN last_message_time_created INTEGER NOT NULL DEFAULT 0"
+      );
+    }
+
+    // Phase B: add the seeded sentinel and run the seed query.
+    // Runs if the sentinel column doesn't exist yet — meaning Phase B never completed.
+    // This correctly re-runs the seed if the process crashed after Phase A but before
+    // the UPDATE committed (the sentinel is written atomically in the same transaction).
+    // Note: v4Cols is a pre-Phase-A snapshot. Using it for Phase B is safe because
+    // Phase A only adds `last_message_time_created`, not `last_message_cursor_seeded`.
+    if (!v4Cols.has("last_message_cursor_seeded")) {
+      this.db.exec(
+        "ALTER TABLE consolidation_state ADD COLUMN last_message_cursor_seeded INTEGER NOT NULL DEFAULT 0"
+      );
+
+      // Seed from OpenCode DB: max message.time_created for already-consolidated sessions.
+      // Use the already-imported Database class — no require() needed.
+      let seedValue = 0;
+      if (existsSync(opencodeDbPath)) {
+        try {
+          const opencodeDb = new Database(opencodeDbPath, { readonly: true });
+          try {
+            const processedSessionIds = (
+              this.db
+                .prepare("SELECT DISTINCT session_id FROM consolidated_episode")
+                .all() as Array<{ session_id: string }>
+            ).map((r) => r.session_id);
+
+            if (processedSessionIds.length > 0) {
+              const row = opencodeDb
+                .prepare(
+                  `SELECT MAX(time_created) as max_time FROM message
+                   WHERE session_id IN (SELECT value FROM json_each(?))`
+                )
+                .get(JSON.stringify(processedSessionIds)) as { max_time: number | null };
+              seedValue = row?.max_time ?? 0;
+            }
+          } finally {
+            opencodeDb.close();
+          }
+        } catch (err) {
+          console.warn("[db] v4 migration: could not seed last_message_time_created from OpenCode DB:", err);
+        }
+      }
+
+      // Write seed value and sentinel atomically so a crash here is detectable on retry.
+      this.db.transaction(() => {
+        this.db
+          .prepare("UPDATE consolidation_state SET last_message_time_created = ?, last_message_cursor_seeded = 1 WHERE id = 1")
+          .run(seedValue);
+      })();
+
+      if (seedValue > 0) {
+        console.log(`[db] v4 migration: last_message_time_created seeded to ${seedValue}`);
+      }
     }
   }
 
@@ -577,7 +665,7 @@ export class KnowledgeDB {
       .prepare("SELECT * FROM consolidation_state WHERE id = 1")
       .get() as {
       last_consolidated_at: number;
-      last_session_time_created: number;
+      last_message_time_created: number;
       total_sessions_processed: number;
       total_entries_created: number;
       total_entries_updated: number;
@@ -585,10 +673,9 @@ export class KnowledgeDB {
 
     return {
       lastConsolidatedAt: row.last_consolidated_at,
-      lastSessionTimeCreated: row.last_session_time_created,
+      lastMessageTimeCreated: row.last_message_time_created,
       totalSessionsProcessed: row.total_sessions_processed,
       totalEntriesCreated: row.total_entries_created,
-      // Column added in schema v2 — default to 0 for existing DBs without migration
       totalEntriesUpdated: row.total_entries_updated ?? 0,
     };
   }
@@ -601,9 +688,9 @@ export class KnowledgeDB {
       fields.push("last_consolidated_at = ?");
       values.push(state.lastConsolidatedAt);
     }
-    if (state.lastSessionTimeCreated !== undefined) {
-      fields.push("last_session_time_created = ?");
-      values.push(state.lastSessionTimeCreated);
+    if (state.lastMessageTimeCreated !== undefined) {
+      fields.push("last_message_time_created = ?");
+      values.push(state.lastMessageTimeCreated);
     }
     if (state.totalSessionsProcessed !== undefined) {
       fields.push("total_sessions_processed = ?");
@@ -714,7 +801,8 @@ export class KnowledgeDB {
       this.db.exec(
         `UPDATE consolidation_state SET 
           last_consolidated_at = 0,
-          last_session_time_created = 0,
+          last_message_time_created = 0,
+          -- last_message_cursor_seeded intentionally not reset: v4 migration does not need to re-run after a dev wipe
           total_sessions_processed = 0,
           total_entries_created = 0,
           total_entries_updated = 0

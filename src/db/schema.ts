@@ -8,7 +8,7 @@
  * - Derived-from stored as JSON array of session/entry IDs (provenance chain)
  */
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 /**
  * DDL for the consolidated_episode table (v3 schema).
@@ -95,19 +95,20 @@ export const CREATE_TABLES = `
   CREATE INDEX IF NOT EXISTS idx_relation_target ON knowledge_relation(target_id);
   CREATE INDEX IF NOT EXISTS idx_relation_type ON knowledge_relation(type);
 
-  -- Consolidation state (summary counters + last run timestamp)
+  -- Consolidation state (message-time cursor + summary counters)
   CREATE TABLE IF NOT EXISTS consolidation_state (
     id INTEGER PRIMARY KEY DEFAULT 1 CHECK(id = 1),  -- singleton row
     last_consolidated_at INTEGER NOT NULL DEFAULT 0,
-    last_session_time_created INTEGER NOT NULL DEFAULT 0,
+    last_message_time_created INTEGER NOT NULL DEFAULT 0,  -- max message.time_created processed (v4 cursor)
+    last_message_cursor_seeded INTEGER NOT NULL DEFAULT 0,  -- v4 migration sentinel; 1 = seed complete
     total_sessions_processed INTEGER NOT NULL DEFAULT 0,
     total_entries_created INTEGER NOT NULL DEFAULT 0,
     total_entries_updated INTEGER NOT NULL DEFAULT 0
   );
 
   -- Initialize consolidation state if not present
-  INSERT OR IGNORE INTO consolidation_state (id, last_consolidated_at, last_session_time_created, total_sessions_processed, total_entries_created, total_entries_updated)
-  VALUES (1, 0, 0, 0, 0, 0);
+  INSERT OR IGNORE INTO consolidation_state (id, last_consolidated_at, last_message_time_created, last_message_cursor_seeded, total_sessions_processed, total_entries_created, total_entries_updated)
+  VALUES (1, 0, 0, 1, 0, 0, 0);
 
   -- Per-episode processing log — enables incremental within-session consolidation.
   -- See CONSOLIDATED_EPISODE_DDL for the table definition (shared with the v3 migration).

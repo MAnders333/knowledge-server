@@ -65,7 +65,7 @@ export class ConsolidationEngine {
    */
   checkPending(): { pendingSessions: number; lastConsolidatedAt: number } {
     const state = this.db.getConsolidationState();
-    const pending = this.episodes.countNewSessions(state.lastSessionTimeCreated);
+    const pending = this.episodes.countNewSessions(state.lastMessageTimeCreated);
     return { pendingSessions: pending, lastConsolidatedAt: state.lastConsolidatedAt };
   }
 
@@ -91,12 +91,11 @@ export class ConsolidationEngine {
       `[consolidation] Starting. Last run: ${state.lastConsolidatedAt ? new Date(state.lastConsolidatedAt).toISOString() : "never"}`
     );
 
-    // 1. Fetch candidate sessions (id + time_created) up to the batch limit.
-    //    We need time_created for ALL fetched sessions — not just ones that produce
-    //    episodes — so the cursor always advances past the full batch, even when
-    //    sessions are skipped due to minSessionMessages filtering.
+    // 1. Fetch candidate sessions: those with messages newer than the cursor.
+    //    Returns session IDs plus the max message timestamp per session,
+    //    ordered by max message time ASC for deterministic batching.
     const candidateSessions = this.episodes.getCandidateSessions(
-      state.lastSessionTimeCreated,
+      state.lastMessageTimeCreated,
       config.consolidation.maxSessionsPerRun
     );
 
@@ -118,9 +117,6 @@ export class ConsolidationEngine {
       };
     }
 
-    // The cursor will advance to the max time_created of ALL fetched sessions —
-    // this ensures sessions with too few messages don't stall the cursor.
-    const maxCandidateTime = candidateSessions.reduce((max, s) => s.timeCreated > max ? s.timeCreated : max, 0);
     const candidateIds = candidateSessions.map((s) => s.id);
 
     // 2. Load already-processed episode ranges for this batch of sessions.
@@ -273,11 +269,51 @@ export class ConsolidationEngine {
       `[consolidation] Generated embeddings for ${embeddedCount} entries.`
     );
 
-    // 9. Advance cursor past ALL fetched candidate sessions (not just episode-producing ones).
-    //    This prevents sessions with too few messages from stalling the cursor.
+    // 9. Advance cursor to the max message timestamp across all processed episodes.
+    //    This is the true high-water mark: any message with time_created > this value
+    //    is genuinely unprocessed.
+    const maxEpisodeMessageTime = episodes.length > 0
+      ? episodes.reduce((max, ep) => ep.maxMessageTime > max ? ep.maxMessageTime : max, 0)
+      : 0;
+
+    // Start with the episode high-water mark; we'll decide below whether to also
+    // advance past sessions that produced no episodes.
+    let newCursor = Math.max(maxEpisodeMessageTime, state.lastMessageTimeCreated);
+
+    const lastSession = candidateSessions[candidateSessions.length - 1];
+    const hitBatchLimit = candidateSessions.length === config.consolidation.maxSessionsPerRun;
+
+    // Boundary-timestamp safety: if the batch is full AND the last session itself
+    // produced at least one episode, there may be additional unprocessed sessions
+    // sharing the exact same maxMessageTime beyond the batch boundary. The next
+    // query uses `>`, so those sessions would be excluded forever if we advance
+    // the cursor to lastSession.maxMessageTime.
+    // Guard: keep the cursor just below the boundary so those sessions are
+    // re-fetched next run. We only apply the cap when it is strictly above
+    // the current cursor (otherwise the safety floor below undoes it).
+    //
+    // If the batch is full but the last session produced NO episode (e.g. it is
+    // below minSessionMessages), there is no boundary risk: the last session will
+    // gain new messages in the future (which will have time_created > its current
+    // maxMessageTime) and naturally re-appear as a candidate. We advance fully.
+    const lastSessionHasEpisode = episodes.some((ep) => ep.sessionId === lastSession.id);
+    if (hitBatchLimit && lastSessionHasEpisode) {
+      // Cap below boundary; re-fetch same-timestamp sessions next run.
+      const cap = lastSession.maxMessageTime - 1;
+      if (cap > state.lastMessageTimeCreated) {
+        newCursor = Math.min(newCursor, cap);
+      }
+    } else {
+      // No boundary risk — advance past all candidates so they don't re-appear.
+      newCursor = Math.max(newCursor, lastSession.maxMessageTime);
+    }
+
+    // Safety floor: never move the cursor backwards.
+    newCursor = Math.max(newCursor, state.lastMessageTimeCreated);
+
     this.db.updateConsolidationState({
       lastConsolidatedAt: Date.now(),
-      lastSessionTimeCreated: maxCandidateTime,
+      lastMessageTimeCreated: newCursor,
       totalSessionsProcessed: state.totalSessionsProcessed + candidateSessions.length,
       totalEntriesCreated: state.totalEntriesCreated + totalCreated,
       totalEntriesUpdated: state.totalEntriesUpdated + totalUpdated,

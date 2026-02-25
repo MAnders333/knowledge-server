@@ -78,7 +78,7 @@ export interface KnowledgeRelation {
  */
 export interface ConsolidationState {
   lastConsolidatedAt: number; // unix timestamp ms
-  lastSessionTimeCreated: number; // time_created of last processed session
+  lastMessageTimeCreated: number; // max time_created of messages processed in last run
   totalSessionsProcessed: number;
   totalEntriesCreated: number;
   totalEntriesUpdated: number;
@@ -108,6 +108,7 @@ export interface Episode {
   projectName: string;
   directory: string;
   timeCreated: number;
+  maxMessageTime: number; // max time_created of messages in this episode — used for cursor advance
   content: string; // pre-formatted text (either compaction summary or formatted messages)
   contentType: "compaction_summary" | "messages"; // what kind of content this is
   approxTokens: number; // rough token estimate for budget enforcement

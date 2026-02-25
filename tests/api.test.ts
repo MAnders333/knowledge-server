@@ -20,7 +20,7 @@ describe("HTTP API", () => {
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "knowledge-api-test-"));
-    db = new KnowledgeDBImpl(join(tempDir, "test.db"));
+    db = new KnowledgeDBImpl(join(tempDir, "test.db"), join(tempDir, "opencode-fake.db"));
     const activation = new ActivationEngine(db);
     // We pass a mock consolidation engine — not testing consolidation via API here
     const consolidation = {

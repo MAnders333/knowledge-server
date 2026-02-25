@@ -1,5 +1,4 @@
 import { Database } from "bun:sqlite";
-import { dirname, resolve } from "node:path";
 import { config } from "../config.js";
 import type { Episode, EpisodeMessage, ProcessedRange } from "../types.js";
 
@@ -38,13 +37,6 @@ function approxTokens(text: string): number {
  *   excluded, so only the new tail of a session is re-processed.
  */
 
-/**
- * Directory of the knowledge DB — used to exclude knowledge-server's own sessions
- * from consolidation. Using the actual config path is robust to the project being
- * cloned under any directory name (avoids fragile %knowledge-server% string match).
- */
-const KNOWLEDGE_DB_DIR = dirname(resolve(config.dbPath));
-
 export class EpisodeReader {
   private db: Database;
 
@@ -53,46 +45,57 @@ export class EpisodeReader {
   }
 
   /**
-   * Return candidate sessions (since cursor, up to limit) with their time_created.
-   * Used by ConsolidationEngine to:
-   *   1. Pre-load processed episode ranges before segmentation
-   *   2. Advance the cursor past ALL fetched sessions, not just ones with episodes —
-   *      so sessions with too few messages don't stall the cursor indefinitely.
+   * Return candidate sessions that have messages newer than the cursor.
+   *
+   * Queries the message table directly — session_id is a FK on every message row,
+   * so no join to session is needed. Groups by session_id and orders by the max
+   * message timestamp ASC so batches advance the cursor in chronological order.
+   *
+   * This replaces the old session time_created cursor, which failed for:
+   *   - Sessions that are consolidated once then continued (time_created never changes)
+   *   - Sessions reopened arbitrarily far in the past (time_created behind cursor)
+   *
+   * The episode-level idempotency (startMessageId/endMessageId) handles skipping
+   * already-processed parts — this query just identifies which sessions need a look.
+   *
+   * Note: the old implementation excluded sessions from the knowledge-server's own
+   * directory to avoid a feedback loop. That filter is intentionally omitted here.
+   * The knowledge-server does not create OpenCode sessions, so there is nothing to
+   * exclude. If that changes, add AND s.directory NOT LIKE '<knowledge_db_dir>%'.
    */
   getCandidateSessions(
-    afterTimeCreated: number,
+    afterMessageTimeCreated: number,
     limit: number = config.consolidation.maxSessionsPerRun
-  ): Array<{ id: string; timeCreated: number }> {
+  ): Array<{ id: string; maxMessageTime: number }> {
     const rows = this.db
       .prepare(
-        `SELECT s.id, s.time_created FROM session s
-         WHERE s.time_created > ?
+        `SELECT m.session_id as id, MAX(m.time_created) as max_message_time
+         FROM message m
+         JOIN session s ON s.id = m.session_id
+         WHERE m.time_created > ?
            AND s.parent_id IS NULL
-           AND s.directory NOT LIKE ?
-         ORDER BY s.time_created ASC
+         GROUP BY m.session_id
+         ORDER BY max_message_time ASC
          LIMIT ?`
       )
-      .all(afterTimeCreated, `${KNOWLEDGE_DB_DIR}%`, limit) as Array<{ id: string; time_created: number }>;
-    return rows.map((r) => ({ id: r.id, timeCreated: r.time_created }));
+      .all(afterMessageTimeCreated, limit) as Array<{ id: string; max_message_time: number }>;
+    return rows.map((r) => ({ id: r.id, maxMessageTime: r.max_message_time }));
   }
 
   /**
-   * Count sessions pending consolidation without loading their content.
-   * Cheap check used at startup.
-   *
-   * Note: this counts sessions by time_created cursor only. Some of these sessions
-   * may already be partially consolidated (some episodes processed). The actual
-   * new-work check is done at the episode level inside getNewEpisodes().
+   * Count sessions with messages newer than the cursor.
+   * Cheap check used at startup to decide whether to start background consolidation.
    */
-  countNewSessions(afterTimeCreated: number): number {
+  countNewSessions(afterMessageTimeCreated: number): number {
     const row = this.db
       .prepare(
-        `SELECT COUNT(*) as n FROM session
-         WHERE time_created > ?
-           AND parent_id IS NULL
-           AND directory NOT LIKE ?`
+        `SELECT COUNT(DISTINCT m.session_id) as n
+         FROM message m
+         JOIN session s ON s.id = m.session_id
+         WHERE m.time_created > ?
+           AND s.parent_id IS NULL`
       )
-      .get(afterTimeCreated, `${KNOWLEDGE_DB_DIR}%`) as { n: number };
+      .get(afterMessageTimeCreated) as { n: number };
     return row.n;
   }
 
@@ -191,7 +194,7 @@ export class EpisodeReader {
    */
   private getCompactionPoints(
     sessionId: string
-  ): Array<{ compactionTime: number; summaryText: string; summaryMessageId: string }> {
+  ): Array<{ compactionTime: number; summaryText: string; summaryMessageId: string; summaryMessageTime: number }> {
     // Find all compaction part timestamps
     const compactionTimes = this.db
       .prepare(
@@ -204,13 +207,15 @@ export class EpisodeReader {
       )
       .all(sessionId) as Array<{ time_created: number }>;
 
-    const points: Array<{ compactionTime: number; summaryText: string; summaryMessageId: string }> = [];
+    const points: Array<{ compactionTime: number; summaryText: string; summaryMessageId: string; summaryMessageTime: number }> = [];
 
     for (const ct of compactionTimes) {
-      // The continuation summary is the first assistant text part AFTER the compaction
+      // The continuation summary is the first assistant text part AFTER the compaction.
+      // We fetch time_created alongside id — the summary message's timestamp is what
+      // the cursor must advance to, not the compaction marker's time (which is earlier).
       const summary = this.db
         .prepare(
-          `SELECT m.id as message_id, json_extract(p.data, '$.text') as text
+          `SELECT m.id as message_id, m.time_created as message_time, json_extract(p.data, '$.text') as text
            FROM message m
            JOIN part p ON p.message_id = m.id
            WHERE m.session_id = ?
@@ -220,13 +225,14 @@ export class EpisodeReader {
            ORDER BY m.time_created ASC, p.time_created ASC
            LIMIT 1`
         )
-        .get(sessionId, ct.time_created) as { message_id: string; text: string } | null;
+        .get(sessionId, ct.time_created) as { message_id: string; message_time: number; text: string } | null;
 
       if (summary?.text) {
         points.push({
           compactionTime: ct.time_created,
           summaryText: summary.text,
           summaryMessageId: summary.message_id,
+          summaryMessageTime: summary.message_time,
         });
       }
     }
@@ -249,11 +255,13 @@ export class EpisodeReader {
       time_created: number;
       project_name: string;
     },
-    compactionPoints: Array<{ compactionTime: number; summaryText: string; summaryMessageId: string }>
+    compactionPoints: Array<{ compactionTime: number; summaryText: string; summaryMessageId: string; summaryMessageTime: number }>
   ): Episode[] {
     const episodes: Episode[] = [];
 
-    // Each compaction summary is one episode keyed by its own message ID
+    // Each compaction summary is one episode keyed by its own message ID.
+    // maxMessageTime uses the summary message's time_created (not the compaction marker's)
+    // so the cursor advances to the actual message that was processed.
     for (const point of compactionPoints) {
       const tokens = approxTokens(point.summaryText);
       episodes.push({
@@ -264,6 +272,7 @@ export class EpisodeReader {
         projectName: session.project_name,
         directory: session.directory,
         timeCreated: session.time_created,
+        maxMessageTime: point.summaryMessageTime,
         content: point.summaryText,
         contentType: "compaction_summary",
         approxTokens: tokens,
@@ -292,6 +301,7 @@ export class EpisodeReader {
             projectName: session.project_name,
             directory: session.directory,
             timeCreated: session.time_created,
+            maxMessageTime: chunk[chunk.length - 1].timestamp,
             content,
             contentType: "messages",
             approxTokens: approxTokens(content),
@@ -368,6 +378,7 @@ export class EpisodeReader {
           projectName: session.project_name,
           directory: session.directory,
           timeCreated: session.time_created,
+          maxMessageTime: chunk[chunk.length - 1].timestamp,
           content,
           contentType: "messages",
           approxTokens: approxTokens(content),

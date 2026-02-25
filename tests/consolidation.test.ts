@@ -59,7 +59,7 @@ let tempDir: string;
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), "ks-consolidation-test-"));
-  db = new KnowledgeDB(join(tempDir, "test.db"));
+  db = new KnowledgeDB(join(tempDir, "test.db"), join(tempDir, "opencode-fake.db"));
   activation = new ActivationEngine(db);
   engine = new ConsolidationEngine(db, activation);
 });

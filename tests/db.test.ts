@@ -10,7 +10,9 @@ describe("KnowledgeDB", () => {
 
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "knowledge-test-"));
-    db = new KnowledgeDB(join(tempDir, "test.db"));
+    // Pass a non-existent opencodeDbPath so the v4 migration seed gracefully falls
+    // back to 0 rather than accidentally querying the real OpenCode DB on disk.
+    db = new KnowledgeDB(join(tempDir, "test.db"), join(tempDir, "opencode-fake.db"));
   });
 
   afterEach(() => {
@@ -182,19 +184,53 @@ describe("KnowledgeDB", () => {
   it("should manage consolidation state", () => {
     const state = db.getConsolidationState();
     expect(state.lastConsolidatedAt).toBe(0);
+    expect(state.lastMessageTimeCreated).toBe(0);
     expect(state.totalSessionsProcessed).toBe(0);
 
     db.updateConsolidationState({
       lastConsolidatedAt: 1000000,
-      lastSessionTimeCreated: 999999,
+      lastMessageTimeCreated: 999999,
       totalSessionsProcessed: 50,
       totalEntriesCreated: 25,
     });
 
     const updated = db.getConsolidationState();
     expect(updated.lastConsolidatedAt).toBe(1000000);
+    expect(updated.lastMessageTimeCreated).toBe(999999);
     expect(updated.totalSessionsProcessed).toBe(50);
     expect(updated.totalEntriesCreated).toBe(25);
+  });
+
+  it("should record and retrieve episode ranges", () => {
+    db.recordEpisode("session-1", "msg-start-1", "msg-end-1", "messages", 3);
+    db.recordEpisode("session-1", "msg-start-2", "msg-end-2", "compaction_summary", 1);
+    db.recordEpisode("session-2", "msg-start-3", "msg-end-3", "messages", 0);
+
+    const ranges = db.getProcessedEpisodeRanges(["session-1", "session-2"]);
+
+    expect(ranges.size).toBe(2);
+    const s1 = ranges.get("session-1")!;
+    expect(s1).toHaveLength(2);
+    expect(s1.some((r) => r.startMessageId === "msg-start-1" && r.endMessageId === "msg-end-1")).toBe(true);
+    expect(s1.some((r) => r.startMessageId === "msg-start-2" && r.endMessageId === "msg-end-2")).toBe(true);
+
+    const s2 = ranges.get("session-2")!;
+    expect(s2).toHaveLength(1);
+    expect(s2[0].startMessageId).toBe("msg-start-3");
+    expect(s2[0].endMessageId).toBe("msg-end-3");
+  });
+
+  it("recordEpisode is idempotent — duplicate inserts are ignored", () => {
+    db.recordEpisode("session-1", "msg-a", "msg-b", "messages", 2);
+    db.recordEpisode("session-1", "msg-a", "msg-b", "messages", 2);
+
+    const ranges = db.getProcessedEpisodeRanges(["session-1"]);
+    expect(ranges.get("session-1")).toHaveLength(1);
+  });
+
+  it("getProcessedEpisodeRanges returns empty map for unknown session", () => {
+    const ranges = db.getProcessedEpisodeRanges(["no-such-session"]);
+    expect(ranges.size).toBe(0);
   });
 
   it("should handle relations between entries", () => {
