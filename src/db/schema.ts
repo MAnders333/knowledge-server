@@ -106,9 +106,13 @@ export const CREATE_TABLES = `
     total_entries_updated INTEGER NOT NULL DEFAULT 0
   );
 
-  -- Initialize consolidation state if not present
-  INSERT OR IGNORE INTO consolidation_state (id, last_consolidated_at, last_message_time_created, last_message_cursor_seeded, total_sessions_processed, total_entries_created, total_entries_updated)
-  VALUES (1, 0, 0, 1, 0, 0, 0);
+  -- Initialize consolidation state if not present.
+  -- Only include base columns here — v2/v4 columns (total_entries_updated,
+  -- last_message_time_created, last_message_cursor_seeded) are added by
+  -- runMigrations() after CREATE_TABLES runs. Referencing them here would
+  -- cause a SQLiteError on existing pre-migration databases.
+  INSERT OR IGNORE INTO consolidation_state (id, last_consolidated_at, total_sessions_processed, total_entries_created)
+  VALUES (1, 0, 0, 0);
 
   -- Per-episode processing log — enables incremental within-session consolidation.
   -- See CONSOLIDATED_EPISODE_DDL for the table definition (shared with the v3 migration).
