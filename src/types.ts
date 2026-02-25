@@ -134,6 +134,17 @@ export interface EpisodeMessage {
 }
 
 /**
+ * When an activated entry has status 'conflicted', this annotation is attached
+ * to surface the counterpart entry that it contradicts — but only when that
+ * counterpart also activates in the same query (i.e. both sides are relevant).
+ */
+export interface ContradictionAnnotation {
+  conflictingEntryId: string;
+  conflictingContent: string;
+  caveat: string; // human-readable warning for the consuming agent
+}
+
+/**
  * Result of an activation query — knowledge entries ranked by relevance.
  */
 export interface ActivationResult {
@@ -146,6 +157,12 @@ export interface ActivationResult {
       lastAccessedDaysAgo: number;
       mayBeStale: boolean;
     };
+    /**
+     * Present only when this entry is conflicted AND its contradicting
+     * counterpart also activated in the same query. The agent should
+     * treat this knowledge with caution and not act on it unilaterally.
+     */
+    contradiction?: ContradictionAnnotation;
   }>;
   query: string;
   totalActive: number;

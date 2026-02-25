@@ -1,7 +1,7 @@
 import type { KnowledgeDB } from "../db/database.js";
 import { EmbeddingClient, cosineSimilarity } from "./embeddings.js";
 import { config } from "../config.js";
-import type { ActivationResult, KnowledgeEntry } from "../types.js";
+import type { ActivationResult, ContradictionAnnotation, KnowledgeEntry } from "../types.js";
 
 /**
  * Activation engine — the core retrieval mechanism.
@@ -77,11 +77,49 @@ export class ActivationEngine {
       this.db.recordAccess(entry.id);
     }
 
+    // Build a map of activated entries for fast lookup during annotation.
+    // Used to determine whether a conflicted entry's counterpart also activated
+    // (we only annotate when both sides of the conflict are relevant to this query),
+    // and to retrieve the counterpart's content without an extra DB round-trip.
+    const scoredById = new Map(scored.map(({ entry }) => [entry.id, entry]));
+
+    // Batch-fetch all contradicts relations for conflicted entries in a single query,
+    // avoiding N+1 DB calls. Only fetch for entries with status 'conflicted'.
+    const conflictedIds = scored
+      .filter(({ entry }) => entry.status === "conflicted")
+      .map(({ entry }) => entry.id);
+
+    const contradictPairs = this.db.getContradictPairsForIds(conflictedIds);
+
+    // Build contradiction annotations for conflicted entries whose counterpart
+    // also activated in this query (both sides relevant — only then is the caveat useful).
+    const contradictionMap = new Map<string, ContradictionAnnotation>();
+    for (const { entry } of scored) {
+      if (entry.status !== "conflicted") continue;
+
+      const counterpartId = contradictPairs.get(entry.id);
+      if (!counterpartId) continue;
+
+      // Only annotate if the counterpart also activated in this same query.
+      // The counterpart is already in scoredById if it activated, so no extra DB fetch needed.
+      const counterpart = scoredById.get(counterpartId);
+      if (!counterpart) continue;
+
+      contradictionMap.set(entry.id, {
+        conflictingEntryId: counterpartId,
+        conflictingContent: counterpart.content,
+        caveat:
+          "This knowledge conflicts with another activated entry and has not been resolved. " +
+          "Verify before relying on it; the conflicting view is also shown in this response.",
+      });
+    }
+
     return {
       entries: scored.map(({ entry, similarity, staleness }) => ({
         entry: { ...entry, embedding: undefined } as KnowledgeEntry,
         similarity,
         staleness,
+        contradiction: contradictionMap.get(entry.id),
       })),
       query,
       totalActive: entries.length,

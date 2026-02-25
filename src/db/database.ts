@@ -317,12 +317,14 @@ export class KnowledgeDB {
   }
 
   /**
-   * Get all active entries that have embeddings (for similarity search).
+   * Get all active and conflicted entries that have embeddings (for similarity search).
+   * Conflicted entries are included so they can be surfaced to the agent with a caveat
+   * annotation, and so the contradiction scan can attempt to re-resolve them.
    */
   getActiveEntriesWithEmbeddings(): Array<KnowledgeEntry & { embedding: number[] }> {
     const rows = this.db
       .prepare(
-        "SELECT * FROM knowledge_entry WHERE status = 'active' AND embedding IS NOT NULL ORDER BY strength DESC"
+        "SELECT * FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL ORDER BY strength DESC"
       )
       .all() as RawEntryRow[];
 
@@ -412,8 +414,12 @@ export class KnowledgeDB {
   // ── Contradiction detection ──
 
   /**
-   * Find active entries that share at least one topic with the given topics list.
-   * Returns only entries that have embeddings (needed for similarity filtering).
+   * Find active and conflicted entries that share at least one topic with the given
+   * topics list. Returns only entries that have embeddings (needed for similarity filtering).
+   *
+   * Conflicted entries are included so that new entries can re-attempt to resolve
+   * existing irresolvable pairs — if a new entry clearly supports one side, the LLM
+   * can supersede the loser and clear the conflict.
    *
    * Used by the post-extraction contradiction scan to find candidates in the
    * mid-similarity band (0.4–0.82) — entries that are topic-related but not
@@ -433,7 +439,7 @@ export class KnowledgeDB {
       .prepare(
         `SELECT DISTINCT ke.*
          FROM knowledge_entry ke, json_each(ke.topics) t
-         WHERE ke.status = 'active'
+         WHERE ke.status IN ('active', 'conflicted')
            AND t.value IN (SELECT value FROM json_each(?))
            AND ke.id NOT IN (SELECT value FROM json_each(?))
          ORDER BY ke.strength DESC`
@@ -455,6 +461,11 @@ export class KnowledgeDB {
    * - "supersede_new": existingEntryId wins — mark newEntryId as superseded
    * - "merge":         replace newEntryId content with merged, mark existingEntryId as superseded
    * - "irresolvable":  insert a contradicts relation, mark BOTH entries as conflicted for human review
+   *
+   * For supersede/merge resolutions: if the winning entry was previously 'conflicted'
+   * (i.e. it was one half of an irresolvable pair), its contradicts relation is deleted
+   * and its status is restored to 'active'. This enables automatic re-resolution when
+   * a new entry clearly settles a previously unresolvable conflict.
    */
   applyContradictionResolution(
     resolution: "supersede_old" | "supersede_new" | "merge" | "irresolvable",
@@ -466,7 +477,10 @@ export class KnowledgeDB {
 
     this.db.transaction(() => {
       switch (resolution) {
-        case "supersede_old":
+        case "supersede_old": {
+          // Resolve any prior conflicts on BOTH entries BEFORE status changes.
+          const loserConflictPartner1 = this.findConflictCounterpart(existingEntryId);
+          const winnerConflictPartner1 = this.findConflictCounterpart(newEntryId);
           // New entry wins — mark existing as superseded
           this.db
             .prepare(
@@ -483,9 +497,24 @@ export class KnowledgeDB {
                VALUES (?, ?, ?, 'supersedes', ?)`
             )
             .run(randomUUID(), newEntryId, existingEntryId, now);
+          // If the loser was half of an irresolvable pair, its counterpart is now orphaned.
+          // Restore the counterpart to 'active' and clean up the contradicts relation.
+          if (loserConflictPartner1) this.restoreConflictCounterpart(loserConflictPartner1, existingEntryId, now);
+          // If the winner was also conflicted, the new entry decisively settles it —
+          // restore the winner to active and clean up its conflict counterpart too.
+          if (winnerConflictPartner1) {
+            this.db
+              .prepare("UPDATE knowledge_entry SET status = 'active', updated_at = ? WHERE id = ? AND status = 'conflicted'")
+              .run(now, newEntryId);
+            this.restoreConflictCounterpart(winnerConflictPartner1, newEntryId, now);
+          }
           break;
+        }
 
-        case "supersede_new":
+        case "supersede_new": {
+          // Resolve any prior conflicts on BOTH entries before status changes.
+          const loserConflictPartner2 = this.findConflictCounterpart(newEntryId);
+          const winnerConflictPartner2 = this.findConflictCounterpart(existingEntryId);
           // Existing entry wins — mark new entry as superseded
           this.db
             .prepare(
@@ -501,9 +530,23 @@ export class KnowledgeDB {
                VALUES (?, ?, ?, 'supersedes', ?)`
             )
             .run(randomUUID(), existingEntryId, newEntryId, now);
+          // Restore the loser's orphaned conflict counterpart if any.
+          if (loserConflictPartner2) this.restoreConflictCounterpart(loserConflictPartner2, newEntryId, now);
+          // If the winner was also conflicted, the new entry decisively settles it —
+          // restore the winner to active and clean up its conflict counterpart too.
+          if (winnerConflictPartner2) {
+            this.db
+              .prepare("UPDATE knowledge_entry SET status = 'active', updated_at = ? WHERE id = ? AND status = 'conflicted'")
+              .run(now, existingEntryId);
+            this.restoreConflictCounterpart(winnerConflictPartner2, existingEntryId, now);
+          }
           break;
+        }
 
         case "merge": {
+          // Resolve any prior conflicts on both entries BEFORE status changes.
+          const existingConflictPartner = this.findConflictCounterpart(existingEntryId);
+          const newConflictPartner = this.findConflictCounterpart(newEntryId);
           // Merge into the new entry, supersede the old one.
           // If mergedData is absent (LLM truncation), newEntryId keeps its
           // original content — still a valid state, just unrefined.
@@ -544,6 +587,19 @@ export class KnowledgeDB {
                VALUES (?, ?, ?, 'supersedes', ?)`
             )
             .run(randomUUID(), newEntryId, existingEntryId, now);
+          // Restore orphaned conflict counterparts for both entries if applicable.
+          // For the loser (existingEntryId): restore its counterpart.
+          if (existingConflictPartner) this.restoreConflictCounterpart(existingConflictPartner, existingEntryId, now);
+          // For the winner (newEntryId): if it was conflicted AND the merge content actually
+          // landed (mergedData present), the conflict is decisively resolved — restore it and
+          // its counterpart to active. If mergedData is absent (LLM truncation), the entry
+          // retains its original unrefined content and should stay under review.
+          if (newConflictPartner && mergedData) {
+            this.db
+              .prepare("UPDATE knowledge_entry SET status = 'active', updated_at = ? WHERE id = ? AND status = 'conflicted'")
+              .run(now, newEntryId);
+            this.restoreConflictCounterpart(newConflictPartner, newEntryId, now);
+          }
           break;
         }
 
@@ -567,6 +623,57 @@ export class KnowledgeDB {
           break;
       }
     })();
+  }
+
+  /**
+   * Find the ID of the entry that shares a 'contradicts' relation with the given entry,
+   * if one exists. Returns null if the entry has no contradicts relation.
+   *
+   * Must be called BEFORE the entry's status is changed (e.g. before superseding),
+   * since the relation lookup does not depend on status but the caller needs the
+   * counterpart ID before the original entry is modified.
+   */
+  private findConflictCounterpart(entryId: string): string | null {
+    const entry = this.db
+      .prepare("SELECT status FROM knowledge_entry WHERE id = ?")
+      .get(entryId) as { status: string } | null;
+
+    if (entry?.status !== "conflicted") return null;
+
+    const rel = this.db
+      .prepare(
+        "SELECT source_id, target_id FROM knowledge_relation WHERE type = 'contradicts' AND (source_id = ? OR target_id = ?) LIMIT 1"
+      )
+      .get(entryId, entryId) as { source_id: string; target_id: string } | null;
+
+    if (!rel) return null;
+    return rel.source_id === entryId ? rel.target_id : rel.source_id;
+  }
+
+  /**
+   * Restore a conflict counterpart to 'active' after its paired entry has been
+   * superseded/resolved. Deletes the contradicts relation between them.
+   *
+   * @param counterpartId  The entry to restore (was orphaned when its partner was resolved)
+   * @param resolvedId     The entry that was just superseded (used to target the relation delete)
+   * @param now            Timestamp for updated_at
+   */
+  private restoreConflictCounterpart(counterpartId: string, resolvedId: string, now: number): void {
+    this.db
+      .prepare(
+        "UPDATE knowledge_entry SET status = 'active', updated_at = ? WHERE id = ? AND status = 'conflicted'"
+      )
+      .run(now, counterpartId);
+
+    // Scope the delete to the specific pair (not all contradicts relations touching resolvedId)
+    // to avoid accidentally orphaning unrelated conflicts if resolvedId has multiple pairs.
+    this.db
+      .prepare(
+        `DELETE FROM knowledge_relation
+         WHERE type = 'contradicts'
+           AND ((source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?))`
+      )
+      .run(resolvedId, counterpartId, counterpartId, resolvedId);
   }
 
   // ── Relations ──
@@ -599,6 +706,37 @@ export class KnowledgeDB {
       type: r.type as KnowledgeRelation["type"],
       createdAt: r.created_at,
     }));
+  }
+
+  /**
+   * Batch fetch all 'contradicts' relations that involve any of the given entry IDs.
+   * Returns a map from each entry ID to its conflict counterpart ID.
+   *
+   * Used by the activation engine to annotate conflicted entries without N+1 queries.
+   * Entries with no contradicts relation are absent from the returned map.
+   */
+  getContradictPairsForIds(entryIds: string[]): Map<string, string> {
+    if (entryIds.length === 0) return new Map();
+
+    const rows = this.db
+      .prepare(
+        `SELECT source_id, target_id FROM knowledge_relation
+         WHERE type = 'contradicts'
+           AND (source_id IN (SELECT value FROM json_each(?))
+                OR target_id IN (SELECT value FROM json_each(?)))`
+      )
+      .all(JSON.stringify(entryIds), JSON.stringify(entryIds)) as Array<{
+      source_id: string;
+      target_id: string;
+    }>;
+
+    const result = new Map<string, string>();
+    for (const row of rows) {
+      // Map both directions so lookup works regardless of which end we query from
+      result.set(row.source_id, row.target_id);
+      result.set(row.target_id, row.source_id);
+    }
+    return result;
   }
 
   // ── Episode Tracking ──

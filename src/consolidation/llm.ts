@@ -86,6 +86,9 @@ async function complete(
  * 1. Direct parse (model returned clean JSON)
  * 2. Extract from ```json ... ``` fence
  * 3. Greedy bracket match (last resort)
+ * 4. Partial-array recovery (array mode only) — when the response is truncated
+ *    mid-object, salvage all complete objects that appeared before the cut-off.
+ *    This handles the case where the LLM hits the token limit inside a JSON array.
  */
 function parseJSON<T>(response: string, arrayMode: boolean): T | null {
   const strategies = [
@@ -103,13 +106,36 @@ function parseJSON<T>(response: string, arrayMode: boolean): T | null {
         : response.match(/\{[\s\S]*\}/);
       return bracket ? bracket[0] : null;
     },
+    // Strategy 4: partial-array recovery for truncated responses (array mode only).
+    // Find the last complete '}' before the truncation point, close the array there.
+    // Only used when the response starts with '[' (looks like an array attempt).
+    () => {
+      if (!arrayMode) return null;
+      const trimmed = response.trim();
+      // Must look like a JSON array that was cut short
+      if (!trimmed.startsWith("[")) return null;
+      const lastClose = trimmed.lastIndexOf("}");
+      if (lastClose === -1) return null;
+      return trimmed.slice(0, lastClose + 1) + "]";
+    },
   ];
 
-  for (const strategy of strategies) {
-    const candidate = strategy();
+  for (let i = 0; i < strategies.length; i++) {
+    const candidate = strategies[i]();
     if (!candidate) continue;
     try {
-      return JSON.parse(candidate) as T;
+      const result = JSON.parse(candidate) as T;
+      // Strategy 4 is partial-array recovery — warn when it salvages fewer objects than expected
+      if (i === 3 && Array.isArray(result)) {
+        const originalCount = (response.match(/"candidateId"/g) || []).length;
+        const recoveredCount = (result as unknown[]).length;
+        if (recoveredCount < originalCount) {
+          console.warn(
+            `[llm] Partial JSON recovery: salvaged ${recoveredCount}/${originalCount} objects from truncated response`
+          );
+        }
+      }
+      return result;
     } catch {
       // try next strategy
     }
@@ -255,7 +281,7 @@ Respond with one of:
 {"action": "replace", "content": "...", "type": "...", "topics": [...], "confidence": 0.0}
 {"action": "insert"}`;
 
-    const response = await complete(config.llm.mergeModel, systemPrompt, userPrompt, 1024);
+    const response = await complete(config.llm.mergeModel, systemPrompt, userPrompt);
 
     const parsed = parseJSON<MergeDecision>(response, false);
     if (!parsed || !["keep", "update", "replace", "insert"].includes(parsed.action)) {
@@ -341,7 +367,7 @@ Respond with a JSON array (one result per candidate, same order):
   }
 ]`;
 
-    const response = await complete(config.llm.contradictionModel, systemPrompt, userPrompt, 2048);
+    const response = await complete(config.llm.contradictionModel, systemPrompt, userPrompt);
 
     const parsed = parseJSON<ContradictionResult[]>(response, true);
     if (!parsed) {

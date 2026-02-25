@@ -286,3 +286,226 @@ describe("KnowledgeDB — getEntries with filters", () => {
     expect(results.map((e) => e.id)).toEqual(["m1"]);
   });
 });
+
+describe("KnowledgeDB — conflicted entries included in similarity queries", () => {
+  it("getEntriesWithOverlappingTopics returns conflicted entries alongside active ones", () => {
+    const emb = fakeEmbedding("abc");
+    db.insertEntry(makeEntry({ id: "ot-active", topics: ["shared"], status: "active", embedding: emb }));
+    db.insertEntry(makeEntry({ id: "ot-conflicted", topics: ["shared"], status: "conflicted", embedding: emb }));
+    db.insertEntry(makeEntry({ id: "ot-archived", topics: ["shared"], status: "archived", embedding: emb }));
+    db.insertEntry(makeEntry({ id: "ot-superseded", topics: ["shared"], status: "superseded", embedding: emb }));
+
+    const results = db.getEntriesWithOverlappingTopics(["shared"], []);
+    const ids = results.map((r) => r.id);
+    expect(ids).toContain("ot-active");
+    expect(ids).toContain("ot-conflicted");
+    expect(ids).not.toContain("ot-archived");
+    expect(ids).not.toContain("ot-superseded");
+  });
+
+  it("getActiveEntriesWithEmbeddings returns conflicted entries alongside active ones", () => {
+    const emb = fakeEmbedding("abc");
+    db.insertEntry(makeEntry({ id: "ae-active", status: "active", embedding: emb }));
+    db.insertEntry(makeEntry({ id: "ae-conflicted", status: "conflicted", embedding: emb }));
+    db.insertEntry(makeEntry({ id: "ae-archived", status: "archived", embedding: emb }));
+
+    const results = db.getActiveEntriesWithEmbeddings();
+    const ids = results.map((r) => r.id);
+    expect(ids).toContain("ae-active");
+    expect(ids).toContain("ae-conflicted");
+    expect(ids).not.toContain("ae-archived");
+  });
+});
+
+describe("KnowledgeDB — applyContradictionResolution clears conflicted status on winner", () => {
+  it("supersede_old: orphaned conflict counterpart of the loser is restored to active", () => {
+    // "loser" and "winner" are an irresolvable pair
+    db.insertEntry(makeEntry({ id: "winner", topics: ["x"] }));
+    db.insertEntry(makeEntry({ id: "loser", topics: ["x"] }));
+    db.applyContradictionResolution("irresolvable", "loser", "winner");
+
+    expect(db.getEntry("winner")?.status).toBe("conflicted");
+    expect(db.getEntry("loser")?.status).toBe("conflicted");
+
+    // New entry decisively supersedes the loser
+    db.insertEntry(makeEntry({ id: "new-decisive", topics: ["x"] }));
+    db.applyContradictionResolution("supersede_old", "new-decisive", "loser");
+
+    // loser is superseded
+    expect(db.getEntry("loser")?.status).toBe("superseded");
+    // winner (the orphaned counterpart) must be restored to active
+    expect(db.getEntry("winner")?.status).toBe("active");
+    // winner's contradicts relation should be gone
+    expect(db.getRelationsFor("winner").some((r) => r.type === "contradicts")).toBe(false);
+  });
+
+  it("supersede_old: winner that was conflicted is restored to active, its counterpart too", () => {
+    // conf-a and conf-b are an irresolvable pair; new-entry arrives and wins over conf-b
+    db.insertEntry(makeEntry({ id: "conf-a", status: "active", topics: ["topic"] }));
+    db.insertEntry(makeEntry({ id: "conf-b", status: "active", topics: ["topic"] }));
+    db.applyContradictionResolution("irresolvable", "conf-a", "conf-b");
+
+    expect(db.getEntry("conf-a")?.status).toBe("conflicted");
+    expect(db.getEntry("conf-b")?.status).toBe("conflicted");
+
+    // conf-a (new entry in this call) was conflicted with conf-b but now decisively wins
+    // over a third entry "old-z". Winning should settle conf-a's prior conflict:
+    // conf-a restored to active, conf-b (its orphaned counterpart) also restored.
+    db.insertEntry(makeEntry({ id: "old-z", topics: ["topic"] }));
+    db.applyContradictionResolution("supersede_old", "conf-a", "old-z");
+
+    // old-z is superseded (the loser)
+    expect(db.getEntry("old-z")?.status).toBe("superseded");
+    // conf-a (the winner) was conflicted — should now be active
+    expect(db.getEntry("conf-a")?.status).toBe("active");
+    // conf-b (conf-a's orphaned counterpart) should also be restored to active
+    expect(db.getEntry("conf-b")?.status).toBe("active");
+    // conf-a's contradicts relation should be gone
+    expect(db.getRelationsFor("conf-a").some((r) => r.type === "contradicts")).toBe(false);
+  });
+
+  it("supersede_new: winner that was conflicted is restored to active, its counterpart too", () => {
+    // conf-a and conf-b are an irresolvable pair; new-entry arrives and loses to conf-b
+    db.insertEntry(makeEntry({ id: "conf-a", status: "active", topics: ["topic"] }));
+    db.insertEntry(makeEntry({ id: "conf-b", status: "active", topics: ["topic"] }));
+    db.applyContradictionResolution("irresolvable", "conf-a", "conf-b");
+
+    expect(db.getEntry("conf-a")?.status).toBe("conflicted");
+    expect(db.getEntry("conf-b")?.status).toBe("conflicted");
+
+    // new-entry (loser) has no prior conflict; conf-b (winner) was conflicted with conf-a.
+    // Winning this battle decisively settles conf-b's conflict — both conf-b and conf-a
+    // should be restored to active.
+    db.insertEntry(makeEntry({ id: "new-entry", topics: ["topic"] }));
+    db.applyContradictionResolution("supersede_new", "new-entry", "conf-b");
+
+    expect(db.getEntry("new-entry")?.status).toBe("superseded");
+    // conf-b won — should be restored to active
+    expect(db.getEntry("conf-b")?.status).toBe("active");
+    // conf-a (conf-b's orphaned counterpart) should also be restored
+    expect(db.getEntry("conf-a")?.status).toBe("active");
+    expect(db.getRelationsFor("conf-b").some((r) => r.type === "contradicts")).toBe(false);
+  });
+
+  it("supersede_new: restores the loser's conflict counterpart when loser was conflicted", () => {
+    // conf-p and conf-q are an irresolvable pair
+    db.insertEntry(makeEntry({ id: "conf-p", topics: ["topic"] }));
+    db.insertEntry(makeEntry({ id: "conf-q", topics: ["topic"] }));
+    db.applyContradictionResolution("irresolvable", "conf-p", "conf-q");
+
+    // decisive-new arrives and supersede_new means conf-q wins (existing) — conf-p is superseded
+    // conf-p was conf-q's conflict partner — conf-q should be restored to active
+    db.insertEntry(makeEntry({ id: "decisive-new", topics: ["topic"] }));
+    db.applyContradictionResolution("supersede_new", "conf-p", "decisive-new");
+
+    // conf-p (the loser/new entry in this call) is superseded
+    expect(db.getEntry("conf-p")?.status).toBe("superseded");
+    // decisive-new (the winner) was never conflicted, stays active
+    expect(db.getEntry("decisive-new")?.status).toBe("active");
+    // conf-q (conf-p's orphaned counterpart) must be restored to active
+    expect(db.getEntry("conf-q")?.status).toBe("active");
+    expect(db.getRelationsFor("conf-q").some((r) => r.type === "contradicts")).toBe(false);
+  });
+
+  it("merge: when the new (winning) entry was conflicted, it is restored to active after merge", () => {
+    // conf-x and conf-y are in irresolvable conflict
+    db.insertEntry(makeEntry({ id: "conf-x", status: "active", topics: ["topic"] }));
+    db.insertEntry(makeEntry({ id: "conf-y", status: "active", topics: ["topic"] }));
+    db.applyContradictionResolution("irresolvable", "conf-x", "conf-y");
+
+    expect(db.getEntry("conf-x")?.status).toBe("conflicted");
+
+    // conf-x (the "new" entry in this call) wins via merge over a third entry "old-z"
+    db.insertEntry(makeEntry({ id: "old-z", status: "active", topics: ["topic"] }));
+    db.applyContradictionResolution("merge", "conf-x", "old-z", {
+      content: "Merged decisive content",
+      type: "fact",
+      topics: ["topic"],
+      confidence: 0.9,
+    });
+
+    // conf-x was conflicted — it's the winning entry in this merge, should now be active
+    expect(db.getEntry("conf-x")?.status).toBe("active");
+    // Its contradicts relations should be gone
+    const relX = db.getRelationsFor("conf-x");
+    expect(relX.some((r) => r.type === "contradicts")).toBe(false);
+    // old-z is superseded
+    expect(db.getEntry("old-z")?.status).toBe("superseded");
+  });
+});
+
+describe("ActivationEngine — contradiction annotation on activated conflicted entries", () => {
+  it("annotates conflicted entry when both sides of the conflict activate", async () => {
+    // Both entries share the same embedding prefix — they will both score above
+    // the similarity threshold for any query with that prefix.
+    const emb = fakeEmbedding("abc");
+    db.insertEntry(makeEntry({ id: "side-a", content: "abc approach A", status: "active", embedding: emb }));
+    db.insertEntry(makeEntry({ id: "side-b", content: "abc approach B", status: "active", embedding: emb }));
+    db.applyContradictionResolution("irresolvable", "side-a", "side-b");
+
+    // Both are now conflicted — mock embeddings so activate() uses deterministic vectors
+    const embedSpy = spyOn(activation["embeddings"], "embed").mockResolvedValue(emb);
+
+    const result = await activation.activate("abc query");
+
+    const sideA = result.entries.find((e) => e.entry.id === "side-a");
+    const sideB = result.entries.find((e) => e.entry.id === "side-b");
+
+    // Both should be present
+    expect(sideA).toBeDefined();
+    expect(sideB).toBeDefined();
+
+    // Both should have contradiction annotations pointing at each other
+    expect(sideA?.contradiction).toBeDefined();
+    expect(sideA?.contradiction?.conflictingEntryId).toBe("side-b");
+    expect(sideA?.contradiction?.conflictingContent).toBe("abc approach B");
+    expect(sideA?.contradiction?.caveat).toContain("conflicts");
+
+    expect(sideB?.contradiction).toBeDefined();
+    expect(sideB?.contradiction?.conflictingEntryId).toBe("side-a");
+
+    embedSpy.mockRestore();
+  });
+
+  it("does NOT annotate when the counterpart did not activate (below similarity threshold)", async () => {
+    // side-c and side-d use orthogonal embeddings — cosine similarity = 0.
+    // [1,0,0,...] and [0,1,0,...] are perpendicular, so their dot product is 0.
+    const embC = [1, 0, 0, 0, 0, 0, 0, 0];
+    const embD = [0, 1, 0, 0, 0, 0, 0, 0];
+    db.insertEntry(makeEntry({ id: "side-c", content: "abc thing", status: "active", embedding: embC }));
+    db.insertEntry(makeEntry({ id: "side-d", content: "xyz thing", status: "active", embedding: embD }));
+    db.applyContradictionResolution("irresolvable", "side-c", "side-d");
+
+    // Query embedding == side-c's embedding (similarity 1.0 with side-c, 0.0 with side-d)
+    const embedSpy = spyOn(activation["embeddings"], "embed").mockResolvedValue(embC);
+
+    const result = await activation.activate("abc query");
+
+    const sideC = result.entries.find((e) => e.entry.id === "side-c");
+    const sideD = result.entries.find((e) => e.entry.id === "side-d");
+
+    // side-c activates (similarity = 1.0 * strength); side-d does not (similarity = 0)
+    expect(sideC).toBeDefined();
+    expect(sideD).toBeUndefined();
+
+    // side-c should NOT be annotated since its counterpart didn't activate
+    expect(sideC?.contradiction).toBeUndefined();
+
+    embedSpy.mockRestore();
+  });
+
+  it("active entries are never annotated even if they have no contradicting partner", async () => {
+    const emb = fakeEmbedding("abc");
+    db.insertEntry(makeEntry({ id: "plain", content: "abc plain entry", status: "active", embedding: emb }));
+
+    const embedSpy = spyOn(activation["embeddings"], "embed").mockResolvedValue(emb);
+
+    const result = await activation.activate("abc query");
+
+    const plain = result.entries.find((e) => e.entry.id === "plain");
+    expect(plain).toBeDefined();
+    expect(plain?.contradiction).toBeUndefined();
+
+    embedSpy.mockRestore();
+  });
+});
