@@ -217,6 +217,25 @@ describe("KnowledgeDB — applyContradictionResolution", () => {
     const old = db.getEntry("old-4");
     expect(old?.status).toBe("superseded");
   });
+
+  it("merge: clamps invalid LLM type to 'fact' rather than crashing", () => {
+    db.insertEntry(makeEntry({ id: "new-5", content: "Original", topics: ["test"] }));
+    db.insertEntry(makeEntry({ id: "old-5", topics: ["test"] }));
+
+    // LLM occasionally returns values like "fact/principle" that violate the CHECK constraint
+    expect(() => {
+      db.applyContradictionResolution("merge", "new-5", "old-5", {
+        content: "Merged content",
+        type: "fact/principle", // invalid — would previously throw SQLITE_CONSTRAINT_CHECK
+        topics: ["test"],
+        confidence: 0.8,
+      });
+    }).not.toThrow();
+
+    const newEntry = db.getEntry("new-5");
+    expect(newEntry?.type).toBe("fact"); // clamped to valid fallback
+    expect(newEntry?.content).toBe("Merged content");
+  });
 });
 
 describe("KnowledgeDB — getEntries with filters", () => {

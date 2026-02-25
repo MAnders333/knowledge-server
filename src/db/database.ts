@@ -9,9 +9,24 @@ import type {
   KnowledgeEntry,
   KnowledgeRelation,
   KnowledgeStatus,
+  KnowledgeType,
   ConsolidationState,
   ProcessedRange,
 } from "../types.js";
+
+/**
+ * Clamp an LLM-returned type string to a valid KnowledgeType.
+ * LLMs occasionally return values outside the schema CHECK constraint
+ * (e.g. "fact/principle"), which would abort the SQLite transaction.
+ * Falls back to "fact" — the broadest, least-assertive type.
+ */
+function clampKnowledgeType(type: string): KnowledgeType {
+  if ((KNOWLEDGE_TYPES as readonly string[]).includes(type)) {
+    return type as KnowledgeType;
+  }
+  console.warn(`[db] invalid knowledge type "${type}" from LLM — falling back to "fact"`);
+  return "fact";
+}
 
 /**
  * Database layer for the knowledge graph.
@@ -410,13 +425,7 @@ export class KnowledgeDB {
               `will be superseded but newEntryId ${newEntryId} content unchanged`
             );
           } else {
-            // Clamp type to valid enum values — LLM occasionally returns something
-            // outside the schema CHECK constraint (e.g. "fact/principle"), causing a
-            // SQLITE_CONSTRAINT_CHECK error that aborts the entire batch.
-            const safeType = (KNOWLEDGE_TYPES as readonly string[]).includes(mergedData.type) ? mergedData.type : "fact";
-            if (safeType !== mergedData.type) {
-              console.warn(`[db] merge: invalid type "${mergedData.type}" — falling back to "fact"`);
-            }
+            const safeType = clampKnowledgeType(mergedData.type);
             this.db
               .prepare(
                 `UPDATE knowledge_entry
@@ -668,14 +677,7 @@ export class KnowledgeDB {
       ...new Set([...existing.derivedFrom, ...updates.additionalSources]),
     ];
 
-    // Clamp type — same guard as applyContradictionResolution; LLM output may not
-    // match the CHECK constraint and would abort the transaction.
-    const safeType = (KNOWLEDGE_TYPES as readonly string[]).includes(updates.type)
-      ? updates.type
-      : "fact";
-    if (safeType !== updates.type) {
-      console.warn(`[db] mergeEntry: invalid type "${updates.type}" — falling back to "fact"`);
-    }
+    const safeType = clampKnowledgeType(updates.type);
 
     const now = Date.now();
     this.db
