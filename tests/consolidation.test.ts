@@ -236,8 +236,8 @@ describe("KnowledgeDB — applyContradictionResolution", () => {
     expect(newEntry?.type).toBe("fact"); // clamped to valid fallback
     expect(newEntry?.content).toBe("Merged content");
 
-    const old = db.getEntry("old-5");
-    expect(old?.status).toBe("superseded");
+    const oldEntry = db.getEntry("old-5");
+    expect(oldEntry?.status).toBe("superseded");
   });
 });
 
