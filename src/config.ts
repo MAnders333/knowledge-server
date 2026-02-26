@@ -5,8 +5,8 @@ import { join } from "node:path";
 /**
  * Parse an integer environment variable with a fallback default and optional
  * minimum clamp. Returns `defaultVal` when the variable is absent, empty, or
- * not a valid integer. NaN-safe: the `Number.isNaN` guard on line 13 ensures NaN
- * never reaches `Math.max` — an invalid string always yields `defaultVal`, never NaN.
+ * not a valid integer. NaN-safe: a `Number.isNaN` guard ensures NaN never reaches
+ * `Math.max` — an invalid string always yields `defaultVal`, never NaN.
  */
 function parseIntEnv(envVar: string | undefined, defaultVal: number, min?: number): number {
   const parsed = Number.parseInt(envVar ?? "", 10);
@@ -16,7 +16,9 @@ function parseIntEnv(envVar: string | undefined, defaultVal: number, min?: numbe
 
 /**
  * Parse a float environment variable with a fallback default and optional
- * minimum clamp. NaN-safe for the same reason as parseIntEnv.
+ * minimum clamp. Returns `defaultVal` when the variable is absent, empty, or
+ * not a valid number. NaN-safe: a `Number.isNaN` guard ensures NaN never reaches
+ * `Math.max` — an invalid string always yields `defaultVal`, never NaN.
  */
 function parseFloatEnv(envVar: string | undefined, defaultVal: number, min?: number): number {
   const parsed = Number.parseFloat(envVar ?? "");
@@ -98,7 +100,7 @@ export const config = {
 
   // Decay parameters
   decay: {
-    archiveThreshold: parseFloatEnv(process.env.DECAY_ARCHIVE_THRESHOLD, 0.15, 0),
+    archiveThreshold: parseFloatEnv(process.env.DECAY_ARCHIVE_THRESHOLD, 0.15),
     tombstoneAfterDays: parseIntEnv(process.env.DECAY_TOMBSTONE_DAYS, 180, 1),
     // Type-specific decay rates (higher = slower decay)
     typeHalfLife: {
@@ -119,7 +121,7 @@ export const config = {
     // Entries above RECONSOLIDATION_THRESHOLD (0.82) are already handled by decideMerge.
     // Entries below contradictionMinSimilarity are too dissimilar to plausibly contradict.
     // The band in between gets the contradiction LLM call.
-    contradictionMinSimilarity: parseFloatEnv(process.env.CONTRADICTION_MIN_SIMILARITY, 0.4, 0),
+    contradictionMinSimilarity: parseFloatEnv(process.env.CONTRADICTION_MIN_SIMILARITY, 0.4),
   },
 
   // Activation
@@ -136,7 +138,7 @@ export const config = {
     // related entries fired too readily. 0.4 cuts noise while keeping
     // genuinely relevant entries (text-embedding-3-large at 0.4 is still a
     // meaningful topical match).
-    similarityThreshold: parseFloatEnv(process.env.ACTIVATION_SIMILARITY_THRESHOLD, 0.4, 0),
+    similarityThreshold: parseFloatEnv(process.env.ACTIVATION_SIMILARITY_THRESHOLD, 0.4),
   },
 } as const;
 
@@ -163,6 +165,52 @@ export function validateConfig(): string[] {
       `OpenCode database not found at ${config.opencodeDbPath}. Set OPENCODE_DB_PATH if it's elsewhere.`
     );
   }
+
+  // Similarity/threshold floats must be in (0, 1] — 0 is semantically invalid
+  // (zero archive threshold means nothing ever archives; zero similarity threshold
+  // activates every entry regardless of relevance).
+  // Validate against the raw env var so the error message reflects what the user
+  // actually typed — parse-time defaults would otherwise corrupt the "got X" value.
+  function validateFloatRange(
+    envVar: string | undefined,
+    envName: string,
+    lo: number,
+    hi: number,
+    hint: string
+  ): void {
+    if (envVar === undefined) return; // not set — default is always valid
+    const raw = Number.parseFloat(envVar);
+    if (Number.isNaN(raw) || raw <= lo || raw > hi) {
+      errors.push(
+        `${envName} must be in (${lo}, ${hi}] (got "${envVar}"). ${hint}`
+      );
+    }
+  }
+
+  validateFloatRange(
+    process.env.DECAY_ARCHIVE_THRESHOLD,
+    "DECAY_ARCHIVE_THRESHOLD", 0, 1, "Default is 0.15."
+  );
+  validateFloatRange(
+    process.env.CONTRADICTION_MIN_SIMILARITY,
+    "CONTRADICTION_MIN_SIMILARITY", 0, 1, "Default is 0.4."
+  );
+  // Also enforce that contradictionMinSimilarity is below RECONSOLIDATION_THRESHOLD
+  // (0.82) — a value at or above that ceiling would collapse the contradiction scan
+  // band to empty since decideMerge already handles entries above 0.82.
+  if (
+    process.env.CONTRADICTION_MIN_SIMILARITY !== undefined &&
+    !Number.isNaN(Number.parseFloat(process.env.CONTRADICTION_MIN_SIMILARITY)) &&
+    config.consolidation.contradictionMinSimilarity >= 0.82
+  ) {
+    errors.push(
+      `CONTRADICTION_MIN_SIMILARITY must be below 0.82 (the reconsolidation threshold) — a value at or above 0.82 collapses the contradiction scan band to empty (got "${process.env.CONTRADICTION_MIN_SIMILARITY}"). Default is 0.4.`
+    );
+  }
+  validateFloatRange(
+    process.env.ACTIVATION_SIMILARITY_THRESHOLD,
+    "ACTIVATION_SIMILARITY_THRESHOLD", 0, 1, "Default is 0.4."
+  );
 
   // Validate EMBEDDING_DIMENSIONS early — a non-positive or non-integer value would
   // be clamped to 1 by parseIntEnv and forwarded to the API, causing a confusing 400.
