@@ -47,9 +47,8 @@ export class ActivationEngine {
       threshold?: number;
     }
   ): Promise<ActivationResult> {
-    const queryList = Array.isArray(queries)
-      ? queries.filter((q) => q.trim().length > 0)
-      : [queries];
+    const queryList = (Array.isArray(queries) ? queries : [queries])
+      .filter((q) => q.trim().length > 0);
     if (queryList.length === 0) {
       return { entries: [], query: "", totalActive: 0 };
     }
