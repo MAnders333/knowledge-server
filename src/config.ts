@@ -195,7 +195,8 @@ export function validateConfig(): string[] {
 
   validateFloatRange(
     process.env.DECAY_ARCHIVE_THRESHOLD,
-    "DECAY_ARCHIVE_THRESHOLD", 0, 1, "Default is 0.15."
+    "DECAY_ARCHIVE_THRESHOLD", 0, 1,
+    `Default is ${config.decay.archiveThreshold}.`
   );
   // Upper bound is RECONSOLIDATION_THRESHOLD (exclusive) — a value at or above it
   // collapses the contradiction scan band to empty since decideMerge already handles
@@ -203,12 +204,13 @@ export function validateConfig(): string[] {
   validateFloatRange(
     process.env.CONTRADICTION_MIN_SIMILARITY,
     "CONTRADICTION_MIN_SIMILARITY", 0, RECONSOLIDATION_THRESHOLD,
-    `Must be strictly below the ${RECONSOLIDATION_THRESHOLD} reconsolidation threshold. Default is 0.4.`,
+    `Must be strictly below the ${RECONSOLIDATION_THRESHOLD} reconsolidation threshold. Default is ${config.consolidation.contradictionMinSimilarity}.`,
     true // hiExclusive
   );
   validateFloatRange(
     process.env.ACTIVATION_SIMILARITY_THRESHOLD,
-    "ACTIVATION_SIMILARITY_THRESHOLD", 0, 1, "Default is 0.4."
+    "ACTIVATION_SIMILARITY_THRESHOLD", 0, 1,
+    `Default is ${config.activation.similarityThreshold}.`
   );
 
   // Validate EMBEDDING_DIMENSIONS early — a non-positive or non-integer value would
