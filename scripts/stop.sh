@@ -25,5 +25,9 @@ fi
 # keeping set -e and exit code propagation intact.
 while read -r pid; do
   [ -z "$pid" ] && continue
-  kill "$pid" 2>/dev/null && echo "Knowledge server stopped (PID $pid)"
+  if kill "$pid" 2>/dev/null; then
+    echo "Knowledge server stopped (PID $pid)"
+  else
+    echo "Warning: could not kill PID $pid (already gone?)" >&2
+  fi
 done <<< "$PIDS"
