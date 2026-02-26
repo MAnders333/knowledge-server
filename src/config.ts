@@ -5,8 +5,8 @@ import { join } from "node:path";
 /**
  * Parse an integer environment variable with a fallback default and optional
  * minimum clamp. Returns `defaultVal` when the variable is absent, empty, or
- * not a valid integer (NaN-safe — `parseInt("abc")` returns `NaN` which would
- * silently pass through `Math.max` as `NaN`).
+ * not a valid integer — NaN-safe, because `Math.max(min, NaN)` returns NaN and
+ * would silently bypass the clamp.
  */
 function parseIntEnv(envVar: string | undefined, defaultVal: number, min?: number): number {
   const parsed = Number.parseInt(envVar ?? "", 10);
@@ -26,7 +26,7 @@ function parseFloatEnv(envVar: string | undefined, defaultVal: number, min?: num
 
 export const config = {
   // Server
-  port: parseIntEnv(process.env.KNOWLEDGE_PORT, 3179),
+  port: parseIntEnv(process.env.KNOWLEDGE_PORT, 3179, 1),
   host: process.env.KNOWLEDGE_HOST || "127.0.0.1",
   // Optional fixed admin token — set KNOWLEDGE_ADMIN_TOKEN to use a stable token
   // instead of a random one generated at startup. Useful for scripted/automated use.
@@ -87,15 +87,17 @@ export const config = {
     // Forwarded to the API only when present — the `dimensions` parameter is
     // only valid for text-embedding-3-* models; sending it to other models
     // (ada-002, Ollama, etc.) causes a 400 error.
+    // Validated in validateConfig() — a non-positive integer is rejected at startup
+    // rather than silently forwarded to the API causing a confusing 400.
     dimensions: process.env.EMBEDDING_DIMENSIONS
-      ? parseIntEnv(process.env.EMBEDDING_DIMENSIONS, 0)
+      ? parseIntEnv(process.env.EMBEDDING_DIMENSIONS, 1, 1)
       : undefined,
   },
 
   // Decay parameters
   decay: {
     archiveThreshold: parseFloatEnv(process.env.DECAY_ARCHIVE_THRESHOLD, 0.15),
-    tombstoneAfterDays: parseIntEnv(process.env.DECAY_TOMBSTONE_DAYS, 180),
+    tombstoneAfterDays: parseIntEnv(process.env.DECAY_TOMBSTONE_DAYS, 180, 1),
     // Type-specific decay rates (higher = slower decay)
     typeHalfLife: {
       fact: 30, // facts go stale in ~30 days
@@ -108,9 +110,9 @@ export const config = {
 
   // Consolidation
   consolidation: {
-    chunkSize: parseIntEnv(process.env.CONSOLIDATION_CHUNK_SIZE, 10),
-    maxSessionsPerRun: parseIntEnv(process.env.CONSOLIDATION_MAX_SESSIONS, 50),
-    minSessionMessages: parseIntEnv(process.env.CONSOLIDATION_MIN_MESSAGES, 4),
+    chunkSize: parseIntEnv(process.env.CONSOLIDATION_CHUNK_SIZE, 10, 1),
+    maxSessionsPerRun: parseIntEnv(process.env.CONSOLIDATION_MAX_SESSIONS, 50, 1),
+    minSessionMessages: parseIntEnv(process.env.CONSOLIDATION_MIN_MESSAGES, 4, 1),
     // Similarity band for post-extraction contradiction scan.
     // Entries above RECONSOLIDATION_THRESHOLD (0.82) are already handled by decideMerge.
     // Entries below contradictionMinSimilarity are too dissimilar to plausibly contradict.
@@ -124,7 +126,7 @@ export const config = {
     // Default is 10 — a generous ceiling for the MCP tool (deliberate active recall).
     // The passive plugin explicitly overrides this to 5 via ?limit=5 to keep
     // injected context tight. ACTIVATION_MAX_RESULTS overrides the server default.
-    maxResults: parseIntEnv(process.env.ACTIVATION_MAX_RESULTS, 10),
+    maxResults: parseIntEnv(process.env.ACTIVATION_MAX_RESULTS, 10, 1),
     // Minimum raw cosine similarity (NOT decay-weighted) to activate an entry.
     // Filtering on rawSimilarity means entry age/staleness never prevents a
     // semantically relevant entry from activating — decay only affects ranking.
@@ -158,6 +160,19 @@ export function validateConfig(): string[] {
     errors.push(
       `OpenCode database not found at ${config.opencodeDbPath}. Set OPENCODE_DB_PATH if it's elsewhere.`
     );
+  }
+
+  // Validate EMBEDDING_DIMENSIONS early — a non-positive or non-integer value would
+  // be clamped to 1 by parseIntEnv and forwarded to the API, causing a confusing 400.
+  // Note: check the raw env var, not config.embedding.dimensions — "0" is falsy so
+  // the config ternary would set dimensions=undefined and silently skip this check.
+  if (process.env.EMBEDDING_DIMENSIONS !== undefined) {
+    const raw = Number.parseInt(process.env.EMBEDDING_DIMENSIONS, 10);
+    if (Number.isNaN(raw) || raw < 1) {
+      errors.push(
+        `EMBEDDING_DIMENSIONS must be a positive integer (got "${process.env.EMBEDDING_DIMENSIONS}"). Remove it to use the model's default dimensions.`
+      );
+    }
   }
 
   return errors;
