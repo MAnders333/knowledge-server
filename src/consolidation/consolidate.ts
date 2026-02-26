@@ -263,10 +263,13 @@ export class ConsolidationEngine {
                   type: (updated.type as KnowledgeEntry["type"]) ?? existing.type,
                   topics: updated.topics ?? existing.topics,
                   confidence: updated.confidence ?? existing.confidence,
-                  // Keep the OLD embedding in memory so contradiction scan can still
-                  // cosine-compare it. The DB embedding is NULL but our in-memory copy
-                  // is stale-but-close enough for the band filter.
-                } as KnowledgeEntry & { embedding: number[] });
+              // NOTE: The embedding here is intentionally STALE — mergeEntry set
+              // embedding = NULL in the DB. We retain the pre-merge embedding in the
+              // in-memory map so the contradiction scan can still cosine-compare this
+              // entry against other candidates in the same chunk. It is close enough
+              // for the band filter. ensureEmbeddings at end-of-run regenerates the
+              // DB embedding from the updated content.
+              } as KnowledgeEntry & { embedding: number[] });
               }
             },
             onKeep: () => {},
@@ -277,7 +280,7 @@ export class ConsolidationEngine {
           // entries in this chunk to be re-processed on the next run and producing
           // duplicates for the entries that were already successfully inserted.
           console.error(
-            `[consolidation] Failed to reconsolidate entry "${entry.content.slice(0, 60)}..." — skipping:`,
+            `[consolidation] Failed to reconsolidate entry "${String(entry.content ?? "").slice(0, 60)}..." — skipping:`,
             err
           );
         }

@@ -194,6 +194,27 @@ describe("HTTP API", () => {
     expect(res.status).toBe(200);
   });
 
+  it("POST /consolidate should return 409 when consolidation lock is held", async () => {
+    const { KnowledgeDB: KDB } = await import("../src/db/database");
+    const { ActivationEngine: AE } = await import("../src/activation/activate");
+    const busyDb = new KDB(join(tempDir, "busy.db"), join(tempDir, "opencode-fake.db"));
+    const busyActivation = new AE(busyDb);
+    const busyConsolidation = {
+      consolidate: async () => ({}),
+      get isConsolidating() { return true; },
+      tryLock: () => false, // lock is held
+      unlock: () => {},
+      close: () => {},
+    } as unknown as ConsolidationEngine;
+    const busyApp = createApp(busyDb, busyActivation, busyConsolidation, TEST_ADMIN_TOKEN);
+    const res = await busyApp.request("/consolidate", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
+    });
+    expect(res.status).toBe(409);
+    busyDb.close();
+  });
+
   it("POST /reinitialize should return 401 without token", async () => {
     const res = await app.request("/reinitialize?confirm=yes", { method: "POST" });
     expect(res.status).toBe(401);

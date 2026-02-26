@@ -135,12 +135,12 @@ export class ActivationEngine {
    * - A merge resolution may clear their embedding (embedding = NULL)
    * - Without re-embedding, they become permanently invisible to reconsolidation
    *   and the contradiction scan, preventing automatic re-resolution.
+   *
+   * Uses a single DB query (getEntriesMissingEmbeddings) rather than two separate
+   * status queries to avoid any risk of duplicate entries in the result set.
    */
   async ensureEmbeddings(): Promise<number> {
-    const active = this.db.getActiveEntries();
-    const conflicted = this.db.getEntriesByStatus("conflicted");
-    const entries = [...active, ...conflicted];
-    const needsEmbedding = entries.filter((e) => !e.embedding);
+    const needsEmbedding = this.db.getEntriesMissingEmbeddings();
 
     if (needsEmbedding.length === 0) return 0;
 

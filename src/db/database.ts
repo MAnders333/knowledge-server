@@ -334,6 +334,24 @@ export class KnowledgeDB {
   }
 
   /**
+   * Get all active and conflicted entries that are missing an embedding.
+   * Used by ensureEmbeddings to find entries that need (re-)embedding after
+   * a merge/update clears their embedding column.
+   *
+   * Returns a single query covering both statuses, avoiding any risk of
+   * double-fetching an entry that appears in two separate status queries.
+   */
+  getEntriesMissingEmbeddings(): KnowledgeEntry[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NULL ORDER BY updated_at DESC"
+      )
+      .all() as RawEntryRow[];
+
+    return rows.map((r) => this.rowToEntry(r));
+  }
+
+  /**
    * Get entries by status (for review, decay processing, etc.)
    */
   getEntriesByStatus(status: KnowledgeStatus): KnowledgeEntry[] {
