@@ -1,33 +1,33 @@
 # knowledge-server
 
-Persistent semantic memory for [OpenCode](https://opencode.ai) agents — fully local, no external service required.
+Persistent memory for [OpenCode](https://opencode.ai) agents — fully local, no external service required.
 
-Your agents forget everything between sessions. This fixes that. It reads your OpenCode session history, distills what's worth keeping into a local knowledge graph, and automatically surfaces relevant entries whenever you start a new conversation.
+Reads your OpenCode session history, extracts what's worth keeping into a local SQLite knowledge store, and injects relevant entries into new conversations automatically.
 
-## The approach
+## Design
 
-Most "memory" systems for AI agents work like a notebook: everything gets written in, everything gets retrieved. The result is noise — every session dumps its raw content into the store, retrieval floods the context window with marginally-related facts, and the store grows without bound.
+The basic problem with agent memory is that naive approaches store everything and retrieve too much — the context window fills with loosely-related facts, and the store grows without bound.
 
-This system is modeled on how human memory actually works. The key insight from cognitive science is that episodic memory (what happened) and semantic memory (what you know) are distinct systems — and the brain doesn't store episodes, it consolidates them. During sleep it replays the day's experiences and extracts only what's worth encoding into long-term memory: facts confirmed, patterns recognized, decisions made, procedures learned.
+This system takes a different approach, with three properties that distinguish it from a simple write-everything/retrieve-top-k store:
 
-Three properties make this different from a naive memory store:
+**High extraction bar.** The LLM reads session transcripts and asks whether each thing learned would still be useful months from now. Most sessions produce nothing. The store only grows when something genuinely new was established — a confirmed fact, a decision made, a procedure that worked.
 
-**High extraction bar.** The LLM reads session transcripts and asks: would this still be useful six months from now? Most sessions produce nothing. The store only grows when something genuinely new was learned.
+**Reconsolidation instead of accumulation.** Before a new entry is inserted, it's embedded and compared to the nearest existing entry. If similarity ≥ 0.82, a focused LLM call decides whether to keep the existing entry, update it, replace it, or insert both as distinct entries. Entries in the 0.4–0.82 band (related but not near-duplicate) get a contradiction scan: if two entries make mutually exclusive claims, the system resolves it — newer supersedes older, they merge, or the conflict is flagged for human review. The store updates rather than appends.
 
-**Reconsolidation instead of accumulation.** Before any new entry is inserted, it's embedded and compared to the nearest existing entry. If they're similar enough (cosine similarity ≥ 0.82), a focused LLM call decides whether to keep the existing, update it, replace it, or insert both as distinct. Entries in the 0.4–0.82 mid-band get a separate contradiction scan: if two topic-related entries make mutually exclusive claims, the system resolves it (supersede, merge, or flag for review). Memory updates rather than accumulates — the same way a person's understanding of a topic changes rather than appends.
+**Cue-dependent activation.** Nothing is retrieved proactively. When a new message arrives, its text is embedded and matched against all stored entries. Only semantically similar entries activate. The query is the retrieval cue — entries that have no bearing on the current conversation stay silent.
 
-**Cue-dependent activation.** Nothing is retrieved proactively. When a new message arrives, the query is embedded and matched against the knowledge graph. Only semantically relevant entries activate. The user's message is the retrieval cue — just like human recall requires a prompt to surface a memory.
+Entries have a strength score that decays with time and inactivity, and increases with repeated access. Entries that fall below the archive threshold are eventually removed. There is no manual pruning.
 
-The result is a compact, high-signal knowledge graph that gets better over time. Entries that keep proving relevant strengthen; entries that become stale decay and eventually disappear.
+The similarity thresholds (0.82 for reconsolidation, 0.4 for the contradiction scan band) were calibrated against `text-embedding-3-large` and may need adjustment for other embedding models. Extraction quality depends on the LLM — cheaper models tend to over-extract or miss nuance.
 
 ## How it works
 
-  1. **Episodes** — OpenCode session logs are the raw material. Each conversation is an episode.
-  2. **Consolidation** — An LLM reads new sessions and extracts what's genuinely worth remembering. The bar is high — most sessions produce nothing. Runs automatically on server startup.
-  3. **Reconsolidation** — Each new entry is embedded and compared to the nearest existing entry. If similarity ≥ 0.82, a focused LLM call decides whether to keep, update, replace, or insert both. The store updates rather than accumulates.
-  4. **Contradiction scan** — Entries in the 0.4–0.82 similarity band (related but not near-duplicate) are checked for genuine contradictions. Contradictions are resolved: the newer entry wins (`supersede_old`), the existing wins (`supersede_new`), both collapse into one (`merge`), or the conflict is flagged for human review (`irresolvable` → `conflicted` status).
-  5. **Activation** — When a query arrives, it's embedded and matched against all entries. Only semantically relevant entries activate. This is cue-dependent retrieval: the query is the cue.
-  6. **Decay** — Entries that aren't accessed decay over time. Entries that are repeatedly relevant strengthen. Eventually unused entries are archived, then tombstoned.
+1. **Episodes** — OpenCode session logs are the raw input. Each conversation is an episode.
+2. **Consolidation** — On startup, an LLM reads any new sessions and extracts entries worth keeping. Most sessions produce nothing.
+3. **Reconsolidation** — Each candidate entry is embedded and compared to the nearest existing entry. If similarity ≥ 0.82, a second LLM call decides whether to keep the existing, update it, replace it, or insert both. The store updates rather than appends.
+4. **Contradiction scan** — Entries in the 0.4–0.82 similarity band are checked for genuine contradictions. Resolution options: `supersede_old`, `supersede_new`, `merge`, or `irresolvable` (flagged for human review).
+5. **Activation** — On each new user message, the query text is embedded and matched against all entries. Entries above the similarity threshold are injected into the conversation context.
+6. **Decay** — Entry strength decays with age and inactivity, increases with access. Below the archive threshold → archived. Archived for 180+ days → tombstoned.
 
 ## Architecture
 
