@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { RECONSOLIDATION_THRESHOLD } from "./types.js";
 
 /**
  * Parse an integer environment variable with a fallback default and optional
@@ -118,7 +119,7 @@ export const config = {
     maxSessionsPerRun: parseIntEnv(process.env.CONSOLIDATION_MAX_SESSIONS, 50, 1),
     minSessionMessages: parseIntEnv(process.env.CONSOLIDATION_MIN_MESSAGES, 4, 1),
     // Similarity band for post-extraction contradiction scan.
-    // Entries above RECONSOLIDATION_THRESHOLD (0.82) are already handled by decideMerge.
+    // Entries above RECONSOLIDATION_THRESHOLD are already handled by decideMerge.
     // Entries below contradictionMinSimilarity are too dissimilar to plausibly contradict.
     // The band in between gets the contradiction LLM call.
     contradictionMinSimilarity: parseFloatEnv(process.env.CONTRADICTION_MIN_SIMILARITY, 0.4),
@@ -196,13 +197,13 @@ export function validateConfig(): string[] {
     process.env.DECAY_ARCHIVE_THRESHOLD,
     "DECAY_ARCHIVE_THRESHOLD", 0, 1, "Default is 0.15."
   );
-  // Upper bound is 0.82 (exclusive) — the reconsolidation threshold.
-  // A value at or above 0.82 collapses the contradiction scan band to empty since
-  // decideMerge already handles entries above that ceiling.
+  // Upper bound is RECONSOLIDATION_THRESHOLD (exclusive) — a value at or above it
+  // collapses the contradiction scan band to empty since decideMerge already handles
+  // entries above that ceiling.
   validateFloatRange(
     process.env.CONTRADICTION_MIN_SIMILARITY,
-    "CONTRADICTION_MIN_SIMILARITY", 0, 0.82,
-    "Must be strictly below the 0.82 reconsolidation threshold. Default is 0.4.",
+    "CONTRADICTION_MIN_SIMILARITY", 0, RECONSOLIDATION_THRESHOLD,
+    `Must be strictly below the ${RECONSOLIDATION_THRESHOLD} reconsolidation threshold. Default is 0.4.`,
     true // hiExclusive
   );
   validateFloatRange(

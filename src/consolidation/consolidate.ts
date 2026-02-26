@@ -7,7 +7,7 @@ import { ConsolidationLLM } from "./llm.js";
 import { computeStrength } from "./decay.js";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
-import { clampKnowledgeType } from "../types.js";
+import { clampKnowledgeType, RECONSOLIDATION_THRESHOLD } from "../types.js";
 import type { Episode, ConsolidationResult, KnowledgeEntry } from "../types.js";
 import type { ExtractedKnowledge, ContradictionResult } from "./llm.js";
 
@@ -18,14 +18,6 @@ import type { ExtractedKnowledge, ContradictionResult } from "./llm.js";
  */
 const MAX_RELEVANT_KNOWLEDGE = 50;
 
-/**
- * Cosine similarity threshold above which a newly extracted entry is
- * considered a candidate for reconsolidation with an existing entry.
- * At 0.82+, the content is topically very close — worth asking the LLM
- * whether to merge, update, replace, or keep separate.
- * Below this threshold, the entry is novel enough to insert directly.
- */
-const RECONSOLIDATION_THRESHOLD = 0.82;
 
 /**
  * The consolidation engine — the heart of the knowledge system.
