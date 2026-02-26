@@ -466,7 +466,12 @@ export class ConsolidationEngine {
 
     switch (decision.action) {
       case "keep":
-        console.log(`[consolidation] Keep existing (no new info): "${nearestEntry.content.slice(0, 60)}..."`);
+        // The same knowledge surfaced again in a new session — reinforce it.
+        // This resets last_accessed_at (decay restarts from now) and increments
+        // access_count (grows the access bonus, permanently slowing future decay).
+        // Mirrors the cognitive science principle: repeated exposure strengthens memory.
+        this.db.recordAccess(nearestEntry.id);
+        console.log(`[consolidation] Keep existing (reinforced): "${nearestEntry.content.slice(0, 60)}..."`);
         callbacks.onKeep();
         break;
 
@@ -728,7 +733,11 @@ export class ConsolidationEngine {
    * Returns the number of entries that were archived.
    */
   private applyDecay(): number {
-    const entries = this.db.getActiveEntries();
+    // Include conflicted entries — their strength must continue aging.
+    // A conflicted entry whose strength falls to zero is effectively forgotten
+    // regardless of the conflict, and should still be archived.
+    // Single query avoids the TOCTOU window of two separate status queries.
+    const entries = this.db.getActiveAndConflictedEntries();
     let archived = 0;
 
     for (const entry of entries) {

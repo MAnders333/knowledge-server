@@ -289,9 +289,6 @@ export class KnowledgeDB {
     return row ? this.rowToEntry(row) : null;
   }
 
-  /**
-   * Get all active entries (for consolidation context and activation).
-   */
   getActiveEntries(): KnowledgeEntry[] {
     const rows = this.db
       .prepare(
@@ -320,12 +317,21 @@ export class KnowledgeDB {
   }
 
   /**
-   * Get all active and conflicted entries that are missing an embedding.
-   * Used by ensureEmbeddings to find entries that need (re-)embedding after
-   * a merge/update clears their embedding column.
-   *
-   * Returns a single query covering both statuses, avoiding any risk of
-   * double-fetching an entry that appears in two separate status queries.
+   * Get all active and conflicted entries in a single query.
+   * Used by applyDecay — avoids the TOCTOU window of two separate queries
+   * (an entry transitioning between statuses between calls could be processed twice).
+   */
+  getActiveAndConflictedEntries(): KnowledgeEntry[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM knowledge_entry WHERE status IN ('active', 'conflicted') ORDER BY updated_at DESC"
+      )
+      .all() as RawEntryRow[];
+    return rows.map((r) => this.rowToEntry(r));
+  }
+
+  /**
+   * Get entries missing an embedding — used by ensureEmbeddings.
    */
   getEntriesMissingEmbeddings(): KnowledgeEntry[] {
     const rows = this.db
