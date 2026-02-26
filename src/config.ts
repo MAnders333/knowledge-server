@@ -171,18 +171,23 @@ export function validateConfig(): string[] {
   // activates every entry regardless of relevance).
   // Validate against the raw env var so the error message reflects what the user
   // actually typed — parse-time defaults would otherwise corrupt the "got X" value.
+  // Interval helpers: lo is always exclusive (values must be > lo).
+  // hi is inclusive by default; pass hiExclusive=true for a strict upper bound.
   function validateFloatRange(
     envVar: string | undefined,
     envName: string,
     lo: number,
     hi: number,
-    hint: string
+    hint: string,
+    hiExclusive = false
   ): void {
     if (envVar === undefined) return; // not set — default is always valid
     const raw = Number.parseFloat(envVar);
-    if (Number.isNaN(raw) || raw <= lo || raw > hi) {
+    const hiViolation = hiExclusive ? raw >= hi : raw > hi;
+    const intervalStr = hiExclusive ? `(${lo}, ${hi})` : `(${lo}, ${hi}]`;
+    if (Number.isNaN(raw) || raw <= lo || hiViolation) {
       errors.push(
-        `${envName} must be in (${lo}, ${hi}] (got "${envVar}"). ${hint}`
+        `${envName} must be in ${intervalStr} (got "${envVar}"). ${hint}`
       );
     }
   }
@@ -191,22 +196,15 @@ export function validateConfig(): string[] {
     process.env.DECAY_ARCHIVE_THRESHOLD,
     "DECAY_ARCHIVE_THRESHOLD", 0, 1, "Default is 0.15."
   );
+  // Upper bound is 0.82 (exclusive) — the reconsolidation threshold.
+  // A value at or above 0.82 collapses the contradiction scan band to empty since
+  // decideMerge already handles entries above that ceiling.
   validateFloatRange(
     process.env.CONTRADICTION_MIN_SIMILARITY,
-    "CONTRADICTION_MIN_SIMILARITY", 0, 1, "Default is 0.4."
+    "CONTRADICTION_MIN_SIMILARITY", 0, 0.82,
+    "Must be strictly below the 0.82 reconsolidation threshold. Default is 0.4.",
+    true // hiExclusive
   );
-  // Also enforce that contradictionMinSimilarity is below RECONSOLIDATION_THRESHOLD
-  // (0.82) — a value at or above that ceiling would collapse the contradiction scan
-  // band to empty since decideMerge already handles entries above 0.82.
-  if (
-    process.env.CONTRADICTION_MIN_SIMILARITY !== undefined &&
-    !Number.isNaN(Number.parseFloat(process.env.CONTRADICTION_MIN_SIMILARITY)) &&
-    config.consolidation.contradictionMinSimilarity >= 0.82
-  ) {
-    errors.push(
-      `CONTRADICTION_MIN_SIMILARITY must be below 0.82 (the reconsolidation threshold) — a value at or above 0.82 collapses the contradiction scan band to empty (got "${process.env.CONTRADICTION_MIN_SIMILARITY}"). Default is 0.4.`
-    );
-  }
   validateFloatRange(
     process.env.ACTIVATION_SIMILARITY_THRESHOLD,
     "ACTIVATION_SIMILARITY_THRESHOLD", 0, 1, "Default is 0.4."
