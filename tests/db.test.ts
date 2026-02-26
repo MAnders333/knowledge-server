@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { Database } from "bun:sqlite";
 import { KnowledgeDB } from "../src/db/database";
+import { CREATE_TABLES, EXPECTED_TABLE_COLUMNS } from "../src/db/schema";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -308,5 +310,58 @@ describe("KnowledgeDB", () => {
     expect(stats.active).toBe(3);
     expect(stats.archived).toBe(1);
     expect(stats.superseded).toBe(1);
+  });
+});
+
+describe("EXPECTED_TABLE_COLUMNS sync with CREATE_TABLES DDL", () => {
+  it("every column in EXPECTED_TABLE_COLUMNS exists in the DDL schema", () => {
+    // Spin up an in-memory DB, apply CREATE_TABLES, then PRAGMA each table.
+    // If a column is listed in EXPECTED_TABLE_COLUMNS but absent from the
+    // schema, this test fails — catching the sync mistake at test time rather
+    // than at production startup (where it would silently invert the drift check).
+    const memDb = new Database(":memory:");
+    memDb.exec(CREATE_TABLES);
+
+    const missing: string[] = [];
+
+    for (const [table, expectedCols] of Object.entries(EXPECTED_TABLE_COLUMNS)) {
+      const actualCols = new Set(
+        (memDb.prepare(`PRAGMA table_info("${table}")`).all() as Array<{ name: string }>)
+          .map((c) => c.name)
+      );
+      for (const col of expectedCols) {
+        if (!actualCols.has(col)) {
+          missing.push(`${table}.${col}`);
+        }
+      }
+    }
+
+    memDb.close();
+    expect(missing).toEqual([]); // empty = all expected columns present in DDL
+  });
+
+  it("every column in the DDL schema is listed in EXPECTED_TABLE_COLUMNS", () => {
+    // Reverse check: catches columns added to the DDL but forgotten in EXPECTED_TABLE_COLUMNS.
+    // Without this, new columns would silently bypass the drift check.
+    const memDb = new Database(":memory:");
+    memDb.exec(CREATE_TABLES);
+
+    const extra: string[] = [];
+
+    for (const [table, expectedCols] of Object.entries(EXPECTED_TABLE_COLUMNS)) {
+      const expectedSet = new Set(expectedCols);
+      const actualCols = (
+        memDb.prepare(`PRAGMA table_info("${table}")`).all() as Array<{ name: string }>
+      ).map((c) => c.name);
+
+      for (const col of actualCols) {
+        if (!expectedSet.has(col)) {
+          extra.push(`${table}.${col}`);
+        }
+      }
+    }
+
+    memDb.close();
+    expect(extra).toEqual([]); // empty = no DDL columns missing from EXPECTED_TABLE_COLUMNS
   });
 });

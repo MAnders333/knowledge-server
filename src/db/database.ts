@@ -3,7 +3,7 @@ import { mkdirSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { config } from "../config.js";
-import { CREATE_TABLES, SCHEMA_VERSION } from "./schema.js";
+import { CREATE_TABLES, SCHEMA_VERSION, EXPECTED_TABLE_COLUMNS } from "./schema.js";
 import { clampKnowledgeType } from "../types.js";
 import type {
   KnowledgeEntry,
@@ -62,29 +62,30 @@ export class KnowledgeDB {
 
     const existingVersion = row?.version ?? 0;
 
-    // Use actual column presence as the authoritative check — not just the version number.
-    // The version number alone can be stale if a prior startup wrote v5 to schema_version
-    // before the DROP+recreate completed (e.g. partial run, crash, or reinitialize race).
-    const knowledgeEntryCols = (
-      this.db.prepare("PRAGMA table_info(knowledge_entry)").all() as Array<{ name: string }>
-    ).map((c) => c.name);
-    const hasObservationCount = knowledgeEntryCols.includes("observation_count");
+    // Detect schema drift: compare actual DB columns against EXPECTED_TABLE_COLUMNS
+    // for every table. This is the authoritative check — the version number alone
+    // can be stale if a prior startup wrote the new version to schema_version before
+    // the DROP+recreate completed (e.g. partial run, crash, or reinitialize race).
+    // Keeping EXPECTED_TABLE_COLUMNS in sync with CREATE_TABLES means adding a new
+    // column to the DDL automatically gets caught here without touching this method.
+    const missingColumns = this.getSchemaDrift();
 
     const needsReset =
       // Explicit version lag: recorded version is older than current code
       (existingVersion > 0 && existingVersion < SCHEMA_VERSION) ||
-      // Schema drift: version says current but a required column is missing
-      (existingVersion >= SCHEMA_VERSION && knowledgeEntryCols.length > 0 && !hasObservationCount);
+      // Schema drift: a table exists but is missing one or more required columns
+      missingColumns.length > 0;
 
     if (needsReset) {
       // Existing DB is from an older schema. Since we have no incremental migrations
       // (single clean schema, solo-use project), drop all tables and start fresh.
-      // This is a hard reset — the caller is expected to reinitialize the data via
-      // POST /reinitialize after the server starts.
+      // This is a hard reset — the caller is expected to run POST /consolidate
+      // after the server starts to rebuild the knowledge graph.
+      const driftDetail = missingColumns.length > 0
+        ? ` (missing columns: ${missingColumns.map((d) => `${d.table}.${d.column}`).join(", ")})`
+        : "";
       console.warn(
-        `[db] Schema mismatch: DB is v${existingVersion}, code expects v${SCHEMA_VERSION}` +
-        (!hasObservationCount ? " (observation_count column missing)" : "") +
-        `. Dropping and recreating all tables. All existing knowledge data has been cleared.`
+        `[db] Schema mismatch: DB is v${existingVersion}, code expects v${SCHEMA_VERSION}${driftDetail}. Dropping and recreating all tables. All existing knowledge data has been cleared.`
       );
       // Wrap in a transaction so a crash mid-drop leaves the DB in its original
       // state (all tables intact) rather than a half-torn-down state.
@@ -918,6 +919,39 @@ export class KnowledgeDB {
 
   close(): void {
     this.db.close();
+  }
+
+  /**
+   * Compare the actual DB column set against EXPECTED_TABLE_COLUMNS for every
+   * table. Returns a list of {table, column} pairs that are expected but absent.
+   *
+   * Only reports missing columns — extra columns in the DB (from a future schema
+   * that was partially rolled back) are ignored. The intent is to detect tables
+   * that are structurally incomplete, not to enforce exact parity.
+   *
+   * Tables that don't exist yet (empty PRAGMA result) are skipped — a missing
+   * table is a normal first-run condition, not drift. CREATE_TABLES handles it.
+   */
+  private getSchemaDrift(): Array<{ table: string; column: string }> {
+    const missing: Array<{ table: string; column: string }> = [];
+
+    for (const [table, expectedCols] of Object.entries(EXPECTED_TABLE_COLUMNS)) {
+      const actualCols = new Set(
+        (this.db.prepare(`PRAGMA table_info("${table}")`).all() as Array<{ name: string }>)
+          .map((c) => c.name)
+      );
+
+      // Table doesn't exist yet — not drift, just a fresh DB
+      if (actualCols.size === 0) continue;
+
+      for (const col of expectedCols) {
+        if (!actualCols.has(col)) {
+          missing.push({ table, column: col });
+        }
+      }
+    }
+
+    return missing;
   }
 }
 

@@ -14,6 +14,34 @@
 
 export const SCHEMA_VERSION = 5;
 
+/**
+ * Expected columns for each table, derived from the DDL below.
+ * Used by initialize() to detect schema drift (missing columns) independently
+ * of the schema_version number — catches partial startups where the version was
+ * written before the DROP+recreate completed.
+ *
+ * Keep in sync with CREATE_TABLES. Adding a column to the DDL requires adding
+ * it here too — the drift check will then catch any DB that's missing it.
+ */
+export const EXPECTED_TABLE_COLUMNS: Readonly<Record<string, readonly string[]>> = {
+  knowledge_entry: [
+    "id", "type", "content", "topics", "confidence", "source", "scope",
+    "status", "strength", "created_at", "updated_at", "last_accessed_at",
+    "access_count", "observation_count", "superseded_by", "derived_from", "embedding",
+  ],
+  knowledge_relation: [
+    "id", "source_id", "target_id", "type", "created_at",
+  ],
+  consolidation_state: [
+    "id", "last_consolidated_at", "last_message_time_created",
+    "total_sessions_processed", "total_entries_created", "total_entries_updated",
+  ],
+  consolidated_episode: [
+    "session_id", "start_message_id", "end_message_id",
+    "content_type", "processed_at", "entries_created",
+  ],
+};
+
 export const CREATE_TABLES = `
   -- Schema version tracking
   CREATE TABLE IF NOT EXISTS schema_version (
