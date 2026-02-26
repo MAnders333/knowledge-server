@@ -186,16 +186,13 @@ export const KnowledgePlugin: Plugin = async (ctx) => {
         // src/ at runtime. The canonical implementations live in format.ts
         // and the parity tests in tests/format.test.ts will fail if this
         // copy drifts.
-        // See CONFLICT_TRUNCATE_LEN in src/activation/format.ts (currently 100)
-        // for the snippet truncation limit — update the literal below if it changes.
         const knowledgeLines = result.entries
           .map((r) => {
             const staleTag = r.staleness.mayBeStale
               ? ` [may be outdated — last accessed ${r.staleness.lastAccessedDaysAgo}d ago]`
               : "";
-            const snippet = r.contradiction?.conflictingContent ?? "";
             const contradictionTag = r.contradiction
-              ? ` [CONFLICTED — conflicts with: "${snippet.length > 100 ? `${snippet.slice(0, 100)}…` : snippet}". ${r.contradiction.caveat}]`
+              ? ` [CONFLICTED — conflicts with: "${r.contradiction.conflictingContent}". ${r.contradiction.caveat}]`
               : "";
             return `- [${r.entry.type}] ${r.entry.content}${staleTag}${contradictionTag}`;
           })

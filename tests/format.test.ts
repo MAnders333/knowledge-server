@@ -1,10 +1,8 @@
 import { describe, it, expect } from "bun:test";
 import {
-  truncate,
   staleTag,
   contradictionTagInline,
   contradictionTagBlock,
-  CONFLICT_TRUNCATE_LEN,
 } from "../src/activation/format.js";
 
 /**
@@ -20,23 +18,6 @@ import {
 // ---------------------------------------------------------------------------
 // Canonical helpers
 // ---------------------------------------------------------------------------
-
-describe("truncate", () => {
-  it("returns the string unchanged when at or under maxLen", () => {
-    expect(truncate("hello", 10)).toBe("hello");
-    expect(truncate("hello", 5)).toBe("hello");
-  });
-
-  it("appends ellipsis only when the string exceeds maxLen", () => {
-    expect(truncate("hello world", 5)).toBe("hello…");
-  });
-
-  it("does not append ellipsis for exact-length strings", () => {
-    const s = "a".repeat(100);
-    expect(truncate(s, 100)).toBe(s);
-    expect(truncate(s, 100).endsWith("…")).toBe(false);
-  });
-});
 
 describe("staleTag", () => {
   it("returns empty string when not stale", () => {
@@ -55,22 +36,21 @@ describe("contradictionTagInline", () => {
     expect(contradictionTagInline(undefined)).toBe("");
   });
 
-  it("renders inline tag with short content unchanged", () => {
-    const tag = contradictionTagInline({
-      conflictingContent: "short content",
-      caveat: "check before using",
-    });
-    expect(tag).toBe(
-      ` [CONFLICTED — conflicts with: "short content". check before using]`
-    );
+  it("renders full conflicting content without truncation", () => {
+    const long = "x".repeat(200);
+    const tag = contradictionTagInline({ conflictingContent: long, caveat: "caveat" });
+    expect(tag).toContain(long);
     expect(tag).not.toContain("…");
   });
 
-  it("truncates conflicting content at CONFLICT_TRUNCATE_LEN", () => {
-    const long = "x".repeat(150);
-    const tag = contradictionTagInline({ conflictingContent: long, caveat: "caveat" });
-    expect(tag).toContain(`${"x".repeat(CONFLICT_TRUNCATE_LEN)}…`);
-    expect(tag).not.toContain("x".repeat(CONFLICT_TRUNCATE_LEN + 1));
+  it("renders inline tag correctly", () => {
+    const tag = contradictionTagInline({
+      conflictingContent: "some conflicting fact",
+      caveat: "check before using",
+    });
+    expect(tag).toBe(
+      ` [CONFLICTED — conflicts with: "some conflicting fact". check before using]`
+    );
   });
 });
 
@@ -79,21 +59,21 @@ describe("contradictionTagBlock", () => {
     expect(contradictionTagBlock(undefined)).toBe("");
   });
 
-  it("renders block tag with short content unchanged", () => {
-    const tag = contradictionTagBlock({
-      conflictingContent: "short content",
-      caveat: "check before using",
-    });
-    expect(tag).toBe(
-      `\n   ⚠ CONFLICTED — conflicts with: "short content"\n   Caveat: check before using`
-    );
+  it("renders full conflicting content without truncation", () => {
+    const long = "x".repeat(200);
+    const tag = contradictionTagBlock({ conflictingContent: long, caveat: "caveat" });
+    expect(tag).toContain(long);
     expect(tag).not.toContain("…");
   });
 
-  it("truncates conflicting content at CONFLICT_TRUNCATE_LEN", () => {
-    const long = "x".repeat(150);
-    const tag = contradictionTagBlock({ conflictingContent: long, caveat: "caveat" });
-    expect(tag).toContain(`${"x".repeat(CONFLICT_TRUNCATE_LEN)}…`);
+  it("renders block tag correctly", () => {
+    const tag = contradictionTagBlock({
+      conflictingContent: "some conflicting fact",
+      caveat: "check before using",
+    });
+    expect(tag).toBe(
+      `\n   ⚠ CONFLICTED — conflicts with: "some conflicting fact"\n   Caveat: check before using`
+    );
   });
 });
 
@@ -108,15 +88,13 @@ function pluginContradictionTag(
   contradiction: { conflictingContent: string; caveat: string } | undefined
 ): string {
   if (!contradiction) return "";
-  const snippet = contradiction.conflictingContent;
-  return ` [CONFLICTED — conflicts with: "${snippet.length > CONFLICT_TRUNCATE_LEN ? `${snippet.slice(0, CONFLICT_TRUNCATE_LEN)}…` : snippet}". ${contradiction.caveat}]`;
+  return ` [CONFLICTED — conflicts with: "${contradiction.conflictingContent}". ${contradiction.caveat}]`;
 }
 
 describe("plugin contradiction tag parity (must match contradictionTagInline)", () => {
   const cases: Array<{ conflictingContent: string; caveat: string }> = [
     { conflictingContent: "short", caveat: "be careful" },
-    { conflictingContent: "x".repeat(100), caveat: "exact limit" },
-    { conflictingContent: "x".repeat(150), caveat: "over limit" },
+    { conflictingContent: "x".repeat(200), caveat: "long content" },
     { conflictingContent: "", caveat: "empty content" },
   ];
 
