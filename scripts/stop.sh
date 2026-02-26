@@ -6,6 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 PORT="${KNOWLEDGE_PORT:-3179}"
+ENTRY_POINT="src/index.ts"  # must match the path passed to bun in start.sh
 
 # Find PIDs listening on the port.
 if command -v lsof &>/dev/null; then
@@ -31,7 +32,7 @@ PIDS=""
 while read -r pid; do
   [ -z "$pid" ] && continue
   cmdline=$(ps -p "$pid" -o args= 2>/dev/null || true)
-  if echo "$cmdline" | grep -qF "$PROJECT_DIR/src/index.ts"; then
+  if echo "$cmdline" | grep -qF "$PROJECT_DIR/$ENTRY_POINT"; then
     PIDS="${PIDS}${pid}"$'\n'
   fi
 done <<< "$PORT_PIDS"
