@@ -18,7 +18,6 @@ import type { ExtractedKnowledge, ContradictionResult } from "./llm.js";
  */
 const MAX_RELEVANT_KNOWLEDGE = 50;
 
-
 /**
  * The consolidation engine — the heart of the knowledge system.
  *

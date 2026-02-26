@@ -18,6 +18,7 @@ export const KNOWLEDGE_TYPES = ["fact", "principle", "pattern", "decision", "pro
  * threshold are already handled by decideMerge and excluded from the scan.
  */
 export const RECONSOLIDATION_THRESHOLD = 0.82;
+
 export type KnowledgeType = typeof KNOWLEDGE_TYPES[number];
 
 /**
