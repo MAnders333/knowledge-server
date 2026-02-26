@@ -15,20 +15,28 @@ import type { KnowledgeEntry } from "../types.js";
  * Bonuses (both use the same log2 shape for diminishing returns):
  *   observationBonus = 1 + log2(1 + observationCount)
  *     — evidence signal: how many episodes produced this knowledge
+ *     — observationCount starts at 1 (insertion itself is the first observation),
+ *       so the minimum bonus is 2× — every new entry gets a baseline durability boost
  *     — observationCount=1 (new entry): bonus = 1 + log2(2) = 2×
  *     — observationCount=3: bonus = 1 + log2(4) = 3×
  *     — observationCount=7: bonus = 1 + log2(8) = 4×
  *   accessBonus = 1 + log2(1 + accessCount)
  *     — retrieval signal: how many times this was surfaced during activation
- *     — starts at 1 when never accessed (accessCount = 0)
+ *     — accessCount starts at 0, so the minimum bonus is 1× (no retrieval boost yet)
  *
  * `confidence` is the LLM's extraction-time quality estimate (prior).
  * It is a ceiling, never mutated after insertion.
  *
  * Examples (fact type, baseHalfLife = 30 days):
- *   New entry, never accessed:       effectiveHalfLife = 30 × 1 × 1   = 30 days
- *   4 observations, never accessed:  effectiveHalfLife = 30 × 2.3 × 1 ≈ 69 days
- *   4 obs + 4 accesses:              effectiveHalfLife = 30 × 2.3 × 2.3 ≈ 159 days
+ *   New entry, never accessed (obs=1, access=0):
+ *     observationBonus = 1 + log2(2) = 2,  accessBonus = 1 + log2(1) = 1
+ *     effectiveHalfLife = 30 × 2 × 1 = 60 days
+ *   4 observations, never accessed (obs=4, access=0):
+ *     observationBonus = 1 + log2(5) ≈ 3.32,  accessBonus = 1
+ *     effectiveHalfLife = 30 × 3.32 × 1 ≈ 100 days
+ *   4 obs + 4 accesses (obs=4, access=4):
+ *     both bonuses ≈ 3.32
+ *     effectiveHalfLife = 30 × 3.32 × 3.32 ≈ 331 days
  */
 export function computeStrength(entry: KnowledgeEntry): number {
   const now = Date.now();

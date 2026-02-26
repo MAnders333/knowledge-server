@@ -71,11 +71,17 @@ export class KnowledgeDB {
         `[db] Schema version mismatch: DB is v${existingVersion}, code expects v${SCHEMA_VERSION}. ` +
         `Dropping and recreating all tables. All existing knowledge data has been cleared.`
       );
-      this.db.exec("DROP TABLE IF EXISTS knowledge_relation");
-      this.db.exec("DROP TABLE IF EXISTS knowledge_entry");
-      this.db.exec("DROP TABLE IF EXISTS consolidated_episode");
-      this.db.exec("DROP TABLE IF EXISTS consolidation_state");
-      this.db.exec("DROP TABLE IF EXISTS schema_version");
+      // Wrap in a transaction so a crash mid-drop leaves the DB in its original
+      // state (all tables intact) rather than a half-torn-down state.
+      // SQLite DROP TABLE cannot be rolled back for WAL checkpoints already flushed,
+      // but within a single transaction a crash before COMMIT leaves the DB unchanged.
+      this.db.transaction(() => {
+        this.db.exec("DROP TABLE IF EXISTS knowledge_relation");
+        this.db.exec("DROP TABLE IF EXISTS knowledge_entry");
+        this.db.exec("DROP TABLE IF EXISTS consolidated_episode");
+        this.db.exec("DROP TABLE IF EXISTS consolidation_state");
+        this.db.exec("DROP TABLE IF EXISTS schema_version");
+      })();
     }
 
     // Create all tables (idempotent on a fresh DB; re-creates after a version-triggered drop).
