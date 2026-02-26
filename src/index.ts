@@ -5,6 +5,7 @@ import { ActivationEngine } from "./activation/activate.js";
 import { ConsolidationEngine } from "./consolidation/consolidate.js";
 import { createApp } from "./api/server.js";
 import { config, validateConfig } from "./config.js";
+import { logger } from "./logger.js";
 // @ts-ignore — Bun supports JSON imports natively
 import pkg from "../package.json" with { type: "json" };
 
@@ -18,18 +19,21 @@ import pkg from "../package.json" with { type: "json" };
  * - /status — health check and stats
  */
 async function main() {
-  console.log("┌─────────────────────────────────────┐");
-  console.log(`│  Knowledge Server v${pkg.version.padEnd(17)}│`);
-  console.log("│  Consolidation-aware knowledge       │");
-  console.log("│  system for OpenCode agents          │");
-  console.log("└─────────────────────────────────────┘");
+  // Initialize logger first so all subsequent output (including config errors) is captured.
+  logger.init(config.logPath);
+
+  logger.raw("┌─────────────────────────────────────┐");
+  logger.raw(`│  Knowledge Server v${pkg.version.padEnd(17)}│`);
+  logger.raw("│  Consolidation-aware knowledge       │");
+  logger.raw("│  system for OpenCode agents          │");
+  logger.raw("└─────────────────────────────────────┘");
 
   // Validate config
   const errors = validateConfig();
   if (errors.length > 0) {
-    console.error("\nConfiguration errors:");
+    logger.error("\nConfiguration errors:");
     for (const err of errors) {
-      console.error(`  ✗ ${err}`);
+      logger.error(`  ✗ ${err}`);
     }
     process.exit(1);
   }
@@ -43,21 +47,21 @@ async function main() {
   const stats = db.getStats();
   const consolidationState = db.getConsolidationState();
 
-  console.log(`\nKnowledge graph: ${stats.total || 0} entries (${stats.active || 0} active)`);
-  console.log(
+  logger.log(`Knowledge graph: ${stats.total || 0} entries (${stats.active || 0} active)`);
+  logger.log(
     `Last consolidation: ${consolidationState.lastConsolidatedAt ? new Date(consolidationState.lastConsolidatedAt).toISOString() : "never"}`
   );
 
   // Check for pending sessions
   const pending = consolidation.checkPending();
   if (pending.pendingSessions > 0) {
-    console.log(
-      `\n⚡ ${pending.pendingSessions} sessions pending consolidation` +
+    logger.log(
+      `⚡ ${pending.pendingSessions} sessions pending consolidation` +
       ` (${config.consolidation.maxSessionsPerRun} per batch).`
     );
-    console.log("  Starting background consolidation...");
+    logger.log("  Starting background consolidation...");
   } else {
-    console.log("\n✓ Knowledge graph is up to date.");
+    logger.log("✓ Knowledge graph is up to date.");
   }
 
   // Admin token: use KNOWLEDGE_ADMIN_TOKEN env var if set (stable, useful for scripting),
@@ -75,14 +79,17 @@ async function main() {
     idleTimeout: 255, // max allowed by Bun — consolidation can take a while
   });
 
-  console.log(`\n✓ HTTP API listening on http://${config.host}:${config.port}`);
-  console.log("  GET  /activate?q=...  — Activate knowledge");
-  console.log("  POST /consolidate     — Run consolidation   [admin token required]");
-  console.log("  GET  /review          — Review entries");
-  console.log("  GET  /status          — Health check");
-  console.log("  GET  /entries         — List entries");
-  console.log(`\n  Admin token (keep this private): ${adminToken}`);
-  console.log(`  curl -X POST -H "Authorization: Bearer <token>" http://${config.host}:${config.port}/consolidate`);
+  logger.raw(`\n✓ HTTP API listening on http://${config.host}:${config.port}`);
+  logger.raw("  GET  /activate?q=...  — Activate knowledge");
+  logger.raw("  POST /consolidate     — Run consolidation   [admin token required]");
+  logger.raw("  GET  /review          — Review entries");
+  logger.raw("  GET  /status          — Health check");
+  logger.raw("  GET  /entries         — List entries");
+  logger.raw(`\n  Admin token (keep this private): ${adminToken}`);
+  logger.raw(`  curl -X POST -H "Authorization: Bearer <token>" http://${config.host}:${config.port}/consolidate`);
+  if (config.logPath) {
+    logger.raw(`\n  Logs: ${config.logPath}`);
+  }
 
   // Background consolidation loop — runs after server is listening
   // so the server is available immediately while consolidation proceeds.
@@ -107,7 +114,7 @@ async function main() {
             await new Promise((resolve) => setTimeout(resolve, 2000));
             continue;
           }
-          console.log(`\n[startup consolidation] Batch ${batch}...`);
+          logger.log(`[startup consolidation] Batch ${batch}...`);
           let result: Awaited<ReturnType<typeof consolidation.consolidate>>;
           try {
             result = await consolidation.consolidate();
@@ -116,10 +123,10 @@ async function main() {
           }
           consecutiveErrors = 0; // reset on success
           if (result.sessionsProcessed === 0) {
-            console.log("[startup consolidation] Complete — all sessions processed.");
+            logger.log("[startup consolidation] Complete — all sessions processed.");
             break;
           }
-          console.log(
+          logger.log(
             `[startup consolidation] Batch ${batch} done: ${result.sessionsProcessed} sessions, ` +
             `${result.entriesCreated} created, ${result.entriesUpdated} updated.`
           );
@@ -127,14 +134,14 @@ async function main() {
         } catch (err) {
           consecutiveErrors++;
           if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-            console.error(
+            logger.error(
               `[startup consolidation] ${MAX_CONSECUTIVE_ERRORS} consecutive errors — giving up. Last error:`,
               err
             );
             break;
           }
           const delay = BASE_RETRY_DELAY_MS * (2 ** (consecutiveErrors - 1));
-          console.error(
+          logger.error(
             `[startup consolidation] Error (attempt ${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}), ` +
             `retrying in ${delay / 1000}s:`,
             err
@@ -148,7 +155,7 @@ async function main() {
   // Graceful shutdown — signal the loop to stop, wait up to 30s for it to finish
   // the current batch before closing the DB. Prevents losing in-flight LLM results.
   async function shutdown(signal: string) {
-    console.log(`\n[${signal}] Shutting down gracefully...`);
+    logger.log(`[${signal}] Shutting down gracefully...`);
     shutdownRequested = true;
     const TIMED_OUT = Symbol("timed_out");
     const result = await Promise.race([
@@ -156,18 +163,18 @@ async function main() {
       new Promise<typeof TIMED_OUT>((r) => setTimeout(() => r(TIMED_OUT), 30_000)),
     ]);
     if (result === TIMED_OUT) {
-      console.warn("[shutdown] 30s timeout reached — in-flight consolidation batch abandoned.");
+      logger.warn("[shutdown] 30s timeout reached — in-flight consolidation batch abandoned.");
     }
     consolidation.close();
     db.close();
     process.exit(0);
   }
 
-  process.on("SIGINT", () => { shutdown("SIGINT").catch(console.error); });
-  process.on("SIGTERM", () => { shutdown("SIGTERM").catch(console.error); });
+  process.on("SIGINT", () => { shutdown("SIGINT").catch((e) => logger.error(e)); });
+  process.on("SIGTERM", () => { shutdown("SIGTERM").catch((e) => logger.error(e)); });
 }
 
 main().catch((e) => {
-  console.error("Fatal error:", e);
+  logger.error("Fatal error:", e);
   process.exit(1);
 });

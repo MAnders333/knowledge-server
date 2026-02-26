@@ -16,6 +16,12 @@ export const config = {
     process.env.KNOWLEDGE_DB_PATH ||
     join(homedir(), ".local", "share", "knowledge-server", "knowledge.db"),
 
+  // Log file — all operational output is tee'd here in addition to stdout.
+  // Set KNOWLEDGE_LOG_PATH to override; set to "" to disable file logging.
+  logPath:
+    process.env.KNOWLEDGE_LOG_PATH ??
+    join(homedir(), ".local", "share", "knowledge-server", "server.log"),
+
   // OpenCode episode source
   opencodeDbPath:
     process.env.OPENCODE_DB_PATH ||

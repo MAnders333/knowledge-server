@@ -5,6 +5,7 @@ import type { KnowledgeDB } from "../db/database.js";
 import type { ActivationEngine } from "../activation/activate.js";
 import type { ConsolidationEngine } from "../consolidation/consolidate.js";
 import { config } from "../config.js";
+import { logger } from "../logger.js";
 // @ts-ignore — Bun supports JSON imports natively; tsc may warn without resolveJsonModule
 import pkg from "../../package.json" with { type: "json" };
 
@@ -75,7 +76,7 @@ export function createApp(
       );
       return c.json(result);
     } catch (e) {
-      console.error("[activate] Error:", e);
+      logger.error("[activate] Error:", e);
       return c.json({ error: "Internal server error" }, 500);
     }
   });
@@ -95,7 +96,7 @@ export function createApp(
       const result = await consolidation.consolidate();
       return c.json(result);
     } catch (e) {
-      console.error("[consolidate] Error:", e);
+      logger.error("[consolidate] Error:", e);
       return c.json({ error: "Internal server error" }, 500);
     } finally {
       consolidation.unlock();
@@ -123,14 +124,14 @@ export function createApp(
 
       db.reinitialize();
 
-      console.log("[reinitialize] Knowledge DB wiped and cursor reset.");
+      logger.log("[reinitialize] Knowledge DB wiped and cursor reset.");
       return c.json({
         status: "reinitialized",
         message:
           "All knowledge entries deleted and consolidation cursor reset to 0. Run POST /consolidate to rebuild.",
       });
     } catch (e) {
-      console.error("[reinitialize] Error:", e);
+      logger.error("[reinitialize] Error:", e);
       return c.json({ error: "Internal server error" }, 500);
     }
   });

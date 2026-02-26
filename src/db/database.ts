@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { config } from "../config.js";
 import { CREATE_TABLES, SCHEMA_VERSION, EXPECTED_TABLE_COLUMNS } from "./schema.js";
+import { logger } from "../logger.js";
 import { clampKnowledgeType } from "../types.js";
 import type {
   KnowledgeEntry,
@@ -84,7 +85,7 @@ export class KnowledgeDB {
       const driftDetail = missingColumns.length > 0
         ? ` (missing columns: ${missingColumns.map((d) => `${d.table}.${d.column}`).join(", ")})`
         : "";
-      console.warn(
+      logger.warn(
         `[db] Schema mismatch: DB is v${existingVersion}, code expects v${SCHEMA_VERSION}${driftDetail}. Dropping and recreating all tables. All existing knowledge data has been cleared.`
       );
       // Wrap in a transaction so a crash mid-drop leaves the DB in its original
@@ -496,7 +497,7 @@ export class KnowledgeDB {
           // If mergedData is absent (LLM truncation), newEntryId keeps its
           // original content — still a valid state, just unrefined.
           if (!mergedData) {
-            console.warn(
+            logger.warn(
               `[db] merge resolution missing mergedData — existingEntryId ${existingEntryId} ` +
               `will be superseded but newEntryId ${newEntryId} content unchanged`
             );
@@ -755,7 +756,7 @@ export class KnowledgeDB {
     // If it's somehow missing (e.g. manual DB surgery), return safe zero state
     // rather than throwing a TypeError on property access.
     if (!row) {
-      console.warn("[db] consolidation_state row missing — returning zero state");
+      logger.warn("[db] consolidation_state row missing — returning zero state");
       return {
         lastConsolidatedAt: 0,
         lastMessageTimeCreated: 0,

@@ -6,6 +6,7 @@ import { EpisodeReader } from "./episodes.js";
 import { ConsolidationLLM } from "./llm.js";
 import { computeStrength } from "./decay.js";
 import { config } from "../config.js";
+import { logger } from "../logger.js";
 import { clampKnowledgeType } from "../types.js";
 import type { Episode, ConsolidationResult, KnowledgeEntry } from "../types.js";
 import type { ExtractedKnowledge, ContradictionResult } from "./llm.js";
@@ -113,7 +114,7 @@ export class ConsolidationEngine {
     const startTime = Date.now();
     const state = this.db.getConsolidationState();
 
-    console.log(
+    logger.log(
       `[consolidation] Starting. Last run: ${state.lastConsolidatedAt ? new Date(state.lastConsolidatedAt).toISOString() : "never"}`
     );
 
@@ -126,7 +127,7 @@ export class ConsolidationEngine {
     );
 
     if (candidateSessions.length === 0) {
-      console.log("[consolidation] No new sessions to process.");
+      logger.log("[consolidation] No new sessions to process.");
       // Still run decay — entries must age even during quiet periods where no
       // new sessions arrive. Without this, the forgetting curve stops ticking.
       const archived = this.applyDecay();
@@ -167,7 +168,7 @@ export class ConsolidationEngine {
       }
     }
 
-    console.log(
+    logger.log(
       `[consolidation] Found ${episodes.length} episodes from ${uniqueSessionIds.size} sessions to process` +
       ` (${tooFew} skipped — too few messages, ${alreadyDone} skipped — already processed).`
     );
@@ -184,7 +185,7 @@ export class ConsolidationEngine {
       const chunk = episodes.slice(i, i + chunkSize);
       const chunkSummary = this.formatEpisodes(chunk);
 
-      console.log(
+      logger.log(
         `[consolidation] Processing chunk ${Math.floor(i / chunkSize) + 1}/${Math.ceil(episodes.length / chunkSize)} (${chunk.length} episodes)`
       );
 
@@ -198,7 +199,7 @@ export class ConsolidationEngine {
       const relevantKnowledge = await this.getRelevantKnowledge(chunkSummary, allEntriesForChunk);
       const existingKnowledgeSummary = this.formatExistingKnowledge(relevantKnowledge);
 
-      console.log(
+      logger.log(
         `[consolidation] Using ${relevantKnowledge.length} relevant existing entries as context.`
       );
 
@@ -208,7 +209,7 @@ export class ConsolidationEngine {
         existingKnowledgeSummary
       );
 
-      console.log(
+      logger.log(
         `[consolidation] Extracted ${extracted.length} knowledge entries from chunk.`
       );
 
@@ -275,7 +276,7 @@ export class ConsolidationEngine {
           // Rethrowing would skip recordEpisode for the whole chunk, causing all
           // entries in this chunk to be re-processed on the next run and producing
           // duplicates for the entries that were already successfully inserted.
-          console.error(
+          logger.error(
             `[consolidation] Failed to reconsolidate entry "${String(entry.content ?? "").slice(0, 60)}..." — skipping:`,
             err
           );
@@ -313,7 +314,7 @@ export class ConsolidationEngine {
 
     // 8. Generate embeddings for new entries
     const embeddedCount = await this.activation.ensureEmbeddings();
-    console.log(
+    logger.log(
       `[consolidation] Generated embeddings for ${embeddedCount} entries.`
     );
 
@@ -379,7 +380,7 @@ export class ConsolidationEngine {
       duration: Date.now() - startTime,
     };
 
-    console.log(
+    logger.log(
       `[consolidation] Complete. ${result.sessionsProcessed} sessions (${result.segmentsProcessed} segments) -> ${result.entriesCreated} entries (${result.entriesArchived} archived, ${result.conflictsDetected} conflicts, ${result.conflictsResolved} resolved) in ${result.duration}ms`
     );
 
@@ -438,14 +439,14 @@ export class ConsolidationEngine {
     if (!nearestEntry || nearestSimilarity < RECONSOLIDATION_THRESHOLD) {
       const inserted = this.insertNewEntry(entry, sessionIds, entryEmbedding);
       callbacks.onInsert(inserted);
-      console.log(
+      logger.log(
         `[consolidation] Insert (novel, sim=${nearestSimilarity.toFixed(3)}): "${entry.content.slice(0, 60)}..."`
       );
       return;
     }
 
     // Above threshold → ask LLM for a focused merge decision
-    console.log(
+    logger.log(
       `[consolidation] Reconsolidation candidate (sim=${nearestSimilarity.toFixed(3)}): "${entry.content.slice(0, 60)}..." vs "${nearestEntry.content.slice(0, 60)}..."`
     );
 
@@ -472,7 +473,7 @@ export class ConsolidationEngine {
         // We use reinforceObservation rather than recordAccess — this is not a retrieval
         // event; it's confirmation that the knowledge is still true.
         this.db.reinforceObservation(nearestEntry.id);
-        console.log(`[consolidation] Keep existing (reinforced): "${nearestEntry.content.slice(0, 60)}..."`);
+        logger.log(`[consolidation] Keep existing (reinforced): "${nearestEntry.content.slice(0, 60)}..."`);
         callbacks.onKeep();
         break;
 
@@ -495,14 +496,14 @@ export class ConsolidationEngine {
           formatEmbeddingText(safeType, decision.content, decision.topics ?? [])
         );
         this.db.mergeEntry(nearestEntry.id, mergeUpdates, freshEmbedding);
-        console.log(`[consolidation] ${decision.action === "update" ? "Updated" : "Replaced"}: "${nearestEntry.content.slice(0, 60)}..." → "${decision.content.slice(0, 60)}..."`);
+        logger.log(`[consolidation] ${decision.action === "update" ? "Updated" : "Replaced"}: "${nearestEntry.content.slice(0, 60)}..." → "${decision.content.slice(0, 60)}..."`);
         callbacks.onUpdate(nearestEntry.id, mergeUpdates, freshEmbedding);
         break;
       }
 
       case "insert": {
         const inserted = this.insertNewEntry(entry, sessionIds, entryEmbedding);
-        console.log(`[consolidation] Insert (distinct despite similarity): "${entry.content.slice(0, 60)}..."`);
+        logger.log(`[consolidation] Insert (distinct despite similarity): "${entry.content.slice(0, 60)}..."`);
         callbacks.onInsert(inserted);
         break;
       }
@@ -636,7 +637,7 @@ export class ConsolidationEngine {
 
       if (midBandCandidates.length === 0) continue;
 
-      console.log(
+      logger.log(
         `[contradiction] Checking ${midBandCandidates.length} candidates for "${entry.content.slice(0, 60)}..."`
       );
 
@@ -668,13 +669,13 @@ export class ConsolidationEngine {
         // WHERE id = <non-existent>) or — worse — self-supersede the newEntry
         // if the LLM echoed entry.id back as the candidateId.
         if (!validCandidateIds.has(result.candidateId)) {
-          console.warn(
+          logger.warn(
             `[contradiction] LLM returned candidateId "${result.candidateId}" not in candidate list — skipping`
           );
           continue;
         }
         detected++;
-        console.log(
+        logger.log(
           `[contradiction] ${result.resolution}: "${entry.content.slice(0, 50)}..." vs candidate ${result.candidateId.slice(0, 8)}... — ${result.reason}`
         );
 
@@ -722,7 +723,7 @@ export class ConsolidationEngine {
     }
 
     if (detected > 0) {
-      console.log(
+      logger.log(
         `[contradiction] Scan complete: ${detected} contradictions found, ${resolved} resolved, ${detected - resolved} flagged for review.`
       );
     }
@@ -751,7 +752,7 @@ export class ConsolidationEngine {
           strength: newStrength,
         });
         archived++;
-        console.log(
+        logger.log(
           `[decay] Archived: "${entry.content.slice(0, 60)}..." (strength: ${newStrength.toFixed(3)})`
         );
       } else if (Math.abs(newStrength - entry.strength) > 0.01) {
@@ -768,7 +769,7 @@ export class ConsolidationEngine {
     for (const entry of archivedEntries) {
       if (entry.updatedAt < tombstoneThreshold) {
         this.db.updateEntry(entry.id, { status: "tombstoned" });
-        console.log(
+        logger.log(
           `[decay] Tombstoned: "${entry.content.slice(0, 60)}..." (archived for ${config.decay.tombstoneAfterDays}+ days)`
         );
       }

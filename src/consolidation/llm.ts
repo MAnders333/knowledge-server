@@ -3,6 +3,7 @@ import { createAnthropic } from "@ai-sdk/anthropic";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { config } from "../config.js";
+import { logger } from "../logger.js";
 
 /**
  * LLM interface for consolidation.
@@ -130,7 +131,7 @@ function parseJSON<T>(response: string, arrayMode: boolean): T | null {
         const originalCount = (response.match(/"candidateId"/g) || []).length;
         const recoveredCount = (result as unknown[]).length;
         if (recoveredCount < originalCount) {
-          console.warn(
+          logger.warn(
             `[llm] Partial JSON recovery: salvaged ${recoveredCount}/${originalCount} objects from truncated response`
           );
         }
@@ -218,7 +219,7 @@ If there is nothing new worth extracting, return an empty array: []`;
 
     const parsed = parseJSON<ExtractedKnowledge[]>(response, true);
     if (!parsed) {
-      console.error("[llm] Failed to parse extraction response:", response.slice(0, 500));
+      logger.error("[llm] Failed to parse extraction response:", response.slice(0, 500));
       return [];
     }
 
@@ -285,7 +286,7 @@ Respond with one of:
 
     const parsed = parseJSON<MergeDecision>(response, false);
     if (!parsed || !["keep", "update", "replace", "insert"].includes(parsed.action)) {
-      console.warn("[llm] decideMerge parse failure — defaulting to insert:", response.slice(0, 200));
+      logger.warn("[llm] decideMerge parse failure — defaulting to insert:", response.slice(0, 200));
       return { action: "insert" }; // safe default — no data loss
     }
     return parsed;
@@ -371,7 +372,7 @@ Respond with a JSON array (one result per candidate, same order):
 
     const parsed = parseJSON<ContradictionResult[]>(response, true);
     if (!parsed) {
-      console.error("[llm] Failed to parse contradiction response:", response.slice(0, 500));
+      logger.error("[llm] Failed to parse contradiction response:", response.slice(0, 500));
       return [];
     }
 
