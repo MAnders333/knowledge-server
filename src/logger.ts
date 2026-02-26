@@ -104,9 +104,13 @@ class Logger {
    * Lines containing sensitive values (e.g. the admin token) should
    * use rawStdoutOnly() instead so they are never persisted to disk.
    */
+  private toDisplay(args: unknown[]): string {
+    return args.map((a) => (typeof a === "string" ? a : String(a))).join(" ");
+  }
+
   raw(...args: unknown[]): void {
     // stdout: use String() for display fidelity (banner lines are always strings in practice)
-    const displayMessage = args.map((a) => (typeof a === "string" ? a : String(a))).join(" ");
+    const displayMessage = this.toDisplay(args);
     process.stdout.write(`${displayMessage}\n`);
     if (this.logPath) {
       // file: use serialize() so Errors and circular objects are represented faithfully
@@ -125,8 +129,7 @@ class Logger {
    * Use for sensitive values (admin token) and interactive-only output.
    */
   rawStdoutOnly(...args: unknown[]): void {
-    const message = args.map((a) => (typeof a === "string" ? a : String(a))).join(" ");
-    process.stdout.write(`${message}\n`);
+    process.stdout.write(`${this.toDisplay(args)}\n`);
   }
 }
 
