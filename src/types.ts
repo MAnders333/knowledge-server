@@ -13,6 +13,16 @@ export const KNOWLEDGE_TYPES = ["fact", "principle", "pattern", "decision", "pro
 export type KnowledgeType = typeof KNOWLEDGE_TYPES[number];
 
 /**
+ * Clamp a raw LLM-returned type string to the nearest valid KnowledgeType.
+ * LLMs sometimes return compound values like "fact/principle" or "Fact".
+ * Falls back to "fact" if no valid type is found.
+ */
+export function clampKnowledgeType(type: string): KnowledgeType {
+  const lower = type.toLowerCase();
+  return (KNOWLEDGE_TYPES.find((t) => lower.includes(t)) ?? "fact") as KnowledgeType;
+}
+
+/**
  * Lifecycle status of a knowledge entry.
  *
  * Models the human forgetting curve:

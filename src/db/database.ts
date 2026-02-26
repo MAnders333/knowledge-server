@@ -4,7 +4,7 @@ import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { config } from "../config.js";
 import { CREATE_TABLES, SCHEMA_VERSION, CONSOLIDATED_EPISODE_DDL } from "./schema.js";
-import { KNOWLEDGE_TYPES } from "../types.js";
+import { clampKnowledgeType } from "../types.js";
 import type {
   KnowledgeEntry,
   KnowledgeRelation,
@@ -13,20 +13,6 @@ import type {
   ConsolidationState,
   ProcessedRange,
 } from "../types.js";
-
-/**
- * Clamp an LLM-returned type string to a valid KnowledgeType.
- * LLMs occasionally return values outside the schema CHECK constraint
- * (e.g. "fact/principle"), which would abort the SQLite transaction.
- * Falls back to "fact" — the broadest, least-assertive type.
- */
-function clampKnowledgeType(type: string): KnowledgeType {
-  if ((KNOWLEDGE_TYPES as readonly string[]).includes(type)) {
-    return type as KnowledgeType;
-  }
-  console.warn(`[db] invalid knowledge type "${type}" — falling back to "fact"`);
-  return "fact";
-}
 
 /**
  * Database layer for the knowledge graph.
@@ -913,6 +899,11 @@ export class KnowledgeDB {
    * Merge new content into an existing entry (reconsolidation).
    * Updates content, type, topics, confidence, and timestamps in place.
    * The entry's derivedFrom is expanded to include the new session IDs.
+   *
+   * @param embedding  Optional pre-computed embedding for the new content.
+   *   If supplied, it is written atomically in the same UPDATE statement so the
+   *   entry never passes through a NULL-embedding state. If omitted, embedding
+   *   is set to NULL and ensureEmbeddings will regenerate it at end of run.
    */
   mergeEntry(
     id: string,
@@ -922,7 +913,8 @@ export class KnowledgeDB {
       topics: string[];
       confidence: number;
       additionalSources: string[]; // session IDs from the new episode
-    }
+    },
+    embedding?: number[]
   ): void {
     const existing = this.getEntry(id);
     if (!existing) return;
@@ -933,13 +925,17 @@ export class KnowledgeDB {
 
     const safeType = clampKnowledgeType(updates.type);
 
+    const embeddingBlob = embedding
+      ? Buffer.from(new Float32Array(embedding).buffer)
+      : null;
+
     const now = Date.now();
     this.db
       .prepare(
         `UPDATE knowledge_entry
          SET content = ?, type = ?, topics = ?, confidence = ?,
              derived_from = ?, updated_at = ?, last_accessed_at = ?,
-             embedding = NULL
+             embedding = ?
          WHERE id = ?`
       )
       .run(
@@ -950,6 +946,7 @@ export class KnowledgeDB {
         JSON.stringify(mergedSources),
         now,
         now,
+        embeddingBlob,
         id
       );
   }
