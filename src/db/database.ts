@@ -62,14 +62,29 @@ export class KnowledgeDB {
 
     const existingVersion = row?.version ?? 0;
 
-    if (existingVersion > 0 && existingVersion < SCHEMA_VERSION) {
+    // Use actual column presence as the authoritative check — not just the version number.
+    // The version number alone can be stale if a prior startup wrote v5 to schema_version
+    // before the DROP+recreate completed (e.g. partial run, crash, or reinitialize race).
+    const knowledgeEntryCols = (
+      this.db.prepare("PRAGMA table_info(knowledge_entry)").all() as Array<{ name: string }>
+    ).map((c) => c.name);
+    const hasObservationCount = knowledgeEntryCols.includes("observation_count");
+
+    const needsReset =
+      // Explicit version lag: recorded version is older than current code
+      (existingVersion > 0 && existingVersion < SCHEMA_VERSION) ||
+      // Schema drift: version says current but a required column is missing
+      (existingVersion >= SCHEMA_VERSION && knowledgeEntryCols.length > 0 && !hasObservationCount);
+
+    if (needsReset) {
       // Existing DB is from an older schema. Since we have no incremental migrations
       // (single clean schema, solo-use project), drop all tables and start fresh.
       // This is a hard reset — the caller is expected to reinitialize the data via
       // POST /reinitialize after the server starts.
       console.warn(
-        `[db] Schema version mismatch: DB is v${existingVersion}, code expects v${SCHEMA_VERSION}. ` +
-        `Dropping and recreating all tables. All existing knowledge data has been cleared.`
+        `[db] Schema mismatch: DB is v${existingVersion}, code expects v${SCHEMA_VERSION}` +
+        (!hasObservationCount ? " (observation_count column missing)" : "") +
+        `. Dropping and recreating all tables. All existing knowledge data has been cleared.`
       );
       // Wrap in a transaction so a crash mid-drop leaves the DB in its original
       // state (all tables intact) rather than a half-torn-down state.
