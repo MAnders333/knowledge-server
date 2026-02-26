@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { KnowledgeDB } from "../db/database.js";
 import { ActivationEngine } from "../activation/activate.js";
+import { staleTag, contradictionTagBlock } from "../activation/format.js";
 // @ts-ignore — Bun supports JSON imports natively
 import pkg from "../../package.json" with { type: "json" };
 
@@ -54,19 +55,11 @@ async function main() {
         }
 
         const formatted = result.entries
-          .map((r, i) => {
-            const staleTag = r.staleness.mayBeStale
-              ? ` [may be outdated — last accessed ${r.staleness.lastAccessedDaysAgo}d ago]`
-              : "";
-            const contradictionTag = r.contradiction
-              ? `\n   ⚠ CONFLICTED — conflicts with: "${r.contradiction.conflictingContent.length > 100 ? `${r.contradiction.conflictingContent.slice(0, 100)}…` : r.contradiction.conflictingContent}"\n   Caveat: ${r.contradiction.caveat}`
-              : "";
-            return (
-              `${i + 1}. [${r.entry.type}] ${r.entry.content}${staleTag}${contradictionTag}\n` +
-              `   Topics: ${r.entry.topics.join(", ")}\n` +
-              `   Confidence: ${r.entry.confidence} | Scope: ${r.entry.scope} | Semantic match: ${r.rawSimilarity.toFixed(3)} | Score: ${r.similarity.toFixed(3)}`
-            );
-          })
+          .map((r, i) => (
+            `${i + 1}. [${r.entry.type}] ${r.entry.content}${staleTag(r.staleness)}${contradictionTagBlock(r.contradiction)}\n` +
+            `   Topics: ${r.entry.topics.join(", ")}\n` +
+            `   Confidence: ${r.entry.confidence} | Scope: ${r.entry.scope} | Semantic match: ${r.rawSimilarity.toFixed(3)} | Score: ${r.similarity.toFixed(3)}`
+          ))
           .join("\n\n");
 
         const conflictCount = result.entries.filter((r) => r.contradiction).length;
