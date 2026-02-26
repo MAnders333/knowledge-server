@@ -85,13 +85,21 @@ Exposes a single tool: `activate`. Agents use this for deliberate recall — whe
 
 ```json
 {
-  "knowledge": {
-    "type": "local",
-    "command": ["bun", "run", "/path/to/src/mcp/index.ts"],
-    "enabled": true
+  "mcp": {
+    "knowledge": {
+      "type": "local",
+      "command": ["bun", "run", "/absolute/path/to/knowledge-server/src/mcp/index.ts"],
+      "enabled": true,
+      "environment": {
+        "LLM_API_KEY": "<your key>",
+        "LLM_BASE_ENDPOINT": "<your endpoint>"
+      }
+    }
   }
 }
 ```
+
+`bun run setup` prints a ready-to-paste version of this block with the correct absolute path and your `.env` values already interpolated.
 
 ### OpenCode plugin (`plugin/knowledge.ts`)
 

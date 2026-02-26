@@ -129,16 +129,17 @@ export const config = {
   activation: {
     // Top-N entries returned per activation call.
     // Default is 10 — a generous ceiling for the MCP tool (deliberate active recall).
-    // The passive plugin explicitly overrides this to 5 via ?limit=5 to keep
-    // injected context tight. ACTIVATION_MAX_RESULTS overrides the server default.
+    // The passive plugin explicitly overrides this to 8 via ?limit=8 to balance
+    // recall against injected context size. ACTIVATION_MAX_RESULTS overrides the server default.
     maxResults: parseIntEnv(process.env.ACTIVATION_MAX_RESULTS, 10, 1),
     // Minimum raw cosine similarity (NOT decay-weighted) to activate an entry.
     // Filtering on rawSimilarity means entry age/staleness never prevents a
     // semantically relevant entry from activating — decay only affects ranking.
-    // 0.35 balances recall vs. noise for text-embedding-3-large: at 0.4 genuine
-    // topical matches (raw ~0.37–0.39) were silently dropped; at 0.3 weakly
-    // related entries fired too readily. 0.35 is the calibrated middle ground.
-    similarityThreshold: parseFloatEnv(process.env.ACTIVATION_SIMILARITY_THRESHOLD, 0.35),
+    // 0.30 favors recall over precision: text-embedding-3-large has a low noise
+    // floor at this range, so the risk of irrelevant entries is acceptable compared
+    // to the cost of silently missing useful knowledge. Raise to 0.35 if noise
+    // becomes a problem in practice.
+    similarityThreshold: parseFloatEnv(process.env.ACTIVATION_SIMILARITY_THRESHOLD, 0.30),
   },
 } as const;
 

@@ -49,10 +49,34 @@ if [ ! -f "$PROJECT_DIR/.env" ]; then
   echo ""
   echo "Creating .env from template..."
   cp "$PROJECT_DIR/.env.template" "$PROJECT_DIR/.env"
-  echo "  ⚠ Created .env — you need to set LLM_API_KEY and LLM_BASE_ENDPOINT"
-  echo "    Edit: $PROJECT_DIR/.env"
+  echo "  ⚠ Created .env — edit it before starting the server:"
+  echo "    $PROJECT_DIR/.env"
 else
   echo "  ✓ .env already exists"
+fi
+
+# Load .env so we can interpolate values into the MCP config hint below.
+# Silently ignore errors — .env may be missing or have syntax issues.
+if [ -f "$PROJECT_DIR/.env" ]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "$PROJECT_DIR/.env" 2>/dev/null || true
+  set +a
+fi
+
+# Detect whether required vars are still at their placeholder values.
+ENV_CONFIGURED=true
+if [ -z "${LLM_API_KEY:-}" ] || [ "$LLM_API_KEY" = "your-unified-endpoint-api-key" ]; then
+  ENV_CONFIGURED=false
+fi
+if [ -z "${LLM_BASE_ENDPOINT:-}" ] || [ "$LLM_BASE_ENDPOINT" = "https://your-llm-endpoint.example.com" ]; then
+  ENV_CONFIGURED=false
+fi
+
+if [ "$ENV_CONFIGURED" = "false" ]; then
+  echo ""
+  echo "  ⚠ LLM_API_KEY and/or LLM_BASE_ENDPOINT are not configured."
+  echo "    Edit $PROJECT_DIR/.env before starting the server."
 fi
 
 # 5. Symlink plugin to OpenCode
@@ -81,20 +105,30 @@ for cmd_file in "$PROJECT_DIR/opencode/command/"*.md; do
   echo "  ✓ Symlinked command: $cmd_name"
 done
 
-# 7. Add MCP config hint
+# 7. Add MCP config hint — interpolate non-sensitive values (path, endpoint) from .env.
+# LLM_API_KEY is intentionally NOT printed — copy it from .env directly.
+MCP_ENDPOINT="${LLM_BASE_ENDPOINT:-https://your-llm-endpoint.example.com}"
+
 echo ""
-echo "To enable the MCP 'activate' tool for agents, add to opencode.jsonc:"
+echo "To enable the MCP 'activate' tool for agents, add this to ~/.config/opencode/opencode.jsonc:"
 echo ""
-echo '  "knowledge": {'
-echo '    "type": "local",'
-echo "    \"command\": [\"bun\", \"run\", \"$PROJECT_DIR/src/mcp/index.ts\"],"
-echo '    "enabled": true,'
-echo '    "environment": {'
-echo '      "LLM_API_KEY": "your-key-here",'
-echo '      "LLM_BASE_ENDPOINT": "https://your-llm-endpoint.example.com"'
-echo '    }'
-echo '  }'
+echo "  \"mcp\": {"
+echo "    \"knowledge\": {"
+echo "      \"type\": \"local\","
+echo "      \"command\": [\"bun\", \"run\", \"$PROJECT_DIR/src/mcp/index.ts\"],"
+echo "      \"enabled\": true,"
+echo "      \"environment\": {"
+echo "        \"LLM_API_KEY\": \"<copy from .env>\","
+echo "        \"LLM_BASE_ENDPOINT\": \"$MCP_ENDPOINT\""
+echo "      }"
+echo "    }"
+echo "  }"
 echo ""
+if [ "$ENV_CONFIGURED" = "false" ]; then
+  echo "  ⚠ LLM_BASE_ENDPOINT above is a placeholder — fill in .env first, then re-run"
+  echo "    setup to get a ready-to-paste block."
+  echo ""
+fi
 
 # 8. Check OpenCode DB
 OPENCODE_DB="$HOME/.local/share/opencode/opencode.db"
@@ -110,8 +144,17 @@ echo ""
 echo "Setup complete!"
 echo ""
 echo "Next steps:"
-echo "  1. Set LLM_API_KEY in $PROJECT_DIR/.env"
-echo "  2. Start the server:  cd $PROJECT_DIR && bun run start"
-echo "  3. Run initial consolidation:  curl -X POST -H \"Authorization: Bearer <token>\" http://127.0.0.1:3179/consolidate"
-echo "  4. Check status:  curl http://127.0.0.1:3179/status"
+if [ "$ENV_CONFIGURED" = "false" ]; then
+  echo "  1. Edit $PROJECT_DIR/.env — set LLM_API_KEY and LLM_BASE_ENDPOINT"
+  echo "  2. Re-run setup to get a ready-to-paste MCP config block:  bun run setup"
+  echo "  3. Add the MCP block above to ~/.config/opencode/opencode.jsonc"
+  echo "  4. Start the server:  cd $PROJECT_DIR && bun run start"
+  echo "     The server prints an admin token on startup — use it for step 5."
+  echo "  5. Check status:  curl http://127.0.0.1:3179/status"
+else
+  echo "  1. Add the MCP block above to ~/.config/opencode/opencode.jsonc"
+  echo "  2. Start the server:  cd $PROJECT_DIR && bun run start"
+  echo "     The server prints an admin token on startup — use it for step 3."
+  echo "  3. Check status:  curl http://127.0.0.1:3179/status"
+fi
 echo ""

@@ -112,14 +112,14 @@ export const KnowledgePlugin: Plugin = async (ctx) => {
         await safeLog(ctx.client, "debug", `chat.message fired — session: ${input.sessionID}, query length: ${queryText.length} chars`);
 
         // Skip very short messages (greetings, confirmations, "yes", "continue")
-        if (queryText.length < 20) {
+        if (queryText.length < 15) {
           await safeLog(ctx.client, "debug", "chat.message skipped — query too short");
           return;
         }
 
         // Build a set of activation queries:
         //   1. Per-line segments — each newline (shift+enter) is a topic boundary.
-        //      Short segments (< 20 chars) are skipped — they're usually connective
+        //      Short segments (< 15 chars) are skipped — they're usually connective
         //      phrases, not substantive cues.
         //   2. The full message as a holistic cue — captures overall intent that
         //      no individual segment may express on its own.
@@ -128,7 +128,7 @@ export const KnowledgePlugin: Plugin = async (ctx) => {
         const segments = queryText
           .split("\n")
           .map((s) => s.trim())
-          .filter((s) => s.length >= 20);
+          .filter((s) => s.length >= 15);
 
         // Union: unique segments + full message (deduplicated if message == single segment).
         // Trim queryText before dedup so a single-line message with leading/trailing
@@ -137,7 +137,7 @@ export const KnowledgePlugin: Plugin = async (ctx) => {
 
         const params = new URLSearchParams();
         for (const q of allQueries) params.append("q", q);
-        params.set("limit", "5"); // passive injection: keep context budget tight
+        params.set("limit", "8"); // passive injection: up from 5 to reduce silent misses
 
         const response = await fetch(
           `${KNOWLEDGE_SERVER_URL}/activate?${params.toString()}`,
