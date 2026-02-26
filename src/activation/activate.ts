@@ -89,8 +89,12 @@ export class ActivationEngine {
 
         return {
           entry,
-          // Raw similarity modulated by entry strength
-          // (stronger entries activate more easily, like well-consolidated memories)
+          // Threshold filtering uses raw cosine similarity so entry age never
+          // prevents a semantically relevant entry from activating.
+          // Ranking uses raw similarity weighted by strength — well-consolidated
+          // entries sort higher, but stale entries still appear if they're on-topic.
+          // The staleness signals in the response let the LLM reason about reliability.
+          rawSimilarity,
           similarity: rawSimilarity * entry.strength,
           staleness: {
             ageDays: Math.round(ageDays),
@@ -100,7 +104,7 @@ export class ActivationEngine {
           },
         };
       })
-      .filter((s) => s.similarity >= similarityThreshold)
+      .filter((s) => s.rawSimilarity >= similarityThreshold)
       .sort((a, b) => b.similarity - a.similarity)
       .slice(0, maxResults);
 
