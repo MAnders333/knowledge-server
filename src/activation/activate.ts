@@ -127,11 +127,19 @@ export class ActivationEngine {
   }
 
   /**
-   * Ensure all active entries have embeddings.
+   * Ensure all active and conflicted entries have embeddings.
    * Called during consolidation (new entries) or on startup (migration).
+   *
+   * Conflicted entries are included because:
+   * - They participate in similarity search (getActiveEntriesWithEmbeddings includes them)
+   * - A merge resolution may clear their embedding (embedding = NULL)
+   * - Without re-embedding, they become permanently invisible to reconsolidation
+   *   and the contradiction scan, preventing automatic re-resolution.
    */
   async ensureEmbeddings(): Promise<number> {
-    const entries = this.db.getActiveEntries();
+    const active = this.db.getActiveEntries();
+    const conflicted = this.db.getEntriesByStatus("conflicted");
+    const entries = [...active, ...conflicted];
     const needsEmbedding = entries.filter((e) => !e.embedding);
 
     if (needsEmbedding.length === 0) return 0;

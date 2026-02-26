@@ -101,18 +101,18 @@ async function main() {
         try {
           // Claim the flag synchronously (no await between check and set) so an
           // API call cannot slip in between and start a concurrent consolidation.
-          if (consolidation.isConsolidating) {
-            // Another path (API) already holds the flag — yield and retry.
+          if (!consolidation.tryLock()) {
+            // Another path (API) already holds the lock — yield and retry.
+            // tryLock() is synchronous so no await between check and claim.
             await new Promise((resolve) => setTimeout(resolve, 2000));
             continue;
           }
-          consolidation.isConsolidating = true; // set synchronously — no await above this line
           console.log(`\n[startup consolidation] Batch ${batch}...`);
           let result: Awaited<ReturnType<typeof consolidation.consolidate>>;
           try {
             result = await consolidation.consolidate();
           } finally {
-            consolidation.isConsolidating = false;
+            consolidation.unlock();
           }
           consecutiveErrors = 0; // reset on success
           if (result.sessionsProcessed === 0) {

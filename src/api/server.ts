@@ -71,11 +71,10 @@ export function createApp(
       return c.json({ error: "Unauthorized" }, 401);
     }
 
-    if (consolidation.isConsolidating) {
+    if (!consolidation.tryLock()) {
       return c.json({ error: "Consolidation already in progress" }, 409);
     }
 
-    consolidation.isConsolidating = true;
     try {
       const result = await consolidation.consolidate();
       return c.json(result);
@@ -83,7 +82,7 @@ export function createApp(
       console.error("[consolidate] Error:", e);
       return c.json({ error: "Internal server error" }, 500);
     } finally {
-      consolidation.isConsolidating = false;
+      consolidation.unlock();
     }
   });
 

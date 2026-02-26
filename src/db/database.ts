@@ -634,12 +634,9 @@ export class KnowledgeDB {
    * counterpart ID before the original entry is modified.
    */
   private findConflictCounterpart(entryId: string): string | null {
-    const entry = this.db
-      .prepare("SELECT status FROM knowledge_entry WHERE id = ?")
-      .get(entryId) as { status: string } | null;
-
-    if (entry?.status !== "conflicted") return null;
-
+    // A 'contradicts' relation only exists when both entries are 'conflicted',
+    // so querying the relation directly is sufficient — no separate status check needed.
+    // This saves one DB round-trip per call (called up to 4 times per resolution).
     const rel = this.db
       .prepare(
         "SELECT source_id, target_id FROM knowledge_relation WHERE type = 'contradicts' AND (source_id = ? OR target_id = ?) LIMIT 1"
@@ -807,7 +804,21 @@ export class KnowledgeDB {
       total_sessions_processed: number;
       total_entries_created: number;
       total_entries_updated: number;
-    };
+    } | null;
+
+    // The singleton row is seeded by CREATE_TABLES (INSERT OR IGNORE).
+    // If it's somehow missing (e.g. manual DB surgery), return safe zero state
+    // rather than throwing a TypeError on property access.
+    if (!row) {
+      console.warn("[db] consolidation_state row missing — returning zero state");
+      return {
+        lastConsolidatedAt: 0,
+        lastMessageTimeCreated: 0,
+        totalSessionsProcessed: 0,
+        totalEntriesCreated: 0,
+        totalEntriesUpdated: 0,
+      };
+    }
 
     return {
       lastConsolidatedAt: row.last_consolidated_at,

@@ -34,6 +34,9 @@ describe("HTTP API", () => {
         conflictsResolved: 0,
         duration: 0,
       }),
+      get isConsolidating() { return false; },
+      tryLock: () => true,
+      unlock: () => {},
       close: () => {},
     } as unknown as ConsolidationEngine;
     app = createApp(db, activation, consolidation, TEST_ADMIN_TOKEN);
