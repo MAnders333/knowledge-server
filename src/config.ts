@@ -88,9 +88,18 @@ export const config = {
 
   // Activation
   activation: {
+    // Top-N entries returned per activation call.
+    // Default is 10 — a generous ceiling for the MCP tool (deliberate active recall).
+    // The passive plugin explicitly overrides this to 5 via ?limit=5 to keep
+    // injected context tight. ACTIVATION_MAX_RESULTS overrides the server default.
     maxResults: Number.parseInt(process.env.ACTIVATION_MAX_RESULTS || "10", 10),
+    // Minimum strength-weighted cosine similarity to activate an entry.
+    // 0.4 is more discriminating than the old 0.3 default — at 0.3, weakly
+    // related entries fired too readily. 0.4 cuts noise while keeping
+    // genuinely relevant entries (text-embedding-3-large at 0.4 is still a
+    // meaningful topical match).
     similarityThreshold: Number.parseFloat(
-      process.env.ACTIVATION_SIMILARITY_THRESHOLD || "0.3"
+      process.env.ACTIVATION_SIMILARITY_THRESHOLD || "0.4"
     ),
   },
 } as const;

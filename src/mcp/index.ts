@@ -39,7 +39,8 @@ async function main() {
     },
     async ({ cues }) => {
       try {
-        const result = await activation.activate(cues);
+        // MCP is deliberate active recall — allow more results than passive injection.
+        const result = await activation.activate(cues, { limit: 10 });
 
         if (result.entries.length === 0) {
           return {

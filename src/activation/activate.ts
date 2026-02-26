@@ -22,32 +22,63 @@ export class ActivationEngine {
   }
 
   /**
-   * Activate knowledge entries based on a query or set of cues.
+   * Activate knowledge entries based on one or more queries.
    *
    * This is the single retrieval mechanism — used by both:
-   * - The plugin (passive: user query -> activate -> inject)
+   * - The plugin (passive: message segments + full message -> activate -> inject)
    * - The MCP tool (active: agent sends cues -> activate -> return)
    *
-   * @param query - The activation cue (user message, agent-generated cues, etc.)
+   * When multiple queries are provided (e.g. per-line segments of a multi-topic
+   * message plus the full message as a holistic cue), they are embedded in a
+   * single batched API call. Each entry is scored against ALL query vectors and
+   * its best (highest) similarity across queries is kept. Results are then
+   * deduplicated, filtered by threshold, and ranked — so a multi-topic message
+   * retrieves relevant knowledge for every topic, not just the dominant one.
+   *
+   * @param queries - One query string, or an array of query strings (segments + full message)
    * @returns Ranked knowledge entries above the similarity threshold, with staleness signals
    */
-  async activate(query: string): Promise<ActivationResult> {
+  async activate(
+    queries: string | string[],
+    options?: {
+      /** Max entries to return. Overrides config.activation.maxResults. */
+      limit?: number;
+      /** Min similarity threshold. Overrides config.activation.similarityThreshold. */
+      threshold?: number;
+    }
+  ): Promise<ActivationResult> {
+    const queryList = Array.isArray(queries) ? queries.filter(Boolean) : [queries];
+    if (queryList.length === 0) {
+      return { entries: [], query: "", totalActive: 0 };
+    }
+
+    // Use the last query as the display query — the plugin sends [segments..., fullMessage]
+    // so the last element is the most holistic representation of the user's intent.
+    // For a single string, queryList[0] === queryList[last], so this is always correct.
+    const primaryQuery = queryList[queryList.length - 1];
+
+    const maxResults = options?.limit ?? config.activation.maxResults;
+    const similarityThreshold = options?.threshold ?? config.activation.similarityThreshold;
+
     const entries = this.db.getActiveEntriesWithEmbeddings();
 
     if (entries.length === 0) {
-      return { entries: [], query, totalActive: 0 };
+      return { entries: [], query: primaryQuery, totalActive: 0 };
     }
 
-    // Embed the query
-    const queryEmbedding = await this.embeddings.embed(query);
+    // Embed all queries in a single batched API call
+    const queryEmbeddings = await this.embeddings.embedBatch(queryList);
 
     const now = Date.now();
     const DAY_MS = 1000 * 60 * 60 * 24;
 
-    // Compute similarity for all active entries
+    // Score each entry against ALL query vectors; keep its best similarity.
+    // This ensures a multi-topic message activates relevant entries for each topic.
     const scored = entries
       .map((entry) => {
-        const rawSimilarity = cosineSimilarity(queryEmbedding, entry.embedding);
+        const rawSimilarity = Math.max(
+          ...queryEmbeddings.map((qEmb) => cosineSimilarity(qEmb, entry.embedding))
+        );
         const ageDays = (now - entry.createdAt) / DAY_MS;
         const lastAccessedDaysAgo = (now - entry.lastAccessedAt) / DAY_MS;
 
@@ -68,9 +99,9 @@ export class ActivationEngine {
           },
         };
       })
-      .filter((s) => s.similarity >= config.activation.similarityThreshold)
+      .filter((s) => s.similarity >= similarityThreshold)
       .sort((a, b) => b.similarity - a.similarity)
-      .slice(0, config.activation.maxResults);
+      .slice(0, maxResults);
 
     // Record access for activated entries (reinforces their strength)
     for (const { entry } of scored) {
@@ -121,7 +152,7 @@ export class ActivationEngine {
         staleness,
         contradiction: contradictionMap.get(entry.id),
       })),
-      query,
+      query: primaryQuery,
       totalActive: entries.length,
     };
   }

@@ -117,11 +117,30 @@ export const KnowledgePlugin: Plugin = async (ctx) => {
           return;
         }
 
-        // Truncate to 500 chars for embedding — enough signal, avoids bloated URLs
-        const queryForEmbedding = queryText.slice(0, 500);
+        // Build a set of activation queries:
+        //   1. Per-line segments — each newline (shift+enter) is a topic boundary.
+        //      Short segments (< 20 chars) are skipped — they're usually connective
+        //      phrases, not substantive cues.
+        //   2. The full message as a holistic cue — captures overall intent that
+        //      no individual segment may express on its own.
+        // All queries are embedded in a single batched API call server-side.
+        // No truncation — let the embedding model handle long inputs natively.
+        const segments = queryText
+          .split("\n")
+          .map((s) => s.trim())
+          .filter((s) => s.length >= 20);
+
+        // Union: unique segments + full message (deduplicated if message == single segment).
+        // Trim queryText before dedup so a single-line message with leading/trailing
+        // whitespace doesn't appear twice (once trimmed as a segment, once raw).
+        const allQueries = [...new Set([...segments, queryText.trim()])];
+
+        const params = new URLSearchParams();
+        for (const q of allQueries) params.append("q", q);
+        params.set("limit", "5"); // passive injection: keep context budget tight
 
         const response = await fetch(
-          `${KNOWLEDGE_SERVER_URL}/activate?q=${encodeURIComponent(queryForEmbedding)}`,
+          `${KNOWLEDGE_SERVER_URL}/activate?${params.toString()}`,
           { signal: AbortSignal.timeout(5000) }
         );
 

@@ -443,8 +443,9 @@ describe("ActivationEngine — contradiction annotation on activated conflicted 
     db.insertEntry(makeEntry({ id: "side-b", content: "abc approach B", status: "active", embedding: emb }));
     db.applyContradictionResolution("irresolvable", "side-a", "side-b");
 
-    // Both are now conflicted — mock embeddings so activate() uses deterministic vectors
-    const embedSpy = spyOn(activation["embeddings"], "embed").mockResolvedValue(emb);
+    // Both are now conflicted — mock embedBatch so activate() uses deterministic vectors.
+    // activate() always calls embedBatch (even for a single string query).
+    const embedSpy = spyOn(activation["embeddings"], "embedBatch").mockResolvedValue([emb]);
 
     const result = await activation.activate("abc query");
 
@@ -477,7 +478,7 @@ describe("ActivationEngine — contradiction annotation on activated conflicted 
     db.applyContradictionResolution("irresolvable", "side-c", "side-d");
 
     // Query embedding == side-c's embedding (similarity 1.0 with side-c, 0.0 with side-d)
-    const embedSpy = spyOn(activation["embeddings"], "embed").mockResolvedValue(embC);
+    const embedSpy = spyOn(activation["embeddings"], "embedBatch").mockResolvedValue([embC]);
 
     const result = await activation.activate("abc query");
 
@@ -498,7 +499,7 @@ describe("ActivationEngine — contradiction annotation on activated conflicted 
     const emb = fakeEmbedding("abc");
     db.insertEntry(makeEntry({ id: "plain", content: "abc plain entry", status: "active", embedding: emb }));
 
-    const embedSpy = spyOn(activation["embeddings"], "embed").mockResolvedValue(emb);
+    const embedSpy = spyOn(activation["embeddings"], "embedBatch").mockResolvedValue([emb]);
 
     const result = await activation.activate("abc query");
 

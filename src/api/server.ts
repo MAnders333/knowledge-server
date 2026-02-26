@@ -50,13 +50,29 @@ export function createApp(
   // -- Activation --
 
   app.get("/activate", async (c) => {
-    const query = c.req.query("q");
-    if (!query) {
+    // Accept one or more `q` params (repeated: ?q=seg1&q=seg2&q=full).
+    // Single ?q=... still works — queries() returns a one-element array.
+    const queries = c.req.queries("q");
+    if (!queries || queries.length === 0) {
       return c.json({ error: "Missing query parameter 'q'" }, 400);
     }
 
+    // Optional overrides — callers (plugin, MCP) can tune per their needs.
+    // Defaults come from config so the server admin controls the baseline.
+    const limitParam = c.req.query("limit");
+    const thresholdParam = c.req.query("threshold");
+
+    const parsedLimit = limitParam ? parseInt(limitParam, 10) : NaN;
+    const limit = !isNaN(parsedLimit) ? Math.max(1, Math.min(50, parsedLimit)) : undefined;
+
+    const parsedThreshold = thresholdParam ? parseFloat(thresholdParam) : NaN;
+    const threshold = !isNaN(parsedThreshold) ? Math.max(0, Math.min(1, parsedThreshold)) : undefined;
+
     try {
-      const result = await activation.activate(query);
+      const result = await activation.activate(
+        queries.length === 1 ? queries[0] : queries,
+        { limit, threshold }
+      );
       return c.json(result);
     } catch (e) {
       console.error("[activate] Error:", e);
