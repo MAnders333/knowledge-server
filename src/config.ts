@@ -53,7 +53,7 @@ export const config = {
     // to this many additional times before throwing to the caller.
     // Retries use exponential backoff starting at retryBaseDelayMs.
     // Set to 0 to disable retries entirely.
-    maxRetries: Number.parseInt(process.env.LLM_MAX_RETRIES || "2", 10),
+    maxRetries: Math.max(0, Number.parseInt(process.env.LLM_MAX_RETRIES || "2", 10)),
     retryBaseDelayMs: Number.parseInt(process.env.LLM_RETRY_BASE_DELAY_MS || "3000", 10),
   },
 

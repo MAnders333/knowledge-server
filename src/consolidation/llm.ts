@@ -105,9 +105,10 @@ async function complete(
     } catch (err) {
       lastError = err;
       if (attempt < maxAttempts) {
-        const delay = retryBaseDelayMs * (2 ** (attempt - 1));
+        const delay = Math.min(retryBaseDelayMs * (2 ** (attempt - 1)), 60_000);
+        const errMsg = err instanceof Error ? err.stack ?? err.message : String(err);
         logger.warn(
-          `[llm] Call to ${modelString} failed on attempt ${attempt}/${maxAttempts} — retrying in ${delay / 1000}s. Error: ${err}`
+          `[llm] Call to ${modelString} failed on attempt ${attempt}/${maxAttempts} — retrying in ${delay / 1000}s. Error: ${errMsg}`
         );
         await new Promise((resolve) => setTimeout(resolve, delay));
       }
