@@ -31,7 +31,7 @@ PIDS=""
 while read -r pid; do
   [ -z "$pid" ] && continue
   cmdline=$(ps -p "$pid" -o args= 2>/dev/null || true)
-  if echo "$cmdline" | grep -qF "$PROJECT_DIR"; then
+  if echo "$cmdline" | grep -qF "$PROJECT_DIR/src/index.ts"; then
     PIDS="${PIDS}${pid}"$'\n'
   fi
 done <<< "$PORT_PIDS"
