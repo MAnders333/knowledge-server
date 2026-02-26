@@ -52,7 +52,7 @@ class Logger {
       try {
         mkdirSync(dirname(logPath), { recursive: true });
       } catch (err) {
-        process.stderr.write(`[logger] Could not create log directory for ${logPath}: ${err}\n`);
+        process.stderr.write(`[logger] Could not create log directory for ${logPath}: ${serialize(err)}\n`);
         this.logPath = "";
       }
     }
@@ -105,12 +105,15 @@ class Logger {
    * use rawStdoutOnly() instead so they are never persisted to disk.
    */
   raw(...args: unknown[]): void {
-    const message = args.map((a) => (typeof a === "string" ? a : String(a))).join(" ");
-    process.stdout.write(`${message}\n`);
+    // stdout: use String() for display fidelity (banner lines are always strings in practice)
+    const displayMessage = args.map((a) => (typeof a === "string" ? a : String(a))).join(" ");
+    process.stdout.write(`${displayMessage}\n`);
     if (this.logPath) {
+      // file: use serialize() so Errors and circular objects are represented faithfully
+      const fileMessage = args.map(serialize).join(" ");
       const ts = new Date().toISOString();
       try {
-        appendFileSync(this.logPath, `${ts} [INFO] ${message}\n`);
+        appendFileSync(this.logPath, `${ts} [INFO] ${fileMessage}\n`);
       } catch {
         process.stderr.write(`[logger] Failed to write to ${this.logPath}\n`);
       }
