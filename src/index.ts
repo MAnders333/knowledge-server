@@ -31,7 +31,7 @@ async function main() {
   // Validate config
   const errors = validateConfig();
   if (errors.length > 0) {
-    logger.error("\nConfiguration errors:");
+    logger.error("Configuration errors:");
     for (const err of errors) {
       logger.error(`  ✗ ${err}`);
     }
@@ -85,8 +85,8 @@ async function main() {
   logger.raw("  GET  /review          — Review entries");
   logger.raw("  GET  /status          — Health check");
   logger.raw("  GET  /entries         — List entries");
-  logger.raw(`\n  Admin token (keep this private): ${adminToken}`);
-  logger.raw(`  curl -X POST -H "Authorization: Bearer <token>" http://${config.host}:${config.port}/consolidate`);
+  logger.rawStdoutOnly(`\n  Admin token (keep this private): ${adminToken}`);
+  logger.rawStdoutOnly(`  curl -X POST -H "Authorization: Bearer <token>" http://${config.host}:${config.port}/consolidate`);
   if (config.logPath) {
     logger.raw(`\n  Logs: ${config.logPath}`);
   }
@@ -170,8 +170,8 @@ async function main() {
     process.exit(0);
   }
 
-  process.on("SIGINT", () => { shutdown("SIGINT").catch((e) => logger.error(e)); });
-  process.on("SIGTERM", () => { shutdown("SIGTERM").catch((e) => logger.error(e)); });
+  process.on("SIGINT", () => { shutdown("SIGINT").catch((e) => logger.error("[SIGINT] Unexpected shutdown error:", e)); });
+  process.on("SIGTERM", () => { shutdown("SIGTERM").catch((e) => logger.error("[SIGTERM] Unexpected shutdown error:", e)); });
 }
 
 main().catch((e) => {

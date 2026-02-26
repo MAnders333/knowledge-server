@@ -18,6 +18,8 @@ export const config = {
 
   // Log file — all operational output is tee'd here in addition to stdout.
   // Set KNOWLEDGE_LOG_PATH to override; set to "" to disable file logging.
+  // Uses ?? (not ||) so that KNOWLEDGE_LOG_PATH="" is respected as an explicit
+  // "disable" signal — || would treat "" as falsy and fall back to the default path.
   logPath:
     process.env.KNOWLEDGE_LOG_PATH ??
     join(homedir(), ".local", "share", "knowledge-server", "server.log"),
