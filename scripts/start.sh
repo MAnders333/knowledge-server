@@ -37,4 +37,4 @@ if [ -z "${LLM_API_KEY:-}" ] || [ "${LLM_API_KEY}" = "your-unified-endpoint-api-
   echo ""
 fi
 
-exec bun run src/index.ts
+exec bun run "$PROJECT_DIR/src/index.ts"
