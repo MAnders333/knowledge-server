@@ -45,7 +45,7 @@ async function main() {
         .max(50)
         .optional()
         .describe(
-          "Maximum number of entries to return (default: 10). Increase when broad topic recall is needed."
+          `Maximum number of entries to return (default: ${config.activation.maxResults}). Increase when broad topic recall is needed.`
         ),
       threshold: z
         .number()
