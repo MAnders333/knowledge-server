@@ -56,7 +56,7 @@ async function main() {
         const formatted = result.entries
           .map(
             (r, i) =>
-              `${i + 1}. [${r.entry.type}] ${r.entry.content}\n   Topics: ${r.entry.topics.join(", ")}\n   Confidence: ${r.entry.confidence} | Scope: ${r.entry.scope} | Relevance: ${r.similarity.toFixed(3)}`
+              `${i + 1}. [${r.entry.type}] ${r.entry.content}\n   Topics: ${r.entry.topics.join(", ")}\n   Confidence: ${r.entry.confidence} | Scope: ${r.entry.scope} | Semantic match: ${r.rawSimilarity.toFixed(3)} | Score: ${r.similarity.toFixed(3)}`
           )
           .join("\n\n");
 

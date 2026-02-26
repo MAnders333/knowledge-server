@@ -38,10 +38,15 @@ import type { KnowledgeEntry } from "../types.js";
  *     both bonuses ≈ 3.32
  *     effectiveHalfLife = 30 × 3.32 × 3.32 ≈ 331 days
  */
-export function computeStrength(entry: KnowledgeEntry): number {
-  const now = Date.now();
+/**
+ * @param nowMs - Current timestamp in milliseconds. Defaults to Date.now().
+ *   Pass an explicit value when scoring many entries in a loop so all entries
+ *   are measured against the same instant (avoids per-entry clock skew and
+ *   makes the function pure/testable).
+ */
+export function computeStrength(entry: KnowledgeEntry, nowMs = Date.now()): number {
   const daysSinceAccess =
-    (now - entry.lastAccessedAt) / (1000 * 60 * 60 * 24);
+    (nowMs - entry.lastAccessedAt) / (1000 * 60 * 60 * 24);
 
   // Base half-life in days (type-specific)
   const baseHalfLife =

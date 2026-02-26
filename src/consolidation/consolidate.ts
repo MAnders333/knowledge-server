@@ -204,13 +204,13 @@ export class ConsolidationEngine {
       );
 
       // Extract knowledge via LLM
+      const extractStart = Date.now();
       const extracted = await this.llm.extractKnowledge(
         chunkSummary,
         existingKnowledgeSummary
       );
-
       logger.log(
-        `[consolidation] Extracted ${extracted.length} knowledge entries from chunk.`
+        `[consolidation] Extracted ${extracted.length} knowledge entries from chunk in ${((Date.now() - extractStart) / 1000).toFixed(1)}s.`
       );
 
       // Reconsolidate each extracted entry against existing knowledge.
@@ -450,6 +450,7 @@ export class ConsolidationEngine {
       `[consolidation] Reconsolidation candidate (sim=${nearestSimilarity.toFixed(3)}): "${entry.content.slice(0, 60)}..." vs "${nearestEntry.content.slice(0, 60)}..."`
     );
 
+    const mergeStart = Date.now();
     const decision = await this.llm.decideMerge(
       {
         content: nearestEntry.content,
@@ -463,6 +464,9 @@ export class ConsolidationEngine {
         topics: entry.topics || [],
         confidence: entry.confidence,
       }
+    );
+    logger.log(
+      `[consolidation] decideMerge responded in ${((Date.now() - mergeStart) / 1000).toFixed(1)}s.`
     );
 
     switch (decision.action) {
@@ -529,7 +533,12 @@ export class ConsolidationEngine {
       source: entry.source || `consolidation ${new Date().toISOString().split("T")[0]}`,
       scope: entry.scope || "personal",
       status: "active",
-      strength: 1.0,
+      // Compute real initial strength rather than hardcoding 1.0.
+      // A new entry (obs=1, access=0, age=0) yields: strength = confidence × 1.0
+      // (no decay yet since lastAccessedAt = now), which is the correct starting value.
+      // This avoids a brief window where DB-stored strength=1.0 while the entry's
+      // actual confidence-adjusted strength is lower.
+      strength: 1.0, // placeholder — overwritten below once all fields are set
       createdAt: now,
       updatedAt: now,
       lastAccessedAt: now,
@@ -539,6 +548,11 @@ export class ConsolidationEngine {
       derivedFrom: sessionIds,
       embedding,
     };
+    // Overwrite placeholder with the real computed value now that all entry fields are set.
+    // Pass `now` explicitly: lastAccessedAt = now, so daysSinceAccess = 0 → decayFactor = 1.0
+    // and strength = confidence × 1.0 = confidence. This is the correct starting value —
+    // the old hardcoded 1.0 overstated strength for any entry with confidence < 1.0.
+    newEntry.strength = computeStrength(newEntry, now);
     this.db.insertEntry(newEntry);
     return newEntry;
   }
@@ -643,6 +657,7 @@ export class ConsolidationEngine {
 
       const validCandidateIds = new Set(midBandCandidates.map((c) => c.id));
 
+      const llmStart = Date.now();
       const results = await this.llm.detectAndResolveContradiction(
         {
           id: entry.id,
@@ -660,6 +675,9 @@ export class ConsolidationEngine {
           confidence: c.confidence,
           createdAt: c.createdAt,
         }))
+      );
+      logger.log(
+        `[contradiction] LLM responded in ${((Date.now() - llmStart) / 1000).toFixed(1)}s (${midBandCandidates.length} candidates).`
       );
 
       let entrySuperseded = false;

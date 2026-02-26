@@ -44,6 +44,17 @@ export const config = {
     extractionModel: process.env.LLM_EXTRACTION_MODEL || "anthropic/claude-sonnet-4-6",
     mergeModel: process.env.LLM_MERGE_MODEL || "anthropic/claude-haiku-4-5",
     contradictionModel: process.env.LLM_CONTRADICTION_MODEL || "anthropic/claude-sonnet-4-6",
+    // Per-call timeout in milliseconds. Applied per attempt (not across all retries).
+    // Default: 5 minutes. Large contradiction batches (50+ candidates) can take
+    // 2–3 minutes for a complex Sonnet response; 5 minutes gives headroom while
+    // still bounding a true hang (network stall, rate-limit loop, etc.).
+    timeoutMs: Number.parseInt(process.env.LLM_TIMEOUT_MS || String(5 * 60 * 1000), 10),
+    // Per-call retry budget. On timeout or transient error, complete() retries up
+    // to this many additional times before throwing to the caller.
+    // Retries use exponential backoff starting at retryBaseDelayMs.
+    // Set to 0 to disable retries entirely.
+    maxRetries: Number.parseInt(process.env.LLM_MAX_RETRIES || "2", 10),
+    retryBaseDelayMs: Number.parseInt(process.env.LLM_RETRY_BASE_DELAY_MS || "3000", 10),
   },
 
   // Embedding (always OpenAI-compatible, always through /openai/v1)
@@ -101,7 +112,9 @@ export const config = {
     // The passive plugin explicitly overrides this to 5 via ?limit=5 to keep
     // injected context tight. ACTIVATION_MAX_RESULTS overrides the server default.
     maxResults: Number.parseInt(process.env.ACTIVATION_MAX_RESULTS || "10", 10),
-    // Minimum strength-weighted cosine similarity to activate an entry.
+    // Minimum raw cosine similarity (NOT decay-weighted) to activate an entry.
+    // Filtering on rawSimilarity means entry age/staleness never prevents a
+    // semantically relevant entry from activating — decay only affects ranking.
     // 0.4 is more discriminating than the old 0.3 default — at 0.3, weakly
     // related entries fired too readily. 0.4 cuts noise while keeping
     // genuinely relevant entries (text-embedding-3-large at 0.4 is still a

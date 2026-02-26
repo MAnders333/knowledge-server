@@ -1,6 +1,7 @@
 import type { KnowledgeDB } from "../db/database.js";
 import { EmbeddingClient, cosineSimilarity, formatEmbeddingText } from "./embeddings.js";
 import { config } from "../config.js";
+import { computeStrength } from "../consolidation/decay.js";
 import type { ActivationResult, ContradictionAnnotation, KnowledgeEntry } from "../types.js";
 
 /**
@@ -87,18 +88,24 @@ export class ActivationEngine {
         const halfLife = config.decay.typeHalfLife[entry.type] || config.decay.typeHalfLife.fact;
         const mayBeStale = ageDays > halfLife && entry.accessCount < 3;
 
+        // Compute strength live at query time rather than relying on the DB-stored
+        // value, which is only updated during consolidation runs and may be stale
+        // by days or weeks between runs. Pass `now` so all entries in this batch
+        // are scored against the same instant (pure, no per-entry clock skew).
+        const liveStrength = computeStrength(entry, now);
+
         return {
           entry,
           // Threshold filtering uses raw cosine similarity so entry age never
           // prevents a semantically relevant entry from activating.
-          // Ranking uses raw similarity weighted by strength — well-consolidated
+          // Ranking uses raw similarity weighted by live strength — well-consolidated
           // entries sort higher, but stale entries still appear if they're on-topic.
           // The staleness signals in the response let the LLM reason about reliability.
           rawSimilarity,
-          similarity: rawSimilarity * entry.strength,
+          similarity: rawSimilarity * liveStrength,
           staleness: {
             ageDays: Math.round(ageDays),
-            strength: entry.strength,
+            strength: liveStrength,
             lastAccessedDaysAgo: Math.round(lastAccessedDaysAgo),
             mayBeStale,
           },
@@ -151,9 +158,10 @@ export class ActivationEngine {
     }
 
     return {
-      entries: scored.map(({ entry, similarity, staleness }) => ({
+      entries: scored.map(({ entry, rawSimilarity, similarity, staleness }) => ({
         entry: { ...entry, embedding: undefined } as KnowledgeEntry,
         similarity,
+        rawSimilarity,
         staleness,
         contradiction: contradictionMap.get(entry.id),
       })),

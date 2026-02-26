@@ -161,6 +161,9 @@ export interface ContradictionAnnotation {
 export interface ActivationResult {
   entries: Array<{
     entry: KnowledgeEntry;
+    /** Pure cosine similarity between query and entry embedding. Reflects semantic match quality. */
+    rawSimilarity: number;
+    /** Decay-weighted ranking score: rawSimilarity × strength. Used for sorting. */
     similarity: number;
     staleness: {
       ageDays: number;

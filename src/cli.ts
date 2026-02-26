@@ -76,7 +76,7 @@ Commands:
             `\n  [${r.entry.type}] ${r.entry.content}`
           );
           console.log(
-            `  Similarity: ${r.similarity.toFixed(3)} | Topics: ${r.entry.topics.join(", ")}`
+            `  Semantic match: ${r.rawSimilarity.toFixed(3)} | Score: ${r.similarity.toFixed(3)} | Topics: ${r.entry.topics.join(", ")}`
           );
         }
         break;

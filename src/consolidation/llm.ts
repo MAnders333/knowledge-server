@@ -62,6 +62,16 @@ function createModel(modelString: string) {
 
 /**
  * Send a prompt to a specific model. All LLM calls go through here.
+ *
+ * Resilience:
+ * - Hard per-attempt timeout via AbortSignal (config.llm.timeoutMs, default 5 min).
+ *   A warning is logged the moment the timeout fires, making hung calls immediately
+ *   visible in the log rather than leaving a silent gap.
+ * - Automatic retry with exponential backoff (config.llm.maxRetries, default 2).
+ *   Retries on any error (timeout, network error, 5xx) so a transient upstream
+ *   stall doesn't fail the whole consolidation chunk.
+ * - On final failure after all retries, throws so the chunk-level error handler
+ *   in consolidate.ts can decide whether to skip or abort the run.
  */
 async function complete(
   modelString: string,
@@ -69,14 +79,47 @@ async function complete(
   userPrompt: string,
   maxTokens = 8192
 ): Promise<string> {
-  const { text } = await generateText({
-    model: createModel(modelString),
-    system: systemPrompt,
-    prompt: userPrompt,
-    temperature: 0.2,
-    maxOutputTokens: maxTokens,
-  });
-  return text;
+  const { timeoutMs, maxRetries, retryBaseDelayMs } = config.llm;
+  const maxAttempts = 1 + maxRetries;
+
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      logger.warn(
+        `[llm] Call to ${modelString} exceeded ${timeoutMs / 1000}s timeout on attempt ${attempt}/${maxAttempts} — aborting.`
+      );
+      controller.abort();
+    }, timeoutMs);
+
+    try {
+      const { text } = await generateText({
+        model: createModel(modelString),
+        system: systemPrompt,
+        prompt: userPrompt,
+        temperature: 0.2,
+        maxOutputTokens: maxTokens,
+        abortSignal: controller.signal,
+      });
+      return text;
+    } catch (err) {
+      lastError = err;
+      if (attempt < maxAttempts) {
+        const delay = retryBaseDelayMs * (2 ** (attempt - 1));
+        logger.warn(
+          `[llm] Call to ${modelString} failed on attempt ${attempt}/${maxAttempts} — retrying in ${delay / 1000}s. Error: ${err}`
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  logger.error(
+    `[llm] Call to ${modelString} failed after ${maxAttempts} attempt(s) — giving up.`
+  );
+  throw lastError;
 }
 
 /**
