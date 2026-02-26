@@ -5,8 +5,8 @@ import { join } from "node:path";
 /**
  * Parse an integer environment variable with a fallback default and optional
  * minimum clamp. Returns `defaultVal` when the variable is absent, empty, or
- * not a valid integer — NaN-safe, because `Math.max(min, NaN)` returns NaN and
- * would silently bypass the clamp.
+ * not a valid integer. NaN-safe: the `Number.isNaN` guard on line 13 ensures NaN
+ * never reaches `Math.max` — an invalid string always yields `defaultVal`, never NaN.
  */
 function parseIntEnv(envVar: string | undefined, defaultVal: number, min?: number): number {
   const parsed = Number.parseInt(envVar ?? "", 10);
@@ -89,6 +89,8 @@ export const config = {
     // (ada-002, Ollama, etc.) causes a 400 error.
     // Validated in validateConfig() — a non-positive integer is rejected at startup
     // rather than silently forwarded to the API causing a confusing 400.
+    // Note: "0" is intentionally falsy here so the ternary gives undefined for that
+    // case too; validateConfig() checks the raw env var and catches it as an error.
     dimensions: process.env.EMBEDDING_DIMENSIONS
       ? parseIntEnv(process.env.EMBEDDING_DIMENSIONS, 1, 1)
       : undefined,
@@ -96,7 +98,7 @@ export const config = {
 
   // Decay parameters
   decay: {
-    archiveThreshold: parseFloatEnv(process.env.DECAY_ARCHIVE_THRESHOLD, 0.15),
+    archiveThreshold: parseFloatEnv(process.env.DECAY_ARCHIVE_THRESHOLD, 0.15, 0),
     tombstoneAfterDays: parseIntEnv(process.env.DECAY_TOMBSTONE_DAYS, 180, 1),
     // Type-specific decay rates (higher = slower decay)
     typeHalfLife: {
@@ -117,7 +119,7 @@ export const config = {
     // Entries above RECONSOLIDATION_THRESHOLD (0.82) are already handled by decideMerge.
     // Entries below contradictionMinSimilarity are too dissimilar to plausibly contradict.
     // The band in between gets the contradiction LLM call.
-    contradictionMinSimilarity: parseFloatEnv(process.env.CONTRADICTION_MIN_SIMILARITY, 0.4),
+    contradictionMinSimilarity: parseFloatEnv(process.env.CONTRADICTION_MIN_SIMILARITY, 0.4, 0),
   },
 
   // Activation
@@ -134,7 +136,7 @@ export const config = {
     // related entries fired too readily. 0.4 cuts noise while keeping
     // genuinely relevant entries (text-embedding-3-large at 0.4 is still a
     // meaningful topical match).
-    similarityThreshold: parseFloatEnv(process.env.ACTIVATION_SIMILARITY_THRESHOLD, 0.4),
+    similarityThreshold: parseFloatEnv(process.env.ACTIVATION_SIMILARITY_THRESHOLD, 0.4, 0),
   },
 } as const;
 
