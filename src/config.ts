@@ -135,11 +135,10 @@ export const config = {
     // Minimum raw cosine similarity (NOT decay-weighted) to activate an entry.
     // Filtering on rawSimilarity means entry age/staleness never prevents a
     // semantically relevant entry from activating — decay only affects ranking.
-    // 0.4 is more discriminating than the old 0.3 default — at 0.3, weakly
-    // related entries fired too readily. 0.4 cuts noise while keeping
-    // genuinely relevant entries (text-embedding-3-large at 0.4 is still a
-    // meaningful topical match).
-    similarityThreshold: parseFloatEnv(process.env.ACTIVATION_SIMILARITY_THRESHOLD, 0.4),
+    // 0.35 balances recall vs. noise for text-embedding-3-large: at 0.4 genuine
+    // topical matches (raw ~0.37–0.39) were silently dropped; at 0.3 weakly
+    // related entries fired too readily. 0.35 is the calibrated middle ground.
+    similarityThreshold: parseFloatEnv(process.env.ACTIVATION_SIMILARITY_THRESHOLD, 0.35),
   },
 } as const;
 

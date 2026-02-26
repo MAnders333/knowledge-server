@@ -37,11 +37,28 @@ async function main() {
         .describe(
           "One or more cues to activate associated knowledge. Can be a question, topic description, or comma-separated keywords. Example: 'churn analysis, segment X, onboarding'"
         ),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(50)
+        .optional()
+        .describe(
+          "Maximum number of entries to return (default: 10). Increase when broad topic recall is needed."
+        ),
+      threshold: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .describe(
+          "Minimum cosine similarity score to include an entry (default: server default, currently 0.35). Lower to cast a wider net (e.g. 0.25), raise to require a tighter match (e.g. 0.45)."
+        ),
     },
-    async ({ cues }) => {
+    async ({ cues, limit, threshold }) => {
       try {
         // MCP is deliberate active recall — allow more results than passive injection.
-        const result = await activation.activate(cues, { limit: 10 });
+        const result = await activation.activate(cues, { limit: limit ?? 10, threshold });
 
         if (result.entries.length === 0) {
           return {
