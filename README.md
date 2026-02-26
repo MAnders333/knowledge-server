@@ -8,7 +8,9 @@ Reads your OpenCode session history, extracts what's worth keeping into a local 
 
 The basic problem with agent memory is that naive approaches store everything and retrieve too much — the context window fills with loosely-related facts, and the store grows without bound.
 
-This system takes a different approach, with three properties that distinguish it from a simple write-everything/retrieve-top-k store:
+The design is loosely inspired by how human memory handles the same problem. Episodic memory (what happened in a session) and semantic memory (what you actually know) are distinct. The brain doesn't store episodes wholesale — it consolidates them, extracting what's worth encoding into long-term memory and discarding the rest. Retrieval is also cue-dependent: memories don't surface proactively, they activate in response to context.
+
+That's the rough model here. Three properties follow from it:
 
 **High extraction bar.** The LLM reads session transcripts and asks whether each thing learned would still be useful months from now. Most sessions produce nothing. The store only grows when something genuinely new was established — a confirmed fact, a decision made, a procedure that worked.
 
