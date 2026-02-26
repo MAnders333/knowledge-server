@@ -2,9 +2,31 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+/**
+ * Parse an integer environment variable with a fallback default and optional
+ * minimum clamp. Returns `defaultVal` when the variable is absent, empty, or
+ * not a valid integer (NaN-safe — `parseInt("abc")` returns `NaN` which would
+ * silently pass through `Math.max` as `NaN`).
+ */
+function parseIntEnv(envVar: string | undefined, defaultVal: number, min?: number): number {
+  const parsed = Number.parseInt(envVar ?? "", 10);
+  const value = Number.isNaN(parsed) ? defaultVal : parsed;
+  return min !== undefined ? Math.max(min, value) : value;
+}
+
+/**
+ * Parse a float environment variable with a fallback default and optional
+ * minimum clamp. NaN-safe for the same reason as parseIntEnv.
+ */
+function parseFloatEnv(envVar: string | undefined, defaultVal: number, min?: number): number {
+  const parsed = Number.parseFloat(envVar ?? "");
+  const value = Number.isNaN(parsed) ? defaultVal : parsed;
+  return min !== undefined ? Math.max(min, value) : value;
+}
+
 export const config = {
   // Server
-  port: Number.parseInt(process.env.KNOWLEDGE_PORT || "3179", 10),
+  port: parseIntEnv(process.env.KNOWLEDGE_PORT, 3179),
   host: process.env.KNOWLEDGE_HOST || "127.0.0.1",
   // Optional fixed admin token — set KNOWLEDGE_ADMIN_TOKEN to use a stable token
   // instead of a random one generated at startup. Useful for scripted/automated use.
@@ -48,13 +70,14 @@ export const config = {
     // Default: 5 minutes. Large contradiction batches (50+ candidates) can take
     // 2–3 minutes for a complex Sonnet response; 5 minutes gives headroom while
     // still bounding a true hang (network stall, rate-limit loop, etc.).
-    timeoutMs: Math.max(1, Number.parseInt(process.env.LLM_TIMEOUT_MS || String(5 * 60 * 1000), 10)),
+    // Minimum 1 ms enforced — set a high value rather than 0 to effectively disable.
+    timeoutMs: parseIntEnv(process.env.LLM_TIMEOUT_MS, 5 * 60 * 1000, 1),
     // Per-call retry budget. On timeout or transient error, complete() retries up
     // to this many additional times before throwing to the caller.
-    // Retries use exponential backoff starting at retryBaseDelayMs.
+    // Retries use exponential backoff starting at retryBaseDelayMs (capped at 60s).
     // Set to 0 to disable retries entirely.
-    maxRetries: Math.max(0, Number.parseInt(process.env.LLM_MAX_RETRIES || "2", 10)),
-    retryBaseDelayMs: Math.max(0, Number.parseInt(process.env.LLM_RETRY_BASE_DELAY_MS || "3000", 10)),
+    maxRetries: parseIntEnv(process.env.LLM_MAX_RETRIES, 2, 0),
+    retryBaseDelayMs: parseIntEnv(process.env.LLM_RETRY_BASE_DELAY_MS, 3000, 0),
   },
 
   // Embedding (always OpenAI-compatible, always through /openai/v1)
@@ -65,18 +88,14 @@ export const config = {
     // only valid for text-embedding-3-* models; sending it to other models
     // (ada-002, Ollama, etc.) causes a 400 error.
     dimensions: process.env.EMBEDDING_DIMENSIONS
-      ? Number.parseInt(process.env.EMBEDDING_DIMENSIONS, 10)
+      ? parseIntEnv(process.env.EMBEDDING_DIMENSIONS, 0)
       : undefined,
   },
 
   // Decay parameters
   decay: {
-    archiveThreshold: Number.parseFloat(
-      process.env.DECAY_ARCHIVE_THRESHOLD || "0.15"
-    ),
-    tombstoneAfterDays: Number.parseInt(
-      process.env.DECAY_TOMBSTONE_DAYS || "180", 10
-    ),
+    archiveThreshold: parseFloatEnv(process.env.DECAY_ARCHIVE_THRESHOLD, 0.15),
+    tombstoneAfterDays: parseIntEnv(process.env.DECAY_TOMBSTONE_DAYS, 180),
     // Type-specific decay rates (higher = slower decay)
     typeHalfLife: {
       fact: 30, // facts go stale in ~30 days
@@ -89,20 +108,14 @@ export const config = {
 
   // Consolidation
   consolidation: {
-    chunkSize: Number.parseInt(process.env.CONSOLIDATION_CHUNK_SIZE || "10", 10),
-    maxSessionsPerRun: Number.parseInt(
-      process.env.CONSOLIDATION_MAX_SESSIONS || "50", 10
-    ),
-    minSessionMessages: Number.parseInt(
-      process.env.CONSOLIDATION_MIN_MESSAGES || "4", 10
-    ),
+    chunkSize: parseIntEnv(process.env.CONSOLIDATION_CHUNK_SIZE, 10),
+    maxSessionsPerRun: parseIntEnv(process.env.CONSOLIDATION_MAX_SESSIONS, 50),
+    minSessionMessages: parseIntEnv(process.env.CONSOLIDATION_MIN_MESSAGES, 4),
     // Similarity band for post-extraction contradiction scan.
     // Entries above RECONSOLIDATION_THRESHOLD (0.82) are already handled by decideMerge.
     // Entries below contradictionMinSimilarity are too dissimilar to plausibly contradict.
     // The band in between gets the contradiction LLM call.
-    contradictionMinSimilarity: Number.parseFloat(
-      process.env.CONTRADICTION_MIN_SIMILARITY || "0.4"
-    ),
+    contradictionMinSimilarity: parseFloatEnv(process.env.CONTRADICTION_MIN_SIMILARITY, 0.4),
   },
 
   // Activation
@@ -111,7 +124,7 @@ export const config = {
     // Default is 10 — a generous ceiling for the MCP tool (deliberate active recall).
     // The passive plugin explicitly overrides this to 5 via ?limit=5 to keep
     // injected context tight. ACTIVATION_MAX_RESULTS overrides the server default.
-    maxResults: Number.parseInt(process.env.ACTIVATION_MAX_RESULTS || "10", 10),
+    maxResults: parseIntEnv(process.env.ACTIVATION_MAX_RESULTS, 10),
     // Minimum raw cosine similarity (NOT decay-weighted) to activate an entry.
     // Filtering on rawSimilarity means entry age/staleness never prevents a
     // semantically relevant entry from activating — decay only affects ranking.
@@ -119,9 +132,7 @@ export const config = {
     // related entries fired too readily. 0.4 cuts noise while keeping
     // genuinely relevant entries (text-embedding-3-large at 0.4 is still a
     // meaningful topical match).
-    similarityThreshold: Number.parseFloat(
-      process.env.ACTIVATION_SIMILARITY_THRESHOLD || "0.4"
-    ),
+    similarityThreshold: parseFloatEnv(process.env.ACTIVATION_SIMILARITY_THRESHOLD, 0.4),
   },
 } as const;
 
