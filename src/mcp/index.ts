@@ -4,6 +4,7 @@ import { z } from "zod";
 import { KnowledgeDB } from "../db/database.js";
 import { ActivationEngine } from "../activation/activate.js";
 import { staleTag, contradictionTagBlock } from "../activation/format.js";
+import { config } from "../config.js";
 // @ts-ignore — Bun supports JSON imports natively
 import pkg from "../../package.json" with { type: "json" };
 
@@ -52,13 +53,13 @@ async function main() {
         .max(1)
         .optional()
         .describe(
-          "Minimum cosine similarity score to include an entry (default: server default, currently 0.35). Lower to cast a wider net (e.g. 0.25), raise to require a tighter match (e.g. 0.45)."
+          `Minimum cosine similarity score to include an entry (default: ${config.activation.similarityThreshold}). Lower to cast a wider net (e.g. 0.25), raise to require a tighter match (e.g. 0.45).`
         ),
     },
     async ({ cues, limit, threshold }) => {
       try {
         // MCP is deliberate active recall — allow more results than passive injection.
-        const result = await activation.activate(cues, { limit: limit ?? 10, threshold });
+        const result = await activation.activate(cues, { limit: limit ?? config.activation.maxResults, threshold });
 
         if (result.entries.length === 0) {
           return {
