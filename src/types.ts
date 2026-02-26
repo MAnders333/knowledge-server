@@ -62,7 +62,8 @@ export interface KnowledgeEntry {
   createdAt: number; // unix timestamp ms
   updatedAt: number;
   lastAccessedAt: number;
-  accessCount: number;
+  accessCount: number; // retrieval-only: incremented on activate, never during consolidation
+  observationCount: number; // evidence-only: incremented on keep/update/insert, never on activate
 
   // Provenance
   supersededBy: string | null;

@@ -466,11 +466,12 @@ export class ConsolidationEngine {
 
     switch (decision.action) {
       case "keep":
-        // The same knowledge surfaced again in a new session — reinforce it.
-        // This resets last_accessed_at (decay restarts from now) and increments
-        // access_count (grows the access bonus, permanently slowing future decay).
-        // Mirrors the cognitive science principle: repeated exposure strengthens memory.
-        this.db.recordAccess(nearestEntry.id);
+        // The same knowledge surfaced again in a new episode — reinforce it as evidence.
+        // This increments observation_count (the evidence signal that extends half-life)
+        // and resets last_accessed_at so decay restarts from now.
+        // We use reinforceObservation rather than recordAccess — this is not a retrieval
+        // event; it's confirmation that the knowledge is still true.
+        this.db.reinforceObservation(nearestEntry.id);
         console.log(`[consolidation] Keep existing (reinforced): "${nearestEntry.content.slice(0, 60)}..."`);
         callbacks.onKeep();
         break;
@@ -532,6 +533,7 @@ export class ConsolidationEngine {
       updatedAt: now,
       lastAccessedAt: now,
       accessCount: 0,
+      observationCount: 1,
       supersededBy: null,
       derivedFrom: sessionIds,
       embedding,

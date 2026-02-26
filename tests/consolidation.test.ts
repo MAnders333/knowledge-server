@@ -32,6 +32,7 @@ function makeEntry(overrides: Partial<Parameters<KnowledgeDB["insertEntry"]>[0]>
     updatedAt: now,
     lastAccessedAt: now,
     accessCount: 0,
+    observationCount: 1,
     supersededBy: null,
     derivedFrom: [],
     ...overrides,

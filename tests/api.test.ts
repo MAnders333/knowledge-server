@@ -83,6 +83,7 @@ describe("HTTP API", () => {
       updatedAt: now,
       lastAccessedAt: now,
       accessCount: 0,
+      observationCount: 1,
       supersededBy: null,
       derivedFrom: [],
     });
@@ -111,6 +112,7 @@ describe("HTTP API", () => {
       updatedAt: now,
       lastAccessedAt: now,
       accessCount: 0,
+      observationCount: 1,
       supersededBy: null,
       derivedFrom: [],
     });
@@ -140,6 +142,7 @@ describe("HTTP API", () => {
       updatedAt: now,
       lastAccessedAt: now,
       accessCount: 0,
+      observationCount: 1,
       supersededBy: null,
       derivedFrom: [],
     });

@@ -6,38 +6,13 @@
  * - Timestamps in unix milliseconds (consistent with OpenCode)
  * - Topics stored as JSON array (queryable via json_each)
  * - Derived-from stored as JSON array of session/entry IDs (provenance chain)
+ *
+ * v5: Added observation_count — evidence signal (how many episodes produced this
+ * knowledge), kept separate from access_count (retrieval signal). Removed all
+ * migration code — single clean schema, DB is reinitialized on upgrade.
  */
 
-export const SCHEMA_VERSION = 4;
-
-/**
- * DDL for the consolidated_episode table (v3 schema).
- * Exported as a standalone constant so the runtime migration in database.ts
- * can reference the same definition — preventing the two copies from drifting.
- *
- * An episode is uniquely identified by (session_id, start_message_id, end_message_id).
- * Message IDs are stable UUIDs from the OpenCode DB — they never shift even as a
- * session grows with new messages, unlike the old segment_index approach where
- * token-chunk boundaries could move when new messages were appended.
- *
- * This allows running consolidate() twice in the same session:
- *   1st run: records episodes up to the last message at that point
- *   2nd run: only new messages (after the last processed end_message_id) are picked up
- */
-export const CONSOLIDATED_EPISODE_DDL = `
-  CREATE TABLE IF NOT EXISTS consolidated_episode (
-    session_id       TEXT    NOT NULL,
-    start_message_id TEXT    NOT NULL,       -- first message ID in this episode (inclusive)
-    end_message_id   TEXT    NOT NULL,       -- last message ID in this episode (inclusive)
-    content_type     TEXT    NOT NULL,       -- 'compaction_summary' | 'messages'
-    processed_at     INTEGER NOT NULL,       -- unix ms when this episode was consolidated
-    entries_created  INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (session_id, start_message_id, end_message_id)
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_episode_session ON consolidated_episode(session_id);
-  CREATE INDEX IF NOT EXISTS idx_episode_processed ON consolidated_episode(processed_at);
-`;
+export const SCHEMA_VERSION = 5;
 
 export const CREATE_TABLES = `
   -- Schema version tracking
@@ -63,6 +38,7 @@ export const CREATE_TABLES = `
     updated_at INTEGER NOT NULL,
     last_accessed_at INTEGER NOT NULL,
     access_count INTEGER NOT NULL DEFAULT 0,
+    observation_count INTEGER NOT NULL DEFAULT 1,
     
     -- Provenance
     superseded_by TEXT,
@@ -99,22 +75,26 @@ export const CREATE_TABLES = `
   CREATE TABLE IF NOT EXISTS consolidation_state (
     id INTEGER PRIMARY KEY DEFAULT 1 CHECK(id = 1),  -- singleton row
     last_consolidated_at INTEGER NOT NULL DEFAULT 0,
-    last_message_time_created INTEGER NOT NULL DEFAULT 0,  -- max message.time_created processed (v4 cursor)
-    last_message_cursor_seeded INTEGER NOT NULL DEFAULT 0,  -- v4 migration sentinel; 1 = seed complete
+    last_message_time_created INTEGER NOT NULL DEFAULT 0,
     total_sessions_processed INTEGER NOT NULL DEFAULT 0,
     total_entries_created INTEGER NOT NULL DEFAULT 0,
     total_entries_updated INTEGER NOT NULL DEFAULT 0
   );
 
-  -- Initialize consolidation state if not present.
-  -- Only include base columns here — v2/v4 columns (total_entries_updated,
-  -- last_message_time_created, last_message_cursor_seeded) are added by
-  -- runMigrations() after CREATE_TABLES runs. Referencing them here would
-  -- cause a SQLiteError on existing pre-migration databases.
-  INSERT OR IGNORE INTO consolidation_state (id, last_consolidated_at, total_sessions_processed, total_entries_created)
-  VALUES (1, 0, 0, 0);
+  INSERT OR IGNORE INTO consolidation_state (id, last_consolidated_at, last_message_time_created, total_sessions_processed, total_entries_created, total_entries_updated)
+  VALUES (1, 0, 0, 0, 0, 0);
 
   -- Per-episode processing log — enables incremental within-session consolidation.
-  -- See CONSOLIDATED_EPISODE_DDL for the table definition (shared with the v3 migration).
-  ${CONSOLIDATED_EPISODE_DDL}
+  CREATE TABLE IF NOT EXISTS consolidated_episode (
+    session_id       TEXT    NOT NULL,
+    start_message_id TEXT    NOT NULL,
+    end_message_id   TEXT    NOT NULL,
+    content_type     TEXT    NOT NULL,
+    processed_at     INTEGER NOT NULL,
+    entries_created  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, start_message_id, end_message_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_episode_session ON consolidated_episode(session_id);
+  CREATE INDEX IF NOT EXISTS idx_episode_processed ON consolidated_episode(processed_at);
 `;

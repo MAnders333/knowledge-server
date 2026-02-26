@@ -41,6 +41,7 @@ describe("KnowledgeDB", () => {
       updatedAt: now,
       lastAccessedAt: now,
       accessCount: 0,
+      observationCount: 1,
       supersededBy: null,
       derivedFrom: ["session-123"],
     });
@@ -69,6 +70,7 @@ describe("KnowledgeDB", () => {
       updatedAt: now,
       lastAccessedAt: now,
       accessCount: 0,
+      observationCount: 1,
       supersededBy: null,
       derivedFrom: [],
     });
@@ -103,6 +105,7 @@ describe("KnowledgeDB", () => {
       updatedAt: now,
       lastAccessedAt: now,
       accessCount: 0,
+      observationCount: 1,
       supersededBy: null,
       derivedFrom: [],
     });
@@ -132,6 +135,7 @@ describe("KnowledgeDB", () => {
       updatedAt: now,
       lastAccessedAt: now,
       accessCount: 0,
+      observationCount: 1,
       supersededBy: null,
       derivedFrom: [],
     });
@@ -165,6 +169,7 @@ describe("KnowledgeDB", () => {
       updatedAt: now,
       lastAccessedAt: now,
       accessCount: 0,
+      observationCount: 1,
       supersededBy: null,
       derivedFrom: [],
       embedding,
@@ -249,6 +254,7 @@ describe("KnowledgeDB", () => {
       updatedAt: now,
       lastAccessedAt: now,
       accessCount: 0,
+      observationCount: 1,
       supersededBy: null,
       derivedFrom: [],
     });
@@ -286,6 +292,7 @@ describe("KnowledgeDB", () => {
       updatedAt: now,
       lastAccessedAt: now,
       accessCount: 0,
+      observationCount: 1,
       supersededBy: null,
       derivedFrom: [],
     });
