@@ -185,7 +185,9 @@ export const KnowledgePlugin: Plugin = async (ctx) => {
         // The plugin runs as a single symlinked file and cannot import from
         // src/ at runtime. The canonical implementations live in format.ts
         // and the parity tests in tests/format.test.ts will fail if this
-        // copy drifts. CONFLICT_TRUNCATE_LEN = 100 (from format.ts).
+        // copy drifts.
+        // See CONFLICT_TRUNCATE_LEN in src/activation/format.ts (currently 100)
+        // for the snippet truncation limit — update the literal below if it changes.
         const knowledgeLines = result.entries
           .map((r) => {
             const staleTag = r.staleness.mayBeStale
