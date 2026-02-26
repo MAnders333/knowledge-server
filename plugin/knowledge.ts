@@ -186,7 +186,7 @@ export const KnowledgePlugin: Plugin = async (ctx) => {
               ? ` [may be outdated — last accessed ${r.staleness.lastAccessedDaysAgo}d ago]`
               : "";
             const contradictionTag = r.contradiction
-              ? ` [CONFLICTED — conflicts with: "${r.contradiction.conflictingContent.slice(0, 80)}…". ${r.contradiction.caveat}]`
+              ? ` [CONFLICTED — conflicts with: "${r.contradiction.conflictingContent.length > 100 ? `${r.contradiction.conflictingContent.slice(0, 100)}…` : r.contradiction.conflictingContent}". ${r.contradiction.caveat}]`
               : "";
             return `- [${r.entry.type}] ${r.entry.content}${staleTag}${contradictionTag}`;
           })

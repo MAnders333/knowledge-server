@@ -59,7 +59,7 @@ async function main() {
               ? ` [may be outdated — last accessed ${r.staleness.lastAccessedDaysAgo}d ago]`
               : "";
             const contradictionTag = r.contradiction
-              ? `\n   ⚠ CONFLICTED — conflicts with: "${r.contradiction.conflictingContent.slice(0, 100)}…"\n   Caveat: ${r.contradiction.caveat}`
+              ? `\n   ⚠ CONFLICTED — conflicts with: "${r.contradiction.conflictingContent.length > 100 ? `${r.contradiction.conflictingContent.slice(0, 100)}…` : r.contradiction.conflictingContent}"\n   Caveat: ${r.contradiction.caveat}`
               : "";
             return (
               `${i + 1}. [${r.entry.type}] ${r.entry.content}${staleTag}${contradictionTag}\n` +
