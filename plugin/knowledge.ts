@@ -158,11 +158,18 @@ export const KnowledgePlugin: Plugin = async (ctx) => {
               confidence: number;
               scope: string;
             };
+            rawSimilarity: number;
             similarity: number;
             staleness: {
               ageDays: number;
               strength: number;
+              lastAccessedDaysAgo: number;
               mayBeStale: boolean;
+            };
+            contradiction?: {
+              conflictingEntryId: string;
+              conflictingContent: string;
+              caveat: string;
             };
           }>;
         };
@@ -175,14 +182,19 @@ export const KnowledgePlugin: Plugin = async (ctx) => {
         // Format activated knowledge as an injected context part
         const knowledgeLines = result.entries
           .map((r) => {
-            const staleTag = r.staleness.mayBeStale ? " [may be outdated]" : "";
-            return `- [${r.entry.type}] ${r.entry.content}${staleTag}`;
+            const staleTag = r.staleness.mayBeStale
+              ? ` [may be outdated — last accessed ${r.staleness.lastAccessedDaysAgo}d ago]`
+              : "";
+            const contradictionTag = r.contradiction
+              ? ` [CONFLICTED — conflicts with: "${r.contradiction.conflictingContent.slice(0, 80)}…". ${r.contradiction.caveat}]`
+              : "";
+            return `- [${r.entry.type}] ${r.entry.content}${staleTag}${contradictionTag}`;
           })
           .join("\n");
 
         const contextText = [
           "## Recalled Knowledge (from prior sessions)",
-          "Use what is relevant. Verify entries marked [may be outdated] before relying on them.",
+          "Use what is relevant. Verify entries marked [may be outdated] before relying on them. Do NOT act on entries marked [CONFLICTED] without first clarifying which version is correct.",
           "",
           knowledgeLines,
         ].join("\n");
@@ -215,12 +227,15 @@ export const KnowledgePlugin: Plugin = async (ctx) => {
         if (!response.ok) return;
 
         const status = (await response.json()) as {
-          knowledge?: { active?: number };
+          knowledge?: { active?: number; conflicted?: number };
         };
 
         if (status.knowledge?.active && status.knowledge.active > 0) {
+          const conflictNote = status.knowledge.conflicted && status.knowledge.conflicted > 0
+            ? ` ${status.knowledge.conflicted} entries have unresolved conflicts — treat those entries with caution if they appear in recalled knowledge.`
+            : "";
           output.context.push(
-            `## Knowledge System\nA knowledge server is running with ${status.knowledge.active} active knowledge entries. These are automatically injected based on user queries -- no manual retrieval needed.`
+            `## Knowledge System\nA knowledge server is running with ${status.knowledge.active} active knowledge entries. These are automatically injected based on user queries — no manual retrieval needed.${conflictNote}`
           );
         }
       } catch {

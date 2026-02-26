@@ -54,17 +54,30 @@ async function main() {
         }
 
         const formatted = result.entries
-          .map(
-            (r, i) =>
-              `${i + 1}. [${r.entry.type}] ${r.entry.content}\n   Topics: ${r.entry.topics.join(", ")}\n   Confidence: ${r.entry.confidence} | Scope: ${r.entry.scope} | Semantic match: ${r.rawSimilarity.toFixed(3)} | Score: ${r.similarity.toFixed(3)}`
-          )
+          .map((r, i) => {
+            const staleTag = r.staleness.mayBeStale
+              ? ` [may be outdated — last accessed ${r.staleness.lastAccessedDaysAgo}d ago]`
+              : "";
+            const contradictionTag = r.contradiction
+              ? `\n   ⚠ CONFLICTED — conflicts with: "${r.contradiction.conflictingContent.slice(0, 100)}…"\n   Caveat: ${r.contradiction.caveat}`
+              : "";
+            return (
+              `${i + 1}. [${r.entry.type}] ${r.entry.content}${staleTag}${contradictionTag}\n` +
+              `   Topics: ${r.entry.topics.join(", ")}\n` +
+              `   Confidence: ${r.entry.confidence} | Scope: ${r.entry.scope} | Semantic match: ${r.rawSimilarity.toFixed(3)} | Score: ${r.similarity.toFixed(3)}`
+            );
+          })
           .join("\n\n");
 
+        const conflictCount = result.entries.filter((r) => r.contradiction).length;
+        const conflictNote = conflictCount > 0
+          ? ` — ${conflictCount} conflicted, do not act on those without clarifying which version is correct`
+          : "";
         return {
           content: [
             {
               type: "text" as const,
-              text: `## Activated Knowledge (${result.entries.length} entries, ${result.totalActive} total active)\n\n${formatted}`,
+              text: `## Activated Knowledge (${result.entries.length} entries, ${result.totalActive} total active${conflictNote})\n\n${formatted}`,
             },
           ],
         };
