@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { KnowledgeDB } from "../db/database.js";
 import type { ActivationEngine } from "../activation/activate.js";
-import { EmbeddingClient, cosineSimilarity } from "../activation/embeddings.js";
+import { EmbeddingClient, cosineSimilarity, formatEmbeddingText } from "../activation/embeddings.js";
 import { EpisodeReader } from "./episodes.js";
 import { ConsolidationLLM } from "./llm.js";
 import { computeStrength } from "./decay.js";
@@ -486,7 +486,7 @@ export class ConsolidationEngine {
         // atomic UPDATE — no gap where the DB has new content but no vector.
         const safeType = clampKnowledgeType(decision.type);
         const freshEmbedding = await this.embeddings.embed(
-          `[${safeType}] ${decision.content} (topics: ${(decision.topics ?? []).join(", ")})`
+          formatEmbeddingText(safeType, decision.content, decision.topics ?? [])
         );
         this.db.mergeEntry(nearestEntry.id, mergeUpdates, freshEmbedding);
         console.log(`[consolidation] ${decision.action === "update" ? "Updated" : "Replaced"}: "${nearestEntry.content.slice(0, 60)}..." → "${decision.content.slice(0, 60)}..."`);

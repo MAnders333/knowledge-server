@@ -1,5 +1,5 @@
 import type { KnowledgeDB } from "../db/database.js";
-import { EmbeddingClient, cosineSimilarity } from "./embeddings.js";
+import { EmbeddingClient, cosineSimilarity, formatEmbeddingText } from "./embeddings.js";
 import { config } from "../config.js";
 import type { ActivationResult, ContradictionAnnotation, KnowledgeEntry } from "../types.js";
 
@@ -144,9 +144,10 @@ export class ActivationEngine {
 
     if (needsEmbedding.length === 0) return 0;
 
-    // Build embedding text: content + topics for richer representation
+    // Build embedding text using the shared formatter — same format as
+    // reconsolidate() so vectors are consistent regardless of which path wrote them.
     const texts = needsEmbedding.map(
-      (e) => `[${e.type}] ${e.content} (topics: ${e.topics.join(", ")})`
+      (e) => formatEmbeddingText(e.type, e.content, e.topics)
     );
 
     const embeddings = await this.embeddings.embedBatch(texts);

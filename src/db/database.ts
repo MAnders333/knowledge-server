@@ -926,7 +926,7 @@ export class KnowledgeDB {
     const safeType = clampKnowledgeType(updates.type);
 
     const embeddingBlob = embedding
-      ? Buffer.from(new Float32Array(embedding).buffer)
+      ? new Uint8Array(new Float32Array(embedding).buffer)
       : null;
 
     const now = Date.now();

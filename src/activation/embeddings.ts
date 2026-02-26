@@ -74,6 +74,20 @@ export class EmbeddingClient {
 }
 
 /**
+ * Format an entry's fields into the canonical text string used for embedding.
+ *
+ * Single source of truth — used by both:
+ * - `reconsolidate()` when embedding immediately after a merge
+ * - `ensureEmbeddings()` when regenerating embeddings for entries missing one
+ *
+ * Keeping both paths in sync here prevents silent vector drift between a
+ * freshly-merged entry and the same entry re-embedded on a later run.
+ */
+export function formatEmbeddingText(type: string, content: string, topics: string[]): string {
+  return `[${type}] ${content} (topics: ${topics.join(", ")})`;
+}
+
+/**
  * Compute cosine similarity between two vectors.
  * Returns a value between -1 and 1 (1 = identical, 0 = orthogonal, -1 = opposite).
  */
