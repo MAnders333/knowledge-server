@@ -48,13 +48,13 @@ export const config = {
     // Default: 5 minutes. Large contradiction batches (50+ candidates) can take
     // 2–3 minutes for a complex Sonnet response; 5 minutes gives headroom while
     // still bounding a true hang (network stall, rate-limit loop, etc.).
-    timeoutMs: Number.parseInt(process.env.LLM_TIMEOUT_MS || String(5 * 60 * 1000), 10),
+    timeoutMs: Math.max(1, Number.parseInt(process.env.LLM_TIMEOUT_MS || String(5 * 60 * 1000), 10)),
     // Per-call retry budget. On timeout or transient error, complete() retries up
     // to this many additional times before throwing to the caller.
     // Retries use exponential backoff starting at retryBaseDelayMs.
     // Set to 0 to disable retries entirely.
     maxRetries: Math.max(0, Number.parseInt(process.env.LLM_MAX_RETRIES || "2", 10)),
-    retryBaseDelayMs: Number.parseInt(process.env.LLM_RETRY_BASE_DELAY_MS || "3000", 10),
+    retryBaseDelayMs: Math.max(0, Number.parseInt(process.env.LLM_RETRY_BASE_DELAY_MS || "3000", 10)),
   },
 
   // Embedding (always OpenAI-compatible, always through /openai/v1)
