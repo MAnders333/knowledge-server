@@ -73,8 +73,8 @@ export class KnowledgeDB {
       );
       // Wrap in a transaction so a crash mid-drop leaves the DB in its original
       // state (all tables intact) rather than a half-torn-down state.
-      // SQLite DROP TABLE cannot be rolled back for WAL checkpoints already flushed,
-      // but within a single transaction a crash before COMMIT leaves the DB unchanged.
+      // SQLite DDL (including DROP TABLE) is fully transactional: if the process
+      // crashes before COMMIT, SQLite rolls back all drops on the next open.
       this.db.transaction(() => {
         this.db.exec("DROP TABLE IF EXISTS knowledge_relation");
         this.db.exec("DROP TABLE IF EXISTS knowledge_entry");
