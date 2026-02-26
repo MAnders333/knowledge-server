@@ -1,6 +1,6 @@
 # knowledge-server
 
-Persistent memory for [OpenCode](https://opencode.ai) agents — fully local, no external service required.
+Persistent semantic memory for [OpenCode](https://opencode.ai) agents — fully local, no external service required.
 
 Reads your OpenCode session history, extracts what's worth keeping into a local SQLite knowledge store, and injects relevant entries into new conversations automatically.
 
@@ -26,8 +26,8 @@ The similarity thresholds (0.82 for reconsolidation, 0.4 for the contradiction s
 2. **Consolidation** — On startup, an LLM reads any new sessions and extracts entries worth keeping. Most sessions produce nothing.
 3. **Reconsolidation** — Each candidate entry is embedded and compared to the nearest existing entry. If similarity ≥ 0.82, a second LLM call decides whether to keep the existing, update it, replace it, or insert both. The store updates rather than appends.
 4. **Contradiction scan** — Entries in the 0.4–0.82 similarity band are checked for genuine contradictions. Resolution options: `supersede_old`, `supersede_new`, `merge`, or `irresolvable` (flagged for human review).
-5. **Activation** — On each new user message, the query text is embedded and matched against all entries. Entries above the similarity threshold are injected into the conversation context.
-6. **Decay** — Entry strength decays with age and inactivity, increases with access. Below the archive threshold → archived. Archived for 180+ days → tombstoned.
+5. **Activation** — On each new user message, the query text is embedded and matched against all entries. Entries above the similarity threshold (default: 0.30) are injected into the conversation context.
+6. **Decay** — Entry strength decays with age and inactivity, increases with access. Strength below 0.15 → archived. Archived for 180+ days → tombstoned.
 
 ## Architecture
 
