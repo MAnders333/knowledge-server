@@ -1,4 +1,5 @@
 import { config } from "../config.js";
+import type { KnowledgeType } from "../types.js";
 
 /**
  * Embedding client.
@@ -83,7 +84,7 @@ export class EmbeddingClient {
  * Keeping both paths in sync here prevents silent vector drift between a
  * freshly-merged entry and the same entry re-embedded on a later run.
  */
-export function formatEmbeddingText(type: string, content: string, topics: string[]): string {
+export function formatEmbeddingText(type: KnowledgeType, content: string, topics: string[]): string {
   return `[${type}] ${content} (topics: ${topics.join(", ")})`;
 }
 
