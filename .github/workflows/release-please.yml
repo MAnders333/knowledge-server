@@ -15,6 +15,9 @@ jobs:
     # Only run if CI passed
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
       - uses: googleapis/release-please-action@v4
         id: release
@@ -22,28 +25,53 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           release-type: node
 
-      # Build release binaries when a release is created
+      # Upload non-binary assets (platform-independent) when a release is created
       - uses: actions/checkout@v4
-        if: ${{ steps.release.outputs.release_created }}
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+
+      - name: Upload non-binary release assets
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ steps.release.outputs.tag_name }}" \
+            plugin/knowledge.ts \
+            opencode/command/consolidate.md \
+            opencode/command/knowledge-review.md \
+            opencode/command/knowledge-update.md \
+            scripts/install.sh
+
+  build-binaries:
+    name: Build binaries (${{ matrix.os }})
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            suffix: linux-x64
+          - os: macos-latest
+            suffix: darwin-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
 
       - uses: oven-sh/setup-bun@v2
-        if: ${{ steps.release.outputs.release_created }}
         with:
           bun-version: latest
 
       - name: Install dependencies
-        if: ${{ steps.release.outputs.release_created }}
         run: bun install --frozen-lockfile
 
       - name: Build binaries
-        if: ${{ steps.release.outputs.release_created }}
-        run: bun run build
+        run: |
+          bun build --compile src/index.ts --outfile dist/knowledge-server-${{ matrix.suffix }}
+          bun build --compile src/mcp/index.ts --outfile dist/knowledge-server-mcp-${{ matrix.suffix }}
 
-      - name: Upload release assets
-        if: ${{ steps.release.outputs.release_created }}
+      - name: Upload binaries
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload ${{ steps.release.outputs.tag_name }} \
-            dist/knowledge-server \
-            dist/knowledge-server-mcp
+          gh release upload "${{ needs.release-please.outputs.tag_name }}" \
+            dist/knowledge-server-${{ matrix.suffix }} \
+            dist/knowledge-server-mcp-${{ matrix.suffix }}

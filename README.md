@@ -120,18 +120,41 @@ Install by symlinking to `~/.config/opencode/plugins/knowledge.ts`.
 
 ## Installation
 
+### Option A — one-liner (no Bun required)
+
+Downloads pre-built binaries for the current release. Supports Linux x64 and macOS arm64 (Apple Silicon).
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MAnders333/knowledge-server/main/scripts/install.sh | bash
+```
+
+This downloads the server binaries, plugin, and OpenCode commands into `~/.local/share/knowledge-server/`, symlinks the plugin and commands into `~/.config/opencode/`, generates a `.env` template, and prints a ready-to-paste MCP config block.
+
+After running:
+1. Edit `~/.local/share/knowledge-server/.env` — set `LLM_API_KEY` and `LLM_BASE_ENDPOINT`
+2. Add the MCP config block to `~/.config/opencode/opencode.jsonc` (printed by the installer)
+3. Run `knowledge-server` (or the full path printed by the installer)
+
+**To update later:**
+
+```bash
+knowledge-server --update
+```
+
+### Option B — from source
+
 **Prerequisites:** [Bun](https://bun.sh), OpenCode with an active session database.
 
 ```bash
-git clone <repo>
+git clone https://github.com/MAnders333/knowledge-server
 cd knowledge-server
 cp .env.template .env
-# Edit .env and set LLM_API_KEY
+# Edit .env — set LLM_API_KEY and LLM_BASE_ENDPOINT
 bun run setup
 bun run start
 ```
 
-`setup` installs dependencies, creates the data directory, and symlinks the plugin and commands into your OpenCode config.
+`bun run setup` installs dependencies, creates the data directory, and symlinks the plugin and commands into your OpenCode config.
 
 ## Configuration
 
@@ -248,7 +271,7 @@ The `/activate` endpoint makes a paid embedding API call per request. There is n
 
 ```bash
 bun run dev          # Watch mode
-bun test             # Run tests (50 tests)
+bun test             # Run tests (172 tests)
 bun run lint         # Biome lint
 bun run format       # Biome format
 ```
