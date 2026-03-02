@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { KnowledgeDB } from "../db/database.js";
 import type { ActivationEngine } from "../activation/activate.js";
-import { EmbeddingClient, cosineSimilarity, formatEmbeddingText } from "../activation/embeddings.js";
+import type { EmbeddingClient } from "../activation/embeddings.js";
+import { cosineSimilarity, formatEmbeddingText } from "../activation/embeddings.js";
 import { EpisodeReader } from "./episodes.js";
-import { ConsolidationLLM } from "./llm.js";
+import { ConsolidationLLM, formatEpisodes, formatExistingKnowledge } from "./llm.js";
 import { computeStrength } from "./decay.js";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
@@ -72,7 +73,9 @@ export class ConsolidationEngine {
   constructor(db: KnowledgeDB, activation: ActivationEngine) {
     this.db = db;
     this.activation = activation;
-    this.embeddings = new EmbeddingClient();
+    // Reuse the EmbeddingClient from ActivationEngine — one shared HTTP client
+    // for both retrieval and consolidation embedding calls.
+    this.embeddings = activation.embeddings;
     this.episodes = new EpisodeReader();
     this.llm = new ConsolidationLLM();
   }
@@ -174,7 +177,7 @@ export class ConsolidationEngine {
 
     for (let i = 0; i < episodes.length; i += chunkSize) {
       const chunk = episodes.slice(i, i + chunkSize);
-      const chunkSummary = this.formatEpisodes(chunk);
+      const chunkSummary = formatEpisodes(chunk);
 
       logger.log(
         `[consolidation] Processing chunk ${Math.floor(i / chunkSize) + 1}/${Math.ceil(episodes.length / chunkSize)} (${chunk.length} episodes)`
@@ -188,7 +191,7 @@ export class ConsolidationEngine {
       // Retrieve only RELEVANT existing knowledge for this chunk
       // (instead of dumping the entire knowledge base into the prompt)
       const relevantKnowledge = await this.getRelevantKnowledge(chunkSummary, allEntriesForChunk);
-      const existingKnowledgeSummary = this.formatExistingKnowledge(relevantKnowledge);
+      const existingKnowledgeSummary = formatExistingKnowledge(relevantKnowledge);
 
       logger.log(
         `[consolidation] Using ${relevantKnowledge.length} relevant existing entries as context.`
@@ -785,39 +788,6 @@ export class ConsolidationEngine {
     }
 
     return archived;
-  }
-
-  /**
-   * Format existing knowledge entries for the LLM context.
-   * This is the "existing mental model" that new episodes are consolidated against.
-   */
-  private formatExistingKnowledge(entries: KnowledgeEntry[]): string {
-    if (entries.length === 0) return "";
-
-    return entries
-      .map(
-        (e) =>
-          `- [${e.type}] ${e.content} (topics: ${e.topics.join(", ")}; confidence: ${e.confidence}; scope: ${e.scope})`
-      )
-      .join("\n");
-  }
-
-  /**
-   * Format a batch of episodes into a text summary for the LLM.
-   * Episodes can be either compaction summaries (already condensed)
-   * or raw message sequences.
-   */
-  private formatEpisodes(episodes: Episode[]): string {
-    return episodes
-      .map((ep) => {
-        const typeLabel = ep.contentType === "compaction_summary"
-          ? " (compaction summary)"
-          : "";
-
-        return `### Session: "${ep.sessionTitle}"${typeLabel} (${new Date(ep.timeCreated).toISOString().split("T")[0]}, project: ${ep.projectName})
-${ep.content}`;
-      })
-      .join("\n\n---\n\n");
   }
 
   close(): void {

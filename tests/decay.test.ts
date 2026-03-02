@@ -1,29 +1,6 @@
 import { describe, it, expect } from "bun:test";
 import { computeStrength } from "../src/consolidation/decay";
-import type { KnowledgeEntry } from "../src/types";
-
-function makeEntry(overrides: Partial<KnowledgeEntry> = {}): KnowledgeEntry {
-  const now = Date.now();
-  return {
-    id: "test",
-    type: "fact",
-    content: "Test",
-    topics: [],
-    confidence: 0.8,
-    source: "test",
-    scope: "personal",
-    status: "active",
-    strength: 1.0,
-    createdAt: now,
-    updatedAt: now,
-    lastAccessedAt: now,
-    accessCount: 0,
-    observationCount: 1,
-    supersededBy: null,
-    derivedFrom: [],
-    ...overrides,
-  };
-}
+import { makeEntry } from "./fixtures";
 
 const ONE_DAY = 24 * 60 * 60 * 1000;
 

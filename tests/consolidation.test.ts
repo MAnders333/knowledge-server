@@ -16,40 +16,7 @@ import { tmpdir } from "node:os";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function makeEntry(overrides: Partial<Parameters<KnowledgeDB["insertEntry"]>[0]> & { id: string }) {
-  const now = Date.now();
-  return {
-    id: overrides.id,
-    type: "fact" as const,
-    content: `Content for ${overrides.id}`,
-    topics: ["test"],
-    confidence: 0.8,
-    source: "test",
-    scope: "personal" as const,
-    status: "active" as const,
-    strength: 1.0,
-    createdAt: now,
-    updatedAt: now,
-    lastAccessedAt: now,
-    accessCount: 0,
-    observationCount: 1,
-    supersededBy: null,
-    derivedFrom: [],
-    ...overrides,
-  };
-}
-
-// Deterministic fake embedding: encodes the first 3 chars of content as a unit vector.
-// Two entries with the same first 3 chars will have similarity 1.0 (near-duplicate).
-// Entries with different first 3 chars will have much lower similarity.
-function fakeEmbedding(content: string): number[] {
-  const vec = new Array(8).fill(0);
-  for (let i = 0; i < Math.min(3, content.length); i++) {
-    vec[i % 8] += content.charCodeAt(i);
-  }
-  const norm = Math.sqrt(vec.reduce((s, v) => s + v * v, 0)) || 1;
-  return vec.map((v) => v / norm);
-}
+import { makeEntry, fakeEmbedding } from "./fixtures";
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
 

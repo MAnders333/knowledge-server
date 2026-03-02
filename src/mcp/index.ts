@@ -4,7 +4,7 @@ import { z } from "zod";
 import { KnowledgeDB } from "../db/database.js";
 import { ActivationEngine } from "../activation/activate.js";
 import { staleTag, contradictionTagBlock } from "../activation/format.js";
-import { config } from "../config.js";
+import { config, validateConfig } from "../config.js";
 // @ts-ignore — Bun supports JSON imports natively
 import pkg from "../../package.json" with { type: "json" };
 
@@ -21,6 +21,12 @@ import pkg from "../../package.json" with { type: "json" };
  * and receives associated knowledge entries ranked by relevance.
  */
 async function main() {
+  const configErrors = validateConfig();
+  if (configErrors.length > 0) {
+    for (const err of configErrors) console.error(`[knowledge-server-mcp] config error: ${err}`);
+    process.exit(1);
+  }
+
   const db = new KnowledgeDB();
   const activation = new ActivationEngine(db);
 
@@ -110,4 +116,7 @@ async function main() {
   await server.connect(transport);
 }
 
-main().catch(console.error);
+main().catch((err) => {
+  console.error("[knowledge-server-mcp] fatal:", err);
+  process.exit(1);
+});

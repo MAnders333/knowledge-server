@@ -15,7 +15,7 @@ import type { ActivationResult, ContradictionAnnotation, KnowledgeEntry } from "
  */
 export class ActivationEngine {
   private db: KnowledgeDB;
-  private embeddings: EmbeddingClient;
+  readonly embeddings: EmbeddingClient;
 
   constructor(db: KnowledgeDB) {
     this.db = db;

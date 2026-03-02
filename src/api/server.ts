@@ -64,11 +64,11 @@ export function createApp(
     const limitParam = c.req.query("limit");
     const thresholdParam = c.req.query("threshold");
 
-    const parsedLimit = limitParam ? parseInt(limitParam, 10) : NaN;
-    const limit = !isNaN(parsedLimit) ? Math.max(1, Math.min(50, parsedLimit)) : undefined;
+    const parsedLimit = limitParam ? Number.parseInt(limitParam, 10) : Number.NaN;
+    const limit = !Number.isNaN(parsedLimit) ? Math.max(1, Math.min(50, parsedLimit)) : undefined;
 
-    const parsedThreshold = thresholdParam ? parseFloat(thresholdParam) : NaN;
-    const threshold = !isNaN(parsedThreshold) ? Math.max(0, Math.min(1, parsedThreshold)) : undefined;
+    const parsedThreshold = thresholdParam ? Number.parseFloat(thresholdParam) : Number.NaN;
+    const threshold = !Number.isNaN(parsedThreshold) ? Math.max(0, Math.min(1, parsedThreshold)) : undefined;
 
     try {
       const result = await activation.activate(

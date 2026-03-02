@@ -4,6 +4,7 @@ import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
+import type { KnowledgeEntry, Episode } from "../types.js";
 
 /**
  * LLM interface for consolidation.
@@ -452,4 +453,39 @@ export interface ContradictionResult {
   mergedType?: string;
   mergedTopics?: string[];
   mergedConfidence?: number;
+}
+
+// ── Prompt formatting helpers ─────────────────────────────────────────────────
+// These live here because they produce text that goes directly into LLM prompts.
+// Keeping them adjacent to the LLM call methods makes prompt changes easy to review.
+
+/**
+ * Format existing knowledge entries for the LLM context.
+ * This is the "existing mental model" that new episodes are consolidated against.
+ */
+export function formatExistingKnowledge(entries: KnowledgeEntry[]): string {
+  if (entries.length === 0) return "";
+  return entries
+    .map(
+      (e) =>
+        `- [${e.type}] ${e.content} (topics: ${e.topics.join(", ")}; confidence: ${e.confidence}; scope: ${e.scope})`
+    )
+    .join("\n");
+}
+
+/**
+ * Format a batch of episodes into a text summary for the LLM.
+ * Episodes can be either compaction summaries (already condensed)
+ * or raw message sequences.
+ */
+export function formatEpisodes(episodes: Episode[]): string {
+  return episodes
+    .map((ep) => {
+      const typeLabel = ep.contentType === "compaction_summary"
+        ? " (compaction summary)"
+        : "";
+      return `### Session: "${ep.sessionTitle}"${typeLabel} (${new Date(ep.timeCreated).toISOString().split("T")[0]}, project: ${ep.projectName})
+${ep.content}`;
+    })
+    .join("\n\n---\n\n");
 }
