@@ -284,11 +284,11 @@ If there is nothing new worth extracting, return an empty array: []`;
         type: clampKnowledgeType(entry.type),
         content: entry.content,
         topics: Array.isArray(entry.topics) ? entry.topics : [],
-        confidence: typeof entry.confidence === "number"
+        confidence: typeof entry.confidence === "number" && !Number.isNaN(entry.confidence)
           ? Math.min(1, Math.max(0, entry.confidence))
           : 0.5,
         scope: clampKnowledgeScope(entry.scope ?? "personal"),
-        source: entry.source ?? "",
+        source: entry.source || `extraction ${new Date().toISOString().split("T")[0]}`,
       }));
   }
 
