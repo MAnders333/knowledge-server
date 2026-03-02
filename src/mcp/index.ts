@@ -9,6 +9,35 @@ import { config, validateConfig } from "../config.js";
 import pkg from "../../package.json" with { type: "json" };
 
 /**
+ * Zod input schema for the `activate` MCP tool.
+ * Exported so tests can validate schema constraints without starting the server.
+ */
+export const activateInputSchema = {
+  cues: z
+    .string()
+    .describe(
+      "One or more cues to activate associated knowledge. Can be a question, topic description, or comma-separated keywords. Example: 'churn analysis, segment X, onboarding'"
+    ),
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(50)
+    .optional()
+    .describe(
+      `Maximum number of entries to return (default: ${config.activation.maxResults}). Increase when broad topic recall is needed.`
+    ),
+  threshold: z
+    .number()
+    .min(0)
+    .max(1)
+    .optional()
+    .describe(
+      `Minimum cosine similarity score to include an entry (default: ${config.activation.similarityThreshold}). Lower to cast a wider net (e.g. 0.25), raise to require a tighter match (e.g. 0.45).`
+    ),
+};
+
+/**
  * MCP server interface for the knowledge system.
  *
  * Exposes a single tool: `activate`
@@ -38,30 +67,7 @@ async function main() {
   server.tool(
     "activate",
     "Activate associated knowledge by providing cues. Returns knowledge entries that are semantically related to the provided cues. Use this when you need to recall what has been learned from prior sessions about a specific topic. Provide descriptive cues — topics, questions, or keywords — and receive relevant knowledge entries ranked by association strength.",
-    {
-      cues: z
-        .string()
-        .describe(
-          "One or more cues to activate associated knowledge. Can be a question, topic description, or comma-separated keywords. Example: 'churn analysis, segment X, onboarding'"
-        ),
-      limit: z
-        .number()
-        .int()
-        .min(1)
-        .max(50)
-        .optional()
-        .describe(
-          `Maximum number of entries to return (default: ${config.activation.maxResults}). Increase when broad topic recall is needed.`
-        ),
-      threshold: z
-        .number()
-        .min(0)
-        .max(1)
-        .optional()
-        .describe(
-          `Minimum cosine similarity score to include an entry (default: ${config.activation.similarityThreshold}). Lower to cast a wider net (e.g. 0.25), raise to require a tighter match (e.g. 0.45).`
-        ),
-    },
+    activateInputSchema,
     async ({ cues, limit, threshold }) => {
       try {
         // MCP is deliberate active recall — allow more results than passive injection.
@@ -116,7 +122,9 @@ async function main() {
   await server.connect(transport);
 }
 
-main().catch((err) => {
-  console.error("[knowledge-server-mcp] fatal:", err);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error("[knowledge-server-mcp] fatal:", err);
+    process.exit(1);
+  });
+}

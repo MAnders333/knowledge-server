@@ -4,21 +4,16 @@
  * We validate the Zod schema directly — no MCP transport is started.
  * This catches regressions where schema constraints (min/max, optionality,
  * types) are accidentally changed.
+ *
+ * `activateInputSchema` is exported from mcp/index.ts at module scope.
+ * The `main()` function is guarded by `import.meta.main` so importing the
+ * module does NOT start the server or open a DB connection.
  */
 import { describe, it, expect } from "bun:test";
 import { z } from "zod";
+import { activateInputSchema } from "../src/mcp/index";
 
-// ── Replicate the schema from mcp/index.ts ────────────────────────────────────
-// Keeping the schema definition here (rather than importing it) ensures the
-// test is resilient to MCP server startup side-effects (DB open, config check).
-// If the real schema changes, the test will catch the drift at type-check time
-// only when the types are exported — for now we test the logical constraints.
-
-const activateSchema = z.object({
-  cues: z.string().describe("cues"),
-  limit: z.number().int().min(1).max(50).optional(),
-  threshold: z.number().min(0).max(1).optional(),
-});
+const activateSchema = z.object(activateInputSchema);
 
 // ── cues ──────────────────────────────────────────────────────────────────────
 
