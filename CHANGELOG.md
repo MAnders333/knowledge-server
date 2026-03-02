@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.1.0](https://github.com/MAnders333/knowledge-server/compare/v1.0.1...v1.1.0) (2026-03-02)
+
+
+### Features
+
+* add binary-first install script, update mechanism, and multi-platform release builds ([197ed66](https://github.com/MAnders333/knowledge-server/commit/197ed668ce53fa0ffaa5ee70f677429a1f94d8d7))
+* add knowledge-server update subcommand for in-place binary self-update ([e2d05bc](https://github.com/MAnders333/knowledge-server/commit/e2d05bcd53269e76545bc822d00b6b3219b6d214))
+
+
+### Bug Fixes
+
+* resolve curl progress-bar flag conflict and add INSTALL_DIR safety guard in install.sh ([8515df9](https://github.com/MAnders333/knowledge-server/commit/8515df9159f3ce8aea51d9eba26400d7e2fd1be8))
+* silence small-file downloads in install.sh to reduce terminal noise ([75adb04](https://github.com/MAnders333/knowledge-server/commit/75adb04e5465bc58b4a6f509f45cf358e50857a3))
+* use explicit long-form curl flags for clarity and consistent --fail on all downloads ([1a63598](https://github.com/MAnders333/knowledge-server/commit/1a63598d01be8d0bc58581c494867a90ca96d195))
+
 ## [1.0.1](https://github.com/MAnders333/knowledge-server/compare/v1.0.0...v1.0.1) (2026-03-02)
 
 
