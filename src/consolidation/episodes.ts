@@ -18,6 +18,80 @@ function approxTokens(text: string): number {
 }
 
 /**
+ * Maximum characters to include from a single tool output.
+ * ~20K chars ≈ 5K tokens — generous enough for a full Confluence page while
+ * preventing a single tool call from dominating the entire episode chunk budget.
+ */
+const MAX_TOOL_OUTPUT_CHARS = 20_000;
+
+/**
+ * Maximum characters for a fully assembled message (text + all tool outputs).
+ * ~60K chars ≈ 15K tokens — aligns with the 50K-token episode soft limit so
+ * no single message can exceed the chunker's budget on its own.
+ * Applied unconditionally so the guard holds even when no tool outputs are present.
+ */
+const MAX_MESSAGE_CHARS = 60_000;
+
+/**
+ * Extract readable text from a tool output value.
+ *
+ * Tool outputs are stored as JSON strings by OpenCode. The structure varies by
+ * tool — Confluence pages return `{metadata, content: {value: "..."}}`, search
+ * results return an array of `{content: {value: "..."}, ...}` objects. We try
+ * to extract the human-readable `.content.value` field(s) when present; if the
+ * structure is unrecognised we fall back to the raw string.
+ *
+ * NOTE: The JSON extraction logic is purpose-built for the Atlassian Confluence
+ * MCP tool schemas. Tools with different output shapes that are added to the
+ * CONSOLIDATION_INCLUDE_TOOL_OUTPUTS allowlist will fall back to the raw JSON
+ * string, which may need updating here for best extraction quality.
+ *
+ * Output is capped at MAX_TOOL_OUTPUT_CHARS to prevent a single large tool
+ * response from blowing through the episode token budget.
+ */
+function extractToolText(raw: string): string {
+  let text = raw;
+
+  try {
+    const parsed: unknown = JSON.parse(raw);
+
+    if (Array.isArray(parsed)) {
+      // e.g. atlassian_confluence_search — array of result objects
+      const parts: string[] = [];
+      for (const item of parsed) {
+        if (item && typeof item === "object") {
+          const entry = item as Record<string, unknown>;
+          const title = typeof entry.title === "string" ? entry.title : "";
+          const content = entry.content as Record<string, unknown> | undefined;
+          const value = typeof content?.value === "string" ? content.value : "";
+          if (title || value) {
+            parts.push(title ? `${title}\n${value}` : value);
+          }
+        }
+      }
+      if (parts.length > 0) text = parts.join("\n\n");
+    } else if (parsed && typeof parsed === "object") {
+      // e.g. atlassian_confluence_get_page — single page object
+      const obj = parsed as Record<string, unknown>;
+      const meta = obj.metadata as Record<string, unknown> | undefined;
+      const title = typeof meta?.title === "string" ? meta.title : "";
+      const content = obj.content as Record<string, unknown> | undefined;
+      const value = typeof content?.value === "string" ? content.value : "";
+      if (title || value) {
+        text = title ? `${title}\n\n${value}` : value;
+      }
+    }
+  } catch {
+    // Not JSON — use raw string as-is
+  }
+
+  if (text.length > MAX_TOOL_OUTPUT_CHARS) {
+    return `${text.slice(0, MAX_TOOL_OUTPUT_CHARS)}\n[...truncated]`;
+  }
+  return text;
+}
+
+/**
  * Reads episodes (raw session data) from OpenCode's SQLite database.
  *
  * This is a READ-ONLY connection to the OpenCode DB.
@@ -458,30 +532,69 @@ export class EpisodeReader {
 
     const result: EpisodeMessage[] = [];
 
+    const includeToolOutputs = config.consolidation.includeToolOutputs;
+
+    // Hoist prepared statements out of the loop — bun:sqlite prepare() is not free.
+    const textPartsStmt = this.db.prepare(
+      `SELECT json_extract(data, '$.text') as text
+       FROM part
+       WHERE message_id = ?
+         AND json_extract(data, '$.type') = 'text'
+       ORDER BY time_created ASC`
+    );
+    const toolPartsStmt = includeToolOutputs.length > 0
+      ? this.db.prepare(
+          `SELECT json_extract(data, '$.tool') as tool,
+                  json_extract(data, '$.state.output') as output
+           FROM part
+           WHERE message_id = ?
+             AND json_extract(data, '$.type') = 'tool'
+             AND json_extract(data, '$.state.status') = 'completed'
+           ORDER BY time_created ASC`
+        )
+      : null;
+
     for (const msg of messages) {
       if (msg.role !== "user" && msg.role !== "assistant") continue;
 
       // Get text parts for this message
-      const parts = this.db
-        .prepare(
-          `SELECT json_extract(data, '$.text') as text
-           FROM part
-           WHERE message_id = ?
-             AND json_extract(data, '$.type') = 'text'
-           ORDER BY time_created ASC`
-        )
-        .all(msg.id) as Array<{ text: string }>;
+      const textParts = textPartsStmt.all(msg.id) as Array<{ text: string }>;
 
-      const content = parts
+      const textContent = textParts
         .map((p) => p.text)
         .filter(Boolean)
         .join("\n");
 
-      if (content.trim()) {
+      // Get tool outputs for allowlisted tools (assistant messages only)
+      let toolContent = "";
+      if (msg.role === "assistant" && toolPartsStmt) {
+        const toolParts = toolPartsStmt.all(msg.id) as Array<{ tool: string; output: string }>;
+
+        const relevantTools = toolParts.filter(
+          (p) => p.tool && p.output && includeToolOutputs.includes(p.tool)
+        );
+
+        if (relevantTools.length > 0) {
+          toolContent = relevantTools
+            .map((p) => `[tool: ${p.tool}]\n${extractToolText(p.output)}`)
+            .join("\n\n");
+        }
+      }
+
+      // Cap final assembled content. Applied unconditionally — protects both the
+      // tool-output path (multiple stacked outputs) and the plain-text path (a
+      // single very long user/assistant message). The chunker's soft token limit
+      // only protects across messages, not within a single oversized one.
+      let content = [textContent.trim(), toolContent].filter(Boolean).join("\n\n");
+      if (content.length > MAX_MESSAGE_CHARS) {
+        content = `${content.slice(0, MAX_MESSAGE_CHARS)}\n[...truncated]`;
+      }
+
+      if (content) {
         result.push({
           messageId: msg.id,
           role: msg.role as "user" | "assistant",
-          content: content.trim(),
+          content,
           timestamp: msg.time_created,
         });
       }
@@ -492,17 +605,11 @@ export class EpisodeReader {
 
   /**
    * Format messages into a text block for the LLM.
-   * Truncates very long individual messages to stay manageable.
+   * Per-message size is bounded by MAX_MESSAGE_CHARS applied in getMessagesInRange.
    */
   private formatMessages(messages: EpisodeMessage[]): string {
     return messages
-      .map((m) => {
-        const content =
-          m.content.length > 2000
-            ? `${m.content.slice(0, 2000)}\n[...truncated]`
-            : m.content;
-        return `  ${m.role}: ${content}`;
-      })
+      .map((m) => `  ${m.role}: ${m.content}`)
       .join("\n");
   }
 

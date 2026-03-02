@@ -51,6 +51,11 @@ async function main() {
   logger.log(
     `Last consolidation: ${consolidationState.lastConsolidatedAt ? new Date(consolidationState.lastConsolidatedAt).toISOString() : "never"}`
   );
+  if (config.consolidation.includeToolOutputs.length > 0) {
+    logger.log(`Tool output extraction: ${config.consolidation.includeToolOutputs.join(", ")}`);
+  } else {
+    logger.log("Tool output extraction: disabled (set CONSOLIDATION_INCLUDE_TOOL_OUTPUTS to enable)");
+  }
 
   // Check for pending sessions
   const pending = consolidation.checkPending();

@@ -118,6 +118,12 @@ export const config = {
     chunkSize: parseIntEnv(process.env.CONSOLIDATION_CHUNK_SIZE, 10, 1),
     maxSessionsPerRun: parseIntEnv(process.env.CONSOLIDATION_MAX_SESSIONS, 50, 1),
     minSessionMessages: parseIntEnv(process.env.CONSOLIDATION_MIN_MESSAGES, 4, 1),
+    // Comma-separated list of tool names whose outputs should be included in
+    // knowledge extraction. Empty by default (no tool outputs included).
+    // Example: atlassian_confluence_get_page,atlassian_confluence_search
+    includeToolOutputs: process.env.CONSOLIDATION_INCLUDE_TOOL_OUTPUTS
+      ? process.env.CONSOLIDATION_INCLUDE_TOOL_OUTPUTS.split(",").map((s) => s.trim()).filter(Boolean)
+      : [],
     // Similarity band for post-extraction contradiction scan.
     // Entries above RECONSOLIDATION_THRESHOLD are already handled by decideMerge.
     // Entries below contradictionMinSimilarity are too dissimilar to plausibly contradict.
