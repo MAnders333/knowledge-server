@@ -126,8 +126,6 @@ Hono-based HTTP server. Starts on `127.0.0.1:3179` by default.
 
 Exposes a single tool: `activate`. Agents use this for deliberate recall — when they want to pull knowledge about a specific topic mid-task. Same underlying mechanism as the passive plugin.
 
-The installer prints a ready-to-paste config block. For a source install, `bun run setup` prints the same block with the correct absolute path and your `.env` values interpolated:
-
 ```json
 {
   "mcp": {
