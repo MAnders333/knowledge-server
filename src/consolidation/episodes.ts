@@ -124,21 +124,22 @@ export class EpisodeReader {
   }
 
   private get textPartsStmt(): Statement {
-    if (!this._textPartsStmt) {
-      this._textPartsStmt = this.db.prepare(
-        `SELECT json_extract(data, '$.text') as text
-         FROM part
-         WHERE message_id = ?
-           AND json_extract(data, '$.type') = 'text'
-         ORDER BY time_created ASC`
-      );
-    }
+    if (this._textPartsStmt) return this._textPartsStmt;
+    this._textPartsStmt = this.db.prepare(
+      `SELECT json_extract(data, '$.text') as text
+       FROM part
+       WHERE message_id = ?
+         AND json_extract(data, '$.type') = 'text'
+       ORDER BY time_created ASC`
+    );
     return this._textPartsStmt;
   }
 
   private get toolPartsStmt(): Statement | null {
-    if (this._toolPartsStmt) return this._toolPartsStmt;
+    // Config check before cache check: if tool output extraction is disabled,
+    // always return null regardless of any previously compiled statement.
     if (config.consolidation.includeToolOutputs.length === 0) return null;
+    if (this._toolPartsStmt) return this._toolPartsStmt;
     this._toolPartsStmt = this.db.prepare(
       `SELECT json_extract(data, '$.tool') as tool,
               json_extract(data, '$.state.output') as output
@@ -629,7 +630,9 @@ export class EpisodeReader {
 
   close(): void {
     this._textPartsStmt?.finalize();
+    this._textPartsStmt = null;
     this._toolPartsStmt?.finalize();
+    this._toolPartsStmt = null;
     this.db.close();
   }
 }
