@@ -27,6 +27,15 @@ COMMAND_DIR="${OPENCODE_COMMAND_DIR:-$HOME/.config/opencode/command}"
 VERSION=""
 UPDATE_MODE=false   # true = skip .env creation, print diff of what changed
 
+# Guard: INSTALL_DIR is baked verbatim into the generated launcher script.
+# Reject paths with characters that could break the generated script or be
+# exploited if KNOWLEDGE_SERVER_DIR is set to a crafted value.
+if [[ ! "$INSTALL_DIR" =~ ^[a-zA-Z0-9_./\ -]+$ ]]; then
+  echo "ERROR: INSTALL_DIR contains unsafe characters: $INSTALL_DIR"
+  echo "       Unset KNOWLEDGE_SERVER_DIR or use a path with only alphanumeric, _, ., /, space, or - characters."
+  exit 1
+fi
+
 # ── Parse arguments ───────────────────────────────────────────────────────────
 
 while [[ $# -gt 0 ]]; do
@@ -136,13 +145,13 @@ mkdir -p "$COMMAND_DIR"
 
 echo "Downloading binaries..."
 
-curl -fsSL --progress-bar \
+curl -fL --fail --show-error --progress-bar \
   "$BASE_URL/knowledge-server-$PLATFORM" \
   -o "$INSTALL_DIR/libexec/knowledge-server"
 chmod +x "$INSTALL_DIR/libexec/knowledge-server"
 echo "  ✓ knowledge-server"
 
-curl -fsSL --progress-bar \
+curl -fL --fail --show-error --progress-bar \
   "$BASE_URL/knowledge-server-mcp-$PLATFORM" \
   -o "$INSTALL_DIR/libexec/knowledge-server-mcp"
 chmod +x "$INSTALL_DIR/libexec/knowledge-server-mcp"
