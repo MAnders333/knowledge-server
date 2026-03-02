@@ -71,12 +71,16 @@ case "$OS" in
   Darwin)
     case "$ARCH" in
       arm64)  PLATFORM="darwin-arm64" ;;
-      x86_64) PLATFORM="darwin-x64" ;;
+      x86_64)
+        echo "Intel Mac (x86_64) is not supported by the binary installer — no pre-built binary is available."
+        echo "Install from source instead: https://github.com/$REPO#option-b--from-source"
+        exit 1
+        ;;
       *) echo "Unsupported architecture: $ARCH on macOS."; exit 1 ;;
     esac
     ;;
   *)
-    echo "Unsupported OS: $OS. Supported: Linux x64, macOS arm64, macOS x64."
+    echo "Unsupported OS: $OS. Supported: Linux x64, macOS arm64."
     exit 1
     ;;
 esac

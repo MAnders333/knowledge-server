@@ -17,10 +17,9 @@ function detectPlatform(): string {
 
   if (os === "linux" && arch === "x64") return "linux-x64";
   if (os === "darwin" && arch === "arm64") return "darwin-arm64";
-  if (os === "darwin" && arch === "x64") return "darwin-x64";
 
   throw new Error(
-    `Unsupported platform: ${os}/${arch}. Supported: linux/x64, darwin/arm64, darwin/x64. To update manually, download from https://github.com/${REPO}/releases`
+    `Unsupported platform: ${os}/${arch}. Supported: linux/x64, darwin/arm64. To update manually, download from https://github.com/${REPO}/releases`
   );
 }
 

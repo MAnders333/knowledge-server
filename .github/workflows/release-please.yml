@@ -51,8 +51,6 @@ jobs:
             suffix: linux-x64
           - os: macos-latest
             suffix: darwin-arm64
-          - os: macos-13
-            suffix: darwin-x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
