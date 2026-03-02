@@ -137,18 +137,17 @@ export class EpisodeReader {
   }
 
   private get toolPartsStmt(): Statement | null {
+    if (this._toolPartsStmt) return this._toolPartsStmt;
     if (config.consolidation.includeToolOutputs.length === 0) return null;
-    if (!this._toolPartsStmt) {
-      this._toolPartsStmt = this.db.prepare(
-        `SELECT json_extract(data, '$.tool') as tool,
-                json_extract(data, '$.state.output') as output
-         FROM part
-         WHERE message_id = ?
-           AND json_extract(data, '$.type') = 'tool'
-           AND json_extract(data, '$.state.status') = 'completed'
-         ORDER BY time_created ASC`
-      );
-    }
+    this._toolPartsStmt = this.db.prepare(
+      `SELECT json_extract(data, '$.tool') as tool,
+              json_extract(data, '$.state.output') as output
+       FROM part
+       WHERE message_id = ?
+         AND json_extract(data, '$.type') = 'tool'
+         AND json_extract(data, '$.state.status') = 'completed'
+       ORDER BY time_created ASC`
+    );
     return this._toolPartsStmt;
   }
 
@@ -629,6 +628,8 @@ export class EpisodeReader {
   }
 
   close(): void {
+    this._textPartsStmt?.finalize();
+    this._toolPartsStmt?.finalize();
     this.db.close();
   }
 }
