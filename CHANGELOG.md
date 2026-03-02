@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.2.1](https://github.com/MAnders333/knowledge-server/compare/v1.2.0...v1.2.1) (2026-03-02)
+
+
+### Bug Fixes
+
+* address medium/low security findings from security review ([43720be](https://github.com/MAnders333/knowledge-server/commit/43720bef351a76bb207439c8e862482e002cefc8))
+* drop darwin-x64 build — macos-13 runner retired, no free Intel Mac runner available ([2bfc637](https://github.com/MAnders333/knowledge-server/commit/2bfc637d60b603f2cc01cc1cce9d924a1403a8fc))
+
 ## [1.2.0](https://github.com/MAnders333/knowledge-server/compare/v1.1.0...v1.2.0) (2026-03-02)
 
 
