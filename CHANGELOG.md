@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.2.3](https://github.com/MAnders333/knowledge-server/compare/v1.2.2...v1.2.3) (2026-03-02)
+
+
+### Bug Fixes
+
+* clamp confidence to [0,1] and default source to empty string in extractKnowledge ([96cf309](https://github.com/MAnders333/knowledge-server/commit/96cf3091817aae927421e8d373eba5730924769c))
+* guard against NaN confidence and use dated fallback for missing source ([36df88c](https://github.com/MAnders333/knowledge-server/commit/36df88caad6d31d85ef6a0ab02202668acb87255))
+
 ## [1.2.2](https://github.com/MAnders333/knowledge-server/compare/v1.2.1...v1.2.2) (2026-03-02)
 
 
