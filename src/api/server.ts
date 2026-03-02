@@ -4,6 +4,7 @@ import { timingSafeEqual } from "node:crypto";
 import type { KnowledgeDB } from "../db/database.js";
 import type { ActivationEngine } from "../activation/activate.js";
 import type { ConsolidationEngine } from "../consolidation/consolidate.js";
+import type { KnowledgeEntry } from "../types.js";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
 // @ts-ignore — Bun supports JSON imports natively; tsc may warn without resolveJsonModule
@@ -228,7 +229,7 @@ export function createApp(
  * Strip the embedding vector from entries before sending over API.
  * Embeddings are large (3072 floats) and not useful to consumers.
  */
-function stripEmbedding(entry: { embedding?: number[]; [key: string]: unknown }) {
+function stripEmbedding(entry: KnowledgeEntry): Omit<KnowledgeEntry, "embedding"> {
   const { embedding: _embedding, ...rest } = entry;
   return rest;
 }

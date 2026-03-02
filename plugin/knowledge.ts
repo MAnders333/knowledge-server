@@ -97,8 +97,8 @@ export const KnowledgePlugin: Plugin = async (ctx) => {
         // Extract text from the user message parts
         const textParts = output.parts
           .filter(
-            (p): p is { type: "text"; text: string } =>
-              "type" in p && p.type === "text" && "text" in p && !!p.text
+            (p): p is import("@opencode-ai/sdk").TextPart =>
+              "type" in p && p.type === "text" && "text" in p && !!(p as { text?: string }).text
           )
           .map((p) => p.text);
 

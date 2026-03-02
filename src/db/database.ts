@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import type { SQLQueryBindings } from "bun:sqlite";
 import { mkdirSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -154,7 +155,7 @@ export class KnowledgeDB {
 
   updateEntry(id: string, updates: Partial<KnowledgeEntry>): void {
     const fields: string[] = [];
-    const values: unknown[] = [];
+    const values: SQLQueryBindings[] = [];
 
     if (updates.content !== undefined) {
       fields.push("content = ?");
@@ -777,7 +778,7 @@ export class KnowledgeDB {
 
   updateConsolidationState(state: Partial<ConsolidationState>): void {
     const fields: string[] = [];
-    const values: unknown[] = [];
+    const values: SQLQueryBindings[] = [];
 
     if (state.lastConsolidatedAt !== undefined) {
       fields.push("last_consolidated_at = ?");

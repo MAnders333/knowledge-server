@@ -474,9 +474,10 @@ export class ConsolidationEngine {
 
       case "update":
       case "replace": {
+        const safeType = clampKnowledgeType(decision.type);
         const mergeUpdates = {
           content: decision.content,
-          type: decision.type,
+          type: safeType,
           topics: decision.topics,
           confidence: Math.max(0, Math.min(1, decision.confidence)),
           additionalSources: sessionIds,
@@ -486,7 +487,6 @@ export class ConsolidationEngine {
         // applies internally) so it matches what ensureEmbeddings would produce.
         // Passing the embedding to mergeEntry writes content + embedding in a single
         // atomic UPDATE — no gap where the DB has new content but no vector.
-        const safeType = clampKnowledgeType(decision.type);
         const freshEmbedding = await this.embeddings.embed(
           formatEmbeddingText(safeType, decision.content, decision.topics ?? [])
         );
