@@ -30,6 +30,9 @@ UPDATE_MODE=false   # true = skip .env creation, print diff of what changed
 # Guard: INSTALL_DIR is baked verbatim into the generated launcher script.
 # Reject paths with characters that could break the generated script or be
 # exploited if KNOWLEDGE_SERVER_DIR is set to a crafted value.
+# PLUGIN_DIR and COMMAND_DIR are not guarded — they are only used in `ln -sf`
+# (quoted), so a crafted value can't inject code, just cause a broken symlink.
+# Leading hyphen is safe because all uses of $INSTALL_DIR are double-quoted.
 if [[ ! "$INSTALL_DIR" =~ ^[a-zA-Z0-9_./\ -]+$ ]]; then
   echo "ERROR: INSTALL_DIR contains unsafe characters: $INSTALL_DIR"
   echo "       Unset KNOWLEDGE_SERVER_DIR or use a path with only alphanumeric, _, ., /, space, or - characters."
@@ -107,7 +110,7 @@ echo "Platform:    $PLATFORM"
 
 if [ -z "$VERSION" ]; then
   echo "Fetching latest release..."
-  RAW_VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+  RAW_VERSION="$(curl --fail --location --silent --show-error "https://api.github.com/repos/$REPO/releases/latest" \
     | grep '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
   # Re-validate the auto-resolved version against the same format as --version input
   if [[ ! "$RAW_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -145,13 +148,13 @@ mkdir -p "$COMMAND_DIR"
 
 echo "Downloading binaries..."
 
-curl -fL --fail --show-error --progress-bar \
+curl --fail --location --show-error --progress-bar \
   "$BASE_URL/knowledge-server-$PLATFORM" \
   -o "$INSTALL_DIR/libexec/knowledge-server"
 chmod +x "$INSTALL_DIR/libexec/knowledge-server"
 echo "  ✓ knowledge-server"
 
-curl -fL --fail --show-error --progress-bar \
+curl --fail --location --show-error --progress-bar \
   "$BASE_URL/knowledge-server-mcp-$PLATFORM" \
   -o "$INSTALL_DIR/libexec/knowledge-server-mcp"
 chmod +x "$INSTALL_DIR/libexec/knowledge-server-mcp"
@@ -230,10 +233,10 @@ echo "  ✓ launcher: $BIN_DIR/knowledge-server"
 echo ""
 echo "Downloading OpenCode integration files..."
 
-curl -fsSL "$BASE_URL/knowledge.ts"          -o "$INSTALL_DIR/knowledge.ts"
-curl -fsSL "$BASE_URL/consolidate.md"        -o "$INSTALL_DIR/consolidate.md"
-curl -fsSL "$BASE_URL/knowledge-review.md"   -o "$INSTALL_DIR/knowledge-review.md"
-curl -fsSL "$BASE_URL/knowledge-update.md"   -o "$INSTALL_DIR/knowledge-update.md"
+curl --fail --location --show-error "$BASE_URL/knowledge.ts"          -o "$INSTALL_DIR/knowledge.ts"
+curl --fail --location --show-error "$BASE_URL/consolidate.md"        -o "$INSTALL_DIR/consolidate.md"
+curl --fail --location --show-error "$BASE_URL/knowledge-review.md"   -o "$INSTALL_DIR/knowledge-review.md"
+curl --fail --location --show-error "$BASE_URL/knowledge-update.md"   -o "$INSTALL_DIR/knowledge-update.md"
 echo "  ✓ plugin and commands"
 
 # ── Symlink plugin and commands into OpenCode ─────────────────────────────────
