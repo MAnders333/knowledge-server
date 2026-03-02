@@ -138,7 +138,7 @@ After running:
 **To update later:**
 
 ```bash
-knowledge-server --update
+knowledge-server update
 ```
 
 ### Option B — from source

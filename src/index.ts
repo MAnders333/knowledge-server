@@ -6,8 +6,20 @@ import { ConsolidationEngine } from "./consolidation/consolidate.js";
 import { createApp } from "./api/server.js";
 import { config, validateConfig } from "./config.js";
 import { logger } from "./logger.js";
+import { runUpdate } from "./update.js";
 // @ts-ignore — Bun supports JSON imports natively
 import pkg from "../package.json" with { type: "json" };
+
+// Handle `knowledge-server update [--version v1.2.3]` before starting the server.
+// Mirrors the `opencode upgrade` pattern — run in a terminal, replaces the binary in place.
+if (process.argv[2] === "update") {
+  console.log("┌─────────────────────────────────────┐");
+  console.log("│  knowledge-server update             │");
+  console.log("└─────────────────────────────────────┘");
+  console.log("");
+  await runUpdate(process.argv.slice(3), `v${pkg.version}`);
+  process.exit(0);
+}
 
 /**
  * Knowledge Server — main entry point.
