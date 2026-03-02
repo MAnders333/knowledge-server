@@ -26,7 +26,7 @@ This downloads the server binaries, plugin, and OpenCode commands into `~/.local
 knowledge-server update
 ```
 
-### Option B — from source
+### From source
 
 **Prerequisites:** [Bun](https://bun.sh), OpenCode with an active session database.
 
@@ -133,7 +133,7 @@ The installer prints a ready-to-paste config block. For a source install, `bun r
   "mcp": {
     "knowledge": {
       "type": "local",
-      "command": ["~/.local/share/knowledge-server/libexec/knowledge-server-mcp"],
+      "command": ["/home/you/.local/share/knowledge-server/libexec/knowledge-server-mcp"],
       "enabled": true,
       "environment": {
         "LLM_API_KEY": "<your key>",
@@ -143,6 +143,8 @@ The installer prints a ready-to-paste config block. For a source install, `bun r
   }
 }
 ```
+
+> The installer prints a ready-to-paste version of this block with the exact path already filled in. If you copy the example above, replace the placeholder path with your actual home directory — tilde (`~`) is not shell-expanded inside JSON.
 
 ### OpenCode plugin (`plugin/knowledge.ts`)
 
@@ -275,7 +277,7 @@ The `/activate` endpoint makes a paid embedding API call per request. There is n
 
 ### Binary integrity
 
-Release binaries are verified with SHA-256 checksums before installation. The installer downloads `SHA256SUMS-<platform>` from the release and verifies both binaries against it before moving them into place. `knowledge-server update` performs the same check before replacing the running binary.
+Release binaries are verified with SHA-256 checksums before installation when `sha256sum` or `shasum` is available (standard on Linux and macOS). The installer downloads `SHA256SUMS-<platform>` from the release and verifies both binaries against it before moving them into place. `knowledge-server update` performs the same check before replacing the running binary.
 
 ## Development
 
