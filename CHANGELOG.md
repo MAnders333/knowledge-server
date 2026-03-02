@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.2.2](https://github.com/MAnders333/knowledge-server/compare/v1.2.1...v1.2.2) (2026-03-02)
+
+
+### Bug Fixes
+
+* clamp invalid LLM-returned scope to 'personal' before DB insert ([1bd4f6a](https://github.com/MAnders333/knowledge-server/commit/1bd4f6aac3573392ecf7dae5cae258a2954e9170))
+* explicit field construction in extractKnowledge map, remove unused import ([08c119d](https://github.com/MAnders333/knowledge-server/commit/08c119d8ccd4952724dc70d88ebdfdca9f324ae2))
+
 ## [1.2.1](https://github.com/MAnders333/knowledge-server/compare/v1.2.0...v1.2.1) (2026-03-02)
 
 
