@@ -142,7 +142,7 @@ Exposes a single tool: `activate`. Agents use this for deliberate recall — whe
 }
 ```
 
-> The installer prints a ready-to-paste version of this block with the exact path already filled in. If you copy the example above, replace the placeholder path with your actual home directory — tilde (`~`) is not shell-expanded inside JSON.
+> The binary installer prints a ready-to-paste version of this block with the exact path already filled in. For a source install, `bun run setup` prints the same block with the correct absolute path and your `.env` values interpolated. If you copy the example above manually, replace the placeholder path with your actual home directory — tilde (`~`) is not shell-expanded inside JSON.
 
 ### OpenCode plugin (`plugin/knowledge.ts`)
 
