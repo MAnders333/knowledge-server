@@ -4,8 +4,8 @@ import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
-import { clampKnowledgeScope } from "../types.js";
-import type { KnowledgeEntry, Episode } from "../types.js";
+import { clampKnowledgeScope, clampKnowledgeType, KNOWLEDGE_TYPES } from "../types.js";
+import type { KnowledgeEntry, KnowledgeType, KnowledgeScope, Episode } from "../types.js";
 
 /**
  * LLM interface for consolidation.
@@ -278,14 +278,10 @@ If there is nothing new worth extracting, return an empty array: []`;
     }
 
     return parsed
-      .filter(
-        (entry) =>
-          entry.content &&
-          entry.type &&
-          ["fact", "principle", "pattern", "decision", "procedure"].includes(entry.type)
-      )
+      .filter((entry) => entry.content && entry.type)
       .map((entry) => ({
         ...entry,
+        type: clampKnowledgeType(entry.type),
         scope: clampKnowledgeScope(entry.scope ?? "personal"),
       }));
   }
@@ -445,11 +441,11 @@ Respond with a JSON array (one result per candidate, same order):
 }
 
 export interface ExtractedKnowledge {
-  type: "fact" | "principle" | "pattern" | "decision" | "procedure";
+  type: KnowledgeType;
   content: string;
   topics: string[];
   confidence: number;
-  scope: "personal" | "team";
+  scope: KnowledgeScope;
   source: string;
 }
 

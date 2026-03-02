@@ -171,14 +171,17 @@ describe("ConsolidationLLM.extractKnowledge", () => {
     expect(result).toEqual([]);
   });
 
-  it("filters out entries with invalid types", async () => {
+  it("clamps entries with invalid types to 'fact' (the default fallback)", async () => {
+    // Invalid type strings are clamped via clampKnowledgeType rather than dropped,
+    // so no knowledge is silently lost (e.g. "fact/principle" → "fact").
     mockGenerateText(JSON.stringify([
-      { type: "INVALID", content: "Bad entry.", topics: [], confidence: 0.5, scope: "personal", source: "t" },
+      { type: "INVALID", content: "Bad type entry.", topics: [], confidence: 0.5, scope: "personal", source: "t" },
       { type: "fact", content: "Good entry.", topics: [], confidence: 0.9, scope: "personal", source: "t" },
     ]));
     const result = await llm.extractKnowledge("episodes", "existing");
-    expect(result.length).toBe(1);
-    expect(result[0].content).toBe("Good entry.");
+    expect(result.length).toBe(2);
+    expect(result[0].type).toBe("fact"); // clamped from "INVALID"
+    expect(result[1].content).toBe("Good entry.");
   });
 
   it("filters out entries missing content", async () => {
