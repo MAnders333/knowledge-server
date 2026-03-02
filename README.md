@@ -4,6 +4,53 @@ Persistent semantic memory for [OpenCode](https://opencode.ai) agents — fully 
 
 Reads your OpenCode session history, extracts what's worth keeping into a local SQLite knowledge store, and injects relevant entries into new conversations automatically.
 
+## Install
+
+Supports **Linux x64** and **macOS arm64** (Apple Silicon). No Bun or Node.js required.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MAnders333/knowledge-server/main/scripts/install.sh | bash
+```
+
+This downloads the server binaries, plugin, and OpenCode commands into `~/.local/share/knowledge-server/`, symlinks the plugin and commands into `~/.config/opencode/`, generates a `.env` template, and prints a ready-to-paste MCP config block.
+
+**After running:**
+
+1. Edit `~/.local/share/knowledge-server/.env` — set `LLM_API_KEY` and `LLM_BASE_ENDPOINT`
+2. Add the printed MCP config block to `~/.config/opencode/opencode.jsonc`
+3. Start the server: `knowledge-server`
+
+**To update later:**
+
+```bash
+knowledge-server update
+```
+
+### Option B — from source
+
+**Prerequisites:** [Bun](https://bun.sh), OpenCode with an active session database.
+
+```bash
+git clone https://github.com/MAnders333/knowledge-server
+cd knowledge-server
+cp .env.template .env
+# Edit .env — set LLM_API_KEY and LLM_BASE_ENDPOINT
+bun run setup
+bun run start
+```
+
+`bun run setup` installs dependencies, creates the data directory, and symlinks the plugin and commands into your OpenCode config.
+
+## How it works
+
+Once running, three things happen automatically:
+
+1. **On startup** — the server reads any OpenCode sessions you've had since it last ran and extracts knowledge entries worth keeping. Most sessions produce nothing; the LLM applies a high bar.
+2. **On each new message** — the query is embedded and matched against stored entries. Semantically relevant entries are injected into the conversation as background context before the LLM sees your message.
+3. **Over time** — entries that haven't been accessed decay and are eventually archived. The store updates rather than accumulates.
+
+There is also an MCP `activate` tool for agents that want to deliberately recall knowledge mid-task.
+
 ## Design
 
 The basic problem with agent memory is that naive approaches store everything and retrieve too much — the context window fills with loosely-related facts, and the store grows without bound.
@@ -21,15 +68,6 @@ That's the rough model here. Three properties follow from it:
 Entries have a strength score that decays with time and inactivity, and increases with repeated access. Entries that fall below the archive threshold are eventually removed. There is no manual pruning.
 
 The similarity thresholds (0.82 for reconsolidation, 0.4 for the contradiction scan band) were calibrated against `text-embedding-3-large` and may need adjustment for other embedding models. Extraction quality depends on the LLM — cheaper models tend to over-extract or miss nuance.
-
-## How it works
-
-1. **Episodes** — OpenCode session logs are the raw input. Each conversation is an episode.
-2. **Consolidation** — On startup, an LLM reads any new sessions and extracts entries worth keeping. Most sessions produce nothing.
-3. **Reconsolidation** — Each candidate entry is embedded and compared to the nearest existing entry. If similarity ≥ 0.82, a second LLM call decides whether to keep the existing, update it, replace it, or insert both. The store updates rather than appends.
-4. **Contradiction scan** — Entries in the 0.4–0.82 similarity band are checked for genuine contradictions. Resolution options: `supersede_old`, `supersede_new`, `merge`, or `irresolvable` (flagged for human review).
-5. **Activation** — On each new user message, the query text is embedded and matched against all entries. Entries above the similarity threshold (default: 0.30) are injected into the conversation context.
-6. **Decay** — Entry strength decays with age and inactivity, increases with access. Strength below 0.15 → archived. Archived for 180+ days → tombstoned.
 
 ## Architecture
 
@@ -71,26 +109,31 @@ OpenCode plugin (passive injection on every user message)
 
 Hono-based HTTP server. Starts on `127.0.0.1:3179` by default.
 
-| Endpoint | Method | Description |
-|---|---|---|
-| `/activate?q=...` | GET | Activate knowledge entries by query |
-| `/consolidate` | POST | Run a consolidation batch |
-| `/reinitialize?confirm=yes` | POST | Wipe all entries and reset cursor |
-| `/status` | GET | Health check and stats |
-| `/entries` | GET | List entries (filter by `status`, `type`, `scope`) |
-| `/entries/:id` | GET | Get a specific entry with relations |
-| `/review` | GET | Surface conflicted, stale, and team-relevant entries |
+| Endpoint | Method | Auth | Description |
+|---|---|---|---|
+| `/activate?q=...` | GET | — | Activate knowledge entries by query |
+| `/consolidate` | POST | admin | Run a consolidation batch |
+| `/reinitialize?confirm=yes` | POST | admin | Wipe all entries and reset cursor |
+| `/status` | GET | — (config block requires admin) | Health check and stats |
+| `/entries` | GET | — | List entries (filter by `status`, `type`, `scope`) |
+| `/entries/:id` | GET | — | Get a specific entry with relations |
+| `/entries/:id` | PATCH | admin | Update content, topics, confidence, status, scope |
+| `/entries/:id/resolve` | POST | admin | Resolve a conflicted entry pair |
+| `/entries/:id` | DELETE | admin | Hard-delete an entry |
+| `/review` | GET | — | Surface conflicted, stale, and team-relevant entries |
 
 ### MCP server (`src/mcp/index.ts`)
 
 Exposes a single tool: `activate`. Agents use this for deliberate recall — when they want to pull knowledge about a specific topic mid-task. Same underlying mechanism as the passive plugin.
+
+The installer prints a ready-to-paste config block. For a source install, `bun run setup` prints the same block with the correct absolute path and your `.env` values interpolated:
 
 ```json
 {
   "mcp": {
     "knowledge": {
       "type": "local",
-      "command": ["bun", "run", "/absolute/path/to/knowledge-server/src/mcp/index.ts"],
+      "command": ["~/.local/share/knowledge-server/libexec/knowledge-server-mcp"],
       "enabled": true,
       "environment": {
         "LLM_API_KEY": "<your key>",
@@ -101,15 +144,13 @@ Exposes a single tool: `activate`. Agents use this for deliberate recall — whe
 }
 ```
 
-`bun run setup` prints a ready-to-paste version of this block with the correct absolute path and your `.env` values already interpolated.
-
 ### OpenCode plugin (`plugin/knowledge.ts`)
 
 Passive injection. Fires on every user message via the `chat.message` hook, before the LLM sees it. Queries `/activate` and injects matching knowledge as a synthetic message part. The LLM sees it as additional context on turn 1.
 
 Design principle: **never throws**. All errors are caught and silently swallowed. A broken plugin must never affect OpenCode's core functionality.
 
-Install by symlinking to `~/.config/opencode/plugins/knowledge.ts`.
+Install by symlinking to `~/.config/opencode/plugins/knowledge.ts` (the installer does this automatically).
 
 ### Consolidation engine (`src/consolidation/`)
 
@@ -117,44 +158,6 @@ Install by symlinking to `~/.config/opencode/plugins/knowledge.ts`.
 - `llm.ts` — three LLM calls across two model slots: `extractKnowledge` (extraction model), `decideMerge` (merge model — cheaper), `detectAndResolveContradiction` (contradiction model)
 - `consolidate.ts` — orchestrates the full cycle: read → extract → reconsolidate → contradiction scan → decay → embed → advance cursor
 - `decay.ts` — forgetting curve with type-specific half-lives (facts decay faster than procedures)
-
-## Installation
-
-### Option A — one-liner (no Bun required)
-
-Downloads pre-built binaries for the current release. Supports Linux x64 and macOS arm64 (Apple Silicon).
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/MAnders333/knowledge-server/main/scripts/install.sh | bash
-```
-
-This downloads the server binaries, plugin, and OpenCode commands into `~/.local/share/knowledge-server/`, symlinks the plugin and commands into `~/.config/opencode/`, generates a `.env` template, and prints a ready-to-paste MCP config block.
-
-After running:
-1. Edit `~/.local/share/knowledge-server/.env` — set `LLM_API_KEY` and `LLM_BASE_ENDPOINT`
-2. Add the MCP config block to `~/.config/opencode/opencode.jsonc` (printed by the installer)
-3. Run `knowledge-server` (or the full path printed by the installer)
-
-**To update later:**
-
-```bash
-knowledge-server update
-```
-
-### Option B — from source
-
-**Prerequisites:** [Bun](https://bun.sh), OpenCode with an active session database.
-
-```bash
-git clone https://github.com/MAnders333/knowledge-server
-cd knowledge-server
-cp .env.template .env
-# Edit .env — set LLM_API_KEY and LLM_BASE_ENDPOINT
-bun run setup
-bun run start
-```
-
-`bun run setup` installs dependencies, creates the data directory, and symlinks the plugin and commands into your OpenCode config.
 
 ## Configuration
 
@@ -172,7 +175,7 @@ All config is via environment variables in `.env`. Defaults are sensible for loc
 | `KNOWLEDGE_PORT` | `3179` | HTTP port |
 | `KNOWLEDGE_HOST` | `127.0.0.1` | HTTP host |
 | `KNOWLEDGE_DB_PATH` | `~/.local/share/knowledge-server/knowledge.db` | Knowledge database path |
-| `KNOWLEDGE_ADMIN_TOKEN` | *(random)* | Fixed admin token for scripted use. If unset, a random token is generated per process lifetime and printed at startup |
+| `KNOWLEDGE_ADMIN_TOKEN` | *(random)* | Fixed admin token (≥16 chars) for scripted use. If unset, a random token is generated per process lifetime and printed at startup |
 | `OPENCODE_DB_PATH` | `~/.local/share/opencode/opencode.db` | OpenCode session database (read-only) |
 | `CONSOLIDATION_MAX_SESSIONS` | `50` | Sessions per consolidation batch |
 | `CONSOLIDATION_CHUNK_SIZE` | `10` | Episodes per LLM extraction call |
@@ -185,22 +188,20 @@ All config is via environment variables in `.env`. Defaults are sensible for loc
 ### Start the server
 
 ```bash
-bun run start
+knowledge-server        # binary install
+bun run start           # source install
 ```
 
 On startup, the server counts pending sessions and runs background consolidation if any are found. The HTTP API is available immediately while consolidation runs behind it.
 
 ### Trigger consolidation manually
 
-`POST /consolidate` and `POST /reinitialize` require the admin token printed at startup:
+`POST /consolidate` and `POST /reinitialize` require the admin token:
 
 ```bash
-# Via HTTP (token is printed to the console when the server starts)
+# Token is printed to the console when the server starts
 curl -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:3179/consolidate
 curl -X POST -H "Authorization: Bearer <token>" 'http://127.0.0.1:3179/reinitialize?confirm=yes'
-
-# Via CLI (no token needed — calls the consolidation engine directly)
-bun run consolidate
 ```
 
 ### Check status
@@ -215,7 +216,11 @@ curl http://127.0.0.1:3179/status
 curl "http://127.0.0.1:3179/activate?q=how+do+we+handle+auth"
 ```
 
-### Review knowledge health
+### Review and resolve knowledge entries
+
+The `/knowledge-review` OpenCode command (installed automatically) provides an interactive workflow for resolving conflicts, archiving stale entries, and reviewing team-relevant items. To run it, type `/knowledge-review` in any OpenCode session.
+
+You can also query the review endpoint directly:
 
 ```bash
 curl http://127.0.0.1:3179/review
@@ -242,18 +247,15 @@ Entries decay based on age and access frequency. Strength drops below 0.15 → a
 
 ### Admin token
 
-`POST /consolidate` and `POST /reinitialize` require an admin token. The token is generated randomly at startup and printed to the console:
+Mutation endpoints (`POST /consolidate`, `POST /reinitialize`, `PATCH /entries/:id`, `POST /entries/:id/resolve`, `DELETE /entries/:id`) require an admin token. A random token is generated at startup and printed to the console:
 
 ```
 Admin token: a3f9c2e1b4d7...
-Usage: curl -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:3179/consolidate
 ```
 
-By default the token is not persisted — it changes every time the server restarts. Set `KNOWLEDGE_ADMIN_TOKEN` in `.env` to use a stable token instead (useful for scripted/automated use). This guards against browser-based CSRF attacks on `POST /consolidate` and `POST /reinitialize`: a malicious web page has no way to learn the token (it is never in a cookie, never auto-sent, and changes on every restart), so it cannot forge a valid `Authorization` header. Without the token, any page open in your browser could trigger these operations against your local server.
+By default the token is not persisted — it changes every time the server restarts. Set `KNOWLEDGE_ADMIN_TOKEN` in `.env` (minimum 16 characters) to use a stable token instead (useful for scripted/automated use). This guards against browser-based CSRF attacks: a malicious web page has no way to learn the token, so it cannot forge a valid `Authorization` header.
 
-The `/activate`, `/status`, `/entries`, and `/review` endpoints are intentionally unauthenticated. Adding auth to read endpoints would require either a per-startup token (unusable for manual `curl` inspection) or a static token in `.env` — but any local process that can read `.env` can also read the SQLite database directly. Auth on reads would be security theater against same-user processes, which are already trusted by the OS. For browser-based reads, a cross-origin page can still *send* requests to these endpoints, but the browser's same-origin policy prevents the page's JavaScript from reading the response body — so the knowledge graph content cannot be exfiltrated that way. Non-browser clients (`curl`, scripts) running as the same user are treated as trusted by design.
-
-On a shared multi-user machine, run the server behind a reverse proxy with authentication.
+The `GET /status` config block (model names, port) is also gated behind the admin token. Unauthenticated callers receive health stats but not configuration details.
 
 ### Localhost only
 
@@ -271,11 +273,15 @@ The system has two prompt injection surfaces:
 
 The `/activate` endpoint makes a paid embedding API call per request. There is no rate limiting — this is intentional for a personal local tool where the call volume is naturally bounded by typing speed. If you expose the server to other processes, consider adding a rate limit.
 
+### Binary integrity
+
+Release binaries are verified with SHA-256 checksums before installation. The installer downloads `SHA256SUMS-<platform>` from the release and verifies both binaries against it before moving them into place. `knowledge-server update` performs the same check before replacing the running binary.
+
 ## Development
 
 ```bash
 bun run dev          # Watch mode
-bun test             # Run tests (172 tests)
+bun test             # Run tests (185 tests)
 bun run lint         # Biome lint
 bun run format       # Biome format
 ```
