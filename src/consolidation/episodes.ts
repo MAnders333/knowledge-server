@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import type { Statement } from "bun:sqlite";
 import { config } from "../config.js";
 import type { Episode, EpisodeMessage, ProcessedRange } from "../types.js";
 
@@ -114,8 +115,41 @@ function extractToolText(raw: string): string {
 export class EpisodeReader {
   private db: Database;
 
+  // Cached prepared statements — compiled once, reused across all getMessagesInRange calls.
+  private _textPartsStmt: Statement | null = null;
+  private _toolPartsStmt: Statement | null = null;
+
   constructor(dbPath?: string) {
     this.db = new Database(dbPath || config.opencodeDbPath, { readonly: true });
+  }
+
+  private get textPartsStmt(): Statement {
+    if (!this._textPartsStmt) {
+      this._textPartsStmt = this.db.prepare(
+        `SELECT json_extract(data, '$.text') as text
+         FROM part
+         WHERE message_id = ?
+           AND json_extract(data, '$.type') = 'text'
+         ORDER BY time_created ASC`
+      );
+    }
+    return this._textPartsStmt;
+  }
+
+  private get toolPartsStmt(): Statement | null {
+    if (config.consolidation.includeToolOutputs.length === 0) return null;
+    if (!this._toolPartsStmt) {
+      this._toolPartsStmt = this.db.prepare(
+        `SELECT json_extract(data, '$.tool') as tool,
+                json_extract(data, '$.state.output') as output
+         FROM part
+         WHERE message_id = ?
+           AND json_extract(data, '$.type') = 'tool'
+           AND json_extract(data, '$.state.status') = 'completed'
+         ORDER BY time_created ASC`
+      );
+    }
+    return this._toolPartsStmt;
   }
 
   /**
@@ -534,31 +568,11 @@ export class EpisodeReader {
 
     const includeToolOutputs = config.consolidation.includeToolOutputs;
 
-    // Hoist prepared statements out of the loop — bun:sqlite prepare() is not free.
-    const textPartsStmt = this.db.prepare(
-      `SELECT json_extract(data, '$.text') as text
-       FROM part
-       WHERE message_id = ?
-         AND json_extract(data, '$.type') = 'text'
-       ORDER BY time_created ASC`
-    );
-    const toolPartsStmt = includeToolOutputs.length > 0
-      ? this.db.prepare(
-          `SELECT json_extract(data, '$.tool') as tool,
-                  json_extract(data, '$.state.output') as output
-           FROM part
-           WHERE message_id = ?
-             AND json_extract(data, '$.type') = 'tool'
-             AND json_extract(data, '$.state.status') = 'completed'
-           ORDER BY time_created ASC`
-        )
-      : null;
-
     for (const msg of messages) {
       if (msg.role !== "user" && msg.role !== "assistant") continue;
 
-      // Get text parts for this message
-      const textParts = textPartsStmt.all(msg.id) as Array<{ text: string }>;
+      // Get text parts for this message (uses cached prepared statement)
+      const textParts = this.textPartsStmt.all(msg.id) as Array<{ text: string }>;
 
       const textContent = textParts
         .map((p) => p.text)
@@ -567,8 +581,9 @@ export class EpisodeReader {
 
       // Get tool outputs for allowlisted tools (assistant messages only)
       let toolContent = "";
-      if (msg.role === "assistant" && toolPartsStmt) {
-        const toolParts = toolPartsStmt.all(msg.id) as Array<{ tool: string; output: string }>;
+      const toolStmt = this.toolPartsStmt;
+      if (msg.role === "assistant" && toolStmt) {
+        const toolParts = toolStmt.all(msg.id) as Array<{ tool: string; output: string }>;
 
         const relevantTools = toolParts.filter(
           (p) => p.tool && p.output && includeToolOutputs.includes(p.tool)
@@ -585,7 +600,7 @@ export class EpisodeReader {
       // tool-output path (multiple stacked outputs) and the plain-text path (a
       // single very long user/assistant message). The chunker's soft token limit
       // only protects across messages, not within a single oversized one.
-      let content = [textContent.trim(), toolContent].filter(Boolean).join("\n\n");
+      let content = [textContent.trim(), toolContent.trim()].filter(Boolean).join("\n\n");
       if (content.length > MAX_MESSAGE_CHARS) {
         content = `${content.slice(0, MAX_MESSAGE_CHARS)}\n[...truncated]`;
       }
