@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/MAnders333/knowledge-server/compare/v1.0.0...v1.0.1) (2026-03-02)
+
+
+### Bug Fixes
+
+* export activateInputSchema from mcp/index.ts and guard main() with import.meta.main to eliminate schema drift in tests ([5c30aae](https://github.com/MAnders333/knowledge-server/commit/5c30aae275a585aad0d025722faa983d2e22b0e2))
+
 ## 1.0.0 (2026-03-02)
 
 
