@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.3](https://github.com/MAnders333/knowledge-server/compare/v1.3.2...v1.3.3) (2026-03-04)
+
+
+### Bug Fixes
+
+* **scripts:** remove stale LLM env vars from MCP config hints; add Claude Code step ([f5c3d62](https://github.com/MAnders333/knowledge-server/commit/f5c3d62a12170d6dd6e933aedd0ea59282e710d3))
+
 ## [1.3.2](https://github.com/MAnders333/knowledge-server/compare/v1.3.1...v1.3.2) (2026-03-04)
 
 
