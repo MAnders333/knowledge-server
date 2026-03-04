@@ -13,29 +13,23 @@ import type { EpisodeMessage } from "../../types.js";
  * Keeping each episode under 50K tokens means a chunk of ~10 typical episodes
  * stays well within context limits even with a large existing knowledge base.
  *
- * Note: a single message capped at MAX_MESSAGE_CHARS (~30K tokens) can
- * occupy up to 60% of this budget on its own; the chunker places oversized
+ * Note: a single message capped at MAX_MESSAGE_CHARS (~15K tokens) can
+ * occupy up to 30% of this budget on its own; the chunker places oversized
  * messages alone in their own chunk (soft-limit behaviour, intentional).
  */
 export const MAX_TOKENS_PER_EPISODE = 50_000;
 
 /**
- * Maximum characters to include from a single tool output.
- * ~40K chars ≈ 10K tokens. Real Confluence pages regularly run 30–80K chars;
- * 20K was too aggressive and silently truncated most of the page content.
- * MAX_MESSAGE_CHARS caps the fully assembled message as a second guard.
+ * Maximum characters for a fully assembled message (text + all tool outputs
+ * combined). 60K chars ≈ 15K tokens — keeps the episode batch sent to the
+ * extraction LLM within limits that the IU unified proxy can handle reliably.
+ *
+ * There is no separate per-tool-output cap: individual tool outputs (e.g.
+ * long Confluence pages) pass through untruncated. The chunker places any
+ * message that individually exceeds this limit alone in its own chunk, so
+ * no content is silently dropped — it simply generates more, smaller chunks.
  */
-export const MAX_TOOL_OUTPUT_CHARS = 40_000;
-
-/**
- * Maximum characters for a fully assembled message (text + all tool outputs).
- * Derived as 3 × MAX_TOOL_OUTPUT_CHARS (~120K chars ≈ 30K tokens) so the cap
- * automatically tracks the per-output limit. The 3× factor gives room for two
- * full tool outputs plus surrounding text without silent truncation.
- * Applied unconditionally — the guard covers both the multi-output path and
- * plain oversized user/assistant messages.
- */
-export const MAX_MESSAGE_CHARS = MAX_TOOL_OUTPUT_CHARS * 3;
+export const MAX_MESSAGE_CHARS = 60_000;
 
 /**
  * Approximate token count from character count (1 token ~ 4 chars for ASCII).

@@ -141,16 +141,28 @@ curl --fail --location --show-error --progress-bar \
   -o "$TMPDIR_DL/knowledge-server-mcp"
 
 echo "Verifying checksums..."
-# The SHA256SUMS file uses the release asset filenames; verify using just the basenames
-if command -v sha256sum > /dev/null 2>&1; then
-  # MCP substitution must come before server substitution to avoid partial match:
-  # "knowledge-server-$PLATFORM" is a prefix of "knowledge-server-mcp-$PLATFORM"
-  (cd "$TMPDIR_DL" && sed "s/knowledge-server-mcp-$PLATFORM/knowledge-server-mcp/; s/knowledge-server-$PLATFORM/knowledge-server/" SHA256SUMS | sha256sum --check --status) || {
+# The SHA256SUMS file uses the release asset filenames; verify using just the basenames.
+# MCP substitution must come before server substitution to avoid partial match:
+# "knowledge-server-$PLATFORM" is a prefix of "knowledge-server-mcp-$PLATFORM".
+#
+# Tool selection: macOS ships `shasum` (BSD) and may also have `sha256sum` via
+# Homebrew coreutils — but Homebrew's sha256sum uses different flags on some
+# versions. Prefer `shasum` on Darwin; use `sha256sum` on Linux.
+_verify_checksums() {
+  sed "s/knowledge-server-mcp-$PLATFORM/knowledge-server-mcp/; s/knowledge-server-$PLATFORM/knowledge-server/" SHA256SUMS | "$@"
+}
+if [[ "$OS" == "Darwin" ]] && command -v shasum > /dev/null 2>&1; then
+  (cd "$TMPDIR_DL" && _verify_checksums shasum -a 256 --check --status) || {
+    echo "Checksum verification FAILED — aborting install."
+    exit 1
+  }
+elif command -v sha256sum > /dev/null 2>&1; then
+  (cd "$TMPDIR_DL" && _verify_checksums sha256sum --check --status) || {
     echo "Checksum verification FAILED — aborting install."
     exit 1
   }
 elif command -v shasum > /dev/null 2>&1; then
-  (cd "$TMPDIR_DL" && sed "s/knowledge-server-mcp-$PLATFORM/knowledge-server-mcp/; s/knowledge-server-$PLATFORM/knowledge-server/" SHA256SUMS | shasum -a 256 --check --status) || {
+  (cd "$TMPDIR_DL" && _verify_checksums shasum -a 256 --check --status) || {
     echo "Checksum verification FAILED — aborting install."
     exit 1
   }

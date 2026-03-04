@@ -10,7 +10,6 @@ import type {
 import {
 	MAX_MESSAGE_CHARS,
 	MAX_TOKENS_PER_EPISODE,
-	MAX_TOOL_OUTPUT_CHARS,
 	approxTokens,
 	chunkByTokenBudget,
 	formatMessages,
@@ -30,8 +29,8 @@ import {
  * CONSOLIDATION_INCLUDE_TOOL_OUTPUTS allowlist will fall back to the raw JSON
  * string, which may need updating here for best extraction quality.
  *
- * Output is capped at MAX_TOOL_OUTPUT_CHARS to prevent a single large tool
- * response from blowing through the episode token budget.
+ * No per-output size cap is applied here — the assembled message cap
+ * (MAX_MESSAGE_CHARS) and the chunker handle oversized content.
  */
 function extractToolText(raw: string): string {
 	let text = raw;
@@ -69,9 +68,6 @@ function extractToolText(raw: string): string {
 		// Not JSON — use raw string as-is
 	}
 
-	if (text.length > MAX_TOOL_OUTPUT_CHARS) {
-		return `${text.slice(0, MAX_TOOL_OUTPUT_CHARS)}\n[...truncated]`;
-	}
 	return text;
 }
 

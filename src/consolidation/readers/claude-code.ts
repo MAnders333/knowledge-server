@@ -10,7 +10,6 @@ import type {
 import {
 	MAX_MESSAGE_CHARS,
 	MAX_TOKENS_PER_EPISODE,
-	MAX_TOOL_OUTPUT_CHARS,
 	approxTokens,
 	chunkByTokenBudget,
 	formatMessages,
@@ -711,13 +710,7 @@ export class ClaudeCodeEpisodeReader implements IEpisodeReader {
 
 				if (relevant.length > 0) {
 					toolContent = relevant
-						.map((r) => {
-							const truncated =
-								r.text.length > MAX_TOOL_OUTPUT_CHARS
-									? `${r.text.slice(0, MAX_TOOL_OUTPUT_CHARS)}\n[...truncated]`
-									: r.text;
-							return `[tool: ${r.name}]\n${truncated}`;
-						})
+						.map((r) => `[tool: ${r.name}]\n${r.text}`)
 						.join("\n\n");
 				}
 			}
