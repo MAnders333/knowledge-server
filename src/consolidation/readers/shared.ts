@@ -10,8 +10,12 @@ import type { EpisodeMessage } from "../../types.js";
 /**
  * Maximum tokens per episode segment (soft limit — see chunkByTokenBudget).
  * The LLM sees: system prompt + existing knowledge + episode batch.
- * Keeping each episode under 50K tokens means a chunk of 10 episodes
+ * Keeping each episode under 50K tokens means a chunk of ~10 typical episodes
  * stays well within context limits even with a large existing knowledge base.
+ *
+ * Note: a single message capped at MAX_MESSAGE_CHARS (~30K tokens) can
+ * occupy up to 60% of this budget on its own; the chunker places oversized
+ * messages alone in their own chunk (soft-limit behaviour, intentional).
  */
 export const MAX_TOKENS_PER_EPISODE = 50_000;
 
@@ -19,21 +23,19 @@ export const MAX_TOKENS_PER_EPISODE = 50_000;
  * Maximum characters to include from a single tool output.
  * ~40K chars ≈ 10K tokens. Real Confluence pages regularly run 30–80K chars;
  * 20K was too aggressive and silently truncated most of the page content.
- * MAX_MESSAGE_CHARS still caps the fully assembled message so a single
- * tool output can never blow past the per-message guard on its own.
+ * MAX_MESSAGE_CHARS caps the fully assembled message as a second guard.
  */
 export const MAX_TOOL_OUTPUT_CHARS = 40_000;
 
 /**
  * Maximum characters for a fully assembled message (text + all tool outputs).
- * ~120K chars ≈ 30K tokens. Raised from 60K to preserve headroom now that
- * MAX_TOOL_OUTPUT_CHARS is 40K: a message containing two large tool outputs
- * (2 × 40K = 80K) plus surrounding text would otherwise be truncated at the
- * cap. The ~3× ratio (MAX_TOOL_OUTPUT_CHARS × 3) gives room for two full
- * outputs and adjacent text. Applied unconditionally — the guard covers both
- * the multi-output path and plain oversized user/assistant messages.
+ * Derived as 3 × MAX_TOOL_OUTPUT_CHARS (~120K chars ≈ 30K tokens) so the cap
+ * automatically tracks the per-output limit. The 3× factor gives room for two
+ * full tool outputs plus surrounding text without silent truncation.
+ * Applied unconditionally — the guard covers both the multi-output path and
+ * plain oversized user/assistant messages.
  */
-export const MAX_MESSAGE_CHARS = 120_000;
+export const MAX_MESSAGE_CHARS = MAX_TOOL_OUTPUT_CHARS * 3;
 
 /**
  * Approximate token count from character count (1 token ~ 4 chars for ASCII).
