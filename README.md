@@ -12,13 +12,14 @@ Supports **Linux x64** and **macOS arm64** (Apple Silicon). No Bun or Node.js re
 curl -fsSL https://raw.githubusercontent.com/MAnders333/knowledge-server/main/scripts/install.sh | bash
 ```
 
-This downloads the server binaries, plugin, and OpenCode commands into `~/.local/share/knowledge-server/`, symlinks the plugin and commands into `~/.config/opencode/`, generates a `.env` template, and prints a ready-to-paste MCP config block.
+This downloads the server binaries into `~/.local/share/knowledge-server/`, generates a `.env` template, and prints a ready-to-paste MCP config block for OpenCode.
 
 **After running:**
 
 1. Edit `~/.local/share/knowledge-server/.env` — set `LLM_API_KEY` and `LLM_BASE_ENDPOINT`
-2. Add the printed MCP config block to `~/.config/opencode/opencode.jsonc`
-3. Start the server: `knowledge-server`
+2. *(OpenCode)* Add the printed MCP config block to `~/.config/opencode/opencode.jsonc`
+3. *(Claude Code)* Run `knowledge-server setup-tool claude-code` — registers the MCP server and `UserPromptSubmit` hook automatically
+4. Start the server: `knowledge-server`
 
 **To update later:**
 
@@ -39,7 +40,15 @@ bun run setup
 bun run start
 ```
 
-`bun run setup` installs dependencies, creates the data directory, and symlinks the plugin and commands into your OpenCode config.
+`bun run setup` installs dependencies, creates the data directory, symlinks the plugin and commands into `~/.config/opencode/`, and prints an MCP config block for OpenCode.
+
+For Claude Code, run the additional setup step after `bun run setup`:
+
+```bash
+bun run src/index.ts setup-tool claude-code
+```
+
+This registers the MCP server (via `claude mcp add-json`) and adds the `UserPromptSubmit` hook to `~/.claude/settings.json`. Both steps are idempotent.
 
 ## Supported session sources
 
@@ -269,10 +278,6 @@ curl "http://127.0.0.1:3179/activate?q=how+do+we+handle+auth"
 
 ### Review and resolve knowledge entries
 
-The `/knowledge-review` OpenCode command (installed automatically) provides an interactive workflow for resolving conflicts, archiving stale entries, and reviewing team-relevant items. To run it, type `/knowledge-review` in any OpenCode session.
-
-You can also query the review endpoint directly:
-
 ```bash
 curl http://127.0.0.1:3179/review
 ```
@@ -281,6 +286,8 @@ Returns:
 - **conflicted** — entries flagged as `irresolvable` by the contradiction scan, needing human resolution
 - **stale** — active entries with low strength (haven't been accessed recently)
 - **team-relevant** — high-confidence `team`-scoped entries that may warrant external documentation
+
+OpenCode users also have a `/knowledge-review` slash command (installed by `setup-tool opencode`) for an interactive review workflow inside the TUI.
 
 ## Knowledge entry types
 
