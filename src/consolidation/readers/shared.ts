@@ -26,11 +26,14 @@ export const MAX_TOOL_OUTPUT_CHARS = 40_000;
 
 /**
  * Maximum characters for a fully assembled message (text + all tool outputs).
- * ~60K chars ≈ 15K tokens — aligns with the 50K-token episode soft limit so
- * no single message can exceed the chunker's budget on its own.
- * Applied unconditionally so the guard holds even when no tool outputs are present.
+ * ~120K chars ≈ 30K tokens. Raised from 60K to preserve headroom now that
+ * MAX_TOOL_OUTPUT_CHARS is 40K: a message containing two large tool outputs
+ * (2 × 40K = 80K) plus surrounding text would otherwise be truncated at the
+ * cap. The ~3× ratio (MAX_TOOL_OUTPUT_CHARS × 3) gives room for two full
+ * outputs and adjacent text. Applied unconditionally — the guard covers both
+ * the multi-output path and plain oversized user/assistant messages.
  */
-export const MAX_MESSAGE_CHARS = 60_000;
+export const MAX_MESSAGE_CHARS = 120_000;
 
 /**
  * Approximate token count from character count (1 token ~ 4 chars for ASCII).
