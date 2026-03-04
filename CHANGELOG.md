@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.1](https://github.com/MAnders333/knowledge-server/compare/v1.4.0...v1.4.1) (2026-03-04)
+
+
+### Bug Fixes
+
+* update release workflow asset paths for commands/ rename ([82eefb2](https://github.com/MAnders333/knowledge-server/commit/82eefb2c3196770104a1d7229ee9e7a1128bfe78))
+
 ## [1.4.0](https://github.com/MAnders333/knowledge-server/compare/v1.3.3...v1.4.0) (2026-03-04)
 
 
