@@ -17,10 +17,12 @@ export const MAX_TOKENS_PER_EPISODE = 50_000;
 
 /**
  * Maximum characters to include from a single tool output.
- * ~20K chars ≈ 5K tokens — generous enough for a full Confluence page while
- * preventing a single tool call from dominating the entire episode chunk budget.
+ * ~40K chars ≈ 10K tokens. Real Confluence pages regularly run 30–80K chars;
+ * 20K was too aggressive and silently truncated most of the page content.
+ * MAX_MESSAGE_CHARS still caps the fully assembled message so a single
+ * tool output can never blow past the per-message guard on its own.
  */
-export const MAX_TOOL_OUTPUT_CHARS = 20_000;
+export const MAX_TOOL_OUTPUT_CHARS = 40_000;
 
 /**
  * Maximum characters for a fully assembled message (text + all tool outputs).
