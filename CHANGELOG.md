@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.4.3](https://github.com/MAnders333/knowledge-server/compare/v1.4.2...v1.4.3) (2026-03-04)
+
+
+### Bug Fixes
+
+* also use formatLlmError on final give-up log line ([f8b1f20](https://github.com/MAnders333/knowledge-server/commit/f8b1f20dca56ba3fc1c0888f4bbef4d80aaa2367))
+* remove existing knowledge context from extractKnowledge, reduce chunkSize to 5 ([bc3a3a2](https://github.com/MAnders333/knowledge-server/commit/bc3a3a29f8b2076dc778af41eab5d28902854321))
+* unwrap AI_RetryError to log actual HTTP status and response body ([846e851](https://github.com/MAnders333/knowledge-server/commit/846e851b7e51d93eb20c630cea7abfcc0779fb8c))
+
 ## [1.4.2](https://github.com/MAnders333/knowledge-server/compare/v1.4.1...v1.4.2) (2026-03-04)
 
 
