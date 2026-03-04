@@ -20,7 +20,7 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { EpisodeReader } from "../src/consolidation/episodes";
+import { OpenCodeEpisodeReader } from "../src/consolidation/readers/opencode";
 
 // ── Schema helpers ─────────────────────────────────────────────────────────────
 
@@ -55,7 +55,7 @@ function createSchema(db: Database) {
 let tmpDir: string;
 let dbPath: string;
 let openCodeDb: Database;
-let reader: EpisodeReader;
+let reader: OpenCodeEpisodeReader;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "ks-episodes-test-"));
@@ -65,7 +65,7 @@ beforeEach(() => {
   // Open with write access to seed data
   openCodeDb = new Database(dbPath);
   createSchema(openCodeDb);
-  reader = new EpisodeReader(dbPath);
+  reader = new OpenCodeEpisodeReader(dbPath);
 });
 
 afterEach(() => {

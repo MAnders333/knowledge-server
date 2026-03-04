@@ -49,10 +49,28 @@ export const config = {
     process.env.KNOWLEDGE_LOG_PATH ??
     join(homedir(), ".local", "share", "knowledge-server", "server.log"),
 
-  // OpenCode episode source
+  // Episode sources
+  //
+  // opencodeDbPath: path to OpenCode's SQLite DB.
+  //   Auto-detected via `opencode db path` or a probe list; override with OPENCODE_DB_PATH.
+  //   A missing path is non-fatal — the source is simply disabled at startup.
+  //   If explicitly set via env var and missing, validateConfig() will error.
   opencodeDbPath:
     process.env.OPENCODE_DB_PATH ||
     join(homedir(), ".local", "share", "opencode", "opencode.db"),
+
+  // claudeDbPath: root directory for Claude Code session JSONL files.
+  //   Defaults to CLAUDE_CONFIG_DIR env var (what Claude Code itself uses), then ~/.claude.
+  //   Override with CLAUDE_DB_PATH (takes precedence over CLAUDE_CONFIG_DIR).
+  claudeDbPath:
+    process.env.CLAUDE_DB_PATH ||
+    process.env.CLAUDE_CONFIG_DIR ||
+    join(homedir(), ".claude"),
+
+  // Explicit source enable/disable.
+  // Both default to true (auto-detect); set to "false" to hard-disable a source.
+  opencodeEnabled: process.env.OPENCODE_ENABLED !== "false",
+  claudeEnabled: process.env.CLAUDE_ENABLED !== "false",
 
   // Unified endpoint — single API key, base URL routes by provider.
   // Set LLM_BASE_ENDPOINT in .env. No default is provided since this is
@@ -178,9 +196,13 @@ export function validateConfig(): string[] {
     );
   }
 
-  if (!existsSync(config.opencodeDbPath)) {
+  // Error only when the user explicitly configured OPENCODE_DB_PATH but the file
+  // doesn't exist — a typo or stale path is worth surfacing as a hard error.
+  // When using the default auto-detected path, a missing file is non-fatal: the
+  // OpenCode source will be disabled at startup with a warning instead.
+  if (process.env.OPENCODE_DB_PATH && !existsSync(config.opencodeDbPath)) {
     errors.push(
-      `OpenCode database not found at ${config.opencodeDbPath}. Set OPENCODE_DB_PATH if it's elsewhere.`
+      `OPENCODE_DB_PATH is set but OpenCode database not found at ${config.opencodeDbPath}.`
     );
   }
 

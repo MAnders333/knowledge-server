@@ -14,6 +14,7 @@ import type {
   KnowledgeType,
   ConsolidationState,
   ProcessedRange,
+  SourceCursor,
 } from "../types.js";
 
 /**
@@ -97,6 +98,7 @@ export class KnowledgeDB {
         this.db.exec("DROP TABLE IF EXISTS knowledge_relation");
         this.db.exec("DROP TABLE IF EXISTS knowledge_entry");
         this.db.exec("DROP TABLE IF EXISTS consolidated_episode");
+        this.db.exec("DROP TABLE IF EXISTS source_cursor");
         this.db.exec("DROP TABLE IF EXISTS consolidation_state");
         this.db.exec("DROP TABLE IF EXISTS schema_version");
       })();
@@ -710,8 +712,11 @@ export class KnowledgeDB {
    * Record a processed episode by its stable message ID range.
    * Called after the LLM call and DB writes for that episode succeed.
    * Uses INSERT OR IGNORE to be idempotent on retry.
+   *
+   * @param source  Reader source name (e.g. "opencode", "claude-code").
    */
   recordEpisode(
+    source: string,
     sessionId: string,
     startMessageId: string,
     endMessageId: string,
@@ -721,29 +726,38 @@ export class KnowledgeDB {
     this.db
       .prepare(
         `INSERT OR IGNORE INTO consolidated_episode
-         (session_id, start_message_id, end_message_id, content_type, processed_at, entries_created)
-         VALUES (?, ?, ?, ?, ?, ?)`
+         (source, session_id, start_message_id, end_message_id, content_type, processed_at, entries_created)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
       )
-      .run(sessionId, startMessageId, endMessageId, contentType, Date.now(), entriesCreated);
+      .run(source, sessionId, startMessageId, endMessageId, contentType, Date.now(), entriesCreated);
   }
 
   /**
-   * Load already-processed message ID ranges for a set of session IDs.
+   * Load already-processed message ID ranges for a set of session IDs from a specific source.
    * Returns a Map<sessionId, ProcessedRange[]> for O(1) lookup during segmentation.
+   *
+   * The source filter ensures episodes from one reader don't mask episodes from another
+   * when session IDs happen to collide (both OpenCode and Claude Code use UUIDs, so
+   * collisions are astronomically unlikely, but the source column is the authoritative
+   * namespace boundary).
    *
    * Uses json_each() to pass IDs as a single JSON array parameter, avoiding the
    * SQLite SQLITE_MAX_VARIABLE_NUMBER limit (999) that a spread IN(?,?,...) would hit.
+   *
+   * @param source      Reader source name (e.g. "opencode", "claude-code").
+   * @param sessionIds  Session IDs to look up.
    */
-  getProcessedEpisodeRanges(sessionIds: string[]): Map<string, ProcessedRange[]> {
+  getProcessedEpisodeRanges(source: string, sessionIds: string[]): Map<string, ProcessedRange[]> {
     if (sessionIds.length === 0) return new Map();
 
     const rows = this.db
       .prepare(
         `SELECT session_id, start_message_id, end_message_id
          FROM consolidated_episode
-         WHERE session_id IN (SELECT value FROM json_each(?))`
+         WHERE source = ?
+           AND session_id IN (SELECT value FROM json_each(?))`
       )
-      .all(JSON.stringify(sessionIds)) as Array<{
+      .all(source, JSON.stringify(sessionIds)) as Array<{
       session_id: string;
       start_message_id: string;
       end_message_id: string;
@@ -761,6 +775,47 @@ export class KnowledgeDB {
     return result;
   }
 
+  // ── Source Cursor ──
+
+  /**
+   * Get the high-water mark cursor for a specific source.
+   * Returns a zero-state cursor if no row exists for this source yet.
+   */
+  getSourceCursor(source: string): SourceCursor {
+    const row = this.db
+      .prepare("SELECT last_message_time_created, last_consolidated_at FROM source_cursor WHERE source = ?")
+      .get(source) as { last_message_time_created: number; last_consolidated_at: number } | null;
+
+    if (!row) {
+      return { source, lastMessageTimeCreated: 0, lastConsolidatedAt: 0 };
+    }
+
+    return {
+      source,
+      lastMessageTimeCreated: row.last_message_time_created,
+      lastConsolidatedAt: row.last_consolidated_at,
+    };
+  }
+
+  /**
+   * Upsert the high-water mark cursor for a specific source.
+   * Uses INSERT OR REPLACE so the first call creates the row automatically.
+   */
+  updateSourceCursor(source: string, cursor: Partial<Omit<SourceCursor, "source">>): void {
+    // Read current values so we only update what's provided
+    const current = this.getSourceCursor(source);
+
+    const newLastMessageTime = cursor.lastMessageTimeCreated ?? current.lastMessageTimeCreated;
+    const newLastConsolidated = cursor.lastConsolidatedAt ?? current.lastConsolidatedAt;
+
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO source_cursor (source, last_message_time_created, last_consolidated_at)
+         VALUES (?, ?, ?)`
+      )
+      .run(source, newLastMessageTime, newLastConsolidated);
+  }
+
   // ── Consolidation State ──
 
   getConsolidationState(): ConsolidationState {
@@ -768,7 +823,6 @@ export class KnowledgeDB {
       .prepare("SELECT * FROM consolidation_state WHERE id = 1")
       .get() as {
       last_consolidated_at: number;
-      last_message_time_created: number;
       total_sessions_processed: number;
       total_entries_created: number;
       total_entries_updated: number;
@@ -781,7 +835,6 @@ export class KnowledgeDB {
       logger.warn("[db] consolidation_state row missing — returning zero state");
       return {
         lastConsolidatedAt: 0,
-        lastMessageTimeCreated: 0,
         totalSessionsProcessed: 0,
         totalEntriesCreated: 0,
         totalEntriesUpdated: 0,
@@ -790,7 +843,6 @@ export class KnowledgeDB {
 
     return {
       lastConsolidatedAt: row.last_consolidated_at,
-      lastMessageTimeCreated: row.last_message_time_created,
       totalSessionsProcessed: row.total_sessions_processed,
       totalEntriesCreated: row.total_entries_created,
       totalEntriesUpdated: row.total_entries_updated,
@@ -804,10 +856,6 @@ export class KnowledgeDB {
     if (state.lastConsolidatedAt !== undefined) {
       fields.push("last_consolidated_at = ?");
       values.push(state.lastConsolidatedAt);
-    }
-    if (state.lastMessageTimeCreated !== undefined) {
-      fields.push("last_message_time_created = ?");
-      values.push(state.lastMessageTimeCreated);
     }
     if (state.totalSessionsProcessed !== undefined) {
       fields.push("total_sessions_processed = ?");
@@ -918,20 +966,20 @@ export class KnowledgeDB {
   }
 
   /**
-   * Wipe all knowledge entries, relations, and reset the consolidation cursor.
+   * Wipe all knowledge entries, relations, episode records, and reset all cursors.
    * Used during development/iteration to start fresh with improved extraction.
    */
   reinitialize(): void {
-    // All four operations must succeed atomically — a crash mid-wipe would
-    // leave entries deleted but the cursor not reset (or vice versa).
+    // All operations must succeed atomically — a crash mid-wipe would leave
+    // entries deleted but cursors not reset (or vice versa).
     this.db.transaction(() => {
       this.db.exec("DELETE FROM knowledge_relation");
       this.db.exec("DELETE FROM knowledge_entry");
       this.db.exec("DELETE FROM consolidated_episode");
+      this.db.exec("DELETE FROM source_cursor");
       this.db.exec(
         `UPDATE consolidation_state SET
           last_consolidated_at = 0,
-          last_message_time_created = 0,
           total_sessions_processed = 0,
           total_entries_created = 0,
           total_entries_updated = 0

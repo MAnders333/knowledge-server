@@ -1,40 +1,39 @@
 import type { KnowledgeDB } from "../db/database.js";
 import type { ActivationEngine } from "../activation/activate.js";
 import type { EmbeddingClient } from "../activation/embeddings.js";
-import { EpisodeReader } from "./episodes.js";
 import { ConsolidationLLM, formatEpisodes, formatExistingKnowledge } from "./llm.js";
 import { Reconsolidator } from "./reconsolidate.js";
 import { ContradictionScanner } from "./contradiction.js";
 import { computeStrength } from "./decay.js";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
-import type { KnowledgeEntry } from "../types.js";
+import type { IEpisodeReader, KnowledgeEntry } from "../types.js";
 import type { ConsolidationResult } from "../types.js";
 
 /**
  * The consolidation engine — the heart of the knowledge system.
  *
  * Orchestrates the full consolidation pipeline, delegating specialised work to:
- * - EpisodeReader         — fetches raw sessions/episodes from the OpenCode DB
+ * - IEpisodeReader[]      — one or more readers (OpenCode, Claude Code, …)
  * - ConsolidationLLM      — wraps all LLM calls (extract, merge, contradiction)
  * - Reconsolidator        — deduplicates extracted entries against existing knowledge
  * - ContradictionScanner  — detects and resolves contradictions in the mid-similarity band
  *
  * Models the human brain's sleep consolidation process:
- * 1. Read NEW episodes (since last consolidation cursor)
+ * 1. For each source reader, read NEW episodes (since that source's cursor)
  * 2. Load EXISTING knowledge (the current mental model)
  * 3. Extract new knowledge from episodes (what's worth remembering?)
  * 4. Reconsolidate — deduplicate/merge against existing knowledge
  * 5. Contradiction scan — detect and resolve conflicts in the mid-band
- * 6. Apply decay to all entries (forgetting curve)
- * 7. Generate embeddings for new entries
- * 8. Advance the cursor
+ * 6. Advance that source's cursor
+ * 7. After all sources: apply decay and generate embeddings
  */
 export class ConsolidationEngine {
   private db: KnowledgeDB;
   private activation: ActivationEngine;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   private embeddings: EmbeddingClient;
-  private episodes: EpisodeReader;
+  private readers: IEpisodeReader[];
   private llm: ConsolidationLLM;
   private reconsolidator: Reconsolidator;
   private contradictionScanner: ContradictionScanner;
@@ -71,13 +70,20 @@ export class ConsolidationEngine {
     this._isConsolidating = false;
   }
 
-  constructor(db: KnowledgeDB, activation: ActivationEngine) {
+  /**
+   * @param db         Knowledge DB instance
+   * @param activation ActivationEngine (provides shared EmbeddingClient)
+   * @param readers    Episode readers, one per source. Passed in by the caller
+   *                   (via createEpisodeReaders()) so construction is testable
+   *                   without real source DBs on disk.
+   */
+  constructor(db: KnowledgeDB, activation: ActivationEngine, readers: IEpisodeReader[] = []) {
     this.db = db;
     this.activation = activation;
     // Reuse the EmbeddingClient from ActivationEngine — one shared HTTP client
     // for both retrieval and consolidation embedding calls.
     this.embeddings = activation.embeddings;
-    this.episodes = new EpisodeReader();
+    this.readers = readers;
     this.llm = new ConsolidationLLM();
     this.reconsolidator = new Reconsolidator(db, this.embeddings, this.llm);
     this.contradictionScanner = new ContradictionScanner(db, this.llm);
@@ -86,11 +92,18 @@ export class ConsolidationEngine {
   /**
    * Check how many sessions are pending consolidation without running it.
    * Used at startup to decide whether to kick off a background consolidation.
+   * Aggregates across all active readers.
    */
   checkPending(): { pendingSessions: number; lastConsolidatedAt: number } {
     const state = this.db.getConsolidationState();
-    const pending = this.episodes.countNewSessions(state.lastMessageTimeCreated);
-    return { pendingSessions: pending, lastConsolidatedAt: state.lastConsolidatedAt };
+    let pendingSessions = 0;
+
+    for (const reader of this.readers) {
+      const cursor = this.db.getSourceCursor(reader.source);
+      pendingSessions += reader.countNewSessions(cursor.lastMessageTimeCreated);
+    }
+
+    return { pendingSessions, lastConsolidatedAt: state.lastConsolidatedAt };
   }
 
   /**
@@ -98,14 +111,16 @@ export class ConsolidationEngine {
    *
    * This is the main entry point — called by HTTP API or CLI.
    *
-   * Per-run steps:
-   * 1. Fetch candidate sessions since the cursor
-   * 2. Load already-processed episode ranges to determine new work
+   * Per-source per-run steps:
+   * 1. Fetch candidate sessions since the source cursor
+   * 2. Load already-processed episode ranges for this source
    * 3. Segment sessions into episodes, skipping already-processed ranges
    * 4. For each chunk: extract → reconsolidate → contradiction scan → record episodes
-   * 5. Apply decay to all active entries
-   * 6. Generate embeddings for new/updated entries
-   * 7. Advance the session cursor past all fetched candidates
+   * 5. Advance the source cursor past all fetched candidates
+   *
+   * After all sources:
+   * 6. Apply decay to all active entries
+   * 7. Generate embeddings for new/updated entries
    */
   async consolidate(): Promise<ConsolidationResult> {
     const startTime = Date.now();
@@ -115,39 +130,95 @@ export class ConsolidationEngine {
       `[consolidation] Starting. Last run: ${state.lastConsolidatedAt ? new Date(state.lastConsolidatedAt).toISOString() : "never"}`
     );
 
-    // 1. Fetch candidate sessions: those with messages newer than the cursor.
+    let totalSessionsProcessed = 0;
+    let totalSegmentsProcessed = 0;
+    let totalCreated = 0;
+    let totalUpdated = 0;
+    let totalConflictsDetected = 0;
+    let totalConflictsResolved = 0;
+
+    // Process each reader source independently with its own cursor.
+    for (const reader of this.readers) {
+      const sourceTotals = await this.consolidateSource(reader);
+      totalSessionsProcessed += sourceTotals.sessionsProcessed;
+      totalSegmentsProcessed += sourceTotals.segmentsProcessed;
+      totalCreated += sourceTotals.entriesCreated;
+      totalUpdated += sourceTotals.entriesUpdated;
+      totalConflictsDetected += sourceTotals.conflictsDetected;
+      totalConflictsResolved += sourceTotals.conflictsResolved;
+    }
+
+    if (totalSessionsProcessed === 0) {
+      logger.log("[consolidation] No new sessions to process.");
+    }
+
+    // Apply decay to ALL active entries (once, after all sources are processed).
+    const archived = this.applyDecay();
+
+    // Generate embeddings for new entries (once, shared across all sources).
+    const embeddedCount = await this.activation.ensureEmbeddings();
+    logger.log(`[consolidation] Generated embeddings for ${embeddedCount} entries.`);
+
+    this.db.updateConsolidationState({
+      lastConsolidatedAt: Date.now(),
+      totalSessionsProcessed: state.totalSessionsProcessed + totalSessionsProcessed,
+      totalEntriesCreated: state.totalEntriesCreated + totalCreated,
+      totalEntriesUpdated: state.totalEntriesUpdated + totalUpdated,
+    });
+
+    const result: ConsolidationResult = {
+      sessionsProcessed: totalSessionsProcessed,
+      segmentsProcessed: totalSegmentsProcessed,
+      entriesCreated: totalCreated,
+      entriesUpdated: totalUpdated,
+      entriesArchived: archived,
+      conflictsDetected: totalConflictsDetected,
+      conflictsResolved: totalConflictsResolved,
+      duration: Date.now() - startTime,
+    };
+
+    logger.log(
+      `[consolidation] Complete. ${result.sessionsProcessed} sessions (${result.segmentsProcessed} segments) -> ${result.entriesCreated} entries (${result.entriesArchived} archived, ${result.conflictsDetected} conflicts, ${result.conflictsResolved} resolved) in ${result.duration}ms`
+    );
+
+    return result;
+  }
+
+  /**
+   * Run consolidation for a single source reader.
+   * Returns partial counts that the caller aggregates across all readers.
+   */
+  private async consolidateSource(
+    reader: IEpisodeReader
+  ): Promise<{
+    sessionsProcessed: number;
+    segmentsProcessed: number;
+    entriesCreated: number;
+    entriesUpdated: number;
+    conflictsDetected: number;
+    conflictsResolved: number;
+  }> {
+    const cursor = this.db.getSourceCursor(reader.source);
+
+    // 1. Fetch candidate sessions: those with messages newer than this source's cursor.
     //    Returns session IDs plus the max message timestamp per session,
     //    ordered by max message time ASC for deterministic batching.
-    const candidateSessions = this.episodes.getCandidateSessions(
-      state.lastMessageTimeCreated,
+    const candidateSessions = reader.getCandidateSessions(
+      cursor.lastMessageTimeCreated,
       config.consolidation.maxSessionsPerRun
     );
 
     if (candidateSessions.length === 0) {
-      logger.log("[consolidation] No new sessions to process.");
-      // Still run decay — entries must age even during quiet periods where no
-      // new sessions arrive. Without this, the forgetting curve stops ticking.
-      const archived = this.applyDecay();
-      await this.activation.ensureEmbeddings();
-      return {
-        sessionsProcessed: 0,
-        segmentsProcessed: 0,
-        entriesCreated: 0,
-        entriesUpdated: 0,
-        entriesArchived: archived,
-        conflictsDetected: 0,
-        conflictsResolved: 0,
-        duration: Date.now() - startTime,
-      };
+      return { sessionsProcessed: 0, segmentsProcessed: 0, entriesCreated: 0, entriesUpdated: 0, conflictsDetected: 0, conflictsResolved: 0 };
     }
 
     const candidateIds = candidateSessions.map((s) => s.id);
 
-    // 2. Load already-processed episode ranges for this batch of sessions.
-    const processedRanges = this.db.getProcessedEpisodeRanges(candidateIds);
+    // 2. Load already-processed episode ranges for this source's batch of sessions.
+    const processedRanges = this.db.getProcessedEpisodeRanges(reader.source, candidateIds);
 
     // 3. Segment sessions into episodes, skipping already-processed ranges.
-    const episodes = this.episodes.getNewEpisodes(candidateIds, processedRanges);
+    const episodes = reader.getNewEpisodes(candidateIds, processedRanges);
 
     // Count unique sessions that produced at least one new episode
     const uniqueSessionIds = new Set(episodes.map((e) => e.sessionId));
@@ -166,7 +237,7 @@ export class ConsolidationEngine {
     }
 
     logger.log(
-      `[consolidation] Found ${episodes.length} episodes from ${uniqueSessionIds.size} sessions to process` +
+      `[consolidation/${reader.source}] Found ${episodes.length} episodes from ${uniqueSessionIds.size} sessions` +
       ` (${tooFew} skipped — too few messages, ${alreadyDone} skipped — already processed).`
     );
 
@@ -183,7 +254,7 @@ export class ConsolidationEngine {
       const chunkSummary = formatEpisodes(chunk);
 
       logger.log(
-        `[consolidation] Processing chunk ${Math.floor(i / chunkSize) + 1}/${Math.ceil(episodes.length / chunkSize)} (${chunk.length} episodes)`
+        `[consolidation/${reader.source}] Chunk ${Math.floor(i / chunkSize) + 1}/${Math.ceil(episodes.length / chunkSize)} (${chunk.length} episodes)`
       );
 
       // Load entries once for this chunk — used both for relevance selection
@@ -197,7 +268,7 @@ export class ConsolidationEngine {
       const existingKnowledgeSummary = formatExistingKnowledge(relevantKnowledge);
 
       logger.log(
-        `[consolidation] Using ${relevantKnowledge.length} relevant existing entries as context.`
+        `[consolidation/${reader.source}] Using ${relevantKnowledge.length} relevant existing entries as context.`
       );
 
       // Extract knowledge via LLM
@@ -207,20 +278,12 @@ export class ConsolidationEngine {
         existingKnowledgeSummary
       );
       logger.log(
-        `[consolidation] Extracted ${extracted.length} knowledge entries from chunk in ${((Date.now() - extractStart) / 1000).toFixed(1)}s.`
+        `[consolidation/${reader.source}] Extracted ${extracted.length} entries in ${((Date.now() - extractStart) / 1000).toFixed(1)}s.`
       );
 
       // Reconsolidate each extracted entry against existing knowledge.
-      // For each extracted entry:
-      //   1. Embed it
-      //   2. Find the nearest existing entry by cosine similarity
-      //   3. If similarity > RECONSOLIDATION_THRESHOLD: ask LLM to decide
-      //      keep / update / replace / insert
-      //   4. Act on the decision
-      //
       // Performance: load all entries with embeddings ONCE per chunk into an in-memory
       // Map. On insert/update, mutate the Map in place rather than reloading from DB.
-      // This avoids an O(n × m) reload — previously ~9.7 MB × m reads per chunk.
       const sessionIds = [...new Set(chunk.map((e) => e.sessionId))];
       // Reuse the entries already loaded for getRelevantKnowledge — no second DB read.
       const entriesMap = new Map(allEntriesForChunk.map((e) => [e.id, e]));
@@ -250,10 +313,6 @@ export class ConsolidationEngine {
               chunkUpdated++;
               changedIds.add(id);
               // Update the cache with the new content and fresh embedding.
-              // The fresh embedding was computed immediately after mergeEntry() and
-              // written to the DB, so the in-memory map and DB are now in sync.
-              // Later extractions in this chunk can deduplicate against the correct
-              // vector, and the contradiction scan sees accurate cosine distances.
               const existing = entriesMap.get(id);
               if (existing) {
                 entriesMap.set(id, {
@@ -274,14 +333,13 @@ export class ConsolidationEngine {
           // entries in this chunk to be re-processed on the next run and producing
           // duplicates for the entries that were already successfully inserted.
           logger.error(
-            `[consolidation] Failed to reconsolidate entry "${String(entry.content ?? "").slice(0, 60)}..." — skipping:`,
+            `[consolidation/${reader.source}] Failed to reconsolidate entry "${String(entry.content ?? "").slice(0, 60)}..." — skipping:`,
             err
           );
         }
       }
 
       // 5. Post-extraction contradiction scan.
-      //    Delegates to ContradictionScanner — finds mid-band candidates and resolves.
       const chunkContradictions = await this.contradictionScanner.scan(entriesMap, changedIds);
       totalConflictsDetected += chunkContradictions.detected;
       totalConflictsResolved += chunkContradictions.resolved;
@@ -289,11 +347,10 @@ export class ConsolidationEngine {
       // 6. Record each episode in this chunk as processed.
       //    This happens after the LLM call and DB writes succeed, making
       //    consolidation idempotent on crash/retry at the episode level.
-      //    entriesCreated is split evenly across episodes in the chunk as an approximation
-      //    (we don't track which entries came from which specific episode).
       const entriesPerEp = chunk.length > 0 ? Math.round((chunkCreated + chunkUpdated) / chunk.length) : 0;
       for (const ep of chunk) {
         this.db.recordEpisode(
+          reader.source,
           ep.sessionId,
           ep.startMessageId,
           ep.endMessageId,
@@ -303,82 +360,47 @@ export class ConsolidationEngine {
       }
     }
 
-    // 7. Apply decay to ALL active entries
-    const archived = this.applyDecay();
-
-    // 8. Generate embeddings for new entries
-    const embeddedCount = await this.activation.ensureEmbeddings();
-    logger.log(
-      `[consolidation] Generated embeddings for ${embeddedCount} entries.`
-    );
-
-    // 9. Advance cursor to the max message timestamp across all processed episodes.
-    //    This is the true high-water mark: any message with time_created > this value
-    //    is genuinely unprocessed.
+    // 7. Advance the source cursor past all fetched candidates.
+    //    Same boundary-safety logic as before, but now per-source.
     const maxEpisodeMessageTime = episodes.length > 0
       ? episodes.reduce((max, ep) => ep.maxMessageTime > max ? ep.maxMessageTime : max, 0)
       : 0;
 
-    // Start with the episode high-water mark; we'll decide below whether to also
-    // advance past sessions that produced no episodes.
-    let newCursor = Math.max(maxEpisodeMessageTime, state.lastMessageTimeCreated);
+    let newCursor = Math.max(maxEpisodeMessageTime, cursor.lastMessageTimeCreated);
 
     const lastSession = candidateSessions[candidateSessions.length - 1];
     const hitBatchLimit = candidateSessions.length === config.consolidation.maxSessionsPerRun;
 
     // Boundary-timestamp safety: if the batch is full, there may be additional
-    // unprocessed sessions beyond the batch boundary that share the exact same
-    // maxMessageTime as the last session in this batch. The next query uses `>`,
-    // so those sessions would be excluded forever if we advance the cursor to
-    // lastSession.maxMessageTime.
-    //
-    // Guard: keep the cursor just below the boundary so those sessions are
-    // re-fetched next run. Apply this cap whenever the batch is full, regardless
-    // of whether the last session produced an episode — a session without episodes
-    // (e.g. below minSessionMessages) could still share a timestamp with other
-    // sessions that DO have episodes and are waiting beyond the boundary.
-    //
-    // We only apply the cap when it is strictly above the current cursor
-    // (otherwise the safety floor below would undo it on the next line).
+    // unprocessed sessions beyond the boundary that share the exact same maxMessageTime.
+    // The next query uses `>`, so cap the cursor just below the boundary to re-fetch them.
     if (hitBatchLimit) {
-      // Cap below boundary; re-fetch same-timestamp sessions next run.
       const cap = lastSession.maxMessageTime - 1;
-      if (cap > state.lastMessageTimeCreated) {
+      if (cap > cursor.lastMessageTimeCreated) {
         newCursor = Math.min(newCursor, cap);
       }
     } else {
-      // Batch is not full — no boundary risk. Advance past all candidates so
-      // sessions that produced no episodes don't re-appear as candidates.
+      // Batch is not full — advance past all candidates so sessions that produced
+      // no episodes don't re-appear as candidates next run.
       newCursor = Math.max(newCursor, lastSession.maxMessageTime);
     }
 
     // Safety floor: never move the cursor backwards.
-    newCursor = Math.max(newCursor, state.lastMessageTimeCreated);
+    newCursor = Math.max(newCursor, cursor.lastMessageTimeCreated);
 
-    this.db.updateConsolidationState({
-      lastConsolidatedAt: Date.now(),
+    this.db.updateSourceCursor(reader.source, {
       lastMessageTimeCreated: newCursor,
-      totalSessionsProcessed: state.totalSessionsProcessed + candidateSessions.length,
-      totalEntriesCreated: state.totalEntriesCreated + totalCreated,
-      totalEntriesUpdated: state.totalEntriesUpdated + totalUpdated,
+      lastConsolidatedAt: Date.now(),
     });
 
-    const result: ConsolidationResult = {
+    return {
       sessionsProcessed: candidateSessions.length,
       segmentsProcessed: episodes.length,
       entriesCreated: totalCreated,
       entriesUpdated: totalUpdated,
-      entriesArchived: archived,
       conflictsDetected: totalConflictsDetected,
       conflictsResolved: totalConflictsResolved,
-      duration: Date.now() - startTime,
     };
-
-    logger.log(
-      `[consolidation] Complete. ${result.sessionsProcessed} sessions (${result.segmentsProcessed} segments) -> ${result.entriesCreated} entries (${result.entriesArchived} archived, ${result.conflictsDetected} conflicts, ${result.conflictsResolved} resolved) in ${result.duration}ms`
-    );
-
-    return result;
   }
 
   /**
@@ -429,6 +451,8 @@ export class ConsolidationEngine {
   }
 
   close(): void {
-    this.episodes.close();
+    for (const reader of this.readers) {
+      reader.close();
+    }
   }
 }

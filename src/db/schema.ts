@@ -10,9 +10,18 @@
  * v5: Added observation_count — evidence signal (how many episodes produced this
  * knowledge), kept separate from access_count (retrieval signal). Removed all
  * migration code — single clean schema, DB is reinitialized on upgrade.
+ *
+ * v6: Multi-source support.
+ * - consolidated_episode gains a `source` column (e.g. "opencode", "claude-code")
+ *   and a new composite PK (source, session_id, start_message_id, end_message_id).
+ * - New source_cursor table replaces the per-source cursor previously embedded in
+ *   consolidation_state. Keyed by source; stores the per-source high-water mark
+ *   (last_message_time_created) and the last time that source was consolidated.
+ * - consolidation_state retains the global counters and lastConsolidatedAt but
+ *   last_message_time_created is removed (superseded by source_cursor).
  */
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 /**
  * Expected columns for each table, derived from the DDL below.
@@ -33,11 +42,14 @@ export const EXPECTED_TABLE_COLUMNS: Readonly<Record<string, readonly string[]>>
     "id", "source_id", "target_id", "type", "created_at",
   ],
   consolidation_state: [
-    "id", "last_consolidated_at", "last_message_time_created",
+    "id", "last_consolidated_at",
     "total_sessions_processed", "total_entries_created", "total_entries_updated",
   ],
+  source_cursor: [
+    "source", "last_message_time_created", "last_consolidated_at",
+  ],
   consolidated_episode: [
-    "session_id", "start_message_id", "end_message_id",
+    "source", "session_id", "start_message_id", "end_message_id",
     "content_type", "processed_at", "entries_created",
   ],
 };
@@ -99,30 +111,41 @@ export const CREATE_TABLES = `
   CREATE INDEX IF NOT EXISTS idx_relation_target ON knowledge_relation(target_id);
   CREATE INDEX IF NOT EXISTS idx_relation_type ON knowledge_relation(type);
 
-  -- Consolidation state (message-time cursor + summary counters)
+  -- Consolidation state (global counters + last-run timestamp).
+  -- last_message_time_created has been removed — use source_cursor instead.
   CREATE TABLE IF NOT EXISTS consolidation_state (
     id INTEGER PRIMARY KEY DEFAULT 1 CHECK(id = 1),  -- singleton row
     last_consolidated_at INTEGER NOT NULL DEFAULT 0,
-    last_message_time_created INTEGER NOT NULL DEFAULT 0,
     total_sessions_processed INTEGER NOT NULL DEFAULT 0,
     total_entries_created INTEGER NOT NULL DEFAULT 0,
     total_entries_updated INTEGER NOT NULL DEFAULT 0
   );
 
-  INSERT OR IGNORE INTO consolidation_state (id, last_consolidated_at, last_message_time_created, total_sessions_processed, total_entries_created, total_entries_updated)
-  VALUES (1, 0, 0, 0, 0, 0);
+  INSERT OR IGNORE INTO consolidation_state (id, last_consolidated_at, total_sessions_processed, total_entries_created, total_entries_updated)
+  VALUES (1, 0, 0, 0, 0);
+
+  -- Per-source high-water mark cursor.
+  -- Replaces the single last_message_time_created in consolidation_state so each
+  -- source (opencode, claude-code) can advance independently.
+  CREATE TABLE IF NOT EXISTS source_cursor (
+    source                   TEXT    PRIMARY KEY,  -- e.g. "opencode", "claude-code"
+    last_message_time_created INTEGER NOT NULL DEFAULT 0,
+    last_consolidated_at      INTEGER NOT NULL DEFAULT 0
+  );
 
   -- Per-episode processing log — enables incremental within-session consolidation.
+  -- source column added in v6 to namespace episodes per reader.
   CREATE TABLE IF NOT EXISTS consolidated_episode (
+    source           TEXT    NOT NULL,
     session_id       TEXT    NOT NULL,
     start_message_id TEXT    NOT NULL,
     end_message_id   TEXT    NOT NULL,
     content_type     TEXT    NOT NULL,
     processed_at     INTEGER NOT NULL,
     entries_created  INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (session_id, start_message_id, end_message_id)
+    PRIMARY KEY (source, session_id, start_message_id, end_message_id)
   );
 
-  CREATE INDEX IF NOT EXISTS idx_episode_session ON consolidated_episode(session_id);
+  CREATE INDEX IF NOT EXISTS idx_episode_source_session ON consolidated_episode(source, session_id);
   CREATE INDEX IF NOT EXISTS idx_episode_processed ON consolidated_episode(processed_at);
 `;

@@ -1,7 +1,9 @@
 import { KnowledgeDB } from "./db/database.js";
 import { ActivationEngine } from "./activation/activate.js";
 import { ConsolidationEngine } from "./consolidation/consolidate.js";
+import { createEpisodeReaders } from "./consolidation/readers/index.js";
 import { validateConfig } from "./config.js";
+import { logger } from "./logger.js";
 
 /**
  * CLI entry point for running knowledge operations directly.
@@ -45,7 +47,9 @@ Commands:
   try {
     switch (command) {
       case "consolidate": {
-        const consolidation = new ConsolidationEngine(db, activation);
+        logger.init(""); // disable file logging in CLI mode
+        const readers = createEpisodeReaders();
+        const consolidation = new ConsolidationEngine(db, activation, readers);
         const result = await consolidation.consolidate();
         console.log("\nConsolidation result:");
         console.log(JSON.stringify(result, null, 2));

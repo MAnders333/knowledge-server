@@ -191,52 +191,80 @@ describe("KnowledgeDB", () => {
   it("should manage consolidation state", () => {
     const state = db.getConsolidationState();
     expect(state.lastConsolidatedAt).toBe(0);
-    expect(state.lastMessageTimeCreated).toBe(0);
     expect(state.totalSessionsProcessed).toBe(0);
 
     db.updateConsolidationState({
       lastConsolidatedAt: 1000000,
-      lastMessageTimeCreated: 999999,
       totalSessionsProcessed: 50,
       totalEntriesCreated: 25,
     });
 
     const updated = db.getConsolidationState();
     expect(updated.lastConsolidatedAt).toBe(1000000);
-    expect(updated.lastMessageTimeCreated).toBe(999999);
     expect(updated.totalSessionsProcessed).toBe(50);
     expect(updated.totalEntriesCreated).toBe(25);
   });
 
-  it("should record and retrieve episode ranges", () => {
-    db.recordEpisode("session-1", "msg-start-1", "msg-end-1", "messages", 3);
-    db.recordEpisode("session-1", "msg-start-2", "msg-end-2", "compaction_summary", 1);
-    db.recordEpisode("session-2", "msg-start-3", "msg-end-3", "messages", 0);
+  it("should manage source cursors", () => {
+    // Default zero state for unknown source
+    const initial = db.getSourceCursor("opencode");
+    expect(initial.source).toBe("opencode");
+    expect(initial.lastMessageTimeCreated).toBe(0);
+    expect(initial.lastConsolidatedAt).toBe(0);
 
-    const ranges = db.getProcessedEpisodeRanges(["session-1", "session-2"]);
+    // Update and re-read
+    db.updateSourceCursor("opencode", { lastMessageTimeCreated: 999999, lastConsolidatedAt: 1000000 });
+    const updated = db.getSourceCursor("opencode");
+    expect(updated.lastMessageTimeCreated).toBe(999999);
+    expect(updated.lastConsolidatedAt).toBe(1000000);
+
+    // Different source is independent
+    const other = db.getSourceCursor("claude-code");
+    expect(other.lastMessageTimeCreated).toBe(0);
+  });
+
+  it("should record and retrieve episode ranges", () => {
+    db.recordEpisode("opencode", "session-1", "msg-start-1", "msg-end-1", "messages", 3);
+    db.recordEpisode("opencode", "session-1", "msg-start-2", "msg-end-2", "compaction_summary", 1);
+    db.recordEpisode("opencode", "session-2", "msg-start-3", "msg-end-3", "messages", 0);
+
+    const ranges = db.getProcessedEpisodeRanges("opencode", ["session-1", "session-2"]);
 
     expect(ranges.size).toBe(2);
-    const s1 = ranges.get("session-1")!;
+    const s1 = ranges.get("session-1");
+    expect(s1).toBeDefined();
     expect(s1).toHaveLength(2);
-    expect(s1.some((r) => r.startMessageId === "msg-start-1" && r.endMessageId === "msg-end-1")).toBe(true);
-    expect(s1.some((r) => r.startMessageId === "msg-start-2" && r.endMessageId === "msg-end-2")).toBe(true);
+    expect((s1 ?? []).some((r) => r.startMessageId === "msg-start-1" && r.endMessageId === "msg-end-1")).toBe(true);
+    expect((s1 ?? []).some((r) => r.startMessageId === "msg-start-2" && r.endMessageId === "msg-end-2")).toBe(true);
 
-    const s2 = ranges.get("session-2")!;
+    const s2 = ranges.get("session-2");
+    expect(s2).toBeDefined();
     expect(s2).toHaveLength(1);
-    expect(s2[0].startMessageId).toBe("msg-start-3");
-    expect(s2[0].endMessageId).toBe("msg-end-3");
+    expect((s2 ?? [{}])[0].startMessageId).toBe("msg-start-3");
+    expect((s2 ?? [{}])[0].endMessageId).toBe("msg-end-3");
+  });
+
+  it("episodes from different sources are isolated", () => {
+    db.recordEpisode("opencode", "session-1", "msg-a", "msg-b", "messages", 2);
+    db.recordEpisode("claude-code", "session-1", "msg-a", "msg-b", "messages", 2);
+
+    // Each source only sees its own episodes
+    const oc = db.getProcessedEpisodeRanges("opencode", ["session-1"]);
+    const cc = db.getProcessedEpisodeRanges("claude-code", ["session-1"]);
+    expect(oc.get("session-1")).toHaveLength(1);
+    expect(cc.get("session-1")).toHaveLength(1);
   });
 
   it("recordEpisode is idempotent — duplicate inserts are ignored", () => {
-    db.recordEpisode("session-1", "msg-a", "msg-b", "messages", 2);
-    db.recordEpisode("session-1", "msg-a", "msg-b", "messages", 2);
+    db.recordEpisode("opencode", "session-1", "msg-a", "msg-b", "messages", 2);
+    db.recordEpisode("opencode", "session-1", "msg-a", "msg-b", "messages", 2);
 
-    const ranges = db.getProcessedEpisodeRanges(["session-1"]);
+    const ranges = db.getProcessedEpisodeRanges("opencode", ["session-1"]);
     expect(ranges.get("session-1")).toHaveLength(1);
   });
 
   it("getProcessedEpisodeRanges returns empty map for unknown session", () => {
-    const ranges = db.getProcessedEpisodeRanges(["no-such-session"]);
+    const ranges = db.getProcessedEpisodeRanges("opencode", ["no-such-session"]);
     expect(ranges.size).toBe(0);
   });
 

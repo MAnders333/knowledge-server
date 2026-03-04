@@ -3,12 +3,20 @@ import { randomBytes } from "node:crypto";
 import { KnowledgeDB } from "./db/database.js";
 import { ActivationEngine } from "./activation/activate.js";
 import { ConsolidationEngine } from "./consolidation/consolidate.js";
+import { createEpisodeReaders } from "./consolidation/readers/index.js";
 import { createApp } from "./api/server.js";
 import { config, validateConfig } from "./config.js";
 import { logger } from "./logger.js";
 import { runUpdate } from "./update.js";
+import { runSetupTool } from "./setup-tool.js";
 // @ts-ignore — Bun supports JSON imports natively
 import pkg from "../package.json" with { type: "json" };
+
+// Handle `knowledge-server setup-tool <opencode|claude-code>` before starting the server.
+if (process.argv[2] === "setup-tool") {
+  runSetupTool(process.argv.slice(3));
+  process.exit(0);
+}
 
 // Handle `knowledge-server update [--version v1.2.3]` before starting the server.
 // Mirrors the `opencode upgrade` pattern — run in a terminal, replaces the binary in place.
@@ -53,7 +61,8 @@ async function main() {
   // Initialize components
   const db = new KnowledgeDB();
   const activation = new ActivationEngine(db);
-  const consolidation = new ConsolidationEngine(db, activation);
+  const readers = createEpisodeReaders();
+  const consolidation = new ConsolidationEngine(db, activation, readers);
 
   // Check if this is a first run (no knowledge yet, but episodes exist)
   const stats = db.getStats();
@@ -97,11 +106,12 @@ async function main() {
   });
 
   logger.raw(`\n✓ HTTP API listening on http://${config.host}:${config.port}`);
-  logger.raw("  GET  /activate?q=...  — Activate knowledge");
-  logger.raw("  POST /consolidate     — Run consolidation   [admin token required]");
-  logger.raw("  GET  /review          — Review entries");
-  logger.raw("  GET  /status          — Health check");
-  logger.raw("  GET  /entries         — List entries");
+  logger.raw("  GET  /activate?q=...                  — Activate knowledge");
+  logger.raw("  POST /consolidate                      — Run consolidation   [admin token required]");
+  logger.raw("  GET  /review                           — Review entries");
+  logger.raw("  GET  /status                           — Health check");
+  logger.raw("  GET  /entries                          — List entries");
+  logger.raw("  POST /hooks/claude-code/user-prompt    — Claude Code hook (unauthenticated)");
   logger.rawStdoutOnly(`\n  Admin token (keep this private): ${adminToken}`);
   logger.rawStdoutOnly(`  curl -X POST -H "Authorization: Bearer <token>" http://${config.host}:${config.port}/consolidate`);
   if (config.logPath) {

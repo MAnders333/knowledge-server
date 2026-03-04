@@ -5,6 +5,7 @@ import type { KnowledgeDB } from "../db/database.js";
 import type { ActivationEngine } from "../activation/activate.js";
 import type { ConsolidationEngine } from "../consolidation/consolidate.js";
 import type { KnowledgeEntry, KnowledgeStatus } from "../types.js";
+import { staleTag, contradictionTagInline } from "../activation/format.js";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
 // @ts-ignore — Bun supports JSON imports natively; tsc may warn without resolveJsonModule
@@ -14,16 +15,17 @@ import pkg from "../../package.json" with { type: "json" };
  * HTTP API for the knowledge server.
  *
  * Endpoints:
- * - GET  /activate?q=...     -- Activate knowledge entries by query (used by plugin)
- * - POST /consolidate         -- Run consolidation cycle          [requires admin token]
- * - POST /reinitialize        -- Wipe knowledge DB and reset cursor [requires admin token]
- * - GET  /review              -- List entries needing attention
- * - GET  /status              -- Server health and stats
- * - GET  /entries             -- List all entries (with filters)
- * - GET  /entries/:id         -- Get a specific entry
- * - PATCH /entries/:id        -- Update fields on an entry       [requires admin token]
- * - POST /entries/:id/resolve -- Resolve a conflicted entry pair [requires admin token]
- * - DELETE /entries/:id       -- Hard-delete an entry            [requires admin token]
+ * - GET  /activate?q=...                   -- Activate knowledge entries by query (used by plugin)
+ * - POST /consolidate                       -- Run consolidation cycle          [requires admin token]
+ * - POST /reinitialize                      -- Wipe knowledge DB and reset cursor [requires admin token]
+ * - GET  /review                            -- List entries needing attention
+ * - GET  /status                            -- Server health and stats
+ * - GET  /entries                           -- List all entries (with filters)
+ * - GET  /entries/:id                       -- Get a specific entry
+ * - PATCH /entries/:id                      -- Update fields on an entry       [requires admin token]
+ * - POST /entries/:id/resolve               -- Resolve a conflicted entry pair [requires admin token]
+ * - DELETE /entries/:id                     -- Hard-delete an entry            [requires admin token]
+ * - POST /hooks/claude-code/user-prompt     -- Claude Code UserPromptSubmit hook (unauthenticated)
  *
  * Admin token:
  * A random token is generated at startup and printed to the console once.
@@ -174,6 +176,18 @@ export function createApp(
     const stats = db.getStats();
     const consolidationState = db.getConsolidationState();
 
+    // Per-source cursor info — surfaced so operators can see each source's
+    // last-consolidated timestamp and high-water mark without tailing logs.
+    const sourceCursors = ["opencode", "claude-code"].map((source) => {
+      const cursor = db.getSourceCursor(source);
+      return {
+        source,
+        lastConsolidatedAt: cursor.lastConsolidatedAt
+          ? new Date(cursor.lastConsolidatedAt).toISOString()
+          : null,
+      };
+    });
+
     // Config block (model names, port) is gated behind the admin token.
     // Unauthenticated callers (e.g. healthcheck scripts) still get version +
     // knowledge stats, but don't learn which models / endpoint are in use.
@@ -192,6 +206,7 @@ export function createApp(
         totalSessionsProcessed:
           consolidationState.totalSessionsProcessed,
         totalEntriesCreated: consolidationState.totalEntriesCreated,
+        sources: sourceCursors,
       },
       ...(isAdmin && {
         config: {
@@ -384,6 +399,73 @@ export function createApp(
     // means newEntryId (:id) wins, existingEntryId (counterpart) is superseded
     db.applyContradictionResolution("supersede_old", entry.id, counterpartId);
     return c.json({ ok: true, resolution: "supersede_other", winner: entry.id, superseded: counterpartId });
+  });
+
+  // -- Claude Code hook --
+
+  // POST /hooks/claude-code/user-prompt
+  //
+  // Called by Claude Code's UserPromptSubmit hook before each user prompt is sent
+  // to the model. Activates relevant knowledge and returns it as additionalContext
+  // so Claude Code injects it into the conversation automatically.
+  //
+  // This endpoint is intentionally unauthenticated (same as GET /activate) because:
+  // - The server binds to 127.0.0.1 only — loopback is the security boundary
+  // - Claude Code hooks run as the local user, not a remote caller
+  // - Adding auth would require storing a token in ~/.claude/settings.json in plaintext
+  //
+  // On any error (bad body, activation failure, etc.) we return {} so Claude Code
+  // continues normally without the context — hook errors are always non-blocking.
+  //
+  // Request body: { prompt: string, session_id?: string, cwd?: string }
+  // Response:     { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: string } }
+  //           or  {} on error (Claude Code ignores empty hookSpecificOutput gracefully)
+  app.post("/hooks/claude-code/user-prompt", async (c) => {
+    let prompt: string;
+    try {
+      const body = await c.req.json() as Record<string, unknown>;
+      if (typeof body.prompt !== "string" || !body.prompt.trim()) {
+        return c.json({});
+      }
+      prompt = body.prompt;
+    } catch {
+      return c.json({});
+    }
+
+    try {
+      const result = await activation.activate(prompt, { limit: 8 });
+
+      if (result.entries.length === 0) {
+        return c.json({});
+      }
+
+      // Format activated entries using the same inline style as the passive plugin.
+      const lines = result.entries.map((r) => {
+        const stale = staleTag(r.staleness);
+        const contradiction = contradictionTagInline(r.contradiction);
+        return `- [${r.entry.type}] ${r.entry.content}${stale}${contradiction}`;
+      });
+
+      const additionalContext = [
+        "Relevant knowledge from your knowledge base:",
+        ...lines,
+      ].join("\n");
+
+      logger.log(
+        `[hooks/claude-code] Activated ${result.entries.length} entries for prompt: "${prompt.slice(0, 60)}..."`
+      );
+
+      return c.json({
+        hookSpecificOutput: {
+          hookEventName: "UserPromptSubmit",
+          additionalContext,
+        },
+      });
+    } catch (e) {
+      logger.error("[hooks/claude-code] Activation error:", e);
+      // Return {} so Claude Code continues without context (non-blocking)
+      return c.json({});
+    }
   });
 
   // DELETE /entries/:id — hard-delete an entry and all its relations.

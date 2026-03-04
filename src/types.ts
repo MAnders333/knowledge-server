@@ -107,14 +107,25 @@ export interface KnowledgeRelation {
 }
 
 /**
- * Consolidation state — tracks the high-water mark of what's been processed.
+ * Consolidation state — global counters and last-run timestamp.
+ * Per-source high-water marks have moved to SourceCursor.
  */
 export interface ConsolidationState {
   lastConsolidatedAt: number; // unix timestamp ms
-  lastMessageTimeCreated: number; // max time_created of messages processed in last run
   totalSessionsProcessed: number;
   totalEntriesCreated: number;
   totalEntriesUpdated: number;
+}
+
+/**
+ * Per-source high-water mark cursor.
+ * Tracks the max time_created of messages processed for each source independently,
+ * so OpenCode and Claude Code can advance without interfering with each other.
+ */
+export interface SourceCursor {
+  source: string;                   // e.g. "opencode", "claude-code"
+  lastMessageTimeCreated: number;   // max time_created of messages seen in last run
+  lastConsolidatedAt: number;       // unix timestamp ms of last successful consolidation
 }
 
 /**
@@ -154,6 +165,48 @@ export interface Episode {
 export interface ProcessedRange {
   startMessageId: string;
   endMessageId: string;
+}
+
+/**
+ * Common interface for episode readers from different sources (OpenCode, Claude Code, etc.).
+ *
+ * Each source implements this interface so ConsolidationEngine can process multiple
+ * sources uniformly without knowing their internal storage formats.
+ *
+ * The source name (e.g. "opencode", "claude-code") is used as the key for:
+ * - The source_cursor table (per-source high-water mark)
+ * - The consolidated_episode.source column (idempotency tracking per source)
+ */
+export interface IEpisodeReader {
+  /** Stable identifier for this source (e.g. "opencode", "claude-code"). */
+  readonly source: string;
+
+  /**
+   * Return candidate sessions that have messages newer than the cursor.
+   * Used to decide whether to start background consolidation and to drive
+   * the consolidation loop.
+   */
+  getCandidateSessions(
+    afterMessageTimeCreated: number,
+    limit?: number
+  ): Array<{ id: string; maxMessageTime: number }>;
+
+  /**
+   * Count sessions with messages newer than the cursor.
+   * Cheap check used at startup.
+   */
+  countNewSessions(afterMessageTimeCreated: number): number;
+
+  /**
+   * Segment candidate sessions into new episodes, excluding already-processed ranges.
+   */
+  getNewEpisodes(
+    candidateSessionIds: string[],
+    processedRanges: Map<string, ProcessedRange[]>
+  ): Episode[];
+
+  /** Release any held resources (DB connections, file handles, etc.). */
+  close(): void;
 }
 
 /**
