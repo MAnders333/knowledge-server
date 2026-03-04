@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/MAnders333/knowledge-server/compare/v1.3.3...v1.4.0) (2026-03-04)
+
+
+### Features
+
+* setup-tool opencode auto-registers MCP server in opencode.jsonc ([fe4aafd](https://github.com/MAnders333/knowledge-server/commit/fe4aafdc82469d6e2484167708fe631ea0d560dd))
+
 ## [1.3.3](https://github.com/MAnders333/knowledge-server/compare/v1.3.2...v1.3.3) (2026-03-04)
 
 
