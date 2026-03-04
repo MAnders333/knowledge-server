@@ -19,6 +19,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { config } from "../src/config";
 import { ClaudeCodeEpisodeReader } from "../src/consolidation/readers/claude-code";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -764,6 +765,64 @@ describe("ClaudeCodeEpisodeReader — tool result extraction", () => {
 		const episodes = reader.getNewEpisodes([SESSION_UUID], new Map());
 		for (const ep of episodes) {
 			expect(ep.content).not.toContain("CONFIDENTIAL OUTPUT");
+		}
+	});
+
+	it("includes tool output when the tool is allowlisted (positive-case for tool_use_id resolution)", () => {
+		// This is the critical positive-case test: verifies that buildToolNameMap correctly
+		// resolves tool_use_id → tool name so allowlisted tools actually appear in output.
+		const originalAllowlist = config.consolidation.includeToolOutputs;
+		config.consolidation.includeToolOutputs = ["allowlisted_tool"];
+		try {
+			writeSession([
+				msgRecord({
+					uuid: "m1",
+					role: "assistant",
+					timestamp: ts(BASE, 0),
+					content: [
+						{ type: "text", text: "Fetching data..." },
+						// tool_use carries the name; tool_result carries only tool_use_id
+						{
+							type: "tool_use",
+							id: "tu-allow",
+							name: "allowlisted_tool",
+							input: {},
+						},
+					],
+				}),
+				msgRecord({
+					uuid: "m2",
+					role: "user",
+					timestamp: ts(BASE, 1000),
+					content: [
+						{ type: "text", text: "Result received." },
+						{
+							type: "tool_result",
+							tool_use_id: "tu-allow",
+							content: "ALLOWLISTED OUTPUT",
+						},
+					],
+				}),
+				msgRecord({
+					uuid: "m3",
+					role: "assistant",
+					timestamp: ts(BASE, 2000),
+					content: "Done.",
+				}),
+				msgRecord({
+					uuid: "m4",
+					role: "user",
+					timestamp: ts(BASE, 3000),
+					content: "Thanks.",
+				}),
+			]);
+
+			const episodes = reader.getNewEpisodes([SESSION_UUID], new Map());
+			expect(episodes).toHaveLength(1);
+			// Tool output must appear because the tool name was resolved via tool_use_id
+			expect(episodes[0].content).toContain("ALLOWLISTED OUTPUT");
+		} finally {
+			config.consolidation.includeToolOutputs = originalAllowlist;
 		}
 	});
 });

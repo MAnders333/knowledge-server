@@ -459,6 +459,9 @@ export class ClaudeCodeEpisodeReader implements IEpisodeReader {
 			summaryTimestampMs: number;
 		}>,
 	): Episode[] {
+		// Build the tool name map once for the whole session rather than
+		// re-scanning all records inside getMessagesAfterCompaction.
+		const toolNameMap = this.buildToolNameMap(session.records);
 		const episodes: Episode[] = [];
 
 		for (const point of compactionPoints) {
@@ -483,6 +486,7 @@ export class ClaudeCodeEpisodeReader implements IEpisodeReader {
 		const tailMessages = this.getMessagesAfterCompaction(
 			session,
 			lastCompaction.summaryUuid,
+			toolNameMap,
 		);
 
 		if (tailMessages.length >= config.consolidation.minSessionMessages) {
@@ -515,12 +519,14 @@ export class ClaudeCodeEpisodeReader implements IEpisodeReader {
 
 	/**
 	 * Get messages after the compaction summary, skipping the summary itself.
+	 *
+	 * @param toolNameMap - pre-built tool_use_id → name map (caller owns, avoids re-scan).
 	 */
 	private getMessagesAfterCompaction(
 		session: ParsedSession,
 		summaryUuid: string,
+		toolNameMap: Map<string, string>,
 	): EpisodeMessage[] {
-		const toolNameMap = this.buildToolNameMap(session.records);
 		let pastSummary = false;
 		const messages: EpisodeMessage[] = [];
 
