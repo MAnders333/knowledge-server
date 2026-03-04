@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.2](https://github.com/MAnders333/knowledge-server/compare/v1.4.1...v1.4.2) (2026-03-04)
+
+
+### Bug Fixes
+
+* remove MAX_TOOL_OUTPUT_CHARS; revert MAX_MESSAGE_CHARS to 60K; fix macOS checksum verification ([908df60](https://github.com/MAnders333/knowledge-server/commit/908df602e400f913956b86d2e68d83d53d6db0f3))
+
 ## [1.4.1](https://github.com/MAnders333/knowledge-server/compare/v1.4.0...v1.4.1) (2026-03-04)
 
 
