@@ -106,15 +106,69 @@ function makeOpenCodeMcpEntry(): { command: string[] } & Record<
 }
 
 /**
- * Strip single-line and block comments from a JSONC string.
- * Simple regex approach — sufficient for machine-generated config files.
- * Does not handle comments inside string values (edge case not present in
- * opencode.jsonc in practice).
+ * Strip single-line (`//`) and block comments from a JSONC string.
+ *
+ * Uses a character-by-character state machine so that `//` or block-comment
+ * delimiters inside string values are never mistaken for comments. Handles:
+ *   - Escaped characters inside strings (`\"`, `\\`)
+ *   - Block comments that span multiple lines
+ *   - Adjacent or nested-looking comment sequences
  */
-function stripJsoncComments(jsonc: string): string {
-	return jsonc
-		.replace(/\/\*[\s\S]*?\*\//g, "") // block comments
-		.replace(/\/\/[^\n]*/g, ""); // line comments
+export function stripJsoncComments(jsonc: string): string {
+	let result = "";
+	let i = 0;
+	let inString = false;
+
+	while (i < jsonc.length) {
+		const ch = jsonc[i];
+
+		if (inString) {
+			if (ch === "\\") {
+				// Escaped character — copy both chars verbatim and skip ahead.
+				result += ch + (jsonc[i + 1] ?? "");
+				i += 2;
+				continue;
+			}
+			if (ch === '"') {
+				inString = false;
+			}
+			result += ch;
+			i++;
+			continue;
+		}
+
+		// Outside a string — check for comment delimiters.
+		if (ch === '"') {
+			inString = true;
+			result += ch;
+			i++;
+			continue;
+		}
+
+		if (ch === "/" && jsonc[i + 1] === "/") {
+			// Line comment — skip to end of line.
+			while (i < jsonc.length && jsonc[i] !== "\n") i++;
+			continue;
+		}
+
+		if (ch === "/" && jsonc[i + 1] === "*") {
+			// Block comment — skip to closing delimiter.
+			i += 2;
+			while (i < jsonc.length) {
+				if (jsonc[i] === "*" && jsonc[i + 1] === "/") {
+					i += 2;
+					break;
+				}
+				i++;
+			}
+			continue;
+		}
+
+		result += ch;
+		i++;
+	}
+
+	return result;
 }
 
 /**
@@ -176,8 +230,18 @@ function writeOpenCodeMcpEntry(opencodeConfigDir: string): void {
 
 	mkdirSync(opencodeConfigDir, { recursive: true });
 	const tmpPath = `${configPath}.tmp`;
-	writeFileSync(tmpPath, `${JSON.stringify(parsed, null, 2)}\n`, "utf8");
-	renameSync(tmpPath, configPath);
+	try {
+		writeFileSync(tmpPath, `${JSON.stringify(parsed, null, 2)}\n`, "utf8");
+		renameSync(tmpPath, configPath);
+	} catch (e) {
+		// Clean up the temp file so it doesn't litter the config directory.
+		try {
+			unlinkSync(tmpPath);
+		} catch {
+			// Ignore — tmp file may not have been created yet.
+		}
+		throw e;
+	}
 }
 
 // ── OpenCode setup ─────────────────────────────────────────────────────────────
@@ -400,8 +464,17 @@ function setupClaudeCode(): void {
 	// Write atomically via a temp file + rename so a crash mid-write never
 	// leaves settings.json in a truncated/unparseable state.
 	const tmpPath = `${settingsPath}.tmp`;
-	writeFileSync(tmpPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
-	renameSync(tmpPath, settingsPath);
+	try {
+		writeFileSync(tmpPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+		renameSync(tmpPath, settingsPath);
+	} catch (e) {
+		try {
+			unlinkSync(tmpPath);
+		} catch {
+			// Ignore — tmp file may not have been created yet.
+		}
+		throw e;
+	}
 	console.log(`  ✓ Wrote ${settingsPath}`);
 
 	// ── Slash command symlinks — ~/.claude/commands/*.md ──
