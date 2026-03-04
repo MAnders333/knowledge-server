@@ -20,7 +20,7 @@ import { config } from "./config.js";
  * opencode:
  *   - Symlink plugin/knowledge.ts → ~/.config/opencode/plugins/knowledge.ts
  *   - Symlink commands/*.md → ~/.config/opencode/command/*.md
- *   - Print MCP config block for opencode.jsonc
+ *   - Merge mcp.knowledge entry into ~/.config/opencode/opencode.jsonc
  *
  * claude-code:
  *   - Register MCP server via `claude mcp add-json` (→ ~/.claude.json)
@@ -48,6 +48,136 @@ function getProjectDir(): string {
 	// Only meaningful for source installs; binary installs use the companion binary directly.
 	const mainFile = typeof Bun !== "undefined" ? Bun.main : process.argv[1];
 	return resolve(dirname(mainFile), "..");
+}
+
+// ── OpenCode MCP config ────────────────────────────────────────────────────────
+
+/**
+ * Build the MCP server entry for opencode.jsonc.
+ *
+ * OpenCode's `opencode mcp add` is interactive-only (no JSON flag), so we write
+ * directly to opencode.jsonc. The file is JSONC — we strip line and block
+ * comments before parsing, merge in the `mcp.knowledge` key, and re-serialize.
+ * Comment loss in the rewritten file is acceptable: the MCP block is machine-
+ * managed and users rarely comment individual server entries.
+ *
+ * Source install: command is `[bunBin, "run", "<projectDir>/src/mcp/index.ts"]`
+ * Binary install: command is `["<INSTALL_DIR>/libexec/knowledge-server-mcp"]`
+ *   — binary install can't know INSTALL_DIR at runtime, so we fall back to
+ *   searching PATH for `knowledge-server-mcp` and using that absolute path.
+ */
+function makeOpenCodeMcpEntry(): { command: string[] } & Record<
+	string,
+	unknown
+> {
+	const env = {
+		// Thin HTTP proxy — only needs to locate the knowledge HTTP server.
+		KNOWLEDGE_HOST: config.host,
+		KNOWLEDGE_PORT: String(config.port),
+	};
+
+	if (isSourceInstall()) {
+		const projectDir = getProjectDir();
+		const bunBin = process.execPath.endsWith("bun")
+			? process.execPath
+			: join(homedir(), ".bun", "bin", "bun");
+		return {
+			type: "local",
+			command: [bunBin, "run", join(projectDir, "src", "mcp", "index.ts")],
+			enabled: true,
+			environment: env,
+		};
+	}
+
+	// Binary install: find knowledge-server-mcp on PATH.
+	const whichResult = spawnSync("which", ["knowledge-server-mcp"], {
+		encoding: "utf8",
+	});
+	const mcpBin =
+		whichResult.status === 0
+			? whichResult.stdout.trim()
+			: "knowledge-server-mcp"; // fallback: hope it's on PATH at runtime
+	return {
+		type: "local",
+		command: [mcpBin],
+		enabled: true,
+		environment: env,
+	};
+}
+
+/**
+ * Strip single-line and block comments from a JSONC string.
+ * Simple regex approach — sufficient for machine-generated config files.
+ * Does not handle comments inside string values (edge case not present in
+ * opencode.jsonc in practice).
+ */
+function stripJsoncComments(jsonc: string): string {
+	return jsonc
+		.replace(/\/\*[\s\S]*?\*\//g, "") // block comments
+		.replace(/\/\/[^\n]*/g, ""); // line comments
+}
+
+/**
+ * Merge `mcp.knowledge` into `~/.config/opencode/opencode.jsonc`.
+ *
+ * Idempotent: if the key already exists with the same command, prints "no
+ * change". If it exists with a different command (e.g. stale path after a
+ * reinstall), replaces it and logs the update.
+ *
+ * Creates a minimal opencode.jsonc with only the mcp.knowledge block if the
+ * file does not yet exist.
+ */
+function writeOpenCodeMcpEntry(opencodeConfigDir: string): void {
+	const configPath = join(opencodeConfigDir, "opencode.jsonc");
+	const entry = makeOpenCodeMcpEntry();
+
+	let parsed: Record<string, unknown> = {};
+
+	if (existsSync(configPath)) {
+		try {
+			const raw = readFileSync(configPath, "utf8");
+			parsed = JSON.parse(stripJsoncComments(raw)) as Record<string, unknown>;
+		} catch (e) {
+			console.error(`  ✗ Failed to parse ${configPath}: ${e}`);
+			console.error(
+				"    Fix the syntax error and retry, or add the MCP entry manually.",
+			);
+			console.error(
+				`    Entry to add: "knowledge": ${JSON.stringify(entry, null, 6)}`,
+			);
+			return; // non-fatal: rest of setup continues
+		}
+	}
+
+	const mcp = (parsed.mcp ?? {}) as Record<string, unknown>;
+	const existing = mcp.knowledge as
+		| ({ command: string[] } & Record<string, unknown>)
+		| undefined;
+
+	if (existing) {
+		const existingCmd = JSON.stringify(existing.command);
+		const newCmd = JSON.stringify(entry.command);
+		if (existingCmd === newCmd) {
+			console.log(
+				"  ✓ MCP server 'knowledge' already in opencode.jsonc (no change)",
+			);
+			return;
+		}
+		// Command changed (e.g. project moved or reinstalled) — update in place.
+		console.log(
+			"  ✓ MCP server 'knowledge' updated in opencode.jsonc (command changed)",
+		);
+	} else {
+		console.log("  ✓ MCP server 'knowledge' added to opencode.jsonc");
+	}
+
+	mcp.knowledge = entry;
+	parsed.mcp = mcp;
+
+	mkdirSync(opencodeConfigDir, { recursive: true });
+	const tmpPath = `${configPath}.tmp`;
+	writeFileSync(tmpPath, `${JSON.stringify(parsed, null, 2)}\n`, "utf8");
+	renameSync(tmpPath, configPath);
 }
 
 // ── OpenCode setup ─────────────────────────────────────────────────────────────
@@ -93,21 +223,16 @@ function setupOpenCode(): void {
 		console.log(`  ✓ Command ${file}: ${dst}`);
 	}
 
-	// MCP config hint
-	console.log(`
-To enable the MCP 'activate' tool, add this to ~/.config/opencode/opencode.jsonc:
+	// MCP server entry — written directly to opencode.jsonc
+	writeOpenCodeMcpEntry(configDir);
 
-  "mcp": {
-    "knowledge": {
-      "type": "local",
-      "command": ["bun", "run", "${join(projectDir, "src", "mcp", "index.ts")}"],
-      "enabled": true,
-      "environment": {
-        "KNOWLEDGE_HOST": "${config.host}",
-        "KNOWLEDGE_PORT": "${config.port}"
-      }
-    }
-  }
+	const startHint = isSourceInstall()
+		? `bun run ${join(projectDir, "src", "index.ts")}`
+		: "knowledge-server";
+
+	console.log(`
+Start the knowledge server before using OpenCode:
+  ${startHint}
 
 Setup complete!`);
 }
@@ -343,7 +468,7 @@ export function runSetupTool(args: string[]): void {
 		console.log(`Usage: knowledge-server setup-tool <tool>
 
 Available tools:
-  opencode      Symlink plugin + commands into ~/.config/opencode/; print MCP config hint
+  opencode      Symlink plugin + commands; register MCP server in opencode.jsonc
   claude-code   Register MCP server + hook; symlink commands into ~/.claude/commands/
 `);
 		process.exit(0);
