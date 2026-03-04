@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.3.0](https://github.com/MAnders333/knowledge-server/compare/v1.2.3...v1.3.0) (2026-03-04)
+
+
+### Features
+
+* add Claude Code as a second session source ([c5f6945](https://github.com/MAnders333/knowledge-server/commit/c5f6945aa3f36e37eb94fe32d989067b82d3c6be))
+
+
+### Bug Fixes
+
+* deduplicate tool name map build in compaction path; add positive allowlist test ([59f67e7](https://github.com/MAnders333/knowledge-server/commit/59f67e7609d6b7f9bf9239c51ea167aff6f00729))
+* two bugs in ClaudeCodeEpisodeReader ([d9d06eb](https://github.com/MAnders333/knowledge-server/commit/d9d06eb03d1175eecc9f4b50f65ca6789f3f9e7b))
+
 ## [1.2.3](https://github.com/MAnders333/knowledge-server/compare/v1.2.2...v1.2.3) (2026-03-02)
 
 
