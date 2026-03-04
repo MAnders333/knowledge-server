@@ -105,12 +105,14 @@ for cmd_file in "$PROJECT_DIR/opencode/command/"*.md; do
   echo "  ✓ Symlinked command: $cmd_name"
 done
 
-# 7. Add MCP config hint — interpolate non-sensitive values (path, endpoint) from .env.
-# LLM_API_KEY is intentionally NOT printed — copy it from .env directly.
-MCP_ENDPOINT="${LLM_BASE_ENDPOINT:-https://your-llm-endpoint.example.com}"
+# 7. MCP config hint for OpenCode.
+# The MCP server is a thin HTTP proxy — it only needs KNOWLEDGE_HOST/PORT,
+# not LLM credentials.
+KNOWLEDGE_HOST_VAL="${KNOWLEDGE_HOST:-127.0.0.1}"
+KNOWLEDGE_PORT_VAL="${KNOWLEDGE_PORT:-3179}"
 
 echo ""
-echo "To enable the MCP 'activate' tool for agents, add this to ~/.config/opencode/opencode.jsonc:"
+echo "To enable the MCP 'activate' tool for OpenCode agents, add this to ~/.config/opencode/opencode.jsonc:"
 echo ""
 echo "  \"mcp\": {"
 echo "    \"knowledge\": {"
@@ -118,17 +120,12 @@ echo "      \"type\": \"local\","
 echo "      \"command\": [\"bun\", \"run\", \"$PROJECT_DIR/src/mcp/index.ts\"],"
 echo "      \"enabled\": true,"
 echo "      \"environment\": {"
-echo "        \"LLM_API_KEY\": \"<copy from .env>\","
-echo "        \"LLM_BASE_ENDPOINT\": \"$MCP_ENDPOINT\""
+echo "        \"KNOWLEDGE_HOST\": \"$KNOWLEDGE_HOST_VAL\","
+echo "        \"KNOWLEDGE_PORT\": \"$KNOWLEDGE_PORT_VAL\""
 echo "      }"
 echo "    }"
 echo "  }"
 echo ""
-if [ "$ENV_CONFIGURED" = "false" ]; then
-  echo "  ⚠ LLM_BASE_ENDPOINT above is a placeholder — fill in .env first, then re-run"
-  echo "    setup to get a ready-to-paste block."
-  echo ""
-fi
 
 # 8. Check OpenCode DB
 OPENCODE_DB="$HOME/.local/share/opencode/opencode.db"
@@ -146,15 +143,16 @@ echo ""
 echo "Next steps:"
 if [ "$ENV_CONFIGURED" = "false" ]; then
   echo "  1. Edit $PROJECT_DIR/.env — set LLM_API_KEY and LLM_BASE_ENDPOINT"
-  echo "  2. Re-run setup to get a ready-to-paste MCP config block:  bun run setup"
-  echo "  3. Add the MCP block above to ~/.config/opencode/opencode.jsonc"
+  echo "  2. Add the MCP block above to ~/.config/opencode/opencode.jsonc"
+  echo "  3. (Claude Code) Register the MCP server and hook:"
+  echo "       bun run $PROJECT_DIR/src/index.ts setup-tool claude-code"
   echo "  4. Start the server:  cd $PROJECT_DIR && bun run start"
-  echo "     The server prints an admin token on startup — use it for step 5."
   echo "  5. Check status:  curl http://127.0.0.1:3179/status"
 else
   echo "  1. Add the MCP block above to ~/.config/opencode/opencode.jsonc"
-  echo "  2. Start the server:  cd $PROJECT_DIR && bun run start"
-  echo "     The server prints an admin token on startup — use it for step 3."
-  echo "  3. Check status:  curl http://127.0.0.1:3179/status"
+  echo "  2. (Claude Code) Register the MCP server and hook:"
+  echo "       bun run $PROJECT_DIR/src/index.ts setup-tool claude-code"
+  echo "  3. Start the server:  cd $PROJECT_DIR && bun run start"
+  echo "  4. Check status:  curl http://127.0.0.1:3179/status"
 fi
 echo ""

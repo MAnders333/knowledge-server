@@ -320,7 +320,12 @@ if grep -qE "your-api-key-here|your-llm-endpoint" "$ENV_FILE" 2>/dev/null; then
   ENV_CONFIGURED=false
 fi
 
-MCP_ENDPOINT="$(grep '^LLM_BASE_ENDPOINT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '\r' || echo '<your-endpoint>')"
+# Read the configured host/port to interpolate into the printed MCP block.
+# Fall back to defaults if not set in .env.
+KNOWLEDGE_HOST_VAL="$(grep '^KNOWLEDGE_HOST=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '\r' || echo '127.0.0.1')"
+KNOWLEDGE_PORT_VAL="$(grep '^KNOWLEDGE_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '\r' || echo '3179')"
+KNOWLEDGE_HOST_VAL="${KNOWLEDGE_HOST_VAL:-127.0.0.1}"
+KNOWLEDGE_PORT_VAL="${KNOWLEDGE_PORT_VAL:-3179}"
 
 echo ""
 echo "Installation complete!"
@@ -337,6 +342,8 @@ if [ "$ENV_CONFIGURED" = false ]; then
   STEP=$((STEP + 1))
 fi
 
+# The MCP server is a thin HTTP proxy — it only needs KNOWLEDGE_HOST/PORT.
+# LLM credentials stay in the knowledge server's .env, not the MCP process.
 echo "  $STEP. Add to ~/.config/opencode/opencode.jsonc:"
 echo ""
 echo '     "mcp": {'
@@ -345,11 +352,16 @@ echo '         "type": "local",'
 echo "         \"command\": [\"$INSTALL_DIR/libexec/knowledge-server-mcp\"],"
 echo '         "enabled": true,'
 echo '         "environment": {'
-echo "           \"LLM_API_KEY\": \"<copy from $ENV_FILE>\","
-echo "           \"LLM_BASE_ENDPOINT\": \"$MCP_ENDPOINT\""
+echo "           \"KNOWLEDGE_HOST\": \"$KNOWLEDGE_HOST_VAL\","
+echo "           \"KNOWLEDGE_PORT\": \"$KNOWLEDGE_PORT_VAL\""
 echo '         }'
 echo '       }'
 echo '     }'
+echo ""
+STEP=$((STEP + 1))
+
+echo "  $STEP. (Claude Code) Register the MCP server and hook:"
+echo "     knowledge-server setup-tool claude-code"
 echo ""
 STEP=$((STEP + 1))
 
@@ -372,6 +384,6 @@ STEP=$((STEP + 1))
 echo "  $STEP. Verify it's running:"
 echo "     curl http://127.0.0.1:3179/status"
 echo ""
-echo "The plugin is already active in OpenCode — no restart needed."
+echo "The OpenCode plugin is already active — no restart needed."
 echo "The MCP 'activate' tool is available in any session once you add the config block above."
 echo ""
