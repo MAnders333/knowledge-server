@@ -264,7 +264,7 @@ echo "  ✓ launcher: $BIN_DIR/knowledge-server"
 # ── Download plugin and commands ──────────────────────────────────────────────
 
 echo ""
-echo "Downloading OpenCode integration files..."
+echo "Downloading plugin and slash commands..."
 
 curl --fail --location --silent --show-error "$BASE_URL/knowledge.ts"         -o "$INSTALL_DIR/knowledge.ts"
 curl --fail --location --silent --show-error "$BASE_URL/consolidate.md"       -o "$INSTALL_DIR/consolidate.md"
@@ -282,6 +282,16 @@ echo "  ✓ plugin: $PLUGIN_DIR/knowledge.ts"
 ln -sf "$INSTALL_DIR/consolidate.md"      "$COMMAND_DIR/consolidate.md"
 ln -sf "$INSTALL_DIR/knowledge-review.md" "$COMMAND_DIR/knowledge-review.md"
 echo "  ✓ commands: consolidate.md, knowledge-review.md"
+
+# ── Symlink commands into Claude Code (if available) ─────────────────────────
+
+CLAUDE_COMMAND_DIR="$HOME/.claude/commands"
+if command -v claude >/dev/null 2>&1 || [ -d "$HOME/.claude" ]; then
+  mkdir -p "$CLAUDE_COMMAND_DIR"
+  ln -sf "$INSTALL_DIR/consolidate.md"      "$CLAUDE_COMMAND_DIR/consolidate.md"
+  ln -sf "$INSTALL_DIR/knowledge-review.md" "$CLAUDE_COMMAND_DIR/knowledge-review.md"
+  echo "  ✓ Claude Code commands: consolidate.md, knowledge-review.md"
+fi
 
 # ── Check whether $BIN_DIR is in PATH ────────────────────────────────────────
 

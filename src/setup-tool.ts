@@ -19,11 +19,13 @@ import { config } from "./config.js";
  *
  * opencode:
  *   - Symlink plugin/knowledge.ts → ~/.config/opencode/plugins/knowledge.ts
- *   - Symlink opencode/command/*.md → ~/.config/opencode/command/*.md
+ *   - Symlink commands/*.md → ~/.config/opencode/command/*.md
  *   - Print MCP config block for opencode.jsonc
  *
  * claude-code:
- *   - Merge MCP server + UserPromptSubmit hook into ~/.claude/settings.json
+ *   - Register MCP server via `claude mcp add-json` (→ ~/.claude.json)
+ *   - Merge UserPromptSubmit hook into ~/.claude/settings.json
+ *   - Symlink commands/*.md → ~/.claude/commands/*.md
  *
  * There are two installation modes:
  *
@@ -75,7 +77,7 @@ function setupOpenCode(): void {
 	console.log(`       → ${pluginSrc}`);
 
 	// Command symlinks
-	const commandSrcDir = join(projectDir, "opencode", "command");
+	const commandSrcDir = join(projectDir, "commands");
 	const commandDstDir = join(configDir, "command");
 	mkdirSync(commandDstDir, { recursive: true });
 
@@ -277,6 +279,37 @@ function setupClaudeCode(): void {
 	renameSync(tmpPath, settingsPath);
 	console.log(`  ✓ Wrote ${settingsPath}`);
 
+	// ── Slash command symlinks — ~/.claude/commands/*.md ──
+	const commandDstDir = join(claudeDir, "commands");
+	mkdirSync(commandDstDir, { recursive: true });
+
+	const commandSrcDir = isSourceInstall()
+		? join(getProjectDir(), "commands")
+		: ""; // binary install: no source tree available
+
+	const commandFiles = ["consolidate.md", "knowledge-review.md"];
+	if (commandSrcDir) {
+		for (const file of commandFiles) {
+			const src = join(commandSrcDir, file);
+			const dst = join(commandDstDir, file);
+			if (!existsSync(src)) {
+				console.log(`  ⚠ Command source not found (skipping): ${src}`);
+				continue;
+			}
+			forceSymlink(src, dst);
+			console.log(`  ✓ Command ${file}: ${dst}`);
+		}
+	} else {
+		// Binary install: commands/ is not bundled; skip silently.
+		// Users can symlink manually or run `setup-tool claude-code` from source.
+		console.log(
+			"  ℹ Slash commands not installed (binary install — no source tree).",
+		);
+		console.log(
+			"    To install slash commands, clone the repo and run setup-tool from source.",
+		);
+	}
+
 	const startHint = isSourceInstall()
 		? `bun run ${join(getProjectDir(), "src", "index.ts")}`
 		: "knowledge-server";
@@ -310,8 +343,8 @@ export function runSetupTool(args: string[]): void {
 		console.log(`Usage: knowledge-server setup-tool <tool>
 
 Available tools:
-  opencode      Symlink plugin + commands; print MCP config hint
-  claude-code   Merge MCP server + hook into ~/.claude/settings.json
+  opencode      Symlink plugin + commands into ~/.config/opencode/; print MCP config hint
+  claude-code   Register MCP server + hook; symlink commands into ~/.claude/commands/
 `);
 		process.exit(0);
 	}

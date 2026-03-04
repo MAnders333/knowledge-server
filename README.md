@@ -18,7 +18,7 @@ This downloads the server binaries into `~/.local/share/knowledge-server/`, gene
 
 1. Edit `~/.local/share/knowledge-server/.env` — set `LLM_API_KEY` and `LLM_BASE_ENDPOINT`
 2. *(OpenCode)* Add the printed MCP config block to `~/.config/opencode/opencode.jsonc`
-3. *(Claude Code)* Run `knowledge-server setup-tool claude-code` — registers the MCP server and `UserPromptSubmit` hook automatically
+3. *(Claude Code)* Run `knowledge-server setup-tool claude-code` — registers the MCP server, `UserPromptSubmit` hook, and slash commands automatically
 4. Start the server: `knowledge-server`
 
 **To update later:**
@@ -48,7 +48,7 @@ For Claude Code, run the additional setup step after `bun run setup`:
 bun run src/index.ts setup-tool claude-code
 ```
 
-This registers the MCP server (via `claude mcp add-json`) and adds the `UserPromptSubmit` hook to `~/.claude/settings.json`. Both steps are idempotent.
+This registers the MCP server (via `claude mcp add-json`), adds the `UserPromptSubmit` hook to `~/.claude/settings.json`, and symlinks slash commands into `~/.claude/commands/`. All three steps are idempotent.
 
 ## Supported session sources
 
@@ -188,7 +188,7 @@ Registered automatically by `setup-tool claude-code`.
 - `readers/opencode.ts` — reads OpenCode's SQLite session DB, segments long sessions, respects compaction summaries
 - `readers/claude-code.ts` — reads Claude Code JSONL session files, handles compacted sessions, correlates tool call results
 - `consolidate.ts` — orchestrates the full cycle: read → extract → reconsolidate → contradiction scan → decay → embed → advance cursor (per source)
-- `llm.ts` — three LLM calls across two model slots: `extractKnowledge` (extraction model), `decideMerge` (merge model — cheaper), `detectAndResolveContradiction` (contradiction model)
+- `llm.ts` — three LLM calls across three model slots: `extractKnowledge` (extraction model), `decideMerge` (merge model — cheaper), `detectAndResolveContradiction` (contradiction model)
 - `decay.ts` — forgetting curve with type-specific half-lives (facts decay faster than procedures)
 
 ## Setup
@@ -212,8 +212,9 @@ bun run src/index.ts setup-tool claude-code  # source install
 This:
 1. Registers the `knowledge` MCP server in `~/.claude.json` via `claude mcp add-json` (user scope)
 2. Adds a `UserPromptSubmit` hook to `~/.claude/settings.json` pointing at the knowledge server
+3. Symlinks slash commands (`consolidate.md`, `knowledge-review.md`) into `~/.claude/commands/`
 
-Both steps are idempotent — re-running is safe.
+All three steps are idempotent — re-running is safe.
 
 ## Configuration
 
@@ -227,7 +228,7 @@ All config is via environment variables in `.env`. Defaults are sensible for loc
 | `LLM_MERGE_MODEL` | `anthropic/claude-haiku-4-5` | Model for near-duplicate merge decisions (cheaper — essentially a classification call) |
 | `LLM_CONTRADICTION_MODEL` | `anthropic/claude-sonnet-4-6` | Model for contradiction detection and resolution (nuanced — fires rarely) |
 | `EMBEDDING_MODEL` | `text-embedding-3-large` | Embedding model (OpenAI-compatible API) |
-| `EMBEDDING_DIMENSIONS` | `3072` | Embedding dimensions |
+| `EMBEDDING_DIMENSIONS` | *(not set — uses model default)* | Embedding dimensions. Only needed to reduce dimensions (e.g. for storage savings); omit to use the model's native output size |
 | `KNOWLEDGE_PORT` | `3179` | HTTP port |
 | `KNOWLEDGE_HOST` | `127.0.0.1` | HTTP host |
 | `KNOWLEDGE_DB_PATH` | `~/.local/share/knowledge-server/knowledge.db` | Knowledge database path |
@@ -287,7 +288,7 @@ Returns:
 - **stale** — active entries with low strength (haven't been accessed recently)
 - **team-relevant** — high-confidence `team`-scoped entries that may warrant external documentation
 
-OpenCode users also have a `/knowledge-review` slash command (installed by `setup-tool opencode`) for an interactive review workflow inside the TUI.
+OpenCode and Claude Code users also have a `/knowledge-review` slash command (installed by `setup-tool opencode` and `setup-tool claude-code` respectively) for an interactive review workflow inside the TUI.
 
 ## Knowledge entry types
 

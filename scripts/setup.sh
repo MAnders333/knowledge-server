@@ -97,7 +97,7 @@ echo "  ✓ Symlinked plugin: $PLUGIN_TARGET → $PLUGIN_SOURCE"
 COMMAND_DIR="$OPENCODE_CONFIG_DIR/command"
 mkdir -p "$COMMAND_DIR"
 
-for cmd_file in "$PROJECT_DIR/opencode/command/"*.md; do
+for cmd_file in "$PROJECT_DIR/commands/"*.md; do
   cmd_name=$(basename "$cmd_file")
   cmd_target="$COMMAND_DIR/$cmd_name"
   # Always force-recreate symlink to keep it in sync (matches plugin behaviour)
