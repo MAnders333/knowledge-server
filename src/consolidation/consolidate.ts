@@ -7,7 +7,21 @@ import type { ConsolidationResult } from "../types.js";
 import { ContradictionScanner } from "./contradiction.js";
 import { computeStrength } from "./decay.js";
 import { ConsolidationLLM, formatEpisodes } from "./llm.js";
+import { approxTokens } from "./readers/shared.js";
 import { Reconsolidator } from "./reconsolidate.js";
+
+/**
+ * Maximum tokens for the episode content portion of an extractKnowledge prompt.
+ * System prompt overhead is ~2K tokens; output budget is 8K tokens.
+ * This leaves 190K available, but we cap at 150K to give a comfortable safety margin
+ * against token-counting imprecision (approxTokens uses chars/4, which underestimates
+ * for non-ASCII content) and future system prompt growth.
+ *
+ * When a formatted chunk exceeds this limit, the chunk is split in half and each
+ * half is processed independently. This is recursive — a single oversized episode
+ * will ultimately be processed alone.
+ */
+const MAX_CHUNK_TOKENS = 150_000;
 
 /**
  * The consolidation engine — the heart of the knowledge system.
@@ -282,118 +296,17 @@ export class ConsolidationEngine {
 
 		for (let i = 0; i < episodes.length; i += chunkSize) {
 			const chunk = episodes.slice(i, i + chunkSize);
-			const chunkSummary = formatEpisodes(chunk);
+			const chunkLabel = `${Math.floor(i / chunkSize) + 1}/${Math.ceil(episodes.length / chunkSize)}`;
 
 			logger.log(
-				`[consolidation/${reader.source}] Chunk ${Math.floor(i / chunkSize) + 1}/${Math.ceil(episodes.length / chunkSize)} (${chunk.length} episodes)`,
+				`[consolidation/${reader.source}] Chunk ${chunkLabel} (${chunk.length} episodes)`,
 			);
 
-			// Load entries for reconsolidation (dedup against existing knowledge).
-			// Existing knowledge is no longer passed to the extraction LLM — deduplication
-			// is handled robustly by the reconsolidation step (embedding similarity +
-			// decideMerge). Sending 50 context entries to extractKnowledge was unreliable
-			// (one coarse embedding for 10 diverse episodes) and caused token overflow.
-			const allEntriesForChunk = this.db.getActiveEntriesWithEmbeddings();
-
-			// Extract knowledge via LLM (episodes only — no existing knowledge context)
-			const extractStart = Date.now();
-			const extracted = await this.llm.extractKnowledge(chunkSummary);
-			logger.log(
-				`[consolidation/${reader.source}] Extracted ${extracted.length} entries in ${((Date.now() - extractStart) / 1000).toFixed(1)}s.`,
-			);
-
-			// Reconsolidate each extracted entry against existing knowledge.
-			// Performance: load all entries with embeddings ONCE per chunk into an in-memory
-			// Map. On insert/update, mutate the Map in place rather than reloading from DB.
-			const sessionIds = [...new Set(chunk.map((e) => e.sessionId))];
-			// Reuse the entries already loaded above — no second DB read.
-			const entriesMap = new Map(allEntriesForChunk.map((e) => [e.id, e]));
-			let chunkCreated = 0;
-			let chunkUpdated = 0;
-
-			// Track IDs that were inserted or updated this chunk — only these are
-			// eligible for the contradiction scan (pre-existing entries were already
-			// checked in a previous consolidation run).
-			const changedIds = new Set<string>();
-
-			for (const entry of extracted) {
-				try {
-					await this.reconsolidator.reconsolidate(
-						entry,
-						sessionIds,
-						entriesMap,
-						{
-							onInsert: (inserted) => {
-								totalCreated++;
-								chunkCreated++;
-								changedIds.add(inserted.id);
-								// Add to cache so subsequent entries in this chunk can deduplicate against it.
-								// Embedding is available immediately since insertNewEntry stores it.
-								if (inserted.embedding) {
-									entriesMap.set(
-										inserted.id,
-										inserted as KnowledgeEntry & { embedding: number[] },
-									);
-								}
-							},
-							onUpdate: (id, updated, freshEmbedding) => {
-								totalUpdated++;
-								chunkUpdated++;
-								changedIds.add(id);
-								// Update the cache with the new content and fresh embedding.
-								const existing = entriesMap.get(id);
-								if (existing) {
-									entriesMap.set(id, {
-										...existing,
-										content: updated.content ?? existing.content,
-										type:
-											(updated.type as KnowledgeEntry["type"]) ?? existing.type,
-										topics: updated.topics ?? existing.topics,
-										confidence: updated.confidence ?? existing.confidence,
-										embedding: freshEmbedding,
-									});
-								}
-							},
-							onKeep: () => {},
-						},
-					);
-				} catch (err) {
-					// Log and skip this extracted entry — do NOT rethrow.
-					// Rethrowing would skip recordEpisode for the whole chunk, causing all
-					// entries in this chunk to be re-processed on the next run and producing
-					// duplicates for the entries that were already successfully inserted.
-					logger.error(
-						`[consolidation/${reader.source}] Failed to reconsolidate entry "${String(entry.content ?? "").slice(0, 60)}..." — skipping:`,
-						err,
-					);
-				}
-			}
-
-			// 5. Post-extraction contradiction scan.
-			const chunkContradictions = await this.contradictionScanner.scan(
-				entriesMap,
-				changedIds,
-			);
-			totalConflictsDetected += chunkContradictions.detected;
-			totalConflictsResolved += chunkContradictions.resolved;
-
-			// 6. Record each episode in this chunk as processed.
-			//    This happens after the LLM call and DB writes succeed, making
-			//    consolidation idempotent on crash/retry at the episode level.
-			const entriesPerEp =
-				chunk.length > 0
-					? Math.round((chunkCreated + chunkUpdated) / chunk.length)
-					: 0;
-			for (const ep of chunk) {
-				this.db.recordEpisode(
-					reader.source,
-					ep.sessionId,
-					ep.startMessageId,
-					ep.endMessageId,
-					ep.contentType,
-					entriesPerEp,
-				);
-			}
+			const counts = await this.processChunk(reader.source, chunk);
+			totalCreated += counts.created;
+			totalUpdated += counts.updated;
+			totalConflictsDetected += counts.conflictsDetected;
+			totalConflictsResolved += counts.conflictsResolved;
 		}
 
 		// 7. Advance the source cursor past all fetched candidates.
@@ -444,6 +357,172 @@ export class ConsolidationEngine {
 			entriesUpdated: totalUpdated,
 			conflictsDetected: totalConflictsDetected,
 			conflictsResolved: totalConflictsResolved,
+		};
+	}
+
+	/**
+	 * Process a single chunk of episodes through the full extraction → reconsolidation
+	 * → contradiction scan pipeline.
+	 *
+	 * Pre-flight token guard: if the formatted chunk exceeds MAX_CHUNK_TOKENS, the chunk
+	 * is split in half and each half is processed independently (recursively). This
+	 * handles fat-tail episodes (e.g. Confluence pages near the 50K episode cap) without
+	 * requiring a conservative global chunk size. A single oversized episode will
+	 * ultimately be processed alone — the soft-limit in chunkByTokenBudget already
+	 * ensures no individual episode is split further.
+	 *
+	 * recordEpisode is called here (not in the caller) so that each sub-chunk's episodes
+	 * are marked processed immediately after their LLM call succeeds. This preserves
+	 * idempotency: a crash mid-chunk only re-processes the remaining sub-chunks.
+	 */
+	private async processChunk(
+		source: string,
+		chunk: ReturnType<IEpisodeReader["getNewEpisodes"]>,
+	): Promise<{
+		created: number;
+		updated: number;
+		conflictsDetected: number;
+		conflictsResolved: number;
+	}> {
+		if (chunk.length === 0) {
+			return {
+				created: 0,
+				updated: 0,
+				conflictsDetected: 0,
+				conflictsResolved: 0,
+			};
+		}
+
+		// Pre-flight: check if the formatted chunk fits within the token budget.
+		const chunkSummary = formatEpisodes(chunk);
+		const chunkTokens = approxTokens(chunkSummary);
+
+		if (chunkTokens > MAX_CHUNK_TOKENS && chunk.length > 1) {
+			// Split in half and process each side independently.
+			logger.log(
+				`[consolidation/${source}] Chunk too large (~${chunkTokens} tokens, limit ${MAX_CHUNK_TOKENS}) — splitting ${chunk.length} episodes into two halves.`,
+			);
+			const mid = Math.ceil(chunk.length / 2);
+			const left = await this.processChunk(source, chunk.slice(0, mid));
+			const right = await this.processChunk(source, chunk.slice(mid));
+			return {
+				created: left.created + right.created,
+				updated: left.updated + right.updated,
+				conflictsDetected: left.conflictsDetected + right.conflictsDetected,
+				conflictsResolved: left.conflictsResolved + right.conflictsResolved,
+			};
+		}
+
+		if (chunkTokens > MAX_CHUNK_TOKENS) {
+			// chunk.length === 1: single episode that can't be split further — log and proceed.
+			// chunkByTokenBudget already applies a per-session soft limit, so this is an
+			// unusual edge case (e.g. one enormous Confluence page). The LLM call may fail
+			// with a context-length error; the caller's retry logic handles it.
+			logger.warn(
+				`[consolidation/${source}] Single episode exceeds token limit (~${chunkTokens} tokens, limit ${MAX_CHUNK_TOKENS}) — processing alone.`,
+			);
+		}
+
+		// Fits within budget (or is a single episode that can't be split further).
+		// Load entries for reconsolidation. Existing knowledge is no longer passed to
+		// the extraction LLM — deduplication is handled by the reconsolidation step
+		// (embedding similarity + decideMerge).
+		const allEntriesForChunk = this.db.getActiveEntriesWithEmbeddings();
+
+		// Extract knowledge via LLM (episodes only — no existing knowledge context).
+		const extractStart = Date.now();
+		const extracted = await this.llm.extractKnowledge(chunkSummary);
+		logger.log(
+			`[consolidation/${source}] Extracted ${extracted.length} entries in ${((Date.now() - extractStart) / 1000).toFixed(1)}s.`,
+		);
+
+		// Reconsolidate each extracted entry against existing knowledge.
+		// Performance: load all entries with embeddings ONCE per chunk into an in-memory
+		// Map. On insert/update, mutate the Map in place rather than reloading from DB.
+		const sessionIds = [...new Set(chunk.map((e) => e.sessionId))];
+		// Reuse the entries already loaded above — no second DB read.
+		const entriesMap = new Map(allEntriesForChunk.map((e) => [e.id, e]));
+		let chunkCreated = 0;
+		let chunkUpdated = 0;
+
+		// Track IDs that were inserted or updated this chunk — only these are
+		// eligible for the contradiction scan (pre-existing entries were already
+		// checked in a previous consolidation run).
+		const changedIds = new Set<string>();
+
+		for (const entry of extracted) {
+			try {
+				await this.reconsolidator.reconsolidate(entry, sessionIds, entriesMap, {
+					onInsert: (inserted) => {
+						chunkCreated++;
+						changedIds.add(inserted.id);
+						// Add to cache so subsequent entries in this chunk can deduplicate against it.
+						// Embedding is available immediately since insertNewEntry stores it.
+						if (inserted.embedding) {
+							entriesMap.set(
+								inserted.id,
+								inserted as KnowledgeEntry & { embedding: number[] },
+							);
+						}
+					},
+					onUpdate: (id, updated, freshEmbedding) => {
+						chunkUpdated++;
+						changedIds.add(id);
+						// Update the cache with the new content and fresh embedding.
+						const existing = entriesMap.get(id);
+						if (existing) {
+							entriesMap.set(id, {
+								...existing,
+								content: updated.content ?? existing.content,
+								type: (updated.type as KnowledgeEntry["type"]) ?? existing.type,
+								topics: updated.topics ?? existing.topics,
+								confidence: updated.confidence ?? existing.confidence,
+								embedding: freshEmbedding,
+							});
+						}
+					},
+					onKeep: () => {},
+				});
+			} catch (err) {
+				// Log and skip this extracted entry — do NOT rethrow.
+				// Rethrowing would skip recordEpisode for the whole chunk, causing all
+				// entries in this chunk to be re-processed on the next run and producing
+				// duplicates for the entries that were already successfully inserted.
+				logger.error(
+					`[consolidation/${source}] Failed to reconsolidate entry "${String(entry.content ?? "").slice(0, 60)}..." — skipping:`,
+					err,
+				);
+			}
+		}
+
+		// Post-extraction contradiction scan.
+		const chunkContradictions = await this.contradictionScanner.scan(
+			entriesMap,
+			changedIds,
+		);
+
+		// Record each episode in this chunk as processed.
+		// Happens after the LLM call and DB writes succeed — makes consolidation
+		// idempotent on crash/retry at the episode level.
+		const entriesPerEp = Math.round(
+			(chunkCreated + chunkUpdated) / chunk.length,
+		);
+		for (const ep of chunk) {
+			this.db.recordEpisode(
+				source,
+				ep.sessionId,
+				ep.startMessageId,
+				ep.endMessageId,
+				ep.contentType,
+				entriesPerEp,
+			);
+		}
+
+		return {
+			created: chunkCreated,
+			updated: chunkUpdated,
+			conflictsDetected: chunkContradictions.detected,
+			conflictsResolved: chunkContradictions.resolved,
 		};
 	}
 

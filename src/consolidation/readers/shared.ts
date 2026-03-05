@@ -11,8 +11,12 @@ import type { EpisodeMessage } from "../../types.js";
  * Maximum tokens per episode segment (soft limit — see chunkByTokenBudget).
  * The LLM sees: system prompt + episode batch (no existing knowledge context —
  * deduplication is handled by the reconsolidation step, not extraction).
- * Keeping each episode under 50K tokens means a chunk of ~5 typical episodes
- * stays well within the 200K context limit.
+ * Keeping each episode under 50K tokens means a chunk of 10 typical episodes
+ * stays well within the 200K context limit for average content.
+ *
+ * Fat-tail protection: consolidate.ts checks the formatted chunk size before
+ * each LLM call (MAX_CHUNK_TOKENS = 150K) and splits the chunk in half if it
+ * exceeds the budget. A single oversized episode is processed alone.
  *
  * Note: a single message capped at MAX_MESSAGE_CHARS (~15K tokens) can
  * occupy up to 30% of this budget on its own; the chunker places oversized

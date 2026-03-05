@@ -143,7 +143,7 @@ export const config = {
 
 	// Consolidation
 	consolidation: {
-		chunkSize: parseIntEnv(process.env.CONSOLIDATION_CHUNK_SIZE, 5, 1),
+		chunkSize: parseIntEnv(process.env.CONSOLIDATION_CHUNK_SIZE, 10, 1),
 		maxSessionsPerRun: parseIntEnv(
 			process.env.CONSOLIDATION_MAX_SESSIONS,
 			50,
