@@ -231,7 +231,7 @@ knowledge-server setup-tool codex    # binary install
 bun run src/index.ts setup-tool codex  # source install
 ```
 
-Registers the `[mcp_servers.knowledge]` block in `~/.codex/config.toml` (checks first; only writes if absent). Idempotent — re-running is safe. Codex CLI has no user-defined slash command directory, so no command symlinks are created.
+Registers the `[mcp_servers.knowledge]` block in `~/.codex/config.toml`. Idempotent — re-running is safe. Codex CLI has no user-defined slash command directory, so no command symlinks are created.
 
 ## Configuration
 
