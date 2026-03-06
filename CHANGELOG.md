@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.0.2](https://github.com/MAnders333/knowledge-server/compare/v2.0.1...v2.0.2) (2026-03-06)
+
+
+### Bug Fixes
+
+* validate pkg.version format before interpolating into download URL ([bc83752](https://github.com/MAnders333/knowledge-server/commit/bc837529ff5882f5a02cc2774361def807750472))
+
 ## [2.0.1](https://github.com/MAnders333/knowledge-server/compare/v2.0.0...v2.0.1) (2026-03-06)
 
 
