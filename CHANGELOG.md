@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.0.1](https://github.com/MAnders333/knowledge-server/compare/v2.0.0...v2.0.1) (2026-03-06)
+
+
+### Bug Fixes
+
+* upload uncompressed binary alongside .gz so v1.x updaters can reach v2.0.0 ([7f514d5](https://github.com/MAnders333/knowledge-server/commit/7f514d5574858a71855eec4b1b87599da3b7896d))
+
 ## [2.0.0](https://github.com/MAnders333/knowledge-server/compare/v1.6.0...v2.0.0) (2026-03-06)
 
 
