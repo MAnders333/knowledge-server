@@ -153,15 +153,19 @@ export class CursorEpisodeReader implements IEpisodeReader {
 	): Array<{ id: string; maxMessageTime: number }> {
 		const sessions = this.loadSessions(afterMessageTimeCreated);
 
-		// Merge into the cache rather than replacing it wholesale, so that IDs
-		// loaded by a prior getCandidateSessions call (or by loadSessionsByIds)
-		// remain available if getNewEpisodes is called with a superset of IDs.
-		for (const s of sessions) this._sessionCache.set(s.sessionId, s);
-
-		return sessions
+		// Rebuild the cache from exactly the sessions being returned this cycle.
+		// This bounds cache size to `limit` entries — the consolidation engine
+		// always calls getCandidateSessions immediately before getNewEpisodes in
+		// the same cycle, so stale entries from prior cycles are never needed.
+		const selected = sessions
 			.sort((a, b) => a.lastUpdatedAt - b.lastUpdatedAt)
-			.slice(0, limit)
-			.map((s) => ({ id: s.sessionId, maxMessageTime: s.lastUpdatedAt }));
+			.slice(0, limit);
+		this._sessionCache = new Map(selected.map((s) => [s.sessionId, s]));
+
+		return selected.map((s) => ({
+			id: s.sessionId,
+			maxMessageTime: s.lastUpdatedAt,
+		}));
 	}
 
 	countNewSessions(afterMessageTimeCreated: number): number {
