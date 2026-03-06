@@ -319,10 +319,32 @@ export async function runUpdate(
 		process.exit(1);
 	}
 
+	// Remove the now-obsolete knowledge-server-mcp binary if it exists alongside
+	// the main binary. As of this release the MCP stdio proxy is built into the
+	// main binary as `knowledge-server mcp`; the separate binary is no longer
+	// distributed or updated.
+	//
+	// Convention from install.sh: both binaries lived at <install-dir>/libexec/.
+	const libexecDir = dirname(execPath);
+	const mcpBinaryPath = join(libexecDir, "knowledge-server-mcp");
+	let removedMcpBinary = false;
+	if (existsSync(mcpBinaryPath)) {
+		try {
+			await unlink(mcpBinaryPath);
+			removedMcpBinary = true;
+			console.log("  ✓ Removed obsolete knowledge-server-mcp binary");
+		} catch {
+			console.warn(
+				"  ⚠ Could not remove obsolete knowledge-server-mcp binary — delete it manually:",
+			);
+			console.warn(`    rm "${mcpBinaryPath}"`);
+		}
+	}
+
 	// Update plugin and command files if the install dir can be inferred.
 	// Convention from install.sh: binary lives at <install-dir>/libexec/knowledge-server,
 	// so the install dir is two levels up from process.execPath.
-	const inferredInstallDir = dirname(dirname(execPath));
+	const inferredInstallDir = dirname(libexecDir);
 	const pluginDest = join(inferredInstallDir, "knowledge.ts");
 	const commandFiles: Array<[string, string]> = [
 		["consolidate.md", join(inferredInstallDir, "consolidate.md")],
@@ -373,4 +395,22 @@ export async function runUpdate(
 
 	console.log(`\n  Updated to ${targetVersion}.`);
 	console.log("  Restart the server to pick up the new binary.");
+
+	// The MCP command changed in this release: the separate knowledge-server-mcp
+	// binary no longer exists. MCP clients now use `knowledge-server mcp`.
+	// Existing MCP configs that point to knowledge-server-mcp will break after
+	// this update — re-running setup-tool rewrites them to the new command.
+	if (removedMcpBinary) {
+		console.log(
+			"\n  ⚠ Breaking change: the separate knowledge-server-mcp binary has been",
+		);
+		console.log(
+			"    replaced by `knowledge-server mcp`. Re-run setup-tool for each of your",
+		);
+		console.log("    tools to update your MCP config:");
+		console.log("      knowledge-server setup-tool opencode");
+		console.log("      knowledge-server setup-tool claude-code");
+		console.log("      knowledge-server setup-tool cursor");
+		console.log("      knowledge-server setup-tool codex");
+	}
 }
