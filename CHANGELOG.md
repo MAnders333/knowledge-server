@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.0.3](https://github.com/MAnders333/knowledge-server/compare/v2.0.2...v2.0.3) (2026-03-06)
+
+
+### Bug Fixes
+
+* correct argv offset for binary vs source installs; prevent mcp fall-through ([7248889](https://github.com/MAnders333/knowledge-server/commit/72488896c8dd032d804cd6ed87dd286e1dc17667))
+
 ## [2.0.2](https://github.com/MAnders333/knowledge-server/compare/v2.0.1...v2.0.2) (2026-03-06)
 
 
