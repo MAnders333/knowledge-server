@@ -157,8 +157,13 @@ async function downloadBinary(
 		});
 
 		// Convert Web ReadableStream to Node Readable for pipeline()
-		// res.body null case is already guarded above; cast narrows ReadableStream<unknown> → Uint8Array.
-		const nodeReadable = Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0]);
+		// res.body null case is already guarded above. Double cast (through unknown) is required
+		// because tsc sees ReadableStream<Uint8Array<ArrayBuffer>> which doesn't structurally
+		// overlap with Node's ReadableStream<any> — the two ReadableStream types come from
+		// different @types packages (lib.dom vs @types/node).
+		const nodeReadable = Readable.fromWeb(
+			res.body as unknown as Parameters<typeof Readable.fromWeb>[0],
+		);
 		await pipeline(nodeReadable, gunzip, fileStream);
 
 		const mb = (bytesWritten / 1_048_576).toFixed(1);
