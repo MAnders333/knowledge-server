@@ -320,18 +320,16 @@ export async function runUpdate(
 	}
 
 	// Remove the now-obsolete knowledge-server-mcp binary if it exists alongside
-	// the main binary. As of this release the MCP stdio proxy is built into the
-	// main binary as `knowledge-server mcp`; the separate binary is no longer
+	// the main binary. As of v1.7.0 the MCP stdio proxy is built into the main
+	// binary as `knowledge-server mcp`; the separate binary is no longer
 	// distributed or updated.
 	//
 	// Convention from install.sh: both binaries lived at <install-dir>/libexec/.
 	const libexecDir = dirname(execPath);
 	const mcpBinaryPath = join(libexecDir, "knowledge-server-mcp");
-	let removedMcpBinary = false;
 	if (existsSync(mcpBinaryPath)) {
 		try {
 			await unlink(mcpBinaryPath);
-			removedMcpBinary = true;
 			console.log("  ✓ Removed obsolete knowledge-server-mcp binary");
 		} catch {
 			console.warn(
@@ -396,21 +394,21 @@ export async function runUpdate(
 	console.log(`\n  Updated to ${targetVersion}.`);
 	console.log("  Restart the server to pick up the new binary.");
 
-	// The MCP command changed in this release: the separate knowledge-server-mcp
-	// binary no longer exists. MCP clients now use `knowledge-server mcp`.
-	// Existing MCP configs that point to knowledge-server-mcp will break after
-	// this update — re-running setup-tool rewrites them to the new command.
-	if (removedMcpBinary) {
-		console.log(
-			"\n  ⚠ Breaking change: the separate knowledge-server-mcp binary has been",
-		);
-		console.log(
-			"    replaced by `knowledge-server mcp`. Re-run setup-tool for each of your",
-		);
-		console.log("    tools to update your MCP config:");
-		console.log("      knowledge-server setup-tool opencode");
-		console.log("      knowledge-server setup-tool claude-code");
-		console.log("      knowledge-server setup-tool cursor");
-		console.log("      knowledge-server setup-tool codex");
+	// The MCP command changed in v1.7.0: knowledge-server-mcp no longer exists.
+	// Show this notice whenever the user has updated to v1.7.0 or later — regardless
+	// of whether the old binary was found on disk — because their existing MCP configs
+	// still point to the old command and will be broken until they re-run setup-tool.
+	const [, major, minor] = /^v(\d+)\.(\d+)/.exec(targetVersion) ?? [];
+	const isV17orLater =
+		Number(major) > 1 || (Number(major) === 1 && Number(minor) >= 7);
+	if (isV17orLater) {
+		console.log(`
+  ⚠ Breaking change: the separate knowledge-server-mcp binary has been
+    replaced by \`knowledge-server mcp\`. Re-run setup-tool for each of your
+    tools to update your MCP config:
+      knowledge-server setup-tool opencode
+      knowledge-server setup-tool claude-code
+      knowledge-server setup-tool cursor
+      knowledge-server setup-tool codex`);
 	}
 }
