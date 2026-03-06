@@ -13,13 +13,13 @@ import { main as mcpMain } from "./mcp/index.js";
 import { runSetupTool } from "./setup-tool.js";
 import { runUpdate } from "./update.js";
 
-// Determine the subcommand offset in process.argv.
-// - Compiled binary:  argv = ["/path/to/knowledge-server", "mcp", ...]  → subcommand at [1]
-// - bun run src/...:  argv = ["/path/to/bun", "src/index.ts", "mcp", ...]  → subcommand at [2]
-// Bun.main is a virtual bundle path (/$bunfs/...) in compiled binaries, a real .ts path otherwise.
-const isBinaryInstall = !Bun.main.endsWith(".ts");
-const subcommand = isBinaryInstall ? process.argv[1] : process.argv[2];
-const subcommandArgs = isBinaryInstall ? process.argv.slice(2) : process.argv.slice(3);
+// Bun normalises process.argv the same way for both compiled binaries and `bun run`:
+//   argv[0] = "bun"
+//   argv[1] = entry point (real .ts path or virtual /$bunfs/... bundle path)
+//   argv[2] = first user argument (the subcommand)
+// So argv[2] is always the subcommand regardless of how the binary is invoked.
+const subcommand = process.argv[2];
+const subcommandArgs = process.argv.slice(3);
 
 /**
  * Knowledge Server — main entry point.
