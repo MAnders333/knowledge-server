@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
-import { chmod, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { createWriteStream, existsSync } from "node:fs";
+import { chmod, readFile, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import { pipeline } from "node:stream/promises";
+import { createGunzip } from "node:zlib";
 
 const REPO = "MAnders333/knowledge-server";
 const GITHUB_API = "https://api.github.com";
@@ -98,18 +100,23 @@ async function verifyChecksum(
 }
 
 /**
- * Download a binary URL to a temp file beside the target path.
+ * Download a gzip-compressed binary URL, decompress on the fly, and write to a
+ * temp file beside the target path. Streams the response body directly to disk
+ * so the full binary is never held in memory.
  *
  * Placing the temp file in the SAME DIRECTORY as the target guarantees the
  * subsequent rename is within the same filesystem — cross-device renames (e.g.
  * /tmp → /home) are not atomic and can corrupt the binary if the process dies
  * mid-copy. A same-directory rename is a single atomic syscall on POSIX.
  *
+ * Prints a live progress indicator showing MB received.
+ *
  * Returns the temp file path (caller is responsible for cleanup on error).
  */
 async function downloadBinary(
 	url: string,
 	targetPath: string,
+	label: string,
 ): Promise<string> {
 	const tmpPath = join(
 		dirname(targetPath),
@@ -129,12 +136,36 @@ async function downloadBinary(
 		throw new Error(`No response body from ${url}`);
 	}
 
+	// Stream: HTTP response → gunzip → disk.
+	// Node's pipeline() handles backpressure and propagates errors.
+	// We wrap res.body (Web ReadableStream) in a Node Readable via Bun's
+	// compatibility layer so we can pipe through node:zlib.createGunzip().
+	const fileStream = createWriteStream(tmpPath);
+	let bytesWritten = 0;
+	process.stdout.write(`  Downloading ${label}... `);
+
 	try {
-		await Bun.write(tmpPath, res);
+		// Bun supports piping Web ReadableStream to Node streams directly.
+		// We interpose a transform to count decompressed bytes for the progress display.
+		const gunzip = createGunzip();
+		gunzip.on("data", (chunk: Buffer) => {
+			bytesWritten += chunk.length;
+			// Overwrite the same line: \r moves to start of line without newline.
+			const mb = (bytesWritten / 1_048_576).toFixed(1);
+			process.stdout.write(`\r  Downloading ${label}... ${mb} MB`);
+		});
+
+		// Convert Web ReadableStream to Node Readable for pipeline()
+		const nodeReadable = require("node:stream").Readable.fromWeb(res.body);
+		await pipeline(nodeReadable, gunzip, fileStream);
+
+		const mb = (bytesWritten / 1_048_576).toFixed(1);
+		process.stdout.write(`\r  Downloading ${label}... ${mb} MB — done\n`);
 	} catch (err) {
 		await unlink(tmpPath).catch(() => {});
 		throw err;
 	}
+
 	return tmpPath;
 }
 
@@ -162,7 +193,8 @@ async function installBinary(
  * Usage: knowledge-server update [--version v1.2.3]
  *
  * Checks for a newer release on GitHub, downloads the platform-appropriate
- * binary, and atomically replaces the current executable in place.
+ * binary (gzip-compressed, streamed directly to disk), verifies SHA-256, and
+ * atomically replaces the current executable in place.
  * The server must be restarted to pick up the new binary.
  *
  * @param argv - process.argv slice after "update" (e.g. ["--version", "v1.2.3"])
@@ -235,7 +267,8 @@ export async function runUpdate(
 
 	console.log(`\n  Updating ${currentVersion} → ${targetVersion}`);
 
-	// Fetch checksums before downloading — fail fast if the checksums file is unavailable
+	// Fetch checksums before downloading — fail fast if the checksums file is unavailable.
+	// The checksum file contains hashes of the uncompressed binaries; we verify after gunzip.
 	process.stdout.write("  Fetching checksums... ");
 	let checksums: Map<string, string>;
 	try {
@@ -246,92 +279,37 @@ export async function runUpdate(
 		process.exit(1);
 	}
 
-	// Download both binaries to temp files BEFORE replacing either.
-	// This prevents a split-version install if the second download fails after
-	// the first binary has already been replaced.
+	// Single binary: knowledge-server now serves both the HTTP server and the MCP
+	// stdio proxy (via `knowledge-server mcp`). There is no separate MCP binary.
 	const binaryAsset = `knowledge-server-${platform}`;
-	const binaryUrl = `${GITHUB_RELEASES}/${targetVersion}/${binaryAsset}`;
-	const mcpPath = join(dirname(execPath), "knowledge-server-mcp");
-	const mcpAsset = `knowledge-server-mcp-${platform}`;
-	const mcpUrl = `${GITHUB_RELEASES}/${targetVersion}/${mcpAsset}`;
-	const hasMcp = existsSync(mcpPath);
+	const binaryUrl = `${GITHUB_RELEASES}/${targetVersion}/${binaryAsset}.gz`;
 
-	process.stdout.write(`  Downloading ${binaryAsset}... `);
 	let mainTmpPath = "";
 	try {
-		mainTmpPath = await downloadBinary(binaryUrl, execPath);
+		mainTmpPath = await downloadBinary(binaryUrl, execPath, binaryAsset);
 		const expectedHash = checksums.get(binaryAsset);
 		if (expectedHash) {
+			process.stdout.write("  Verifying checksum... ");
 			await verifyChecksum(mainTmpPath, expectedHash, binaryAsset);
+			console.log("ok");
 		} else {
-			console.error(
-				`\n  ⚠ No checksum found for ${binaryAsset} — proceeding without verification`,
+			console.warn(
+				`  ⚠ No checksum found for ${binaryAsset} — proceeding without verification`,
 			);
 		}
-		console.log("done");
 	} catch (err) {
 		await unlink(mainTmpPath).catch(() => {});
 		console.error(`\n  ✗ ${err instanceof Error ? err.message : err}`);
 		process.exit(1);
 	}
 
-	let mcpTmpPath = "";
-	if (hasMcp) {
-		process.stdout.write(`  Downloading ${mcpAsset}... `);
-		try {
-			mcpTmpPath = await downloadBinary(mcpUrl, mcpPath);
-			const expectedMcpHash = checksums.get(mcpAsset);
-			if (expectedMcpHash) {
-				await verifyChecksum(mcpTmpPath, expectedMcpHash, mcpAsset);
-			} else {
-				console.error(
-					`\n  ⚠ No checksum found for ${mcpAsset} — proceeding without verification`,
-				);
-			}
-			console.log("done");
-		} catch (err) {
-			// Clean up the already-downloaded main binary temp file before exiting
-			await unlink(mainTmpPath).catch(() => {});
-			await unlink(mcpTmpPath).catch(() => {});
-			console.error(`\n  ✗ ${err instanceof Error ? err.message : err}`);
-			process.exit(1);
-		}
-	}
-
-	// Both downloads succeeded — now atomically replace the binaries.
-	// Main and MCP installs are kept in separate try/catch blocks so that a failure
-	// on the MCP rename (after the main binary is already replaced) produces a clear
-	// recovery message rather than a generic error with no indication of partial success.
-	process.stdout.write("  Installing main binary... ");
+	process.stdout.write("  Installing binary... ");
 	try {
 		await installBinary(mainTmpPath, execPath);
 		console.log("done");
 	} catch (err) {
-		// Main install failed — clean up both temp files and exit
-		if (mcpTmpPath) await unlink(mcpTmpPath).catch(() => {});
 		console.error(`\n  ✗ ${err instanceof Error ? err.message : err}`);
 		process.exit(1);
-	}
-
-	if (mcpTmpPath) {
-		process.stdout.write("  Installing MCP binary... ");
-		try {
-			await installBinary(mcpTmpPath, mcpPath);
-			console.log("done");
-		} catch (err) {
-			// Main binary was already replaced. MCP is still the old version.
-			// NOTE: Re-running `knowledge-server update` (with or without --version) will NOT
-			// fix this — the main binary now reports the new version, so the equality check
-			// exits early with "nothing to do". Recovery requires re-running install.sh, which
-			// has no version equality check and will replace both binaries unconditionally.
-			console.error(
-				`\n  ⚠ MCP binary update failed: ${err instanceof Error ? err.message : err}`,
-			);
-			console.error(`    Main binary was updated to ${targetVersion}.`);
-			console.error(
-				"    To finish updating the MCP binary, re-run the installer: curl … | bash",
-			);
-		}
 	}
 
 	// Update plugin and command files if the install dir can be inferred.
@@ -362,18 +340,12 @@ export async function runUpdate(
 					});
 					if (!res.ok)
 						throw new Error(`${res.status} ${res.statusText} (${name})`);
-					// Write to a temp file beside the destination then rename atomically,
-					// matching the binary install pattern so a crash mid-write doesn't corrupt
-					// the live plugin file.
-					// Include `name` in the temp path so concurrent writes in Promise.all
-					// can never share the same temp file (Date.now() is the same millisecond
-					// for all promises launched in the same tick).
 					const tmpDest = join(
 						dirname(dest),
 						`.knowledge-server-update-${name}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
 					);
 					try {
-						await writeFile(tmpDest, await res.text(), "utf8");
+						await Bun.write(tmpDest, await res.text());
 						await rename(tmpDest, dest);
 					} catch (err) {
 						await unlink(tmpDest).catch(() => {});
@@ -387,7 +359,7 @@ export async function runUpdate(
 				`\n  ⚠ Plugin/command update failed: ${err instanceof Error ? err.message : err}`,
 			);
 			console.error(
-				"    Binaries were updated. Re-run install.sh to refresh plugin files.",
+				"    Binary was updated. Re-run install.sh to refresh plugin files.",
 			);
 		}
 	}

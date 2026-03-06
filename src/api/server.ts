@@ -1,15 +1,18 @@
 import { timingSafeEqual } from "node:crypto";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { bodyLimit } from "hono/body-limit";
 // @ts-ignore — Bun supports JSON imports natively; tsc may warn without resolveJsonModule
 import pkg from "../../package.json" with { type: "json" };
 import type { ActivationEngine } from "../activation/activate.js";
-import { contradictionTagInline, staleTag } from "../activation/format.js";
+import { contradictionTagBlock, contradictionTagInline, staleTag } from "../activation/format.js";
 import { config } from "../config.js";
 import type { ConsolidationEngine } from "../consolidation/consolidate.js";
 import type { KnowledgeDB } from "../db/database.js";
 import { logger } from "../logger.js";
+import { activateInputSchema } from "../mcp/index.js";
 import type { KnowledgeEntry, KnowledgeStatus } from "../types.js";
 
 /**
@@ -27,19 +30,113 @@ import type { KnowledgeEntry, KnowledgeStatus } from "../types.js";
  * - POST /entries/:id/resolve               -- Resolve a conflicted entry pair [requires admin token]
  * - DELETE /entries/:id                     -- Hard-delete an entry            [requires admin token]
  * - POST /hooks/claude-code/user-prompt     -- Claude Code UserPromptSubmit hook (unauthenticated)
+ * - ALL  /mcp                               -- MCP streamable-http endpoint (auth optional, see below)
  *
  * Admin token:
  * A random token is generated at startup and printed to the console once.
  * Pass it as `Authorization: Bearer <token>` on protected endpoints.
  * This guards against CSRF and other local-process abuse of destructive operations.
+ *
+ * /mcp auth:
+ * When KNOWLEDGE_ADMIN_TOKEN is set, the /mcp endpoint requires the same Bearer
+ * token. When unset (random token per process), /mcp is unauthenticated — suitable
+ * for local use where the server is only accessible on 127.0.0.1. For hosted/shared
+ * deployments, always set KNOWLEDGE_ADMIN_TOKEN so remote MCP clients must authenticate.
  */
 export function createApp(
 	db: KnowledgeDB,
 	activation: ActivationEngine,
 	consolidation: ConsolidationEngine,
 	adminToken: string,
+	/** Whether adminToken was explicitly configured (vs randomly generated for local use). */
+	adminTokenIsStable = false,
 ): Hono {
 	const app = new Hono();
+
+	// -- /mcp streamable-http transport --
+	//
+	// One stateless transport instance shared across all requests. Stateless mode
+	// is appropriate here because every `activate` call is independent — there is
+	// no conversation state to maintain between MCP requests.
+	//
+	// For hosted deployments: set KNOWLEDGE_ADMIN_TOKEN and point MCP clients at
+	// https://your-server.com/mcp with `Authorization: Bearer <token>`.
+	// For local use: no token required (server binds to 127.0.0.1 only).
+	const mcpTransport = new WebStandardStreamableHTTPServerTransport({
+		sessionIdGenerator: undefined, // stateless
+	});
+
+	const mcpServer = new McpServer({
+		name: "knowledge-server",
+		version: pkg.version,
+	});
+
+	mcpServer.tool(
+		"activate",
+		"Activate associated knowledge by providing cues. Returns knowledge entries that are semantically related to the provided cues. Use this when you need to recall what has been learned from prior sessions about a specific topic. Provide descriptive cues — topics, questions, or keywords — and receive relevant knowledge entries ranked by association strength.",
+		activateInputSchema,
+		async ({ cues, limit, threshold }) => {
+			try {
+				const result = await activation.activate(
+					cues,
+					{
+						limit: limit ?? undefined,
+						threshold: threshold ?? undefined,
+					},
+				);
+
+				if (result.entries.length === 0) {
+					return {
+						content: [{ type: "text" as const, text: "No relevant knowledge found for these cues." }],
+					};
+				}
+
+				const formatted = result.entries
+					.map(
+						(r, i) =>
+							`${i + 1}. [${r.entry.type}] ${r.entry.content}${staleTag(r.staleness)}${contradictionTagBlock(r.contradiction)}\n` +
+							`   Topics: ${r.entry.topics.join(", ")}\n` +
+							`   Confidence: ${r.entry.confidence} | Scope: ${r.entry.scope} | Semantic match: ${r.rawSimilarity.toFixed(3)} | Score: ${r.similarity.toFixed(3)}`,
+					)
+					.join("\n\n");
+
+				const conflictCount = result.entries.filter((r) => r.contradiction).length;
+				const conflictNote = conflictCount > 0
+					? ` — ${conflictCount} conflicted, do not act on those without clarifying which version is correct`
+					: "";
+
+				return {
+					content: [{
+						type: "text" as const,
+						text: `## Activated Knowledge (${result.entries.length} entries, ${result.totalActive} total active${conflictNote})\n\n${formatted}`,
+					}],
+				};
+			} catch (e) {
+				logger.error("[mcp/activate] Error:", e);
+				return {
+					content: [{ type: "text" as const, text: `Error activating knowledge: ${e}` }],
+					isError: true,
+				};
+			}
+		},
+	);
+
+	// Connect McpServer to transport (async; safe to fire-and-forget here since
+	// connect() only sets up event listeners and does not block).
+	mcpServer.connect(mcpTransport).catch((e) => {
+		logger.error("[mcp] Failed to connect MCP server to transport:", e);
+	});
+
+	// Route all methods on /mcp to the transport.
+	// Auth: required only when a stable admin token is configured (hosted mode).
+	// In local mode (random per-process token) /mcp is open — the server already
+	// binds to 127.0.0.1 so network access is not a concern.
+	app.all("/mcp", async (c) => {
+		if (adminTokenIsStable && !requireAdminToken(c)) {
+			return c.json({ error: "Unauthorized" }, 401);
+		}
+		return mcpTransport.handleRequest(c.req.raw);
+	});
 
 	// -- Auth helper --
 

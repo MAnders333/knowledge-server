@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -36,6 +37,75 @@ export const activateInputSchema = {
 		),
 };
 
+/** Base URL of the knowledge HTTP server, derived from KNOWLEDGE_HOST / KNOWLEDGE_PORT. */
+function serverBaseUrl(): string {
+	return `http://${config.host}:${config.port}`;
+}
+
+/**
+ * Check whether the knowledge HTTP server is reachable.
+ * Returns true if it responds to GET /status within the given timeout.
+ */
+async function isServerReachable(baseUrl: string, timeoutMs = 2000): Promise<boolean> {
+	try {
+		const res = await fetch(`${baseUrl}/status`, {
+			signal: AbortSignal.timeout(timeoutMs),
+		});
+		return res.ok;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Attempt to auto-start the knowledge HTTP server as a background process.
+ *
+ * Uses the same binary that is currently running (`process.execPath`) when
+ * invoked as a compiled binary, or falls back to `bun run src/index.ts` when
+ * running from source. The server process is detached so it outlives the MCP
+ * subprocess.
+ *
+ * Returns true if the server came up within the timeout, false otherwise.
+ */
+async function tryAutoStart(timeoutMs = 8000): Promise<boolean> {
+	// Determine how to launch the server. When running as a compiled binary,
+	// process.execPath points to `knowledge-server` — run it with no args to
+	// start the HTTP server. When running via `bun run src/mcp/index.ts`,
+	// execPath is the bun binary — run `bun run src/index.ts` instead.
+	let cmd: string;
+	let args: string[];
+	const execName = process.execPath.split("/").pop() ?? "";
+	if (execName === "knowledge-server") {
+		cmd = process.execPath;
+		args = [];
+	} else {
+		cmd = process.execPath; // bun
+		args = ["run", new URL("../index.ts", import.meta.url).pathname];
+	}
+
+	try {
+		const child = spawn(cmd, args, {
+			detached: true,
+			stdio: "ignore",
+			// Inherit env so .env-loaded vars (KNOWLEDGE_PORT, etc.) are available
+			// if the launcher script has already exported them.
+			env: process.env,
+		});
+		child.unref(); // don't keep the MCP process alive waiting for the child
+	} catch {
+		return false;
+	}
+
+	// Poll until the server responds or we time out
+	const pollIntervalMs = 200;
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		await new Promise((r) => setTimeout(r, pollIntervalMs));
+		if (await isServerReachable(serverBaseUrl(), 1000)) return true;
+	}
+	return false;
+}
+
 /**
  * MCP server interface for the knowledge system.
  *
@@ -46,20 +116,27 @@ export const activateInputSchema = {
  * knowledge HTTP server via GET /activate. This keeps the MCP process lightweight:
  * it only needs KNOWLEDGE_HOST / KNOWLEDGE_PORT to find the server.
  *
+ * On startup, if the HTTP server is not reachable, this process will attempt to
+ * auto-start it as a background daemon before connecting the stdio transport.
+ *
  * Usage: Agent sends cues (keywords, topics, questions)
  * and receives associated knowledge entries ranked by relevance.
  */
-
-/** Base URL of the knowledge HTTP server, derived from KNOWLEDGE_HOST / KNOWLEDGE_PORT. */
-function serverBaseUrl(): string {
-	return `http://${config.host}:${config.port}`;
-}
-
-async function main() {
+export async function main() {
 	// No validateConfig() call — LLM credentials are not needed here.
 	// The knowledge HTTP server holds those; this process is a thin proxy.
 	// Connection errors are surfaced per-call with a clear ECONNREFUSED message.
 	const baseUrl = serverBaseUrl();
+
+	// Auto-start: if the HTTP server isn't reachable, try to launch it.
+	// This lets users skip the manual "start the server" step — the MCP process
+	// handles it transparently when the IDE starts.
+	// Failures are silent: if auto-start doesn't work (e.g. .env not configured),
+	// the activate tool will surface the ECONNREFUSED error on first use instead.
+	if (!(await isServerReachable(baseUrl))) {
+		await tryAutoStart();
+		// Don't error if it didn't come up — the activate handler will explain.
+	}
 
 	const server = new McpServer({
 		name: "knowledge-server",

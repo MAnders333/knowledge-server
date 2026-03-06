@@ -9,8 +9,20 @@ import { ConsolidationEngine } from "./consolidation/consolidate.js";
 import { createEpisodeReaders } from "./consolidation/readers/index.js";
 import { KnowledgeDB } from "./db/database.js";
 import { logger } from "./logger.js";
+import { main as mcpMain } from "./mcp/index.js";
 import { runSetupTool } from "./setup-tool.js";
 import { runUpdate } from "./update.js";
+
+// Handle `knowledge-server mcp` — run the MCP stdio proxy instead of the HTTP server.
+// This replaces the separate knowledge-server-mcp binary; MCP clients should use
+// ["knowledge-server", "mcp"] as the command.
+if (process.argv[2] === "mcp") {
+	await mcpMain().catch((err) => {
+		console.error("[knowledge-server-mcp] fatal:", err);
+		process.exit(1);
+	});
+	process.exit(0);
+}
 
 // Handle `knowledge-server setup-tool <opencode|claude-code>` before starting the server.
 if (process.argv[2] === "setup-tool") {
@@ -98,10 +110,11 @@ async function main() {
 
 	// Admin token: use KNOWLEDGE_ADMIN_TOKEN env var if set (stable, useful for scripting),
 	// otherwise generate a random token per process lifetime (more secure for interactive use).
+	const adminTokenIsStable = !!config.adminToken;
 	const adminToken = config.adminToken ?? randomBytes(24).toString("hex");
 
 	// Create HTTP app
-	const app = createApp(db, activation, consolidation, adminToken);
+	const app = createApp(db, activation, consolidation, adminToken, adminTokenIsStable);
 
 	// Start server
 	const server = serve({
@@ -121,6 +134,9 @@ async function main() {
 	logger.raw("  GET  /entries                          — List entries");
 	logger.raw(
 		"  POST /hooks/claude-code/user-prompt    — Claude Code hook (unauthenticated)",
+	);
+	logger.raw(
+		`  ALL  /mcp                              — MCP streamable-http${adminTokenIsStable ? " [admin token required]" : " (unauthenticated — local only)"}`,
 	);
 	logger.rawStdoutOnly(`\n  Admin token (keep this private): ${adminToken}`);
 	logger.rawStdoutOnly(

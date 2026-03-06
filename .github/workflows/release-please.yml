@@ -62,25 +62,26 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Build binaries
+      - name: Build binary
         run: |
-          bun build --compile src/index.ts --outfile dist/knowledge-server-${{ matrix.suffix }}
-          bun build --compile src/mcp/index.ts --outfile dist/knowledge-server-mcp-${{ matrix.suffix }}
+          bun build --compile --minify src/index.ts --outfile dist/knowledge-server-${{ matrix.suffix }}
 
-      - name: Generate checksums
+      - name: Generate checksums and compress
         run: |
           cd dist
+          # Checksum the uncompressed binary — update.ts verifies after gunzip
           if command -v sha256sum &>/dev/null; then
-            sha256sum knowledge-server-${{ matrix.suffix }} knowledge-server-mcp-${{ matrix.suffix }} > SHA256SUMS-${{ matrix.suffix }}
+            sha256sum knowledge-server-${{ matrix.suffix }} > SHA256SUMS-${{ matrix.suffix }}
           else
-            shasum -a 256 knowledge-server-${{ matrix.suffix }} knowledge-server-mcp-${{ matrix.suffix }} > SHA256SUMS-${{ matrix.suffix }}
+            shasum -a 256 knowledge-server-${{ matrix.suffix }} > SHA256SUMS-${{ matrix.suffix }}
           fi
+          # Compress for distribution — update.ts and install.sh decompress on download
+          gzip -k knowledge-server-${{ matrix.suffix }}
 
-      - name: Upload binaries and checksums
+      - name: Upload binary and checksums
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "${{ needs.release-please.outputs.tag_name }}" \
-            dist/knowledge-server-${{ matrix.suffix }} \
-            dist/knowledge-server-mcp-${{ matrix.suffix }} \
+            dist/knowledge-server-${{ matrix.suffix }}.gz \
             dist/SHA256SUMS-${{ matrix.suffix }}

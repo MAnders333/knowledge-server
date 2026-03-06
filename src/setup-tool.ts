@@ -13,7 +13,7 @@ import { dirname, join, resolve } from "node:path";
 import { config } from "./config.js";
 
 /**
- * `knowledge-server setup-tool <opencode|claude-code>`
+ * `knowledge-server setup-tool <opencode|claude-code|cursor|codex>`
  *
  * Idempotent tool-specific wiring:
  *
@@ -27,14 +27,17 @@ import { config } from "./config.js";
  *   - Merge UserPromptSubmit hook into ~/.claude/settings.json
  *   - Symlink commands/*.md → ~/.claude/commands/*.md
  *
+ * cursor / codex:
+ *   - Register MCP server in ~/.cursor/mcp.json / ~/.codex/config.toml
+ *
  * There are two installation modes:
  *
  *   Source install  — cloned repo, run via `bun run src/index.ts`.
- *                     Bun.main ends in `.ts`. MCP server → `bun run src/mcp/index.ts`.
+ *                     Bun.main ends in `.ts`. MCP command → `bun run src/index.ts mcp`.
  *
  *   Binary install  — compiled binary on PATH (`knowledge-server`).
- *                     Bun.main does NOT end in `.ts`. MCP server → `knowledge-server-mcp`
- *                     (the companion binary, expected to be on PATH alongside the main one).
+ *                     MCP command → `knowledge-server mcp`
+ *                     (the `mcp` subcommand is built into the main binary).
  */
 
 /** True when running from source (`bun run src/index.ts`), false when compiled binary. */
@@ -61,10 +64,10 @@ function getProjectDir(): string {
  * Comment loss in the rewritten file is acceptable: the MCP block is machine-
  * managed and users rarely comment individual server entries.
  *
- * Source install: command is `[bunBin, "run", "<projectDir>/src/mcp/index.ts"]`
- * Binary install: command is `["<INSTALL_DIR>/libexec/knowledge-server-mcp"]`
- *   — binary install can't know INSTALL_DIR at runtime, so we fall back to
- *   searching PATH for `knowledge-server-mcp` and using that absolute path.
+ * Source install: command is `[bunBin, "run", "<projectDir>/src/index.ts", "mcp"]`
+ * Binary install: command is `["<path>/knowledge-server", "mcp"]`
+ *   — binary install can't know INSTALL_DIR at runtime, so we search PATH for
+ *   `knowledge-server` and use that absolute path.
  */
 function makeOpenCodeMcpEntry(): { command: string[] } & Record<
 	string,
@@ -83,23 +86,23 @@ function makeOpenCodeMcpEntry(): { command: string[] } & Record<
 			: join(homedir(), ".bun", "bin", "bun");
 		return {
 			type: "local",
-			command: [bunBin, "run", join(projectDir, "src", "mcp", "index.ts")],
+			command: [bunBin, "run", join(projectDir, "src", "index.ts"), "mcp"],
 			enabled: true,
 			environment: env,
 		};
 	}
 
-	// Binary install: find knowledge-server-mcp on PATH.
-	const whichResult = spawnSync("which", ["knowledge-server-mcp"], {
+	// Binary install: find knowledge-server on PATH; append "mcp" subcommand.
+	const whichResult = spawnSync("which", ["knowledge-server"], {
 		encoding: "utf8",
 	});
-	const mcpBin =
+	const mainBin =
 		whichResult.status === 0
 			? whichResult.stdout.trim()
-			: "knowledge-server-mcp"; // fallback: hope it's on PATH at runtime
+			: "knowledge-server"; // fallback: hope it's on PATH at runtime
 	return {
 		type: "local",
-		command: [mcpBin],
+		command: [mainBin, "mcp"],
 		enabled: true,
 		environment: env,
 	};
@@ -306,14 +309,20 @@ Setup complete!`);
 /**
  * Build the MCP server entry for Claude Code.
  *
- * Source install: `bun run <projectDir>/src/mcp/index.ts`
+ * Source install: `bun run <projectDir>/src/index.ts mcp`
  *   - Always reflects current source; no stale compiled binary risk.
  *   - Bun executable resolved from the running process or ~/.bun/bin/bun.
  *
- * Binary install: `knowledge-server-mcp` (companion binary, must be on PATH
- *   alongside `knowledge-server`).
+ * Binary install: `knowledge-server mcp`
+ *   - The `mcp` subcommand is built into the main binary.
  */
 function makeClaudeMcpEntry() {
+	const env = {
+		// The MCP subcommand is a thin HTTP proxy — it only needs to locate the
+		// knowledge HTTP server. No LLM credentials required here.
+		KNOWLEDGE_HOST: config.host,
+		KNOWLEDGE_PORT: String(config.port),
+	};
 	if (isSourceInstall()) {
 		const projectDir = getProjectDir();
 		// In source mode, process.execPath is the bun binary itself.
@@ -323,24 +332,18 @@ function makeClaudeMcpEntry() {
 		return {
 			type: "stdio",
 			command: bunBin,
-			args: ["run", join(projectDir, "src", "mcp", "index.ts")],
-			env: {
-				// The MCP server is a thin HTTP proxy — it only needs to locate the
-				// knowledge HTTP server. No LLM credentials required here.
-				KNOWLEDGE_HOST: config.host,
-				KNOWLEDGE_PORT: String(config.port),
-			},
+			args: ["run", join(projectDir, "src", "index.ts"), "mcp"],
+			env,
 		};
 	}
-	// Binary install: companion binary knowledge-server-mcp must be on PATH.
+	// Binary install: `knowledge-server mcp` — mcp is a built-in subcommand.
+	const whichResult = spawnSync("which", ["knowledge-server"], { encoding: "utf8" });
+	const mainBin = whichResult.status === 0 ? whichResult.stdout.trim() : "knowledge-server";
 	return {
 		type: "stdio",
-		command: "knowledge-server-mcp",
-		env: {
-			// Same as source install — just KNOWLEDGE_HOST / KNOWLEDGE_PORT.
-			KNOWLEDGE_HOST: config.host,
-			KNOWLEDGE_PORT: String(config.port),
-		},
+		command: mainBin,
+		args: ["mcp"],
+		env,
 	};
 }
 
@@ -540,11 +543,13 @@ function makeCursorMcpEntry() {
 			: join(homedir(), ".bun", "bin", "bun");
 		return {
 			command: bunBin,
-			args: ["run", join(projectDir, "src", "mcp", "index.ts")],
+			args: ["run", join(projectDir, "src", "index.ts"), "mcp"],
 			env,
 		};
 	}
-	return { command: "knowledge-server-mcp", env };
+	const whichResult = spawnSync("which", ["knowledge-server"], { encoding: "utf8" });
+	const mainBin = whichResult.status === 0 ? whichResult.stdout.trim() : "knowledge-server";
+	return { command: mainBin, args: ["mcp"], env };
 }
 
 export function setupCursor(): void {
@@ -647,12 +652,14 @@ export function setupCodex(): void {
 		const bunBin = process.execPath.endsWith("bun")
 			? process.execPath
 			: join(homedir(), ".bun", "bin", "bun");
-		// TOML array: ["bun", "run", "/path/to/src/mcp/index.ts"]
-		const args = ["run", join(projectDir, "src", "mcp", "index.ts")];
+		// TOML array: ["bun", "run", "/path/to/src/index.ts", "mcp"]
+		const args = ["run", join(projectDir, "src", "index.ts"), "mcp"];
 		const argsToml = args.map((a) => `"${a.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`).join(", ");
 		commandToml = `command = "${bunBin.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"\nargs = [${argsToml}]`;
 	} else {
-		commandToml = `command = "knowledge-server-mcp"`;
+		const whichResult = spawnSync("which", ["knowledge-server"], { encoding: "utf8" });
+		const mainBin = whichResult.status === 0 ? whichResult.stdout.trim() : "knowledge-server";
+		commandToml = `command = "${mainBin.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"\nargs = ["mcp"]`;
 	}
 
 	const block = `

@@ -12,7 +12,7 @@ Supports **Linux x64** and **macOS arm64** (Apple Silicon). No Bun or Node.js re
 curl -fsSL https://raw.githubusercontent.com/MAnders333/knowledge-server/main/scripts/install.sh | bash
 ```
 
-This downloads the server binaries into `~/.local/share/knowledge-server/` and generates a `.env` template.
+This downloads the server binary into `~/.local/share/knowledge-server/` and generates a `.env` template.
 
 **After running:**
 
@@ -124,8 +124,10 @@ OpenCode    Claude Code    Cursor    Codex CLI
               ActivationEngine       cosine similarity search over embeddings
                         │
                    ┌────┴────┐
-                   ▼         ▼
-               HTTP API    MCP server (thin HTTP proxy → GET /activate)
+                    ▼         ▼
+                HTTP API    MCP stdio proxy (`knowledge-server mcp` → GET /activate)
+                    │
+                  /mcp      MCP streamable-http (built into HTTP server)
                    │
                    ▼
          OpenCode plugin (passive injection on every user message)
@@ -151,12 +153,17 @@ Hono-based HTTP server. Starts on `127.0.0.1:3179` by default.
 | `/entries/:id` | DELETE | admin | Hard-delete an entry |
 | `/review` | GET | — | Surface conflicted, stale, and team-relevant entries |
 | `/hooks/claude-code/user-prompt` | POST | — | Claude Code `UserPromptSubmit` hook endpoint |
+| `/mcp` | ALL | — (admin token if `KNOWLEDGE_ADMIN_TOKEN` is set) | MCP streamable-http endpoint — connect MCP clients directly via HTTP |
 
-### MCP server (`src/mcp/index.ts`)
+### MCP server
 
 Exposes a single tool: `activate`. Agents use this for deliberate recall — when they want to pull knowledge about a specific topic mid-task.
 
-The MCP server is a **thin HTTP proxy** — it forwards `activate` calls to the already-running knowledge HTTP server via `GET /activate`. It does not open the database or call any LLM directly. Only `KNOWLEDGE_HOST` and `KNOWLEDGE_PORT` are required; no LLM credentials are needed.
+There are two ways to connect an MCP client:
+
+**stdio (local)** — `knowledge-server mcp` starts a lightweight stdio proxy that forwards `activate` calls to the already-running HTTP server via `GET /activate`. It does not open the database or call any LLM directly. Only `KNOWLEDGE_HOST` and `KNOWLEDGE_PORT` are required; no LLM credentials are needed. The `setup-tool` commands register this automatically.
+
+**streamable-http (local or hosted)** — the main HTTP server also exposes `ALL /mcp` as a stateless MCP endpoint. MCP clients can connect directly at `http://127.0.0.1:3179/mcp` without a separate subprocess. When `KNOWLEDGE_ADMIN_TOKEN` is set, the `/mcp` endpoint requires a `Authorization: Bearer <token>` header — suitable for hosted deployments. When unset (random per-process token), `/mcp` is unauthenticated since the server already binds to `127.0.0.1`.
 
 **OpenCode** — registered automatically by `knowledge-server setup-tool opencode` (or `bun run setup` from source). Writes the `mcp.knowledge` entry directly into `~/.config/opencode/opencode.jsonc`.
 
@@ -355,7 +362,7 @@ The `/activate` endpoint makes a paid embedding API call per request. There is n
 
 ### Binary integrity
 
-Release binaries are verified with SHA-256 checksums before installation when `sha256sum` or `shasum` is available (standard on Linux and macOS). The installer downloads `SHA256SUMS-<platform>` from the release and verifies both binaries against it before moving them into place. `knowledge-server update` performs the same check before replacing the running binary.
+Release binaries are distributed as gzip-compressed assets (`.gz`) and verified with SHA-256 checksums on the uncompressed binary. The installer decompresses the binary on the fly (streaming — never buffered in full), then verifies the SHA-256 against `SHA256SUMS-<platform>` from the release before moving it into place. `knowledge-server update` performs the same streaming decompress + checksum check before replacing the running binary.
 
 ## Development
 

@@ -121,35 +121,27 @@ mkdir -p "$COMMAND_DIR"
 
 # ── Download binaries and verify checksums ────────────────────────────────────
 
-echo "Downloading binaries..."
+echo "Downloading binary..."
 
 TMPDIR_DL="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR_DL"' EXIT
 
-# Download the checksum file first
+# Download the checksum file first (contains hash of the uncompressed binary)
 curl --fail --location --silent --show-error \
   "$BASE_URL/SHA256SUMS-$PLATFORM" \
   -o "$TMPDIR_DL/SHA256SUMS"
 
-# Download both binaries to temp dir, then verify before installing
+# Download gzip-compressed binary and decompress on the fly.
+# Streaming decompress avoids storing both compressed and uncompressed copies.
 curl --fail --location --show-error --progress-bar \
-  "$BASE_URL/knowledge-server-$PLATFORM" \
-  -o "$TMPDIR_DL/knowledge-server"
+  "$BASE_URL/knowledge-server-$PLATFORM.gz" \
+  | gunzip > "$TMPDIR_DL/knowledge-server"
 
-curl --fail --location --show-error --progress-bar \
-  "$BASE_URL/knowledge-server-mcp-$PLATFORM" \
-  -o "$TMPDIR_DL/knowledge-server-mcp"
-
-echo "Verifying checksums..."
-# The SHA256SUMS file uses the release asset filenames; verify using just the basenames.
-# MCP substitution must come before server substitution to avoid partial match:
-# "knowledge-server-$PLATFORM" is a prefix of "knowledge-server-mcp-$PLATFORM".
-#
-# Tool selection: macOS ships `shasum` (BSD) and may also have `sha256sum` via
-# Homebrew coreutils — but Homebrew's sha256sum uses different flags on some
-# versions. Prefer `shasum` on Darwin; use `sha256sum` on Linux.
+echo "Verifying checksum..."
+# The SHA256SUMS file contains the hash of the uncompressed binary.
+# Tool selection: macOS ships `shasum` (BSD); prefer it on Darwin.
 _verify_checksums() {
-  sed "s/knowledge-server-mcp-$PLATFORM/knowledge-server-mcp/; s/knowledge-server-$PLATFORM/knowledge-server/" SHA256SUMS | "$@"
+  sed "s/knowledge-server-$PLATFORM/knowledge-server/" SHA256SUMS | "$@"
 }
 if [[ "$OS" == "Darwin" ]] && command -v shasum > /dev/null 2>&1; then
   (cd "$TMPDIR_DL" && _verify_checksums shasum -a 256 --check --status) || {
@@ -169,18 +161,14 @@ elif command -v shasum > /dev/null 2>&1; then
 else
   echo "  ⚠ No sha256sum or shasum found — skipping checksum verification"
 fi
-echo "  ✓ Checksums verified"
+echo "  ✓ Checksum verified"
 
-# Move verified binaries into place
+# Move verified binary into place
 mv "$TMPDIR_DL/knowledge-server" "$INSTALL_DIR/libexec/knowledge-server"
 chmod +x "$INSTALL_DIR/libexec/knowledge-server"
 echo "  ✓ knowledge-server"
 
-mv "$TMPDIR_DL/knowledge-server-mcp" "$INSTALL_DIR/libexec/knowledge-server-mcp"
-chmod +x "$INSTALL_DIR/libexec/knowledge-server-mcp"
-echo "  ✓ knowledge-server-mcp"
-
-# Record installed version — written after both downloads succeed so a failed
+# Record installed version — written after download succeeds so a failed
 # update doesn't leave the version file pointing at a partially-updated install
 echo "$VERSION" > "$INSTALL_DIR/version"
 
@@ -364,21 +352,16 @@ if [ "$ENV_CONFIGURED" = false ]; then
   STEP=$((STEP + 1))
 fi
 
-# The MCP server is a thin HTTP proxy — it only needs KNOWLEDGE_HOST/PORT.
+# The MCP subcommand is built into the main binary — no separate process needed.
 # LLM credentials stay in the knowledge server's .env, not the MCP process.
-echo "  $STEP. Add to ~/.config/opencode/opencode.jsonc:"
+echo "  $STEP. Run the setup command for your tool(s):"
+echo "     knowledge-server setup-tool opencode"
+echo "     knowledge-server setup-tool claude-code"
+echo "     knowledge-server setup-tool cursor"
+echo "     knowledge-server setup-tool codex"
 echo ""
-echo '     "mcp": {'
-echo '       "knowledge": {'
-echo '         "type": "local",'
-echo "         \"command\": [\"$INSTALL_DIR/libexec/knowledge-server-mcp\"],"
-echo '         "enabled": true,'
-echo '         "environment": {'
-echo "           \"KNOWLEDGE_HOST\": \"$KNOWLEDGE_HOST_VAL\","
-echo "           \"KNOWLEDGE_PORT\": \"$KNOWLEDGE_PORT_VAL\""
-echo '         }'
-echo '       }'
-echo '     }'
+echo "     Or add manually to your tool's MCP config:"
+echo '     "command": ["'"$INSTALL_DIR/libexec/knowledge-server"'", "mcp"]'
 echo ""
 STEP=$((STEP + 1))
 
