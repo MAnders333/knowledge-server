@@ -1,5 +1,26 @@
 # Changelog
 
+## [2.0.0](https://github.com/MAnders333/knowledge-server/compare/v1.6.0...v2.0.0) (2026-03-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* the separate knowledge-server-mcp binary no longer exists. MCP clients must use ['knowledge-server', 'mcp'] as the command instead of ['knowledge-server-mcp']. Running 'knowledge-server update' will automatically remove the obsolete binary and print instructions to re-run setup-tool. Users who have not yet run 'knowledge-server update' should run:   knowledge-server setup-tool <opencode|claude-code|cursor|codex>
+
+### Features
+
+* remove knowledge-server-mcp binary; MCP is now 'knowledge-server mcp' ([ba9b00f](https://github.com/MAnders333/knowledge-server/commit/ba9b00f29113dd93bbc280a4c2f983cfcfabe5f8))
+* single binary, /mcp streamable-http endpoint, streaming update fix ([c3cd1fd](https://github.com/MAnders333/knowledge-server/commit/c3cd1fd8bd1a349145c31194db19cf1c38b862c7))
+
+
+### Bug Fixes
+
+* always show MCP migration notice when updating to v1.7.0+, not only when old binary found ([e1cc3df](https://github.com/MAnders333/knowledge-server/commit/e1cc3df0ab23a247633e27b48d16bd27bf1e5ed7))
+* assert version regex match instead of silent ?? [] fallback ([4937ac2](https://github.com/MAnders333/knowledge-server/commit/4937ac26263d6056dc79ff32821b852e97f7109f))
+* double-cast res.body through unknown to satisfy tsc (dom vs node ReadableStream types) ([821de4b](https://github.com/MAnders333/knowledge-server/commit/821de4bc8c0f6faabe8a175d713f2da20d5bb88c))
+* restore Readable.fromWeb cast (non-null assertion blocked by biome) ([d2a7892](https://github.com/MAnders333/knowledge-server/commit/d2a78927d70300e97d29002ff3d5649a874e9a3b))
+* use top-level Readable import in update.ts; remove ?? undefined noise in server.ts ([577ea9d](https://github.com/MAnders333/knowledge-server/commit/577ea9d97dd3cd4626beb749b800e1b4b4f62f7f))
+
 ## [1.6.0](https://github.com/MAnders333/knowledge-server/compare/v1.5.0...v1.6.0) (2026-03-06)
 
 
