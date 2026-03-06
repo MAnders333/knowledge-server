@@ -157,6 +157,7 @@ async function downloadBinary(
 		});
 
 		// Convert Web ReadableStream to Node Readable for pipeline()
+		// res.body null case is already guarded above; cast narrows ReadableStream<unknown> → Uint8Array.
 		const nodeReadable = Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0]);
 		await pipeline(nodeReadable, gunzip, fileStream);
 
