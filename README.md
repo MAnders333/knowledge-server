@@ -98,11 +98,12 @@ The similarity thresholds (0.82 for reconsolidation, 0.4 for the contradiction s
 ## Architecture
 
 ```
-OpenCode (SQLite)   Claude Code (JSONL)   Cursor (SQLite)   Codex CLI (JSONL)
-       │                   │                    │                  │
-       └───────────────────┴────────────────────┴──────────────────┘
-                                       ▼
-                  EpisodeReader          reads new sessions since cursor (per source)
+OpenCode    Claude Code    Cursor    Codex CLI
+(SQLite)      (JSONL)    (SQLite)    (JSONL)
+    │             │          │          │
+    └─────────────┴──────────┴──────────┘
+                            ▼
+                   EpisodeReader          reads new sessions since cursor (per source)
                         │
                         ▼
               ConsolidationLLM       extracts knowledge entries (high bar: most sessions → [])
@@ -163,7 +164,7 @@ The MCP server is a **thin HTTP proxy** — it forwards `activate` calls to the 
 
 **Cursor** — registered automatically by `knowledge-server setup-tool cursor`. Writes the `knowledge` entry into `~/.cursor/mcp.json`.
 
-**Codex CLI** — registered automatically by `knowledge-server setup-tool codex`. Appends `[mcp_servers.knowledge]` to `~/.codex/config.toml`.
+**Codex CLI** — registered automatically by `knowledge-server setup-tool codex`. Registers `[mcp_servers.knowledge]` in `~/.codex/config.toml`.
 
 ### OpenCode plugin (`plugin/knowledge.ts`)
 
@@ -230,7 +231,7 @@ knowledge-server setup-tool codex    # binary install
 bun run src/index.ts setup-tool codex  # source install
 ```
 
-Appends the `[mcp_servers.knowledge]` block to `~/.codex/config.toml`. Idempotent — re-running is safe. Codex CLI has no user-defined slash command directory, so no command symlinks are created.
+Registers the `[mcp_servers.knowledge]` block in `~/.codex/config.toml` (checks first; only writes if absent). Idempotent — re-running is safe. Codex CLI has no user-defined slash command directory, so no command symlinks are created.
 
 ## Configuration
 
