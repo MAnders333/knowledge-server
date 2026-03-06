@@ -1,5 +1,5 @@
 ---
-description: Run knowledge consolidation — process recent sessions (OpenCode + Claude Code) into knowledge entries
+description: Run knowledge consolidation — process recent sessions (OpenCode, Claude Code, Cursor, Codex, VSCode) into knowledge entries
 ---
 
 Run a knowledge consolidation cycle by calling the local knowledge server.
@@ -12,8 +12,8 @@ curl -s -X POST -H "Authorization: Bearer $KNOWLEDGE_ADMIN_TOKEN" \
   http://127.0.0.1:3179/consolidate | python3 -m json.tool
 ```
 
-This processes recent session logs from all configured sources (OpenCode and Claude Code)
-and extracts/updates knowledge entries (semantic knowledge).
+This processes recent session logs from all configured sources (OpenCode, Claude Code,
+Cursor, Codex CLI, and VSCode) and extracts/updates knowledge entries (semantic knowledge).
 
 After consolidation, show a brief summary of:
 - Sessions processed (per source)

@@ -90,12 +90,20 @@ export const config = {
 	//   An empty string means "auto-detect".
 	codexSessionsDir: process.env.CODEX_SESSIONS_DIR || "",
 
+	// vscodeDataDir: root data directory for VSCode.
+	//   Auto-detected by resolveVSCodeDataDir() in vscode.ts using a platform-specific
+	//   probe list (macOS: ~/Library/Application Support/Code, Linux: ~/.config/Code).
+	//   Only set here when VSCODE_DATA_DIR is explicitly provided — an empty string
+	//   means "auto-detect" rather than "path was not found".
+	vscodeDataDir: process.env.VSCODE_DATA_DIR || "",
+
 	// Explicit source enable/disable.
 	// All default to true (auto-detect); set to "false" to hard-disable a source.
 	opencodeEnabled: process.env.OPENCODE_ENABLED !== "false",
 	claudeEnabled: process.env.CLAUDE_ENABLED !== "false",
 	cursorEnabled: process.env.CURSOR_ENABLED !== "false",
 	codexEnabled: process.env.CODEX_ENABLED !== "false",
+	vscodeEnabled: process.env.VSCODE_ENABLED !== "false",
 
 	// Unified endpoint — single API key, base URL routes by provider.
 	// Set LLM_BASE_ENDPOINT in .env. No default is provided since this is
@@ -274,6 +282,13 @@ export function validateConfig(): string[] {
 	) {
 		errors.push(
 			`CODEX_SESSIONS_DIR is set but directory not found at ${process.env.CODEX_SESSIONS_DIR}.`,
+		);
+	}
+
+	// Same pattern for VSCODE_DATA_DIR.
+	if (process.env.VSCODE_DATA_DIR && !existsSync(process.env.VSCODE_DATA_DIR)) {
+		errors.push(
+			`VSCODE_DATA_DIR is set but directory not found at ${process.env.VSCODE_DATA_DIR}.`,
 		);
 	}
 

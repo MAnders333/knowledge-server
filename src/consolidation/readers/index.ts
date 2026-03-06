@@ -7,11 +7,13 @@ import { ClaudeCodeEpisodeReader } from "./claude-code.js";
 import { CodexEpisodeReader, resolveCodexSessionsDir } from "./codex.js";
 import { CursorEpisodeReader, resolveCursorDbPath } from "./cursor.js";
 import { OpenCodeEpisodeReader } from "./opencode.js";
+import { VSCodeEpisodeReader, resolveVSCodeDataDir } from "./vscode.js";
 
 export { OpenCodeEpisodeReader } from "./opencode.js";
 export { ClaudeCodeEpisodeReader } from "./claude-code.js";
 export { CursorEpisodeReader } from "./cursor.js";
 export { CodexEpisodeReader } from "./codex.js";
+export { VSCodeEpisodeReader } from "./vscode.js";
 
 /**
  * Probe list of candidate OpenCode DB paths to check when OPENCODE_DB_PATH is not set.
@@ -157,6 +159,24 @@ export function createEpisodeReaders(): IEpisodeReader[] {
 		}
 	} else {
 		logger.log("[sources] Cursor: disabled (CURSOR_ENABLED=false)");
+	}
+
+	// ── VSCode ──
+	if (config.vscodeEnabled) {
+		const vscodeDataDir = resolveVSCodeDataDir();
+		if (vscodeDataDir) {
+			readers.push(new VSCodeEpisodeReader(vscodeDataDir));
+			logger.log(`[sources] VSCode: ${vscodeDataDir}`);
+		} else {
+			const hint = config.vscodeDataDir
+				? `Expected at ${config.vscodeDataDir}.`
+				: "Auto-detection found no VSCode installation on this platform.";
+			logger.warn(
+				`[sources] VSCode source enabled but data directory not found. ${hint} Set VSCODE_DATA_DIR or disable with VSCODE_ENABLED=false.`,
+			);
+		}
+	} else {
+		logger.log("[sources] VSCode: disabled (VSCODE_ENABLED=false)");
 	}
 
 	return readers;

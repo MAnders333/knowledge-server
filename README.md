@@ -1,6 +1,6 @@
 # knowledge-server
 
-Persistent semantic memory for [OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview), [Cursor](https://cursor.com), and [Codex CLI](https://github.com/openai/codex) — fully local, no external service required.
+Persistent semantic memory for [OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview), [Cursor](https://cursor.com), [Codex CLI](https://github.com/openai/codex), and [VSCode](https://code.visualstudio.com) (GitHub Copilot) — fully local, no external service required.
 
 Reads your session history, extracts what's worth keeping into a local SQLite knowledge store, and injects relevant entries into new conversations automatically.
 
@@ -22,6 +22,7 @@ This downloads the server binary into `~/.local/share/knowledge-server/` and gen
    - `knowledge-server setup-tool claude-code` — registers the MCP server, `UserPromptSubmit` hook, and slash commands
    - `knowledge-server setup-tool cursor` — registers the MCP server in `~/.cursor/mcp.json`
    - `knowledge-server setup-tool codex` — registers the MCP server in `~/.codex/config.toml`
+   - `knowledge-server setup-tool vscode` — registers the MCP server via `code --add-mcp`
 3. Start the server: `knowledge-server`
 
 **To update later:**
@@ -51,6 +52,7 @@ For other tools, run the corresponding setup step:
 bun run src/index.ts setup-tool claude-code  # MCP server + hook + slash commands
 bun run src/index.ts setup-tool cursor       # MCP server in ~/.cursor/mcp.json
 bun run src/index.ts setup-tool codex        # MCP server in ~/.codex/config.toml
+bun run src/index.ts setup-tool vscode       # MCP server via `code --add-mcp`
 ```
 
 All setup steps are idempotent — re-running is safe.
@@ -64,8 +66,10 @@ All setup steps are idempotent — re-running is safe.
 | **Codex CLI** | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (JSONL rollout logs) | macOS, Linux |
 | **Cursor** | `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` (SQLite) | macOS |
 | **Cursor** | `~/.config/Cursor/User/globalStorage/state.vscdb` (SQLite) | Linux |
+| **VSCode** | `~/Library/Application Support/Code/User/workspaceStorage/*/chatSessions/*.json` (JSON) | macOS |
+| **VSCode** | `~/.config/Code/User/workspaceStorage/*/chatSessions/*.json` (JSON) | Linux |
 
-All sources are enabled by default and auto-detected on startup. Disable any with `OPENCODE_ENABLED=false`, `CLAUDE_ENABLED=false`, `CODEX_ENABLED=false`, or `CURSOR_ENABLED=false`. Override a path with `OPENCODE_DB_PATH`, `CLAUDE_DB_PATH`, `CODEX_SESSIONS_DIR`, or `CURSOR_DB_PATH`.
+All sources are enabled by default and auto-detected on startup. Disable any with `OPENCODE_ENABLED=false`, `CLAUDE_ENABLED=false`, `CODEX_ENABLED=false`, `CURSOR_ENABLED=false`, or `VSCODE_ENABLED=false`. Override a path with `OPENCODE_DB_PATH`, `CLAUDE_DB_PATH`, `CODEX_SESSIONS_DIR`, `CURSOR_DB_PATH`, or `VSCODE_DATA_DIR`.
 
 ## How it works
 
@@ -98,10 +102,10 @@ The similarity thresholds (0.82 for reconsolidation, 0.4 for the contradiction s
 ## Architecture
 
 ```
-OpenCode    Claude Code    Cursor    Codex CLI
-(SQLite)      (JSONL)    (SQLite)    (JSONL)
-    │             │          │          │
-    └─────────────┴──────────┴──────────┘
+OpenCode    Claude Code    Cursor    Codex CLI    VSCode
+(SQLite)      (JSONL)    (SQLite)    (JSONL)     (JSON)
+    │             │          │          │           │
+    └─────────────┴──────────┴──────────┴───────────┘
                             ▼
                    EpisodeReader          reads new sessions since cursor (per source)
                         │
@@ -173,6 +177,8 @@ There are two ways to connect an MCP client:
 
 **Codex CLI** — registered automatically by `knowledge-server setup-tool codex`. Registers `[mcp_servers.knowledge]` in `~/.codex/config.toml`.
 
+**VSCode** — registered automatically by `knowledge-server setup-tool vscode`. Uses `code --add-mcp` to register the `knowledge` server in the active profile's `mcp.json`.
+
 ### OpenCode plugin (`plugin/knowledge.ts`)
 
 Passive injection. Fires on every user message via the `chat.message` hook, before the LLM sees it. Queries `/activate` and injects matching knowledge as a synthetic message part. The LLM sees it as additional context on turn 1.
@@ -193,6 +199,7 @@ Registered automatically by `setup-tool claude-code`.
 - `readers/claude-code.ts` — reads Claude Code JSONL session files, handles compacted sessions, correlates tool call results
 - `readers/cursor.ts` — reads Cursor's SQLite state DB (`state.vscdb`), handles both inline (Format A) and bubble-per-KV (Format B) conversation layouts
 - `readers/codex.ts` — reads Codex CLI JSONL rollout files, two-pass parse for stable session IDs, skips injected context blocks
+- `readers/vscode.ts` — reads VSCode / GitHub Copilot Chat session JSON files from per-workspace `chatSessions/` directories, extracts user messages and assistant text responses
 - `consolidate.ts` — orchestrates the full cycle: read → extract → reconsolidate → contradiction scan → decay → embed → advance cursor (per source)
 - `llm.ts` — three LLM calls across three model slots: `extractKnowledge` (extraction model), `decideMerge` (merge model — cheaper), `detectAndResolveContradiction` (contradiction model)
 - `decay.ts` — forgetting curve with type-specific half-lives (facts decay faster than procedures)
@@ -240,6 +247,17 @@ bun run src/index.ts setup-tool codex  # source install
 
 Registers the `[mcp_servers.knowledge]` block in `~/.codex/config.toml`. Idempotent — re-running is safe. Codex CLI has no user-defined slash command directory, so no command symlinks are created.
 
+### VSCode
+
+```bash
+knowledge-server setup-tool vscode    # binary install
+bun run src/index.ts setup-tool vscode  # source install
+```
+
+Registers the `knowledge` MCP server via `code --add-mcp`, which writes to the active VSCode profile's `mcp.json`. Requires the `code` CLI to be on PATH (install via VSCode: Cmd+Shift+P → "Shell Command: Install 'code' command in PATH").
+
+VSCode reads GitHub Copilot Chat session files from per-workspace `chatSessions/` directories. No additional hooks or plugins are needed — VSCode natively supports MCP tools through its chat interface.
+
 ## Configuration
 
 All config is via environment variables in `.env`. Defaults are sensible for local use.
@@ -265,6 +283,8 @@ All config is via environment variables in `.env`. Defaults are sensible for loc
 | `CODEX_ENABLED` | `true` | Set to `false` to disable Codex CLI session reading |
 | `CURSOR_DB_PATH` | *(auto-detected)* | Path to Cursor's `state.vscdb`. Auto-detected per platform (macOS: `~/Library/Application Support/Cursor/…`, Linux: `~/.config/Cursor/…`) |
 | `CURSOR_ENABLED` | `true` | Set to `false` to disable Cursor session reading |
+| `VSCODE_DATA_DIR` | *(auto-detected)* | Path to VSCode's data directory. Auto-detected per platform (macOS: `~/Library/Application Support/Code`, Linux: `~/.config/Code`) |
+| `VSCODE_ENABLED` | `true` | Set to `false` to disable VSCode session reading |
 | `CONSOLIDATION_MAX_SESSIONS` | `50` | Sessions per consolidation batch |
 | `CONSOLIDATION_CHUNK_SIZE` | `10` | Episodes per LLM extraction call |
 | `CONTRADICTION_MIN_SIMILARITY` | `0.4` | Lower bound of the contradiction scan similarity band (upper bound is always 0.82) |
@@ -316,7 +336,7 @@ Returns:
 - **stale** — active entries with low strength (haven't been accessed recently)
 - **team-relevant** — high-confidence `team`-scoped entries that may warrant external documentation
 
-OpenCode and Claude Code users also have a `/knowledge-review` slash command (installed by `setup-tool opencode` and `setup-tool claude-code` respectively) for an interactive review workflow inside the TUI. Cursor and Codex CLI do not support user-defined slash commands.
+OpenCode and Claude Code users also have a `/knowledge-review` slash command (installed by `setup-tool opencode` and `setup-tool claude-code` respectively) for an interactive review workflow inside the TUI. Cursor, Codex CLI, and VSCode do not support user-defined slash commands.
 
 ## Knowledge entry types
 

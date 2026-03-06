@@ -100,9 +100,7 @@ function makeOpenCodeMcpEntry(): { command: string[] } & Record<
 		encoding: "utf8",
 	});
 	const mainBin =
-		whichResult.status === 0
-			? whichResult.stdout.trim()
-			: "knowledge-server"; // fallback: hope it's on PATH at runtime
+		whichResult.status === 0 ? whichResult.stdout.trim() : "knowledge-server"; // fallback: hope it's on PATH at runtime
 	return {
 		type: "local",
 		command: [mainBin, "mcp"],
@@ -264,7 +262,8 @@ function getBinaryInstallDir(): string {
 	return resolve(dirname(process.execPath), "..");
 }
 
-const GITHUB_RELEASES = "https://github.com/MAnders333/knowledge-server/releases/download";
+const GITHUB_RELEASES =
+	"https://github.com/MAnders333/knowledge-server/releases/download";
 
 /**
  * Download a text asset from the current release and write it atomically to dst.
@@ -285,21 +284,45 @@ function downloadAssetSync(name: string, dst: string): void {
 	const tmp = `${dst}.tmp`;
 	const result = spawnSync(
 		"curl",
-		["-fsSL", "--proto", "=https", "--tlsv1.2", "--max-time", "30", "--output", tmp, url],
+		[
+			"-fsSL",
+			"--proto",
+			"=https",
+			"--tlsv1.2",
+			"--max-time",
+			"30",
+			"--output",
+			tmp,
+			url,
+		],
 		{ encoding: "utf8", timeout: 35_000 },
 	);
 	if (result.error) {
-		try { unlinkSync(tmp); } catch { /* ignore */ }
+		try {
+			unlinkSync(tmp);
+		} catch {
+			/* ignore */
+		}
 		throw new Error(`Failed to run curl: ${result.error.message}`);
 	}
 	if (result.status !== 0) {
-		try { unlinkSync(tmp); } catch { /* ignore */ }
-		throw new Error(`curl failed for ${name}: ${result.stderr?.trim() || "unknown error"}`);
+		try {
+			unlinkSync(tmp);
+		} catch {
+			/* ignore */
+		}
+		throw new Error(
+			`curl failed for ${name}: ${result.stderr?.trim() || "unknown error"}`,
+		);
 	}
 	try {
 		renameSync(tmp, dst);
 	} catch (err) {
-		try { unlinkSync(tmp); } catch { /* ignore */ }
+		try {
+			unlinkSync(tmp);
+		} catch {
+			/* ignore */
+		}
 		throw err;
 	}
 }
@@ -321,7 +344,9 @@ function setupOpenCode(): void {
 		const pluginSrc = join(projectDir, "plugin", "knowledge.ts");
 		if (!existsSync(pluginSrc)) {
 			console.error(`  ✗ Plugin source not found: ${pluginSrc}`);
-			console.error("    Make sure you are running from the knowledge-server project directory.");
+			console.error(
+				"    Make sure you are running from the knowledge-server project directory.",
+			);
 			process.exit(1);
 		}
 		forceSymlink(pluginSrc, pluginDst);
@@ -355,7 +380,10 @@ function setupOpenCode(): void {
 		];
 		const optionalAssets: Array<[string, string]> = [
 			["consolidate.md", join(configDir, "command", "consolidate.md")],
-			["knowledge-review.md", join(configDir, "command", "knowledge-review.md")],
+			[
+				"knowledge-review.md",
+				join(configDir, "command", "knowledge-review.md"),
+			],
 		];
 		mkdirSync(join(configDir, "command"), { recursive: true });
 
@@ -388,7 +416,9 @@ function setupOpenCode(): void {
 
 		for (const [name, dst] of requiredAssets) {
 			if (!installAsset(name, dst)) {
-				console.error("    Plugin is required for OpenCode integration — aborting.");
+				console.error(
+					"    Plugin is required for OpenCode integration — aborting.",
+				);
 				process.exit(1);
 			}
 		}
@@ -444,8 +474,11 @@ function makeClaudeMcpEntry() {
 		};
 	}
 	// Binary install: `knowledge-server mcp` — mcp is a built-in subcommand.
-	const whichResult = spawnSync("which", ["knowledge-server"], { encoding: "utf8" });
-	const mainBin = whichResult.status === 0 ? whichResult.stdout.trim() : "knowledge-server";
+	const whichResult = spawnSync("which", ["knowledge-server"], {
+		encoding: "utf8",
+	});
+	const mainBin =
+		whichResult.status === 0 ? whichResult.stdout.trim() : "knowledge-server";
 	return {
 		type: "stdio",
 		command: mainBin,
@@ -654,8 +687,11 @@ function makeCursorMcpEntry() {
 			env,
 		};
 	}
-	const whichResult = spawnSync("which", ["knowledge-server"], { encoding: "utf8" });
-	const mainBin = whichResult.status === 0 ? whichResult.stdout.trim() : "knowledge-server";
+	const whichResult = spawnSync("which", ["knowledge-server"], {
+		encoding: "utf8",
+	});
+	const mainBin =
+		whichResult.status === 0 ? whichResult.stdout.trim() : "knowledge-server";
 	return { command: mainBin, args: ["mcp"], env };
 }
 
@@ -691,15 +727,24 @@ export function setupCursor(): void {
 
 	let needsWrite = true;
 	if (existing) {
-		const existingCmd = JSON.stringify([existing.command, ...(existing.args ?? [])]);
+		const existingCmd = JSON.stringify([
+			existing.command,
+			...(existing.args ?? []),
+		]);
 		const newCmd = JSON.stringify([entry.command, ...(entry.args ?? [])]);
 		if (existingCmd === newCmd) {
-			console.log("  ✓ MCP server 'knowledge' already in ~/.cursor/mcp.json (no change)");
-			console.log("    To update: remove the 'knowledge' entry from ~/.cursor/mcp.json and re-run this command.");
+			console.log(
+				"  ✓ MCP server 'knowledge' already in ~/.cursor/mcp.json (no change)",
+			);
+			console.log(
+				"    To update: remove the 'knowledge' entry from ~/.cursor/mcp.json and re-run this command.",
+			);
 			needsWrite = false;
 		} else {
 			mcpConfig.mcpServers.knowledge = entry;
-			console.log("  ✓ MCP server 'knowledge' updated in ~/.cursor/mcp.json (command changed)");
+			console.log(
+				"  ✓ MCP server 'knowledge' updated in ~/.cursor/mcp.json (command changed)",
+			);
 		}
 	} else {
 		mcpConfig.mcpServers.knowledge = entry;
@@ -712,7 +757,11 @@ export function setupCursor(): void {
 			writeFileSync(tmpPath, `${JSON.stringify(mcpConfig, null, 2)}\n`, "utf8");
 			renameSync(tmpPath, mcpPath);
 		} catch (e) {
-			try { unlinkSync(tmpPath); } catch { /* ignore */ }
+			try {
+				unlinkSync(tmpPath);
+			} catch {
+				/* ignore */
+			}
 			throw e;
 		}
 		console.log(`  ✓ Wrote ${mcpPath}`);
@@ -761,11 +810,16 @@ export function setupCodex(): void {
 			: join(homedir(), ".bun", "bin", "bun");
 		// TOML array: ["bun", "run", "/path/to/src/index.ts", "mcp"]
 		const args = ["run", join(projectDir, "src", "index.ts"), "mcp"];
-		const argsToml = args.map((a) => `"${a.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`).join(", ");
+		const argsToml = args
+			.map((a) => `"${a.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`)
+			.join(", ");
 		commandToml = `command = "${bunBin.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"\nargs = [${argsToml}]`;
 	} else {
-		const whichResult = spawnSync("which", ["knowledge-server"], { encoding: "utf8" });
-		const mainBin = whichResult.status === 0 ? whichResult.stdout.trim() : "knowledge-server";
+		const whichResult = spawnSync("which", ["knowledge-server"], {
+			encoding: "utf8",
+		});
+		const mainBin =
+			whichResult.status === 0 ? whichResult.stdout.trim() : "knowledge-server";
 		commandToml = `command = "${mainBin.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"\nargs = ["mcp"]`;
 	}
 
@@ -787,8 +841,12 @@ env = { KNOWLEDGE_HOST = "${config.host}", KNOWLEDGE_PORT = "${config.port}" }
 	}
 
 	if (existing.includes("[mcp_servers.knowledge]")) {
-		console.log("  ✓ MCP server 'knowledge' already in ~/.codex/config.toml (no change)");
-		console.log("    To update: remove the [mcp_servers.knowledge] block and re-run this command.");
+		console.log(
+			"  ✓ MCP server 'knowledge' already in ~/.codex/config.toml (no change)",
+		);
+		console.log(
+			"    To update: remove the [mcp_servers.knowledge] block and re-run this command.",
+		);
 	} else {
 		const updated = `${existing.trimEnd()}\n${block}`;
 		const tmpPath = `${configPath}.tmp`;
@@ -796,7 +854,11 @@ env = { KNOWLEDGE_HOST = "${config.host}", KNOWLEDGE_PORT = "${config.port}" }
 			writeFileSync(tmpPath, updated, "utf8");
 			renameSync(tmpPath, configPath);
 		} catch (e) {
-			try { unlinkSync(tmpPath); } catch { /* ignore */ }
+			try {
+				unlinkSync(tmpPath);
+			} catch {
+				/* ignore */
+			}
 			throw e;
 		}
 		console.log("  ✓ MCP server 'knowledge' added to ~/.codex/config.toml");
@@ -809,6 +871,108 @@ env = { KNOWLEDGE_HOST = "${config.host}", KNOWLEDGE_PORT = "${config.port}" }
 
 	console.log(`
 Start the knowledge server before using Codex:
+  ${startHint}
+
+Setup complete!`);
+}
+
+// ── VSCode setup ───────────────────────────────────────────────────────────────
+
+/**
+ * Build the MCP server entry for VSCode's mcp.json.
+ *
+ * VSCode uses a `servers` key in mcp.json (different from Cursor's `mcpServers`).
+ * Each entry: { command, args?, env? }
+ *
+ * The MCP server is registered via `code --add-mcp` which writes to the active
+ * profile's mcp.json. This avoids hardcoding profile-specific paths.
+ */
+function makeVSCodeMcpEntry() {
+	const env = {
+		KNOWLEDGE_HOST: config.host,
+		KNOWLEDGE_PORT: String(config.port),
+	};
+
+	if (isSourceInstall()) {
+		const projectDir = getProjectDir();
+		const bunBin = process.execPath.endsWith("bun")
+			? process.execPath
+			: join(homedir(), ".bun", "bin", "bun");
+		return {
+			name: "knowledge",
+			command: bunBin,
+			args: ["run", join(projectDir, "src", "index.ts"), "mcp"],
+			env,
+		};
+	}
+	const whichResult = spawnSync("which", ["knowledge-server"], {
+		encoding: "utf8",
+	});
+	const mainBin =
+		whichResult.status === 0 ? whichResult.stdout.trim() : "knowledge-server";
+	return { name: "knowledge", command: mainBin, args: ["mcp"], env };
+}
+
+export function setupVSCode(): void {
+	console.log("Setting up VSCode integration...\n");
+
+	const entry = makeVSCodeMcpEntry();
+
+	// Use `code --add-mcp` to register the MCP server in the active profile.
+	// This is the official VSCode CLI approach and handles profile-specific
+	// mcp.json paths transparently. The --add-mcp flag accepts a JSON object
+	// with { name, command, args?, env? }.
+	const mcpJson = JSON.stringify(entry);
+
+	// First check if `code` is available on PATH
+	const codeCheck = spawnSync("which", ["code"], { encoding: "utf8" });
+	if (codeCheck.status !== 0) {
+		console.error("  ✗ 'code' command not found on PATH.");
+		console.error(
+			"    Install the VSCode CLI: open VSCode → Cmd+Shift+P → 'Shell Command: Install code command in PATH'",
+		);
+		console.error("");
+		console.error("    Alternatively, add the MCP server manually:");
+		console.error(
+			"    1. Open VSCode → Cmd+Shift+P → 'MCP: Open User Configuration'",
+		);
+		console.error(`    2. Add to the "servers" object:`);
+		console.error(
+			`       "knowledge": ${JSON.stringify({ command: entry.command, args: entry.args, env: entry.env }, null, 6)}`,
+		);
+		process.exit(1);
+	}
+
+	const addResult = spawnSync("code", ["--add-mcp", mcpJson], {
+		encoding: "utf8",
+	});
+
+	if (addResult.status === 0) {
+		console.log("  ✓ MCP server 'knowledge' registered via `code --add-mcp`");
+	} else {
+		// Fallback: `code --add-mcp` may not be available in older VSCode versions.
+		// Print manual instructions instead.
+		console.error(
+			"  ✗ Failed to register MCP server via `code --add-mcp`:",
+			addResult.stderr?.trim(),
+		);
+		console.error("");
+		console.error("    Add the MCP server manually:");
+		console.error(
+			"    1. Open VSCode → Cmd+Shift+P → 'MCP: Open User Configuration'",
+		);
+		console.error(`    2. Add to the "servers" object:`);
+		console.error(
+			`       "knowledge": ${JSON.stringify({ command: entry.command, args: entry.args, env: entry.env }, null, 6)}`,
+		);
+	}
+
+	const startHint = isSourceInstall()
+		? `bun run ${join(getProjectDir(), "src", "index.ts")}`
+		: "knowledge-server";
+
+	console.log(`
+Start the knowledge server before using VSCode:
   ${startHint}
 
 Setup complete!`);
@@ -840,6 +1004,7 @@ Available tools:
   claude-code   Register MCP server + hook; symlink commands into ~/.claude/commands/
   cursor        Register MCP server in ~/.cursor/mcp.json
   codex         Register MCP server in ~/.codex/config.toml
+  vscode        Register MCP server via \`code --add-mcp\`
 `);
 		process.exit(0);
 	}
@@ -857,9 +1022,14 @@ Available tools:
 		case "codex":
 			setupCodex();
 			break;
+		case "vscode":
+			setupVSCode();
+			break;
 		default:
 			console.error(`Unknown tool: ${tool}`);
-			console.error("Valid options: opencode, claude-code, cursor, codex");
+			console.error(
+				"Valid options: opencode, claude-code, cursor, codex, vscode",
+			);
 			process.exit(1);
 	}
 }
