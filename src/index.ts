@@ -13,33 +13,13 @@ import { main as mcpMain } from "./mcp/index.js";
 import { runSetupTool } from "./setup-tool.js";
 import { runUpdate } from "./update.js";
 
-// Handle `knowledge-server mcp` — run the MCP stdio proxy instead of the HTTP server.
-// This replaces the separate knowledge-server-mcp binary; MCP clients should use
-// ["knowledge-server", "mcp"] as the command.
-if (process.argv[2] === "mcp") {
-	await mcpMain().catch((err) => {
-		console.error("[knowledge-server-mcp] fatal:", err);
-		process.exit(1);
-	});
-	process.exit(0);
-}
-
-// Handle `knowledge-server setup-tool <opencode|claude-code>` before starting the server.
-if (process.argv[2] === "setup-tool") {
-	runSetupTool(process.argv.slice(3));
-	process.exit(0);
-}
-
-// Handle `knowledge-server update [--version v1.2.3]` before starting the server.
-// Mirrors the `opencode upgrade` pattern — run in a terminal, replaces the binary in place.
-if (process.argv[2] === "update") {
-	console.log("┌─────────────────────────────────────┐");
-	console.log("│  knowledge-server update             │");
-	console.log("└─────────────────────────────────────┘");
-	console.log("");
-	await runUpdate(process.argv.slice(3), `v${pkg.version}`);
-	process.exit(0);
-}
+// Determine the subcommand offset in process.argv.
+// - Compiled binary:  argv = ["/path/to/knowledge-server", "mcp", ...]  → subcommand at [1]
+// - bun run src/...:  argv = ["/path/to/bun", "src/index.ts", "mcp", ...]  → subcommand at [2]
+// Bun.main is a virtual bundle path (/$bunfs/...) in compiled binaries, a real .ts path otherwise.
+const isBinaryInstall = !Bun.main.endsWith(".ts");
+const subcommand = isBinaryInstall ? process.argv[1] : process.argv[2];
+const subcommandArgs = isBinaryInstall ? process.argv.slice(2) : process.argv.slice(3);
 
 /**
  * Knowledge Server — main entry point.
@@ -51,6 +31,37 @@ if (process.argv[2] === "update") {
  * - /status — health check and stats
  */
 async function main() {
+	// Handle subcommands before starting the HTTP server.
+	// All early-exit paths use return so we avoid process.exit() where possible,
+	// which allows the event loop to drain naturally (important for the mcp branch).
+
+	// `knowledge-server mcp` — MCP stdio proxy.
+	// mcpMain() calls server.connect(StdioServerTransport), which returns immediately
+	// after the protocol handshake. The event loop stays alive because StdioServerTransport
+	// holds stdin open; returning here lets it drain naturally when the client disconnects.
+	if (subcommand === "mcp") {
+		// Let errors propagate to the outer main().catch handler, which logs and exits 1.
+		// return (not process.exit) lets the StdioServerTransport drain naturally.
+		await mcpMain();
+		return;
+	}
+
+	// `knowledge-server setup-tool <tool>`
+	if (subcommand === "setup-tool") {
+		runSetupTool(subcommandArgs);
+		process.exit(0);
+	}
+
+	// `knowledge-server update [--version v1.2.3]`
+	if (subcommand === "update") {
+		console.log("┌─────────────────────────────────────┐");
+		console.log("│  knowledge-server update             │");
+		console.log("└─────────────────────────────────────┘");
+		console.log("");
+		await runUpdate(subcommandArgs, `v${pkg.version}`);
+		process.exit(0);
+	}
+
 	// Initialize logger first so all subsequent output (including config errors) is captured.
 	logger.init(config.logPath);
 
