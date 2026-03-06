@@ -398,9 +398,13 @@ export async function runUpdate(
 	// Show this notice whenever the user has updated to v1.7.0 or later — regardless
 	// of whether the old binary was found on disk — because their existing MCP configs
 	// still point to the old command and will be broken until they re-run setup-tool.
-	const [, major, minor] = /^v(\d+)\.(\d+)/.exec(targetVersion) ?? [];
+	// targetVersion is already validated as /^v\d+\.\d+\.\d+$/ earlier in this
+	// function, so this regex match is guaranteed to succeed.
+	const versionMatch = /^v(\d+)\.(\d+)/.exec(targetVersion);
+	if (!versionMatch) throw new Error(`Unexpected version format: ${targetVersion}`);
 	const isV17orLater =
-		Number(major) > 1 || (Number(major) === 1 && Number(minor) >= 7);
+		Number(versionMatch[1]) > 1 ||
+		(Number(versionMatch[1]) === 1 && Number(versionMatch[2]) >= 7);
 	if (isV17orLater) {
 		console.log(`
   ⚠ Breaking change: the separate knowledge-server-mcp binary has been
