@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.1.0](https://github.com/MAnders333/knowledge-server/compare/v2.0.4...v2.1.0) (2026-03-07)
+
+
+### Features
+
+* add VSCode / GitHub Copilot Chat integration ([8253414](https://github.com/MAnders333/knowledge-server/commit/825341445626bf71f60ef6043d680963ec2ca7e6))
+* add VSCode / GitHub Copilot Chat integration with tests and review fixes ([7ff1af1](https://github.com/MAnders333/knowledge-server/commit/7ff1af1760072c2d08338796ae60e3672f2243c6)), closes [#23](https://github.com/MAnders333/knowledge-server/issues/23)
+
+
+### Bug Fixes
+
+* **vscode:** remove dead parts type, document idempotency and kind allowlist, add tests ([0df62d6](https://github.com/MAnders333/knowledge-server/commit/0df62d6c4d0db1bfc4ef299e073f294bc588f7cd))
+
 ## [2.0.4](https://github.com/MAnders333/knowledge-server/compare/v2.0.3...v2.0.4) (2026-03-06)
 
 
