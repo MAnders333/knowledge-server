@@ -159,8 +159,14 @@ async function main() {
 			);
 			process.exit(1);
 		}
-		// Stale file — remove and continue.
-		unlinkSync(config.pidPath);
+		// Stale file — remove and continue. Wrapped in try/catch to handle
+		// a TOCTOU race where two concurrent starts both pass the liveness
+		// check and the second unlinkSync hits ENOENT.
+		try {
+			unlinkSync(config.pidPath);
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+		}
 	}
 
 	// Create HTTP app
@@ -168,12 +174,25 @@ async function main() {
 
 	// Start server — PID file written after this succeeds so it only exists
 	// when a port is truly bound.
-	const server = serve({
-		fetch: app.fetch,
-		port: config.port,
-		hostname: config.host,
-		idleTimeout: 255, // max allowed by Bun — consolidation can take a while
-	});
+	let server: ReturnType<typeof serve>;
+	try {
+		server = serve({
+			fetch: app.fetch,
+			port: config.port,
+			hostname: config.host,
+			idleTimeout: 255, // max allowed by Bun — consolidation can take a while
+		});
+	} catch (e) {
+		const msg = e instanceof Error ? e.message : String(e);
+		if (msg.includes("EADDRINUSE") || msg.includes("address already in use")) {
+			logger.error(
+				`Port ${config.port} is already in use. Is another process running on that port?`,
+			);
+		} else {
+			logger.error(`Failed to start HTTP server: ${msg}`);
+		}
+		process.exit(1);
+	}
 
 	if (config.pidPath) {
 		writeFileSync(config.pidPath, String(process.pid), "utf8");
