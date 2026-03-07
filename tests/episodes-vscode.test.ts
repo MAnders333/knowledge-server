@@ -621,9 +621,6 @@ describe("VSCodeEpisodeReader.getNewEpisodes — minSessionMessages filter", () 
 
 	it("skips sessions that produce fewer messages than minSessionMessages", () => {
 		// 1 request → 2 messages (1 user + 1 assistant), always below any threshold >= 3.
-		// config.consolidation.minSessionMessages is the value frozen at process startup
-		// (reflects CONSOLIDATION_MIN_MESSAGES env var). Fail loudly if it's ever set
-		// below 3, because then 2 messages may or may not pass and we can't assert cleanly.
 		// config.consolidation.minSessionMessages is frozen at process startup
 		// (reflects CONSOLIDATION_MIN_MESSAGES env var, default 4 in config.ts).
 		// Fail loudly if it's ever set below 3 — the 2-message session we construct
