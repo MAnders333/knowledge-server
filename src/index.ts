@@ -183,13 +183,14 @@ async function main() {
 			idleTimeout: 255, // max allowed by Bun — consolidation can take a while
 		});
 	} catch (e) {
-		const msg = e instanceof Error ? e.message : String(e);
-		if (msg.includes("EADDRINUSE") || msg.includes("address already in use")) {
+		if ((e as NodeJS.ErrnoException).code === "EADDRINUSE") {
 			logger.error(
 				`Port ${config.port} is already in use. Is another process running on that port?`,
 			);
 		} else {
-			logger.error(`Failed to start HTTP server: ${msg}`);
+			logger.error(
+				`Failed to start HTTP server: ${e instanceof Error ? e.message : String(e)}`,
+			);
 		}
 		process.exit(1);
 	}
