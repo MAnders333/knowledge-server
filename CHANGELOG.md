@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.2.0](https://github.com/MAnders333/knowledge-server/compare/v2.1.0...v2.2.0) (2026-03-07)
+
+
+### Features
+
+* **config:** support XDG config dir (~/.config/knowledge-server/.env) ([9b671df](https://github.com/MAnders333/knowledge-server/commit/9b671df05753b1d02f0e434f90ed13d16a5b9907))
+
+
+### Bug Fixes
+
+* **config:** detect placeholder credentials and point to correct .env path ([9c9dd4d](https://github.com/MAnders333/knowledge-server/commit/9c9dd4d0a592f392836ce4795ebc336ecc481f51))
+* **startup:** handle port bind failure and stale PID file TOCTOU race ([67b5dc1](https://github.com/MAnders333/knowledge-server/commit/67b5dc15abaf8d33f0ae628ac970a1f03f96836e))
+* **startup:** update banner to 'AI coding agents', fix PID file timing and EPERM handling ([87a1bcc](https://github.com/MAnders333/knowledge-server/commit/87a1bcc6c51084fcbfd6403c44fca59f8d347d46))
+* **startup:** use .code for EADDRINUSE check instead of string matching ([62eb1f3](https://github.com/MAnders333/knowledge-server/commit/62eb1f32c0b3ea3523fc3e0547ba77220dbf5be5))
+* **stop:** move PID guard before serve(), use readFileSync, handle EPERM ([9ca0b79](https://github.com/MAnders333/knowledge-server/commit/9ca0b795d6bb3672ab0733af7d8912fa634e9251))
+
 ## [2.1.0](https://github.com/MAnders333/knowledge-server/compare/v2.0.4...v2.1.0) (2026-03-07)
 
 
