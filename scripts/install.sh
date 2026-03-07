@@ -201,9 +201,16 @@ else
   # Use $HOME rather than ~ — tilde is not expanded in sourced variable assignments.
   cat > "$ENV_FILE" << 'EOF'
 # knowledge-server configuration
-# Fill in LLM_API_KEY and LLM_BASE_ENDPOINT — all other settings have sensible defaults.
-
-# Required
+#
+# OPTION A — Direct provider credentials (recommended)
+# Set the key for the provider(s) you use.
+#
+# ANTHROPIC_API_KEY=sk-ant-...
+# OPENAI_API_KEY=sk-...
+# GOOGLE_API_KEY=...
+#
+# OPTION B — Unified proxy endpoint (if you have one)
+#
 LLM_API_KEY=your-api-key-here
 LLM_BASE_ENDPOINT=https://your-llm-endpoint.example.com
 
@@ -213,6 +220,9 @@ LLM_BASE_ENDPOINT=https://your-llm-endpoint.example.com
 # LLM_CONTRADICTION_MODEL=anthropic/claude-sonnet-4-6
 # EMBEDDING_MODEL=text-embedding-3-large
 # EMBEDDING_DIMENSIONS=3072
+# Example: local Ollama embeddings
+# EMBEDDING_BASE_URL=http://localhost:11434/v1
+# EMBEDDING_MODEL=nomic-embed-text
 # KNOWLEDGE_PORT=3179
 # KNOWLEDGE_HOST=127.0.0.1
 # Use $HOME rather than ~ — tilde is not expanded in sourced variable assignments
@@ -221,7 +231,7 @@ LLM_BASE_ENDPOINT=https://your-llm-endpoint.example.com
 # KNOWLEDGE_ADMIN_TOKEN=your-stable-token-here
 EOF
   echo "  ✓ Created $ENV_FILE"
-  echo "  ⚠ Edit it before starting the server: set LLM_API_KEY and LLM_BASE_ENDPOINT"
+  echo "  ⚠ Edit it before starting the server — set LLM credentials (ANTHROPIC_API_KEY, OPENAI_API_KEY, or LLM_BASE_ENDPOINT+LLM_API_KEY)"
 fi
 
 # ── Generate launcher wrapper for the HTTP server ─────────────────────────────
@@ -272,7 +282,7 @@ if [ -n "\$_env_file" ]; then
     _val="\${_line#*=}"
     # Allowlist: only load keys with a known knowledge-server prefix.
     # This rejects PATH, LD_PRELOAD, IFS, BASH_ENV, etc.
-    if [[ "\$_key" =~ ^(KNOWLEDGE_|LLM_|EMBEDDING_|OPENCODE_|CONSOLIDATION_|ACTIVATION_|CONTRADICTION_|DECAY_|CURSOR_|CLAUDE_|CODEX_|VSCODE_)[A-Za-z0-9_]*\$ ]]; then
+    if [[ "\$_key" =~ ^(KNOWLEDGE_|LLM_|EMBEDDING_|ANTHROPIC_|OPENAI_|GOOGLE_|OPENCODE_|CONSOLIDATION_|ACTIVATION_|CONTRADICTION_|DECAY_|CURSOR_|CLAUDE_|CODEX_|VSCODE_)[A-Za-z0-9_]*\$ ]]; then
       # Strip matching surrounding quotes from the value so KNOWLEDGE_PORT="3179"
       # and KNOWLEDGE_PORT='3179' both work correctly. Asymmetric stripping (e.g.
       # removing a leading " and trailing ' independently) is intentionally avoided

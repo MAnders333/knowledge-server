@@ -4,8 +4,13 @@ import type { KnowledgeType } from "../types.js";
 /**
  * Embedding client.
  *
- * Embeddings always use the OpenAI-compatible API format
- * (the unified endpoint exposes embeddings via /openai/v1 regardless of model vendor).
+ * All embedding APIs must be OpenAI-compatible (/v1/embeddings).
+ *
+ * Endpoint resolution priority:
+ *   1. EMBEDDING_BASE_URL / EMBEDDING_API_KEY  — dedicated embedding endpoint
+ *      (e.g. Ollama: EMBEDDING_BASE_URL=http://localhost:11434/v1)
+ *   2. OPENAI_BASE_URL / OPENAI_API_KEY        — reuse OpenAI-compatible provider if set
+ *   3. LLM_BASE_ENDPOINT / LLM_API_KEY         — unified proxy fallback (/openai/v1 appended)
  */
 export class EmbeddingClient {
 	private endpoint: string;
@@ -14,9 +19,27 @@ export class EmbeddingClient {
 	private dimensions: number | undefined;
 
 	constructor() {
-		// Embeddings always go through the OpenAI-compatible path
-		this.endpoint = `${config.llm.baseEndpoint}/openai/v1`;
-		this.apiKey = config.llm.apiKey;
+		// Resolve endpoint and key using the priority chain.
+		if (config.embedding.baseURL) {
+			// Dedicated embedding endpoint — use as-is (user provides full base URL).
+			// Key: dedicated embedding key, or generic unified key. Do NOT fall back to
+			// OPENAI_API_KEY here — a custom endpoint (e.g. Ollama) won't accept it.
+			this.endpoint = config.embedding.baseURL;
+			this.apiKey = config.embedding.apiKey || config.llm.apiKey;
+		} else if (config.llm.openai.baseURL) {
+			// Reuse OpenAI-compatible provider base URL + key.
+			this.endpoint = config.llm.openai.baseURL;
+			this.apiKey = config.llm.openai.apiKey || config.llm.apiKey;
+		} else if (config.llm.baseEndpoint) {
+			// Unified proxy fallback — append OpenAI-compatible path.
+			this.endpoint = `${config.llm.baseEndpoint}/openai/v1`;
+			this.apiKey = config.llm.apiKey;
+		} else {
+			// No base URL configured at all — fall back to OpenAI's public API.
+			// This covers the case where OPENAI_API_KEY is set without OPENAI_BASE_URL.
+			this.endpoint = "https://api.openai.com/v1";
+			this.apiKey = config.llm.openai.apiKey || config.llm.apiKey;
+		}
 		this.model = config.embedding.model;
 		this.dimensions = config.embedding.dimensions;
 	}

@@ -112,18 +112,41 @@ export const config = {
 	codexEnabled: process.env.CODEX_ENABLED !== "false",
 	vscodeEnabled: process.env.VSCODE_ENABLED !== "false",
 
-	// Unified endpoint — single API key, base URL routes by provider.
-	// Set LLM_BASE_ENDPOINT in .env. No default is provided since this is
-	// deployment-specific; the server will fail config validation if not set
-	// when LLM_API_KEY is present but the endpoint is wrong.
+	// LLM credentials — three tiers, evaluated per-provider at call time:
+	//
+	//   Tier 1 — per-provider direct credentials (no proxy needed):
+	//     ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY   → Anthropic models
+	//     OPENAI_BASE_URL    / OPENAI_API_KEY       → OpenAI-compatible models
+	//     GOOGLE_BASE_URL    / GOOGLE_API_KEY        → Google models
+	//
+	//   Tier 2 — unified proxy (existing behaviour, backwards compatible):
+	//     LLM_BASE_ENDPOINT  / LLM_API_KEY
+	//     Routes by model prefix: anthropic/→/anthropic/v1, google/→/gemini/v1beta, else /openai/v1
+	//
+	// Per-provider credentials take precedence over the unified endpoint.
+	// At least one credential source must be configured; validateConfig() checks this.
 	//
 	// Three model slots with independent defaults — tune cost vs quality per task:
-	//   extractionModel   — full episode → knowledge extraction (complex reasoning)
-	//   mergeModel        — decideMerge near-duplicate comparison (structured, cheap)
+	//   extractionModel    — full episode → knowledge extraction (complex reasoning)
+	//   mergeModel         — decideMerge near-duplicate comparison (structured, cheap)
 	//   contradictionModel — detect + resolve contradictions (nuanced, fires rarely)
 	llm: {
+		// Unified proxy fallback (backwards compatible)
 		baseEndpoint: process.env.LLM_BASE_ENDPOINT || "",
 		apiKey: process.env.LLM_API_KEY || "",
+		// Per-provider overrides — take precedence over unified endpoint when set
+		anthropic: {
+			baseURL: process.env.ANTHROPIC_BASE_URL || "",
+			apiKey: process.env.ANTHROPIC_API_KEY || "",
+		},
+		openai: {
+			baseURL: process.env.OPENAI_BASE_URL || "",
+			apiKey: process.env.OPENAI_API_KEY || "",
+		},
+		google: {
+			baseURL: process.env.GOOGLE_BASE_URL || "",
+			apiKey: process.env.GOOGLE_API_KEY || "",
+		},
 		extractionModel:
 			process.env.LLM_EXTRACTION_MODEL || "anthropic/claude-sonnet-4-6",
 		mergeModel: process.env.LLM_MERGE_MODEL || "anthropic/claude-haiku-4-5",
@@ -143,8 +166,19 @@ export const config = {
 		retryBaseDelayMs: parseIntEnv(process.env.LLM_RETRY_BASE_DELAY_MS, 3000, 0),
 	},
 
-	// Embedding (always OpenAI-compatible, always through /openai/v1)
+	// Embedding endpoint — separate from LLM so local models (Ollama, etc.) can
+	// be used for embeddings while a cloud LLM handles extraction/merge/contradiction.
+	//
+	// Priority order:
+	//   1. EMBEDDING_BASE_URL / EMBEDDING_API_KEY  — dedicated embedding endpoint
+	//   2. OPENAI_BASE_URL    / OPENAI_API_KEY      — reuse OpenAI-compatible provider if set
+	//   3. LLM_BASE_ENDPOINT  / LLM_API_KEY         — unified proxy fallback
+	//
+	// All embedding APIs must be OpenAI-compatible (/v1/embeddings).
+	// Example for Ollama: EMBEDDING_BASE_URL=http://localhost:11434/v1
 	embedding: {
+		baseURL: process.env.EMBEDDING_BASE_URL || "",
+		apiKey: process.env.EMBEDDING_API_KEY || "",
 		model: process.env.EMBEDDING_MODEL || "text-embedding-3-large",
 		// Only defined when EMBEDDING_DIMENSIONS is explicitly set.
 		// Forwarded to the API only when present — the `dimensions` parameter is
@@ -294,18 +328,40 @@ export function validateConfig(): string[] {
 
 	const envPath = resolveEnvFilePath();
 
-	const apiKey = config.llm.apiKey?.trim() ?? "";
-	if (!apiKey || apiKey === PLACEHOLDER_API_KEY) {
-		errors.push(
-			`LLM_API_KEY is not configured. Edit ${envPath} and set LLM_API_KEY to your API key.`,
-		);
-	}
+	// Validate that at least one LLM credential source is configured.
+	// Per-provider credentials (ANTHROPIC_API_KEY etc.) take precedence over the
+	// unified endpoint (LLM_BASE_ENDPOINT + LLM_API_KEY). Having any one of them
+	// configured is sufficient — the runtime routing will use whichever applies.
+	const hasAnthropic = !!(
+		config.llm.anthropic.apiKey?.trim() && config.llm.anthropic.apiKey.trim() !== PLACEHOLDER_API_KEY
+	);
+	const hasOpenAI = !!(
+		config.llm.openai.apiKey?.trim() && config.llm.openai.apiKey.trim() !== PLACEHOLDER_API_KEY
+	);
+	const hasGoogle = !!(
+		config.llm.google.apiKey?.trim() && config.llm.google.apiKey.trim() !== PLACEHOLDER_API_KEY
+	);
+	const unifiedApiKey = config.llm.apiKey?.trim() ?? "";
+	const unifiedEndpoint = config.llm.baseEndpoint?.trim() ?? "";
+	const hasUnified =
+		!!(unifiedApiKey && unifiedApiKey !== PLACEHOLDER_API_KEY) &&
+		!!(unifiedEndpoint && unifiedEndpoint !== PLACEHOLDER_ENDPOINT);
 
-	const baseEndpoint = config.llm.baseEndpoint?.trim() ?? "";
-	if (!baseEndpoint || baseEndpoint === PLACEHOLDER_ENDPOINT) {
-		errors.push(
-			`LLM_BASE_ENDPOINT is not configured. Edit ${envPath} and set LLM_BASE_ENDPOINT to your endpoint URL.`,
-		);
+	if (!hasAnthropic && !hasOpenAI && !hasGoogle && !hasUnified) {
+		// Provide a more specific hint when the user has set half of the unified pair.
+		if (unifiedApiKey && !unifiedEndpoint) {
+			errors.push(
+				`LLM_API_KEY is set but LLM_BASE_ENDPOINT is missing. Edit ${envPath} and set LLM_BASE_ENDPOINT, or use a per-provider key (ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY) instead.`,
+			);
+		} else if (unifiedEndpoint && !unifiedApiKey) {
+			errors.push(
+				`LLM_BASE_ENDPOINT is set but LLM_API_KEY is missing. Edit ${envPath} and set LLM_API_KEY.`,
+			);
+		} else {
+			errors.push(
+				`No LLM credentials configured. Edit ${envPath} and set one of:\n    ANTHROPIC_API_KEY (direct Anthropic)\n    OPENAI_API_KEY (direct OpenAI-compatible)\n    GOOGLE_API_KEY (direct Google)\n    LLM_BASE_ENDPOINT + LLM_API_KEY (unified proxy)`,
+			);
+		}
 	}
 
 	// Enforce a minimum token length when a fixed admin token is configured.

@@ -30,38 +30,43 @@ import type {
  * Provider routing based on model string prefix.
  *
  * Model format: "provider/model-name"
- * - "anthropic/..." -> Anthropic SDK, .../anthropic/v1
- * - "google/..."    -> Google SDK, .../gemini/v1beta
- * - "openai/..."    -> OpenAI-compatible SDK, .../openai/v1
- * - anything else   -> OpenAI-compatible (fallback)
+ * - "anthropic/..." -> Anthropic SDK
+ * - "google/..."    -> Google SDK
+ * - "openai/..." or anything else -> OpenAI-compatible SDK
+ *
+ * Credential priority per provider:
+ *   1. Per-provider env vars (ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY)
+ *      with optional per-provider base URL (ANTHROPIC_BASE_URL, etc.)
+ *   2. Unified proxy (LLM_BASE_ENDPOINT + LLM_API_KEY) — appends provider path suffix
  */
 function createModel(modelString: string) {
 	const [providerName, ...modelParts] = modelString.split("/");
 	const modelId = modelParts.join("/");
-	const baseEndpoint = config.llm.baseEndpoint;
-	const apiKey = config.llm.apiKey;
 
 	switch (providerName) {
 		case "anthropic": {
-			const provider = createAnthropic({
-				baseURL: `${baseEndpoint}/anthropic/v1`,
-				apiKey,
-			});
+			// Per-provider credentials take precedence over unified endpoint.
+			// baseURL: per-provider override → unified proxy path → undefined (SDK uses api.anthropic.com)
+			const apiKey = config.llm.anthropic.apiKey || config.llm.apiKey;
+			const baseURL = config.llm.anthropic.baseURL ||
+				(config.llm.baseEndpoint ? `${config.llm.baseEndpoint}/anthropic/v1` : undefined);
+			const provider = createAnthropic({ ...(baseURL && { baseURL }), apiKey });
 			return provider(modelId);
 		}
 		case "google": {
-			const provider = createGoogleGenerativeAI({
-				baseURL: `${baseEndpoint}/gemini/v1beta`,
-				apiKey,
-			});
+			const apiKey = config.llm.google.apiKey || config.llm.apiKey;
+			const baseURL = config.llm.google.baseURL ||
+				(config.llm.baseEndpoint ? `${config.llm.baseEndpoint}/gemini/v1beta` : undefined);
+			const provider = createGoogleGenerativeAI({ ...(baseURL && { baseURL }), apiKey });
 			return provider(modelId);
 		}
 		default: {
-			const provider = createOpenAICompatible({
-				name: providerName,
-				baseURL: `${baseEndpoint}/openai/v1`,
-				apiKey,
-			});
+			// openai/ prefix or any unknown provider — use OpenAI-compatible SDK.
+			const apiKey = config.llm.openai.apiKey || config.llm.apiKey;
+			// baseURL is required by createOpenAICompatible — fall back to public API.
+			const baseURL = config.llm.openai.baseURL ||
+				(config.llm.baseEndpoint ? `${config.llm.baseEndpoint}/openai/v1` : "https://api.openai.com/v1");
+			const provider = createOpenAICompatible({ name: providerName, baseURL, apiKey });
 			return provider.chatModel(modelId);
 		}
 	}
