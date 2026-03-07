@@ -12,11 +12,11 @@ Supports **Linux x64** and **macOS arm64** (Apple Silicon). No Bun or Node.js re
 curl -fsSL https://raw.githubusercontent.com/MAnders333/knowledge-server/main/scripts/install.sh | bash
 ```
 
-This downloads the server binary into `~/.local/share/knowledge-server/` and generates a `.env` template.
+This downloads the server binary into `~/.local/share/knowledge-server/` and generates a `.env` template at `~/.config/knowledge-server/.env`.
 
 **After running:**
 
-1. Edit `~/.local/share/knowledge-server/.env` — set `LLM_API_KEY` and `LLM_BASE_ENDPOINT`
+1. Edit `~/.config/knowledge-server/.env` — set `LLM_API_KEY` and `LLM_BASE_ENDPOINT`
 2. Run the setup command for your tool(s):
    - `knowledge-server setup-tool opencode` — symlinks the plugin and commands, registers the MCP server in `opencode.jsonc`
    - `knowledge-server setup-tool claude-code` — registers the MCP server, `UserPromptSubmit` hook, and slash commands
@@ -49,10 +49,10 @@ bun run start
 For other tools, run the corresponding setup step:
 
 ```bash
-bun run src/index.ts setup-tool claude-code  # MCP server + hook + slash commands
-bun run src/index.ts setup-tool cursor       # MCP server in ~/.cursor/mcp.json
-bun run src/index.ts setup-tool codex        # MCP server in ~/.codex/config.toml
-bun run src/index.ts setup-tool vscode       # MCP server via `code --add-mcp`
+bun run start setup-tool claude-code  # MCP server + hook + slash commands
+bun run start setup-tool cursor       # MCP server in ~/.cursor/mcp.json
+bun run start setup-tool codex        # MCP server in ~/.codex/config.toml
+bun run start setup-tool vscode       # MCP server via `code --add-mcp`
 ```
 
 All setup steps are idempotent — re-running is safe.
@@ -171,7 +171,7 @@ There are two ways to connect an MCP client:
 
 **OpenCode** — registered automatically by `knowledge-server setup-tool opencode` (or `bun run setup` from source). Writes the `mcp.knowledge` entry directly into `~/.config/opencode/opencode.jsonc`.
 
-**Claude Code** — registered automatically by `knowledge-server setup-tool claude-code` (or `bun run src/index.ts setup-tool claude-code` from source). Uses `claude mcp add-json` to write to `~/.claude.json`.
+**Claude Code** — registered automatically by `knowledge-server setup-tool claude-code` (or `bun run start setup-tool claude-code` from source). Uses `claude mcp add-json` to write to `~/.claude.json`.
 
 **Cursor** — registered automatically by `knowledge-server setup-tool cursor`. Writes the `knowledge` entry into `~/.cursor/mcp.json`.
 
@@ -210,7 +210,7 @@ Registered automatically by `setup-tool claude-code`.
 
 ```bash
 knowledge-server setup-tool opencode    # binary install
-bun run src/index.ts setup-tool opencode  # source install
+bun run start setup-tool opencode       # source install
 ```
 
 This symlinks the plugin and commands into `~/.config/opencode/` and registers the MCP server directly in `~/.config/opencode/opencode.jsonc`. All steps are idempotent — re-running is safe.
@@ -219,7 +219,7 @@ This symlinks the plugin and commands into `~/.config/opencode/` and registers t
 
 ```bash
 knowledge-server setup-tool claude-code    # binary install
-bun run src/index.ts setup-tool claude-code  # source install
+bun run start setup-tool claude-code       # source install
 ```
 
 This:
@@ -233,7 +233,7 @@ All three steps are idempotent — re-running is safe.
 
 ```bash
 knowledge-server setup-tool cursor    # binary install
-bun run src/index.ts setup-tool cursor  # source install
+bun run start setup-tool cursor       # source install
 ```
 
 Registers the `knowledge` MCP server in `~/.cursor/mcp.json`. Idempotent — re-running is safe. Cursor does not support user-defined slash commands, so no command symlinks are created.
@@ -242,7 +242,7 @@ Registers the `knowledge` MCP server in `~/.cursor/mcp.json`. Idempotent — re-
 
 ```bash
 knowledge-server setup-tool codex    # binary install
-bun run src/index.ts setup-tool codex  # source install
+bun run start setup-tool codex       # source install
 ```
 
 Registers the `[mcp_servers.knowledge]` block in `~/.codex/config.toml`. Idempotent — re-running is safe. Codex CLI has no user-defined slash command directory, so no command symlinks are created.
@@ -251,7 +251,7 @@ Registers the `[mcp_servers.knowledge]` block in `~/.codex/config.toml`. Idempot
 
 ```bash
 knowledge-server setup-tool vscode    # binary install
-bun run src/index.ts setup-tool vscode  # source install
+bun run start setup-tool vscode       # source install
 ```
 
 Registers the `knowledge` MCP server via `code --add-mcp`, which writes to the active VSCode profile's `mcp.json`. Requires the `code` CLI to be on PATH (install via VSCode: Cmd+Shift+P → "Shell Command: Install 'code' command in PATH").
@@ -260,7 +260,13 @@ VSCode reads GitHub Copilot Chat session files from per-workspace `chatSessions/
 
 ## Configuration
 
-All config is via environment variables in `.env`. Defaults are sensible for local use.
+All config is via environment variables, loaded from `.env` at startup. The `.env` file is searched in priority order:
+
+1. `$KNOWLEDGE_CONFIG_HOME/.env` — explicit override
+2. `$XDG_CONFIG_HOME/knowledge-server/.env` — XDG standard (default: `~/.config/knowledge-server/.env`)
+3. `~/.local/share/knowledge-server/.env` — legacy location (still supported for existing installs)
+
+New installs create the file at `~/.config/knowledge-server/.env`. Defaults are sensible for local use.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -303,23 +309,57 @@ bun run start           # source install
 
 On startup, the server counts pending sessions across all sources and runs background consolidation if any are found. The HTTP API is available immediately while consolidation runs behind it.
 
-### Trigger consolidation manually
-
-`POST /consolidate` and `POST /reinitialize` require the admin token:
+### Stop the server
 
 ```bash
-# Token is printed to the console when the server starts
-curl -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:3179/consolidate
-curl -X POST -H "Authorization: Bearer <token>" 'http://127.0.0.1:3179/reinitialize?confirm=yes'
+knowledge-server stop
 ```
 
 ### Check status
 
 ```bash
-curl http://127.0.0.1:3179/status
+knowledge-server status
 ```
 
-### Query knowledge directly
+Shows whether the server is running, entry counts, last consolidation time, and pending sessions — without needing the HTTP server to be up.
+
+### Trigger consolidation manually
+
+Via CLI (no server required, no admin token needed):
+
+```bash
+knowledge-server consolidate
+```
+
+Or via the HTTP API (requires admin token printed at startup):
+
+```bash
+curl -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:3179/consolidate
+```
+
+### Test knowledge activation
+
+```bash
+knowledge-server activate "how do we handle authentication"
+```
+
+Shows which knowledge entries would be injected into a conversation for a given query, with similarity scores.
+
+### Reinitialize the knowledge store
+
+```bash
+knowledge-server reinitialize           # preview (shows entry count, no changes)
+knowledge-server reinitialize --dry-run # same
+knowledge-server reinitialize --confirm # wipe all entries and reset cursor
+```
+
+Or via the HTTP API (requires admin token):
+
+```bash
+curl -X POST -H "Authorization: Bearer <token>" 'http://127.0.0.1:3179/reinitialize?confirm=yes'
+```
+
+### Query knowledge via HTTP
 
 ```bash
 curl "http://127.0.0.1:3179/activate?q=how+do+we+handle+auth"

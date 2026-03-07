@@ -5,6 +5,10 @@ import { serve } from "bun";
 import pkg from "../package.json" with { type: "json" };
 import { ActivationEngine } from "./activation/activate.js";
 import { createApp } from "./api/server.js";
+import { runActivate } from "./commands/activate.js";
+import { runConsolidate } from "./commands/consolidate.js";
+import { runReinitialize } from "./commands/reinitialize.js";
+import { runStatus } from "./commands/status.js";
 import { config, validateConfig } from "./config.js";
 import { ConsolidationEngine } from "./consolidation/consolidate.js";
 import { createEpisodeReaders } from "./consolidation/readers/index.js";
@@ -68,6 +72,69 @@ async function main() {
 	if (subcommand === "stop") {
 		await runStop(config.pidPath);
 		process.exit(0);
+	}
+
+	// `knowledge-server status`
+	if (subcommand === "status") {
+		runStatus(config.pidPath);
+		process.exit(0);
+	}
+
+	// `knowledge-server consolidate`
+	if (subcommand === "consolidate") {
+		const errors = validateConfig();
+		if (errors.length > 0) {
+			for (const err of errors) console.error(`  ✗ ${err}`);
+			process.exit(1);
+		}
+		await runConsolidate();
+		process.exit(0);
+	}
+
+	// `knowledge-server activate <query>`
+	if (subcommand === "activate") {
+		const errors = validateConfig();
+		if (errors.length > 0) {
+			for (const err of errors) console.error(`  ✗ ${err}`);
+			process.exit(1);
+		}
+		await runActivate(subcommandArgs[0] ?? "");
+		process.exit(0);
+	}
+
+	// `knowledge-server reinitialize [--confirm|--dry-run]`
+	if (subcommand === "reinitialize") {
+		runReinitialize(subcommandArgs);
+		process.exit(0);
+	}
+
+	// `knowledge-server --help` / `knowledge-server help`
+	if (subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
+		console.log(`knowledge-server v${pkg.version}
+
+Usage: knowledge-server [command]
+
+Commands:
+  (no command)              Start the HTTP server
+  stop                      Stop the running HTTP server
+  status                    Show server state and knowledge graph stats
+  consolidate               Run a manual consolidation cycle
+  activate <query>          Test knowledge activation for a query
+  reinitialize              Wipe all knowledge and reset consolidation cursor
+  setup-tool <tool>         Set up integration (opencode|claude-code|cursor|codex|vscode)
+  update [--version v1.2.3] Update to the latest (or specified) release
+  mcp                       Start the MCP stdio proxy (used by tool integrations)
+
+Options:
+  -h, --help                Show this help message
+`);
+		process.exit(0);
+	}
+
+	// Unknown subcommand guard
+	if (subcommand !== undefined) {
+		console.error(`Unknown command: "${subcommand}". Run \`knowledge-server --help\` for usage.`);
+		process.exit(1);
 	}
 
 	// Initialize logger first so all subsequent output (including config errors) is captured.
