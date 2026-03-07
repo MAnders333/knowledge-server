@@ -57,6 +57,13 @@ export const config = {
 		process.env.KNOWLEDGE_LOG_PATH ??
 		join(homedir(), ".local", "share", "knowledge-server", "server.log"),
 
+	// PID file — written on startup, deleted on clean shutdown.
+	// Used by `knowledge-server stop` to signal the running server.
+	// Override with KNOWLEDGE_PID_PATH; set to "" to disable PID file management.
+	pidPath:
+		process.env.KNOWLEDGE_PID_PATH ??
+		join(homedir(), ".local", "share", "knowledge-server", "server.pid"),
+
 	// Episode sources
 	//
 	// opencodeDbPath: path to OpenCode's SQLite DB.

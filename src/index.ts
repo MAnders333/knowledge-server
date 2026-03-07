@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { serve } from "bun";
 // @ts-ignore — Bun supports JSON imports natively
 import pkg from "../package.json" with { type: "json" };
@@ -11,6 +12,7 @@ import { KnowledgeDB } from "./db/database.js";
 import { logger } from "./logger.js";
 import { main as mcpMain } from "./mcp/index.js";
 import { runSetupTool } from "./setup-tool.js";
+import { runStop } from "./stop.js";
 import { runUpdate } from "./update.js";
 
 // Bun normalises process.argv the same way for both compiled binaries and `bun run`:
@@ -59,6 +61,12 @@ async function main() {
 		console.log("└─────────────────────────────────────┘");
 		console.log("");
 		await runUpdate(subcommandArgs, `v${pkg.version}`);
+		process.exit(0);
+	}
+
+	// `knowledge-server stop`
+	if (subcommand === "stop") {
+		await runStop(config.pidPath);
 		process.exit(0);
 	}
 
@@ -123,6 +131,39 @@ async function main() {
 	// otherwise generate a random token per process lifetime (more secure for interactive use).
 	const adminTokenIsStable = !!config.adminToken;
 	const adminToken = config.adminToken ?? randomBytes(24).toString("hex");
+
+	// PID file guard — must run before serve() so we never bind the port if
+	// another instance is already running. If the file exists but the PID is
+	// dead (crash without cleanup), treat it as stale and overwrite it.
+	if (config.pidPath) {
+		if (existsSync(config.pidPath)) {
+			const stalePid = Number.parseInt(
+				readFileSync(config.pidPath, "utf8").trim(),
+				10,
+			);
+			const isAlive =
+				!Number.isNaN(stalePid) &&
+				(() => {
+					try {
+						process.kill(stalePid, 0);
+						return true;
+					} catch (e) {
+						// EPERM = process exists but we can't signal it (still alive).
+						// ESRCH = no such process (truly dead).
+						return (e as NodeJS.ErrnoException).code === "EPERM";
+					}
+				})();
+			if (isAlive) {
+				logger.error(
+					`Server already running at PID ${stalePid}. Run \`knowledge-server stop\` first.`,
+				);
+				process.exit(1);
+			}
+			// Stale file — remove and continue.
+			unlinkSync(config.pidPath);
+		}
+		writeFileSync(config.pidPath, String(process.pid), "utf8");
+	}
 
 	// Create HTTP app
 	const app = createApp(db, activation, consolidation, adminToken, adminTokenIsStable);
@@ -280,6 +321,19 @@ async function main() {
 		}
 		consolidation.close();
 		db.close();
+		// Clean up PID file on graceful shutdown — only if it still points to us.
+		// Guards against a race where a second instance already overwrote the file.
+		if (config.pidPath && existsSync(config.pidPath)) {
+			try {
+				const stored = Number.parseInt(
+					readFileSync(config.pidPath, "utf8").trim(),
+					10,
+				);
+				if (stored === process.pid) unlinkSync(config.pidPath);
+			} catch {
+				// Non-fatal — process is exiting anyway.
+			}
+		}
 		process.exit(0);
 	}
 
