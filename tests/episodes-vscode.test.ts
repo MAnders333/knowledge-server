@@ -620,19 +620,15 @@ describe("VSCodeEpisodeReader.getNewEpisodes — minSessionMessages filter", () 
 	});
 
 	it("skips sessions that produce fewer messages than minSessionMessages", () => {
-		// Each request produces 2 messages (1 user + 1 assistant).
-		// Build a session that produces exactly (threshold - 1) messages by using
-		// Math.ceil((threshold - 1) / 2) requests, then check that the last
-		// request's assistant turn is dropped when it would exceed (threshold - 1).
-		// Simpler: just use 1 request (= 2 messages) which is always below any
-		// threshold >= 3. Guard against threshold < 3 to keep the test honest.
+		// 1 request → 2 messages (1 user + 1 assistant), always below any threshold >= 3.
+		// config.consolidation.minSessionMessages is the value frozen at process startup
+		// (reflects CONSOLIDATION_MIN_MESSAGES env var). Fail loudly if it's ever set
+		// below 3, because then 2 messages may or may not pass and we can't assert cleanly.
 		const threshold = config.consolidation.minSessionMessages;
 		if (threshold < 3) {
-			// Cannot construct a "below threshold" session with whole requests
-			// when threshold < 3 — skip rather than assert incorrectly.
+			expect(threshold).toBeGreaterThanOrEqual(3);
 			return;
 		}
-		// 1 request → 2 messages < threshold (which is >= 3)
 		const requestCount = 1;
 		const requests = Array.from({ length: requestCount }, (_, i) => ({
 			messageText: `msg ${i}`,
