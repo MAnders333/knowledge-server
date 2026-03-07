@@ -33,6 +33,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { config } from "../src/config";
 import {
 	VSCodeEpisodeReader,
 	resolveVSCodeDataDir,
@@ -42,22 +43,19 @@ import {
 
 const BASE = 1_700_000_000_000; // fixed unix ms base for all timestamps
 
-let tmpDir: string;
-let dataDir: string;
-let wsDir: string;
-let chatDir: string;
-
-/**
- * Create the standard VSCode directory structure under tmpDir.
- * Returns paths for convenience.
- */
-function setup(): { dataDir: string; wsDir: string; chatDir: string } {
-	tmpDir = mkdtempSync(join(tmpdir(), "ks-vscode-test-"));
-	dataDir = join(tmpDir, "vscode-data");
-	wsDir = join(dataDir, "User", "workspaceStorage", "abc123hash");
-	chatDir = join(wsDir, "chatSessions");
+/** Build the standard VSCode directory structure under a fresh temp dir. */
+function setupDataDir(): {
+	tmpDir: string;
+	dataDir: string;
+	wsDir: string;
+	chatDir: string;
+} {
+	const tmpDir = mkdtempSync(join(tmpdir(), "ks-vscode-test-"));
+	const dataDir = join(tmpDir, "vscode-data");
+	const wsDir = join(dataDir, "User", "workspaceStorage", "abc123hash");
+	const chatDir = join(wsDir, "chatSessions");
 	mkdirSync(chatDir, { recursive: true });
-	return { dataDir, wsDir, chatDir };
+	return { tmpDir, dataDir, wsDir, chatDir };
 }
 
 /** Write workspace.json mapping the workspace hash to a fake project path. */
@@ -98,30 +96,35 @@ function makeSession(opts: {
 	};
 }
 
-/** Write a session JSON file into chatDir and return its path. */
+/** Write a session JSON file into the given chatDir. */
 function writeSession(
+	chatDir: string,
 	filename: string,
 	session: object,
-	dir = chatDir,
 ): string {
-	const path = join(dir, filename);
+	const path = join(chatDir, filename);
 	writeFileSync(path, JSON.stringify(session));
 	return path;
 }
 
-beforeEach(() => {
-	({ dataDir, wsDir, chatDir } = setup());
-});
-
-afterEach(() => {
-	rmSync(tmpDir, { recursive: true, force: true });
-});
-
 // ── getCandidateSessions / countNewSessions ────────────────────────────────────
 
 describe("VSCodeEpisodeReader.getCandidateSessions", () => {
+	let tmpDir: string;
+	let dataDir: string;
+	let chatDir: string;
+
+	beforeEach(() => {
+		({ tmpDir, dataDir, chatDir } = setupDataDir());
+	});
+
+	afterEach(() => {
+		rmSync(tmpDir, { recursive: true, force: true });
+	});
+
 	it("returns a session newer than the cursor", () => {
 		writeSession(
+			chatDir,
 			"s1.json",
 			makeSession({
 				sessionId: "session-1",
@@ -143,6 +146,7 @@ describe("VSCodeEpisodeReader.getCandidateSessions", () => {
 
 	it("excludes sessions at or before the cursor", () => {
 		writeSession(
+			chatDir,
 			"s1.json",
 			makeSession({
 				sessionId: "session-1",
@@ -152,13 +156,14 @@ describe("VSCodeEpisodeReader.getCandidateSessions", () => {
 		);
 
 		const reader = new VSCodeEpisodeReader(dataDir);
+		// cursor is exactly at lastMessageDate — must be excluded (strictly greater than)
 		expect(reader.getCandidateSessions(BASE)).toHaveLength(0);
 		reader.close();
 	});
 
 	it("returns sessions ordered by lastMessageDate ASC", () => {
-		// s2 is newer — should come second
 		writeSession(
+			chatDir,
 			"s1.json",
 			makeSession({
 				sessionId: "session-earlier",
@@ -170,6 +175,7 @@ describe("VSCodeEpisodeReader.getCandidateSessions", () => {
 			}),
 		);
 		writeSession(
+			chatDir,
 			"s2.json",
 			makeSession({
 				sessionId: "session-later",
@@ -192,6 +198,7 @@ describe("VSCodeEpisodeReader.getCandidateSessions", () => {
 	it("respects the limit parameter", () => {
 		for (let i = 1; i <= 3; i++) {
 			writeSession(
+				chatDir,
 				`s${i}.json`,
 				makeSession({
 					sessionId: `session-${i}`,
@@ -212,8 +219,21 @@ describe("VSCodeEpisodeReader.getCandidateSessions", () => {
 });
 
 describe("VSCodeEpisodeReader.countNewSessions", () => {
+	let tmpDir: string;
+	let dataDir: string;
+	let chatDir: string;
+
+	beforeEach(() => {
+		({ tmpDir, dataDir, chatDir } = setupDataDir());
+	});
+
+	afterEach(() => {
+		rmSync(tmpDir, { recursive: true, force: true });
+	});
+
 	it("returns the correct count", () => {
 		writeSession(
+			chatDir,
 			"s1.json",
 			makeSession({
 				sessionId: "session-1",
@@ -224,6 +244,7 @@ describe("VSCodeEpisodeReader.countNewSessions", () => {
 
 		const reader = new VSCodeEpisodeReader(dataDir);
 		expect(reader.countNewSessions(BASE)).toBe(1);
+		// lastMessageDate (BASE+5000) is not strictly greater than BASE+5000 — excluded
 		expect(reader.countNewSessions(BASE + 5000)).toBe(0);
 		reader.close();
 	});
@@ -232,8 +253,22 @@ describe("VSCodeEpisodeReader.countNewSessions", () => {
 // ── getNewEpisodes — basic extraction ─────────────────────────────────────────
 
 describe("VSCodeEpisodeReader.getNewEpisodes — basic extraction", () => {
+	let tmpDir: string;
+	let dataDir: string;
+	let wsDir: string;
+	let chatDir: string;
+
+	beforeEach(() => {
+		({ tmpDir, dataDir, wsDir, chatDir } = setupDataDir());
+	});
+
+	afterEach(() => {
+		rmSync(tmpDir, { recursive: true, force: true });
+	});
+
 	it("produces one episode with correct user and assistant content", () => {
 		writeSession(
+			chatDir,
 			"s1.json",
 			makeSession({
 				sessionId: "session-1",
@@ -253,10 +288,7 @@ describe("VSCodeEpisodeReader.getNewEpisodes — basic extraction", () => {
 
 		const reader = new VSCodeEpisodeReader(dataDir);
 		const candidates = reader.getCandidateSessions(0);
-		const episodes = reader.getNewEpisodes(
-			[candidates[0].id],
-			new Map(),
-		);
+		const episodes = reader.getNewEpisodes([candidates[0].id], new Map());
 
 		expect(episodes).toHaveLength(1);
 		expect(episodes[0].sessionId).toBe("session-1");
@@ -271,6 +303,7 @@ describe("VSCodeEpisodeReader.getNewEpisodes — basic extraction", () => {
 
 	it("falls back to sessionId-based title when customTitle is absent", () => {
 		writeSession(
+			chatDir,
 			"s1.json",
 			makeSession({
 				sessionId: "abcd1234-5678-0000-0000-000000000000",
@@ -291,6 +324,7 @@ describe("VSCodeEpisodeReader.getNewEpisodes — basic extraction", () => {
 	it("derives projectName from workspace.json folder URI", () => {
 		writeWorkspaceJson(wsDir, "/Users/alice/my-project");
 		writeSession(
+			chatDir,
 			"s1.json",
 			makeSession({
 				sessionId: "session-1",
@@ -309,8 +343,13 @@ describe("VSCodeEpisodeReader.getNewEpisodes — basic extraction", () => {
 		reader.close();
 	});
 
-	it("sets startMessageId and endMessageId to requestIds", () => {
+	it("sets startMessageId to requestId and endMessageId to requestId-response", () => {
+		// extractMessages produces messageIds as:
+		//   user turn:      requestId
+		//   assistant turn: `${requestId}-response`
+		// The last chunk's endMessageId is therefore the last assistant messageId.
 		writeSession(
+			chatDir,
 			"s1.json",
 			makeSession({
 				sessionId: "session-1",
@@ -325,8 +364,7 @@ describe("VSCodeEpisodeReader.getNewEpisodes — basic extraction", () => {
 		const candidates = reader.getCandidateSessions(0);
 		const episodes = reader.getNewEpisodes([candidates[0].id], new Map());
 		expect(episodes[0].startMessageId).toBe("req-aaa");
-		// endMessageId is the last message id — could be req-bbb or a derived response id
-		expect(episodes[0].endMessageId).toBeTruthy();
+		expect(episodes[0].endMessageId).toBe("req-bbb-response");
 		reader.close();
 	});
 });
@@ -334,8 +372,21 @@ describe("VSCodeEpisodeReader.getNewEpisodes — basic extraction", () => {
 // ── getNewEpisodes — response part kind filtering ─────────────────────────────
 
 describe("VSCodeEpisodeReader.getNewEpisodes — response part kind filtering", () => {
+	let tmpDir: string;
+	let dataDir: string;
+	let chatDir: string;
+
+	beforeEach(() => {
+		({ tmpDir, dataDir, chatDir } = setupDataDir());
+	});
+
+	afterEach(() => {
+		rmSync(tmpDir, { recursive: true, force: true });
+	});
+
 	it("includes parts with no kind (plain text)", () => {
 		writeSession(
+			chatDir,
 			"s1.json",
 			makeSession({
 				sessionId: "session-1",
@@ -358,6 +409,7 @@ describe("VSCodeEpisodeReader.getNewEpisodes — response part kind filtering", 
 
 	it("includes parts with kind=markdownContent", () => {
 		writeSession(
+			chatDir,
 			"s1.json",
 			makeSession({
 				sessionId: "session-1",
@@ -380,6 +432,7 @@ describe("VSCodeEpisodeReader.getNewEpisodes — response part kind filtering", 
 
 	it("includes parts with kind=markdownVuln", () => {
 		writeSession(
+			chatDir,
 			"s1.json",
 			makeSession({
 				sessionId: "session-1",
@@ -400,8 +453,9 @@ describe("VSCodeEpisodeReader.getNewEpisodes — response part kind filtering", 
 		reader.close();
 	});
 
-	it("skips metadata parts (toolInvocationSerialized, codeblockUri, etc.)", () => {
+	it("skips metadata parts (toolInvocationSerialized, codeblockUri, textEditGroup, inlineReference, undoStop)", () => {
 		writeSession(
+			chatDir,
 			"s1.json",
 			makeSession({
 				sessionId: "session-1",
@@ -426,8 +480,11 @@ describe("VSCodeEpisodeReader.getNewEpisodes — response part kind filtering", 
 		const candidates = reader.getCandidateSessions(0);
 		const episodes = reader.getNewEpisodes([candidates[0].id], new Map());
 		expect(episodes[0].content).toContain("Tool completed successfully");
+		// All metadata part values must be absent
 		expect(episodes[0].content).not.toContain("toolInvocationSerialized");
 		expect(episodes[0].content).not.toContain("/some/file.ts");
+		expect(episodes[0].content).not.toContain("edit data");
+		expect(episodes[0].content).not.toContain("ref data");
 		reader.close();
 	});
 });
@@ -435,8 +492,21 @@ describe("VSCodeEpisodeReader.getNewEpisodes — response part kind filtering", 
 // ── getNewEpisodes — session-level skip conditions ────────────────────────────
 
 describe("VSCodeEpisodeReader.getNewEpisodes — session skip conditions", () => {
+	let tmpDir: string;
+	let dataDir: string;
+	let chatDir: string;
+
+	beforeEach(() => {
+		({ tmpDir, dataDir, chatDir } = setupDataDir());
+	});
+
+	afterEach(() => {
+		rmSync(tmpDir, { recursive: true, force: true });
+	});
+
 	it("skips sessions with isEmpty=true", () => {
 		writeSession(
+			chatDir,
 			"s1.json",
 			makeSession({
 				sessionId: "session-1",
@@ -451,7 +521,7 @@ describe("VSCodeEpisodeReader.getNewEpisodes — session skip conditions", () =>
 	});
 
 	it("skips sessions with missing sessionId", () => {
-		writeSession("s1.json", {
+		writeSession(chatDir, "s1.json", {
 			creationDate: BASE,
 			lastMessageDate: BASE + 5000,
 			requests: [
@@ -469,7 +539,7 @@ describe("VSCodeEpisodeReader.getNewEpisodes — session skip conditions", () =>
 	});
 
 	it("skips sessions with lastMessageDate=0", () => {
-		writeSession("s1.json", {
+		writeSession(chatDir, "s1.json", {
 			sessionId: "session-1",
 			creationDate: 0,
 			lastMessageDate: 0,
@@ -483,6 +553,7 @@ describe("VSCodeEpisodeReader.getNewEpisodes — session skip conditions", () =>
 
 	it("skips sessions where all requests have empty message text", () => {
 		writeSession(
+			chatDir,
 			"s1.json",
 			makeSession({
 				sessionId: "session-1",
@@ -501,6 +572,7 @@ describe("VSCodeEpisodeReader.getNewEpisodes — session skip conditions", () =>
 		writeFileSync(join(chatDir, "bad.json"), "{not valid json");
 		// Also write one valid session so we can verify the reader still works
 		writeSession(
+			chatDir,
 			"good.json",
 			makeSession({
 				sessionId: "session-good",
@@ -519,7 +591,7 @@ describe("VSCodeEpisodeReader.getNewEpisodes — session skip conditions", () =>
 	});
 
 	it("skips sessions with empty requests array", () => {
-		writeSession("s1.json", {
+		writeSession(chatDir, "s1.json", {
 			sessionId: "session-1",
 			creationDate: BASE,
 			lastMessageDate: BASE + 5000,
@@ -535,17 +607,34 @@ describe("VSCodeEpisodeReader.getNewEpisodes — session skip conditions", () =>
 // ── getNewEpisodes — minSessionMessages filter ────────────────────────────────
 
 describe("VSCodeEpisodeReader.getNewEpisodes — minSessionMessages filter", () => {
+	let tmpDir: string;
+	let dataDir: string;
+	let chatDir: string;
+
+	beforeEach(() => {
+		({ tmpDir, dataDir, chatDir } = setupDataDir());
+	});
+
+	afterEach(() => {
+		rmSync(tmpDir, { recursive: true, force: true });
+	});
+
 	it("skips sessions that produce fewer messages than minSessionMessages", () => {
-		// Default minSessionMessages is 4. A single request with 1 user + 1 assistant
-		// message produces only 2 messages — below the threshold.
+		// Build a session with exactly (minSessionMessages - 1) / 2 requests,
+		// each yielding one user + one assistant message, so the total is
+		// minSessionMessages - 1 and the session is always below the threshold
+		// regardless of the configured value.
+		const threshold = config.consolidation.minSessionMessages;
+		const requestCount = Math.max(1, Math.floor((threshold - 1) / 2));
+		const requests = Array.from({ length: requestCount }, (_, i) => ({
+			messageText: `msg ${i}`,
+			response: [{ value: `reply ${i}` }],
+		}));
+
 		writeSession(
+			chatDir,
 			"s1.json",
-			makeSession({
-				sessionId: "session-short",
-				requests: [
-					{ messageText: "hi", response: [{ value: "hey" }] },
-				],
-			}),
+			makeSession({ sessionId: "session-short", requests }),
 		);
 
 		const reader = new VSCodeEpisodeReader(dataDir);
@@ -559,8 +648,21 @@ describe("VSCodeEpisodeReader.getNewEpisodes — minSessionMessages filter", () 
 // ── getNewEpisodes — processedRanges exclusion ────────────────────────────────
 
 describe("VSCodeEpisodeReader.getNewEpisodes — processedRanges exclusion", () => {
+	let tmpDir: string;
+	let dataDir: string;
+	let chatDir: string;
+
+	beforeEach(() => {
+		({ tmpDir, dataDir, chatDir } = setupDataDir());
+	});
+
+	afterEach(() => {
+		rmSync(tmpDir, { recursive: true, force: true });
+	});
+
 	it("skips episodes whose (startMessageId, endMessageId) are already processed", () => {
 		writeSession(
+			chatDir,
 			"s1.json",
 			makeSession({
 				sessionId: "session-1",
@@ -599,6 +701,18 @@ describe("VSCodeEpisodeReader.getNewEpisodes — processedRanges exclusion", () 
 // ── Edge cases ────────────────────────────────────────────────────────────────
 
 describe("VSCodeEpisodeReader — edge cases", () => {
+	let tmpDir: string;
+	let dataDir: string;
+	let chatDir: string;
+
+	beforeEach(() => {
+		({ tmpDir, dataDir, chatDir } = setupDataDir());
+	});
+
+	afterEach(() => {
+		rmSync(tmpDir, { recursive: true, force: true });
+	});
+
 	it("returns no sessions when workspaceStorage directory does not exist", () => {
 		// dataDir exists but has no User/workspaceStorage
 		const emptyDataDir = mkdtempSync(join(tmpdir(), "ks-vscode-empty-"));
@@ -622,15 +736,18 @@ describe("VSCodeEpisodeReader — edge cases", () => {
 	});
 
 	it("sessions across multiple workspace directories are all discovered", () => {
-		// Create a second workspace directory
+		// Create a second workspace directory with distinct lastMessageDate
+		// to avoid non-deterministic ordering on equal timestamps.
 		const wsDir2 = join(dataDir, "User", "workspaceStorage", "def456hash");
 		const chatDir2 = join(wsDir2, "chatSessions");
 		mkdirSync(chatDir2, { recursive: true });
 
 		writeSession(
+			chatDir,
 			"s1.json",
 			makeSession({
 				sessionId: "session-ws1",
+				lastMessageDate: BASE + 1000,
 				requests: [
 					{ messageText: "from ws1", response: [{ value: "reply1" }] },
 					{ messageText: "more ws1", response: [{ value: "reply2" }] },
@@ -638,15 +755,16 @@ describe("VSCodeEpisodeReader — edge cases", () => {
 			}),
 		);
 		writeSession(
+			chatDir2,
 			"s2.json",
 			makeSession({
 				sessionId: "session-ws2",
+				lastMessageDate: BASE + 2000,
 				requests: [
 					{ messageText: "from ws2", response: [{ value: "reply3" }] },
 					{ messageText: "more ws2", response: [{ value: "reply4" }] },
 				],
 			}),
-			chatDir2,
 		);
 
 		const reader = new VSCodeEpisodeReader(dataDir);
