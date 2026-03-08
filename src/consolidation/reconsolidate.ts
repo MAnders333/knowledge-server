@@ -80,6 +80,17 @@ export class Reconsolidator {
 			) => void;
 			onKeep: () => void;
 		},
+		/**
+		 * Timestamp of the source session (unix ms, capped at Date.now()).
+		 *
+		 * Used as `createdAt` / `lastAccessedAt` for newly inserted entries so that
+		 * knowledge extracted from old sessions starts with the correct decay already
+		 * applied. Without this, an entry from a 6-month-old session would be inserted
+		 * with `lastAccessedAt = now` and appear fresh — understating its age.
+		 *
+		 * Defaults to Date.now() when not supplied (backwards-compatible).
+		 */
+		sessionTimestamp?: number,
 	): Promise<void> {
 		// Embed the extracted entry content
 		const entryEmbedding = await this.embeddings.embed(entry.content);
@@ -98,7 +109,7 @@ export class Reconsolidator {
 
 		// Below threshold → clearly novel, insert directly
 		if (!nearestEntry || nearestSimilarity < RECONSOLIDATION_THRESHOLD) {
-			const inserted = this.insertNewEntry(entry, sessionIds, entryEmbedding);
+			const inserted = this.insertNewEntry(entry, sessionIds, entryEmbedding, sessionTimestamp);
 			callbacks.onInsert(inserted);
 			logger.log(
 				`[consolidation] Insert (novel, sim=${nearestSimilarity.toFixed(3)}): "${entry.content.slice(0, 60)}..."`,
@@ -175,7 +186,7 @@ export class Reconsolidator {
 			}
 
 			case "insert": {
-				const inserted = this.insertNewEntry(entry, sessionIds, entryEmbedding);
+				const inserted = this.insertNewEntry(entry, sessionIds, entryEmbedding, sessionTimestamp);
 				logger.log(
 					`[consolidation] Insert (distinct despite similarity): "${entry.content.slice(0, 60)}..."`,
 				);
@@ -188,13 +199,24 @@ export class Reconsolidator {
 	/**
 	 * Insert a new knowledge entry into the DB.
 	 * Optionally pre-supply the embedding to avoid re-computing it.
+	 *
+	 * sessionTimestamp: unix ms of the source session (capped at now).
+	 * Using the session's time rather than Date.now() means entries extracted from
+	 * old sessions start with the correct decay already applied — an entry from a
+	 * session 30 days ago will have 30 days of decay, not 0.
 	 */
 	private insertNewEntry(
 		entry: ExtractedKnowledge,
 		sessionIds: string[],
 		embedding?: number[],
+		sessionTimestamp?: number,
 	): KnowledgeEntry & { embedding?: number[] } {
 		const now = Date.now();
+		// Cap at now — sessions cannot be from the future, and a clock skew or
+		// corrupt timestamp should not produce a future lastAccessedAt.
+		const entryTime = sessionTimestamp
+			? Math.min(sessionTimestamp, now)
+			: now;
 		const newEntry: KnowledgeEntry & { embedding?: number[] } = {
 			id: randomUUID(),
 			type: entry.type,
@@ -203,18 +225,16 @@ export class Reconsolidator {
 			confidence: Math.max(0, Math.min(1, entry.confidence || 0.5)),
 			source:
 				entry.source ||
-				`consolidation ${new Date().toISOString().split("T")[0]}`,
+				`consolidation ${new Date(entryTime).toISOString().split("T")[0]}`,
 			scope: entry.scope || "personal",
 			status: "active",
-			// Compute real initial strength rather than hardcoding 1.0.
-			// A new entry (obs=1, access=0, age=0) yields: strength = confidence × 1.0
-			// (no decay yet since lastAccessedAt = now), which is the correct starting value.
-			// This avoids a brief window where DB-stored strength=1.0 while the entry's
-			// actual confidence-adjusted strength is lower.
+			// Compute real initial strength using the session timestamp so decay is
+			// pre-applied for old sessions. A new entry (obs=1, access=0) from a
+			// session N days ago already has N days of decay factored into its strength.
 			strength: 1.0, // placeholder — overwritten below once all fields are set
-			createdAt: now,
-			updatedAt: now,
-			lastAccessedAt: now,
+			createdAt: entryTime,
+			updatedAt: entryTime,
+			lastAccessedAt: entryTime,
 			accessCount: 0,
 			observationCount: 1,
 			supersededBy: null,
@@ -222,9 +242,8 @@ export class Reconsolidator {
 			embedding,
 		};
 		// Overwrite placeholder with the real computed value now that all entry fields are set.
-		// Pass `now` explicitly: lastAccessedAt = now, so daysSinceAccess = 0 → decayFactor = 1.0
-		// and strength = confidence × 1.0 = confidence. This is the correct starting value —
-		// the old hardcoded 1.0 overstated strength for any entry with confidence < 1.0.
+		// Pass `now` as the reference time for age computation so daysSinceAccess reflects
+		// real elapsed time from the session date to the current moment.
 		newEntry.strength = computeStrength(newEntry, now);
 		this.db.insertEntry(newEntry);
 		return newEntry;

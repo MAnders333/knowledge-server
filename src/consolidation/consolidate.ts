@@ -440,6 +440,10 @@ export class ConsolidationEngine {
 		// Performance: load all entries with embeddings ONCE per chunk into an in-memory
 		// Map. On insert/update, mutate the Map in place rather than reloading from DB.
 		const sessionIds = [...new Set(chunk.map((e) => e.sessionId))];
+		// Use the max message time of the chunk as the session timestamp for new entries.
+		// This ensures entries extracted from old sessions start with the correct decay
+		// already applied rather than appearing freshly created.
+		const chunkSessionTimestamp = Math.max(...chunk.map((e) => e.maxMessageTime));
 		// Reuse the entries already loaded above — no second DB read.
 		const entriesMap = new Map(allEntriesForChunk.map((e) => [e.id, e]));
 		let chunkCreated = 0;
@@ -482,7 +486,9 @@ export class ConsolidationEngine {
 						}
 					},
 					onKeep: () => {},
-				});
+				},
+				chunkSessionTimestamp,
+				);
 			} catch (err) {
 				// Log and skip this extracted entry — do NOT rethrow.
 				// Rethrowing would skip recordEpisode for the whole chunk, causing all

@@ -38,11 +38,36 @@ elif [ -f "$PROJECT_DIR/.env" ]; then
   _env_file="$PROJECT_DIR/.env"
 fi
 
+# Safe KEY=value parser — does NOT execute arbitrary shell code.
+# Key and value are split manually; printf -v assigns the literal value string
+# to the variable without any word-splitting, glob expansion, or command
+# substitution — so a crafted value like $(evil-command) or `evil` is stored
+# verbatim rather than executed.
+# Only keys with a known knowledge-server prefix are loaded; this prevents a
+# crafted .env from overwriting sensitive process variables such as PATH,
+# LD_PRELOAD, or IFS — variables that a valid identifier check alone would allow.
 if [ -n "$_env_file" ]; then
-  set -a
-  # shellcheck source=/dev/null
-  source "$_env_file" 2>/dev/null || true
-  set +a
+  while IFS= read -r _line || [ -n "$_line" ]; do # || handles no-trailing-newline files
+    # Skip blank lines and comments
+    case "$_line" in
+      ''|'#'*) continue ;;
+    esac
+    # Split on first '=' to get key and value separately
+    _key="${_line%%=*}"
+    _val="${_line#*=}"
+    # Allowlist: only load keys with a known knowledge-server prefix.
+    # This rejects PATH, LD_PRELOAD, IFS, BASH_ENV, etc.
+    if [[ "$_key" =~ ^(KNOWLEDGE_|LLM_|EMBEDDING_|ANTHROPIC_|OPENAI_|GOOGLE_|OPENCODE_|CONSOLIDATION_|ACTIVATION_|CONTRADICTION_|DECAY_|CURSOR_|CLAUDE_|CODEX_|VSCODE_)[A-Za-z0-9_]*$ ]]; then
+      # Strip matching surrounding quotes from the value so KNOWLEDGE_PORT="3179"
+      # and KNOWLEDGE_PORT='3179' both work correctly.
+      case "$_val" in
+        '"'*'"') _val="${_val:1:${#_val}-2}" ;;
+        "'"*"'")   _val="${_val:1:${#_val}-2}" ;;
+      esac
+      printf -v "$_key" '%s' "$_val"  # assign literal value — no shell evaluation
+      export "$_key"
+    fi
+  done < "$_env_file"
 fi
 
 exec bun run "$PROJECT_DIR/src/index.ts"

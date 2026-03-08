@@ -384,17 +384,20 @@ Respond ONLY with a JSON object. No markdown, no explanation.
 
 If the action is "update" or "replace", include the full improved content (incorporating both the existing entry and the new observation), the best type, topics array, and confidence.`;
 
+		// Content values are wrapped in XML tags to prevent prompt injection —
+		// a crafted entry containing text like "NEW OBSERVATION:" or JSON keywords
+		// cannot escape its container and alter the instruction structure.
 		const userPrompt = `EXISTING ENTRY:
 type: ${existing.type}
 topics: ${existing.topics.join(", ")}
 confidence: ${existing.confidence}
-content: ${existing.content}
+content: <existing_content>${existing.content}</existing_content>
 
 NEW OBSERVATION:
 type: ${extracted.type}
 topics: ${extracted.topics.join(", ")}
 confidence: ${extracted.confidence}
-content: ${extracted.content}
+content: <new_content>${extracted.content}</new_content>
 
 Respond with one of:
 {"action": "keep"}
@@ -458,13 +461,15 @@ Respond with one of:
 	): Promise<ContradictionResult[]> {
 		if (candidates.length === 0) return [];
 
+		// Content values are wrapped in XML tags to prevent prompt injection —
+		// a crafted entry cannot escape its container and alter the instruction structure.
 		const candidateList = candidates
 			.map(
 				(c, i) =>
 					`[${i + 1}] id: ${c.id}
 type: ${c.type} | confidence: ${c.confidence} | created: ${new Date(c.createdAt).toISOString().split("T")[0]}
 topics: ${c.topics.join(", ")}
-content: ${c.content}`,
+content: <candidate_content>${c.content}</candidate_content>`,
 			)
 			.join("\n\n");
 
@@ -495,7 +500,7 @@ Respond ONLY with a JSON array — one object per candidate, in the same order.`
 id: ${newEntry.id}
 type: ${newEntry.type} | confidence: ${newEntry.confidence} | created: ${new Date(newEntry.createdAt).toISOString().split("T")[0]}
 topics: ${newEntry.topics.join(", ")}
-content: ${newEntry.content}
+content: <new_entry_content>${newEntry.content}</new_entry_content>
 
 EXISTING CANDIDATES to check:
 ${candidateList}

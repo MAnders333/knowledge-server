@@ -349,17 +349,48 @@ export function validateConfig(): string[] {
 
 	if (!hasAnthropic && !hasOpenAI && !hasGoogle && !hasUnified) {
 		// Provide a more specific hint when the user has set half of the unified pair.
-		if (unifiedApiKey && !unifiedEndpoint) {
+		// Guard against placeholder values — a key equal to PLACEHOLDER_API_KEY means
+		// the .env was never edited, so it should not trigger the "key set but endpoint
+		// missing" hint (the user would see a confusing message about a key they didn't
+		// actually configure).
+		const unifiedApiKeyReal =
+			unifiedApiKey && unifiedApiKey !== PLACEHOLDER_API_KEY;
+		const unifiedEndpointReal =
+			unifiedEndpoint && unifiedEndpoint !== PLACEHOLDER_ENDPOINT;
+		if (unifiedApiKeyReal && !unifiedEndpointReal) {
 			errors.push(
 				`LLM_API_KEY is set but LLM_BASE_ENDPOINT is missing. Edit ${envPath} and set LLM_BASE_ENDPOINT, or use a per-provider key (ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY) instead.`,
 			);
-		} else if (unifiedEndpoint && !unifiedApiKey) {
+		} else if (unifiedEndpointReal && !unifiedApiKeyReal) {
 			errors.push(
 				`LLM_BASE_ENDPOINT is set but LLM_API_KEY is missing. Edit ${envPath} and set LLM_API_KEY.`,
 			);
 		} else {
 			errors.push(
 				`No LLM credentials configured. Edit ${envPath} and set one of:\n    ANTHROPIC_API_KEY (direct Anthropic)\n    OPENAI_API_KEY (direct OpenAI-compatible)\n    GOOGLE_API_KEY (direct Google)\n    LLM_BASE_ENDPOINT + LLM_API_KEY (unified proxy)`,
+			);
+		}
+	}
+
+	// Warn when a dedicated embedding endpoint is configured but no API key is
+	// available. This silently produces empty-string credentials and causes
+	// authentication failures at runtime — surface it early at startup instead.
+	// Affected setup: Ollama embeddings + cloud LLM where OPENAI_API_KEY is not set
+	// and LLM_API_KEY is the cloud provider key (not an OpenAI-compatible key).
+	if (config.embedding.baseURL) {
+		const embeddingApiKey =
+			config.embedding.apiKey?.trim() ||
+			config.llm.openai.apiKey?.trim() ||
+			config.llm.apiKey?.trim() ||
+			"";
+		if (!embeddingApiKey || embeddingApiKey === PLACEHOLDER_API_KEY) {
+			// Warn rather than error — local endpoints (Ollama, llama.cpp) don't
+			// require authentication and will work without a key. Cloud-hosted
+			// OpenAI-compatible endpoints do require one, so surface the hint.
+			console.warn(
+				"[config] EMBEDDING_BASE_URL is set but no embedding API key was found. " +
+					"If your endpoint requires authentication, set EMBEDDING_API_KEY. " +
+					"Local endpoints (Ollama, llama.cpp) work without a key — this warning can be ignored.",
 			);
 		}
 	}

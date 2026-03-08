@@ -33,11 +33,28 @@ export async function runConsolidate(): Promise<void> {
 		let totalCreated = 0;
 		let totalUpdated = 0;
 
+		// tryLock timeout — spin at most 10 seconds before giving up.
+		// In CLI mode there should be no concurrent callers, but if the server is
+		// running and holds the lock we surface a clear error rather than looping
+		// indefinitely.
+		const LOCK_TIMEOUT_MS = 10_000;
+		const LOCK_POLL_MS = 500;
+
 		while (true) {
 			if (!consolidation.tryLock()) {
-				// Shouldn't happen in CLI mode (no concurrent callers), but be safe.
-				await new Promise((r) => setTimeout(r, 500));
-				continue;
+				// Shouldn't happen in CLI mode (no concurrent callers), but guard
+				// against a running server holding the lock.
+				let waited = 0;
+				while (!consolidation.tryLock()) {
+					if (waited >= LOCK_TIMEOUT_MS) {
+						console.error(
+							"Could not acquire consolidation lock after 10 s — is the server running? Stop it first.",
+						);
+						process.exit(1);
+					}
+					await new Promise((r) => setTimeout(r, LOCK_POLL_MS));
+					waited += LOCK_POLL_MS;
+				}
 			}
 			let result: Awaited<ReturnType<typeof consolidation.consolidate>>;
 			try {

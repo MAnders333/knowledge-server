@@ -27,7 +27,7 @@ export const MAX_TOKENS_PER_EPISODE = 50_000;
 /**
  * Maximum characters for a fully assembled message (text + all tool outputs
  * combined). 60K chars ≈ 15K tokens — keeps the episode batch sent to the
- * extraction LLM within limits that the IU unified proxy can handle reliably.
+ * extraction LLM within limits that most LLM providers can handle reliably.
  *
  * There is no separate per-tool-output cap: individual tool outputs (e.g.
  * long Confluence pages) pass through untruncated. The chunker places any

@@ -26,6 +26,15 @@ export function runReinitialize(args: string[]): void {
 		}
 
 		if (flag !== "--confirm") {
+			if (flag !== undefined) {
+				// Unrecognised flag — warn so the user knows their input was ignored
+				// rather than silently falling through to the usage message.
+				console.error(`Unknown flag: ${flag}`);
+				console.error(
+					"Valid flags: --confirm, --dry-run",
+				);
+				console.error("");
+			}
 			console.log(
 				"This will DELETE all knowledge entries and reset the consolidation cursor.",
 			);
@@ -35,7 +44,8 @@ export function runReinitialize(args: string[]): void {
 				"Run with --confirm to proceed:  knowledge-server reinitialize --confirm",
 			);
 			console.log("Run with --dry-run to preview:  knowledge-server reinitialize --dry-run");
-			process.exit(1);
+			// Exit 0 — this is an informational path, not an error.
+			process.exit(0);
 		}
 
 		db.reinitialize();
