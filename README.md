@@ -16,7 +16,7 @@ This downloads the server binary into `~/.local/share/knowledge-server/` and gen
 
 **After running:**
 
-1. Edit `~/.config/knowledge-server/.env` — set `LLM_API_KEY` and `LLM_BASE_ENDPOINT`
+1. Edit `~/.config/knowledge-server/.env` — set your LLM credentials (e.g. `ANTHROPIC_API_KEY`)
 2. Run the setup command for your tool(s):
    - `knowledge-server setup-tool opencode` — symlinks the plugin and commands, registers the MCP server in `opencode.jsonc`
    - `knowledge-server setup-tool claude-code` — registers the MCP server, `UserPromptSubmit` hook, and slash commands
@@ -39,7 +39,7 @@ knowledge-server update
 git clone https://github.com/MAnders333/knowledge-server
 cd knowledge-server
 cp .env.template .env
-# Edit .env — set LLM_API_KEY and LLM_BASE_ENDPOINT
+# Edit .env — set your LLM credentials (e.g. ANTHROPIC_API_KEY)
 bun run setup
 bun run start
 ```
@@ -268,35 +268,99 @@ All config is via environment variables, loaded from `.env` at startup. The `.en
 
 New installs create the file at `~/.config/knowledge-server/.env`. Defaults are sensible for local use.
 
+### LLM credentials
+
+Two options — set one or the other (or both; per-provider credentials take precedence):
+
+**Option A — Direct provider credentials (recommended)**
+
+| Variable | Description |
+|---|---|
+| `ANTHROPIC_API_KEY` | Anthropic API key. Routes all `anthropic/` model prefixes directly to `api.anthropic.com`. |
+| `OPENAI_API_KEY` | OpenAI API key. Routes all `openai/` model prefixes and embedding calls directly to `api.openai.com`. |
+| `GOOGLE_API_KEY` | Google API key. Routes all `google/` model prefixes directly to the Gemini API. |
+| `ANTHROPIC_BASE_URL` | Override the Anthropic base URL (e.g. for Azure or a custom proxy). |
+| `OPENAI_BASE_URL` | Override the OpenAI base URL. Also used as the embedding endpoint fallback when `EMBEDDING_BASE_URL` is not set. |
+| `GOOGLE_BASE_URL` | Override the Google base URL. |
+
+**Option B — Unified proxy (backwards compatible)**
+
+| Variable | Description |
+|---|---|
+| `LLM_API_KEY` | API key for the unified proxy endpoint. |
+| `LLM_BASE_ENDPOINT` | Base URL for a proxy that serves multiple providers. Provider-specific paths are appended automatically: `anthropic/` → `/anthropic/v1`, `google/` → `/gemini/v1beta`, everything else → `/openai/v1`. |
+
+### LLM models
+
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_API_KEY` | — | **Required.** API key for the LLM endpoint |
-| `LLM_BASE_ENDPOINT` | — | **Required.** Base URL for LLM API. Provider-specific paths are appended automatically (`/anthropic/v1`, `/openai/v1`, etc.) |
-| `LLM_EXTRACTION_MODEL` | `anthropic/claude-sonnet-4-6` | Model for episode → knowledge extraction. Prefix routes the provider: `anthropic/`, `google/`, `openai/` |
-| `LLM_MERGE_MODEL` | `anthropic/claude-haiku-4-5` | Model for near-duplicate merge decisions (cheaper — essentially a classification call) |
-| `LLM_CONTRADICTION_MODEL` | `anthropic/claude-sonnet-4-6` | Model for contradiction detection and resolution (nuanced — fires rarely) |
-| `EMBEDDING_MODEL` | `text-embedding-3-large` | Embedding model (OpenAI-compatible API) |
-| `EMBEDDING_DIMENSIONS` | *(not set — uses model default)* | Embedding dimensions. Only needed to reduce dimensions (e.g. for storage savings); omit to use the model's native output size |
-| `KNOWLEDGE_PORT` | `3179` | HTTP port |
-| `KNOWLEDGE_HOST` | `127.0.0.1` | HTTP host |
-| `KNOWLEDGE_DB_PATH` | `~/.local/share/knowledge-server/knowledge.db` | Knowledge database path |
-| `KNOWLEDGE_ADMIN_TOKEN` | *(random)* | Fixed admin token (≥16 chars) for scripted use. If unset, a random token is generated per process lifetime and printed at startup |
-| `OPENCODE_DB_PATH` | `~/.local/share/opencode/opencode.db` | OpenCode session database (read-only) |
-| `OPENCODE_ENABLED` | `true` | Set to `false` to disable OpenCode session reading |
-| `CLAUDE_DB_PATH` | `~/.claude` | Root directory for Claude Code JSONL session files |
-| `CLAUDE_ENABLED` | `true` | Set to `false` to disable Claude Code session reading |
-| `CODEX_SESSIONS_DIR` | *(auto-detected)* | Root directory for Codex CLI JSONL rollout files. Auto-detected at `~/.codex/sessions` (or `$CODEX_HOME/sessions` if `CODEX_HOME` is set) |
-| `CODEX_ENABLED` | `true` | Set to `false` to disable Codex CLI session reading |
-| `CURSOR_DB_PATH` | *(auto-detected)* | Path to Cursor's `state.vscdb`. Auto-detected per platform (macOS: `~/Library/Application Support/Cursor/…`, Linux: `~/.config/Cursor/…`) |
-| `CURSOR_ENABLED` | `true` | Set to `false` to disable Cursor session reading |
-| `VSCODE_DATA_DIR` | *(auto-detected)* | Path to VSCode's data directory. Auto-detected per platform (macOS: `~/Library/Application Support/Code`, Linux: `~/.config/Code`) |
-| `VSCODE_ENABLED` | `true` | Set to `false` to disable VSCode session reading |
-| `CONSOLIDATION_MAX_SESSIONS` | `50` | Sessions per consolidation batch |
-| `CONSOLIDATION_CHUNK_SIZE` | `10` | Episodes per LLM extraction call |
-| `CONTRADICTION_MIN_SIMILARITY` | `0.4` | Lower bound of the contradiction scan similarity band (upper bound is always 0.82) |
-| `CONSOLIDATION_POLL_INTERVAL_MS` | `0` (disabled) | Auto-consolidation polling interval in ms while server runs. `0` = disabled; e.g. `1800000` = every 30 min |
-| `ACTIVATION_MAX_RESULTS` | `10` | Max entries returned by activation |
-| `ACTIVATION_SIMILARITY_THRESHOLD` | `0.3` | Minimum cosine similarity to activate |
+| `LLM_EXTRACTION_MODEL` | `anthropic/claude-sonnet-4-6` | Model for episode → knowledge extraction. Prefix routes the provider: `anthropic/`, `google/`, `openai/`. |
+| `LLM_MERGE_MODEL` | `anthropic/claude-haiku-4-5` | Model for near-duplicate merge decisions (cheaper — essentially a classification call). |
+| `LLM_CONTRADICTION_MODEL` | `anthropic/claude-sonnet-4-6` | Model for contradiction detection and resolution (nuanced — fires rarely). |
+| `LLM_TIMEOUT_MS` | `300000` (5 min) | Per-call LLM timeout in ms. Applied per attempt, not across all retries. |
+| `LLM_MAX_RETRIES` | `2` | Number of additional retry attempts on timeout or transient error. `0` disables retries. |
+| `LLM_RETRY_BASE_DELAY_MS` | `3000` | Base delay for exponential backoff between retries (capped at 60s). |
+
+### Embedding
+
+| Variable | Default | Description |
+|---|---|---|
+| `EMBEDDING_MODEL` | `text-embedding-3-large` | Embedding model (OpenAI-compatible `/v1/embeddings` API). |
+| `EMBEDDING_DIMENSIONS` | *(model default)* | Override embedding output dimensions. Only valid for `text-embedding-3-*` models; omit for all others. |
+| `EMBEDDING_BASE_URL` | *(see priority below)* | Dedicated embedding endpoint. Priority: `EMBEDDING_BASE_URL` → `OPENAI_BASE_URL` → `LLM_BASE_ENDPOINT/openai/v1`. Use this to point at a local model (e.g. Ollama) while using a cloud LLM for extraction. |
+| `EMBEDDING_API_KEY` | *(see priority below)* | API key for the embedding endpoint. Falls back to `OPENAI_API_KEY` then `LLM_API_KEY`. Local endpoints (Ollama, llama.cpp) work without a key. |
+
+### Server
+
+| Variable | Default | Description |
+|---|---|---|
+| `KNOWLEDGE_PORT` | `3179` | HTTP port. |
+| `KNOWLEDGE_HOST` | `127.0.0.1` | HTTP bind address. Must be a loopback address. |
+| `KNOWLEDGE_ADMIN_TOKEN` | *(random)* | Fixed admin token (≥16 chars) for scripted use. If unset, a random token is generated per process and printed at startup. |
+| `KNOWLEDGE_DB_PATH` | `~/.local/share/knowledge-server/knowledge.db` | Knowledge database path. |
+| `KNOWLEDGE_LOG_PATH` | `~/.local/share/knowledge-server/server.log` | Log file path. Set to `""` to disable file logging. |
+| `KNOWLEDGE_PID_PATH` | `~/.local/share/knowledge-server/server.pid` | PID file path. Used by `knowledge-server stop`. Set to `""` to disable. |
+| `KNOWLEDGE_CONFIG_HOME` | *(see .env search order above)* | Explicit override for the directory containing `.env`. |
+
+### Session sources
+
+| Variable | Default | Description |
+|---|---|---|
+| `OPENCODE_DB_PATH` | `~/.local/share/opencode/opencode.db` | OpenCode session database (read-only). |
+| `OPENCODE_ENABLED` | `true` | Set to `false` to disable OpenCode session reading. |
+| `CLAUDE_DB_PATH` | `~/.claude` | Root directory for Claude Code JSONL session files. Falls back to `CLAUDE_CONFIG_DIR` if set (the env var Claude Code itself uses). |
+| `CLAUDE_ENABLED` | `true` | Set to `false` to disable Claude Code session reading. |
+| `CODEX_SESSIONS_DIR` | *(auto-detected)* | Root directory for Codex CLI JSONL rollout files. Auto-detected at `~/.codex/sessions` or `$CODEX_HOME/sessions`. |
+| `CODEX_ENABLED` | `true` | Set to `false` to disable Codex CLI session reading. |
+| `CURSOR_DB_PATH` | *(auto-detected)* | Path to Cursor's `state.vscdb`. Auto-detected per platform (macOS: `~/Library/Application Support/Cursor/…`, Linux: `~/.config/Cursor/…`). |
+| `CURSOR_ENABLED` | `true` | Set to `false` to disable Cursor session reading. |
+| `VSCODE_DATA_DIR` | *(auto-detected)* | Path to VSCode's data directory. Auto-detected per platform (macOS: `~/Library/Application Support/Code`, Linux: `~/.config/Code`). |
+| `VSCODE_ENABLED` | `true` | Set to `false` to disable VSCode session reading. |
+
+### Consolidation
+
+| Variable | Default | Description |
+|---|---|---|
+| `CONSOLIDATION_MAX_SESSIONS` | `50` | Sessions per consolidation batch. |
+| `CONSOLIDATION_CHUNK_SIZE` | `10` | Episodes per LLM extraction call. |
+| `CONSOLIDATION_MIN_MESSAGES` | `4` | Minimum messages a session must have to be eligible for consolidation. |
+| `CONSOLIDATION_POLL_INTERVAL_MS` | `0` (disabled) | Auto-consolidation polling interval in ms while the server runs. `0` = disabled; e.g. `1800000` = every 30 min. |
+| `CONSOLIDATION_INCLUDE_TOOL_OUTPUTS` | *(empty)* | Comma-separated tool names whose completed outputs are included in knowledge extraction (e.g. `atlassian_confluence_get_page`). Empty by default — most tool outputs are not worth encoding. |
+| `CONTRADICTION_MIN_SIMILARITY` | `0.4` | Lower bound of the contradiction scan similarity band. Upper bound is always the reconsolidation threshold (0.82). |
+
+### Decay
+
+| Variable | Default | Description |
+|---|---|---|
+| `DECAY_ARCHIVE_THRESHOLD` | `0.15` | Strength below which an entry is archived. |
+| `DECAY_TOMBSTONE_DAYS` | `180` | Days after archiving before an entry is permanently deleted. |
+
+### Activation
+
+| Variable | Default | Description |
+|---|---|---|
+| `ACTIVATION_MAX_RESULTS` | `10` | Max entries returned by activation. |
+| `ACTIVATION_SIMILARITY_THRESHOLD` | `0.3` | Minimum cosine similarity to activate an entry. |
 
 ## Usage
 
