@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.4.0](https://github.com/MAnders333/knowledge-server/compare/v2.3.0...v2.4.0) (2026-03-08)
+
+
+### Features
+
+* **logging:** add activation logging to all call sites ([c90dd41](https://github.com/MAnders333/knowledge-server/commit/c90dd4125dfa0576e7a5efd7bab61ee38102e25a))
+
+
+### Bug Fixes
+
+* remove duplicate log line in claude-code-hook activation path ([88877aa](https://github.com/MAnders333/knowledge-server/commit/88877aa8945974dc76280543d1f21065b331f86d))
+
 ## [2.3.0](https://github.com/MAnders333/knowledge-server/compare/v2.2.0...v2.3.0) (2026-03-08)
 
 
