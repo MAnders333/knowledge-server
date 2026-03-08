@@ -214,9 +214,18 @@ export class Reconsolidator {
 		const now = Date.now();
 		// Cap at now — sessions cannot be from the future, and a clock skew or
 		// corrupt timestamp should not produce a future lastAccessedAt.
-		// Use != null rather than a falsy check: sessionTimestamp = 0 (epoch or
-		// uninitialised record) should still be respected rather than silently
-		// replaced with now, which would defeat the purpose of this feature.
+		// Use != null rather than a falsy check: sessionTimestamp = 0 is still
+		// meaningful (epoch timestamp) and should not be silently replaced with now.
+		// However, epoch-0 is almost certainly a corrupt or uninitialised record —
+		// log a warning so the operator can investigate, since an entry stamped at
+		// 1970-01-01 will appear 55+ years old and likely archive on the first decay pass.
+		if (sessionTimestamp === 0) {
+			// JSON.stringify escapes control characters and ANSI codes so LLM-sourced
+			// content cannot inject structured tokens into the log stream.
+			logger.warn(
+				`[consolidation] sessionTimestamp = 0 (epoch) — likely a corrupt or uninitialised session record. Entry will be stamped at 1970-01-01 and may archive immediately. Preview: ${JSON.stringify(entry.content.slice(0, 60))}`,
+			);
+		}
 		const entryTime =
 			sessionTimestamp != null
 				? Math.min(sessionTimestamp, now)

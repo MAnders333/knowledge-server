@@ -446,10 +446,16 @@ export class ConsolidationEngine {
 		// Defensive fallback: the empty-chunk guard at line 387 means chunk.length > 0
 		// here, but an explicit fallback prevents Math.max(...[]) = -Infinity if that
 		// guard is ever moved or removed in a future refactor.
-		const chunkSessionTimestamp =
-			chunk.length > 0
-				? Math.max(...chunk.map((e) => e.maxMessageTime))
-				: Date.now();
+		// Use reduce rather than Math.max(...spread) to avoid stack-size issues
+		// on very large chunks. Use -Infinity as the neutral element so that a
+		// chunk where every entry has maxMessageTime = 0 (epoch) correctly yields
+		// 0, not -Infinity. -Infinity only arises for an empty chunk (already
+		// guarded at line 387); isFinite() catches that fallback case.
+		const reduced = chunk.reduce(
+			(max, e) => Math.max(max, e.maxMessageTime),
+			Number.NEGATIVE_INFINITY,
+		);
+		const chunkSessionTimestamp = Number.isFinite(reduced) ? reduced : Date.now();
 		// Reuse the entries already loaded above — no second DB read.
 		const entriesMap = new Map(allEntriesForChunk.map((e) => [e.id, e]));
 		let chunkCreated = 0;
