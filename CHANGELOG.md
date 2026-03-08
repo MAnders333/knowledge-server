@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.3.0](https://github.com/MAnders333/knowledge-server/compare/v2.2.0...v2.3.0) (2026-03-08)
+
+
+### Features
+
+* **cli:** merge cli.ts subcommands into binary, add --help, update README ([eba6068](https://github.com/MAnders333/knowledge-server/commit/eba6068b304cf8d329629e2cd33fea1b9837f270))
+
+
+### Bug Fixes
+
+* address reviewer-flagged bugs from security hardening commit ([b187254](https://github.com/MAnders333/knowledge-server/commit/b1872549fbc0cda53c229852dd2dad4d356e6e28))
+* **config:** handle missing baseURL for direct provider credentials ([0091cd7](https://github.com/MAnders333/knowledge-server/commit/0091cd7a4f384da00945fa12c9c097bd6847059f))
+* correct reduce seed in chunkSessionTimestamp and sanitise log output ([da19b5a](https://github.com/MAnders333/knowledge-server/commit/da19b5aa1b1757113e8cabd84e6f1ea3347223c6))
+* security hardening, CLI edge cases, and timestamp-aware entry decay ([c4a2e69](https://github.com/MAnders333/knowledge-server/commit/c4a2e69749c3b2a33647e7d823fa91b29c57097b))
+
 ## [2.2.0](https://github.com/MAnders333/knowledge-server/compare/v2.1.0...v2.2.0) (2026-03-07)
 
 
