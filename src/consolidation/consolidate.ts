@@ -443,7 +443,13 @@ export class ConsolidationEngine {
 		// Use the max message time of the chunk as the session timestamp for new entries.
 		// This ensures entries extracted from old sessions start with the correct decay
 		// already applied rather than appearing freshly created.
-		const chunkSessionTimestamp = Math.max(...chunk.map((e) => e.maxMessageTime));
+		// Defensive fallback: the empty-chunk guard at line 387 means chunk.length > 0
+		// here, but an explicit fallback prevents Math.max(...[]) = -Infinity if that
+		// guard is ever moved or removed in a future refactor.
+		const chunkSessionTimestamp =
+			chunk.length > 0
+				? Math.max(...chunk.map((e) => e.maxMessageTime))
+				: Date.now();
 		// Reuse the entries already loaded above — no second DB read.
 		const entriesMap = new Map(allEntriesForChunk.map((e) => [e.id, e]));
 		let chunkCreated = 0;

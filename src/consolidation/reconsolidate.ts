@@ -214,9 +214,13 @@ export class Reconsolidator {
 		const now = Date.now();
 		// Cap at now — sessions cannot be from the future, and a clock skew or
 		// corrupt timestamp should not produce a future lastAccessedAt.
-		const entryTime = sessionTimestamp
-			? Math.min(sessionTimestamp, now)
-			: now;
+		// Use != null rather than a falsy check: sessionTimestamp = 0 (epoch or
+		// uninitialised record) should still be respected rather than silently
+		// replaced with now, which would defeat the purpose of this feature.
+		const entryTime =
+			sessionTimestamp != null
+				? Math.min(sessionTimestamp, now)
+				: now;
 		const newEntry: KnowledgeEntry & { embedding?: number[] } = {
 			id: randomUUID(),
 			type: entry.type,

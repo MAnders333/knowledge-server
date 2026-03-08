@@ -44,8 +44,9 @@ export function runReinitialize(args: string[]): void {
 				"Run with --confirm to proceed:  knowledge-server reinitialize --confirm",
 			);
 			console.log("Run with --dry-run to preview:  knowledge-server reinitialize --dry-run");
-			// Exit 0 — this is an informational path, not an error.
-			process.exit(0);
+			// Return rather than process.exit(0) so the finally block runs db.close().
+			// The caller (src/index.ts) exits 0 after runReinitialize() returns.
+			return;
 		}
 
 		db.reinitialize();
