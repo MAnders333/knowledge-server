@@ -70,7 +70,9 @@ export async function runStop(pidPath: string): Promise<void> {
 	}
 
 	// Poll until the process is gone, up to STOP_TIMEOUT_MS.
-	const STOP_TIMEOUT_MS = 10_000;
+	// Must exceed the server's own SHUTDOWN_TIMEOUT_MS (30 s) so we don't
+	// declare failure while the server is still draining in-flight LLM calls.
+	const STOP_TIMEOUT_MS = 35_000;
 	const POLL_INTERVAL_MS = 100;
 	const deadline = Date.now() + STOP_TIMEOUT_MS;
 
