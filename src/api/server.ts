@@ -13,7 +13,7 @@ import type { ConsolidationEngine } from "../consolidation/consolidate.js";
 import type { KnowledgeDB } from "../db/database.js";
 import { logger } from "../logger.js";
 import { activateInputSchema } from "../mcp/index.js";
-import type { KnowledgeEntry, KnowledgeStatus } from "../types.js";
+import type { ActivationResult, KnowledgeEntry, KnowledgeStatus } from "../types.js";
 
 /**
  * HTTP API for the knowledge server.
@@ -78,6 +78,8 @@ export function createApp(
 		async ({ cues, limit, threshold }) => {
 			try {
 				const result = await activation.activate(cues, { limit, threshold });
+				const cueStr = Array.isArray(cues) ? cues.join(" | ") : cues;
+				logActivation("mcp", cueStr, result.entries);
 
 				if (result.entries.length === 0) {
 					return {
@@ -146,6 +148,46 @@ export function createApp(
 		return timingSafeEqual(provided, expectedToken);
 	}
 
+	// -- Helpers --
+
+	/**
+	 * Log a single activation event to the server log.
+	 *
+	 * Format (one line):
+	 *   [activation/http] q="<query>" → 3 entries: 0.72 fact "...", 0.61 decision "...", ...
+	 *
+	 * caller:
+	 *   "http"             — GET /activate (plugin, direct curl)
+	 *   "mcp"              — MCP activate tool (agent deliberate recall)
+	 *   "claude-code-hook" — POST /hooks/claude-code/user-prompt (passive injection)
+	 *
+	 * Query is truncated to 120 chars so long prompts from the Claude Code hook
+	 * don't flood the log. Entry content is truncated to 60 chars.
+	 */
+	function logActivation(
+		caller: string,
+		query: string,
+		entries: ActivationResult["entries"],
+	): void {
+		const queryPreview = query.length > 120 ? `${query.slice(0, 120)}…` : query;
+		if (entries.length === 0) {
+			logger.log(`[activation/${caller}] q=${JSON.stringify(queryPreview)} → 0 entries`);
+			return;
+		}
+		const entryPreviews = entries
+			.map((r) => {
+				const preview =
+					r.entry.content.length > 60
+						? `${r.entry.content.slice(0, 60)}…`
+						: r.entry.content;
+				return `${r.rawSimilarity.toFixed(2)} ${r.entry.type} ${JSON.stringify(preview)}`;
+			})
+			.join(", ");
+		logger.log(
+			`[activation/${caller}] q=${JSON.stringify(queryPreview)} → ${entries.length} entr${entries.length === 1 ? "y" : "ies"}: ${entryPreviews}`,
+		);
+	}
+
 	// -- Activation --
 
 	app.get("/activate", async (c) => {
@@ -180,6 +222,7 @@ export function createApp(
 				queries.length === 1 ? queries[0] : queries,
 				{ limit, threshold },
 			);
+			logActivation("http", queries.join(" | "), result.entries);
 			return c.json(result);
 		} catch (e) {
 			logger.error("[activate] Error:", e);
@@ -625,6 +668,7 @@ export function createApp(
 
 			try {
 				const result = await activation.activate(prompt, { limit: 8 });
+				logActivation("claude-code-hook", prompt, result.entries);
 
 				if (result.entries.length === 0) {
 					return c.json({});
