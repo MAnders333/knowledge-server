@@ -218,6 +218,7 @@ LLM_BASE_ENDPOINT=https://your-llm-endpoint.example.com
 # LLM_EXTRACTION_MODEL=anthropic/claude-sonnet-4-6
 # LLM_MERGE_MODEL=anthropic/claude-haiku-4-5
 # LLM_CONTRADICTION_MODEL=anthropic/claude-sonnet-4-6
+# LLM_SYNTHESIS_MODEL=anthropic/claude-sonnet-4-6     # cross-session synthesis (defaults to LLM_EXTRACTION_MODEL)
 # EMBEDDING_MODEL=text-embedding-3-large
 # EMBEDDING_DIMENSIONS=3072
 # Example: local Ollama embeddings

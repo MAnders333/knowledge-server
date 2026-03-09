@@ -201,7 +201,7 @@ Registered automatically by `setup-tool claude-code`.
 - `readers/codex.ts` — reads Codex CLI JSONL rollout files, two-pass parse for stable session IDs, skips injected context blocks
 - `readers/vscode.ts` — reads VSCode / GitHub Copilot Chat session JSON files from per-workspace `chatSessions/` directories, extracts user messages and assistant text responses
 - `consolidate.ts` — orchestrates the full cycle: read → extract → reconsolidate → contradiction scan → decay → embed → advance cursor (per source)
-- `llm.ts` — three LLM calls across three model slots: `extractKnowledge` (extraction model), `decideMerge` (merge model — cheaper), `detectAndResolveContradiction` (contradiction model)
+- `llm.ts` — four LLM calls across four model slots: `extractKnowledge` (extraction model), `decideMerge` (merge model — cheaper), `detectAndResolveContradiction` (contradiction model), `synthesizePrinciple` (synthesis model — fires rarely on high-observation entries)
 - `decay.ts` — forgetting curve with type-specific half-lives (facts decay faster than procedures)
 
 ## Setup
@@ -297,6 +297,7 @@ Two options — set one or the other (or both; per-provider credentials take pre
 | `LLM_EXTRACTION_MODEL` | `anthropic/claude-sonnet-4-6` | Model for episode → knowledge extraction. Prefix routes the provider: `anthropic/`, `google/`, `openai/`. |
 | `LLM_MERGE_MODEL` | `anthropic/claude-haiku-4-5` | Model for near-duplicate merge decisions (cheaper — essentially a classification call). |
 | `LLM_CONTRADICTION_MODEL` | `anthropic/claude-sonnet-4-6` | Model for contradiction detection and resolution (nuanced — fires rarely). |
+| `LLM_SYNTHESIS_MODEL` | (inherits `LLM_EXTRACTION_MODEL`) | Model for cross-session principle synthesis. Fires at obs=10, 20, 30, ... Defaults to `LLM_EXTRACTION_MODEL`, then `claude-sonnet-4-6`. |
 | `LLM_TIMEOUT_MS` | `300000` (5 min) | Per-call LLM timeout in ms. Applied per attempt, not across all retries. |
 | `LLM_MAX_RETRIES` | `2` | Number of additional retry attempts on timeout or transient error. `0` disables retries. |
 | `LLM_RETRY_BASE_DELAY_MS` | `3000` | Base delay for exponential backoff between retries (capped at 60s). |
