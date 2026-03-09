@@ -786,7 +786,7 @@ describe("ConsolidationEngine.reconsolidate() — synthesis trigger on 'keep'", 
 				lastSynthesizedObservationCount: null,
 			}),
 		);
-		// A neighbor entry is required so attemptSynthesis has candidates to look at
+		// A neighbor entry is required so runKBSynthesis has candidates to look at
 		db.insertEntry(
 			makeEntry({
 				id: "neighbor-entry",
@@ -810,9 +810,8 @@ describe("ConsolidationEngine.reconsolidate() — synthesis trigger on 'keep'", 
 		spyOn(ConsolidationLLM.prototype, "decideMerge").mockResolvedValue({ action: "keep" });
 		const synthSpy = spyOn(ConsolidationLLM.prototype, "synthesizePrinciple").mockResolvedValue(null);
 
+		// Synthesis runs synchronously inside consolidate() — no setTimeout needed.
 		await engine.consolidate();
-		// Give the fire-and-forget synthesis promise a tick to complete
-		await new Promise((r) => setTimeout(r, 50));
 
 		// obs=2 → reinforced to 3 = threshold → synthesis fires
 		expect(synthSpy).toHaveBeenCalledTimes(1);
@@ -846,8 +845,8 @@ describe("ConsolidationEngine.reconsolidate() — synthesis trigger on 'keep'", 
 		spyOn(ConsolidationLLM.prototype, "decideMerge").mockResolvedValue({ action: "keep" });
 		const synthSpy = spyOn(ConsolidationLLM.prototype, "synthesizePrinciple").mockResolvedValue(null);
 
+		// Synthesis runs synchronously inside consolidate() — no setTimeout needed.
 		await engine.consolidate();
-		await new Promise((r) => setTimeout(r, 10));
 
 		// Next threshold would be 3+3=6, obs=4 < 6 → no re-synthesis
 		expect(synthSpy).not.toHaveBeenCalled();
@@ -856,6 +855,11 @@ describe("ConsolidationEngine.reconsolidate() — synthesis trigger on 'keep'", 
 	it("inserts a synthesized entry and supports relations when synthesis returns a result", async () => {
 		const emb = fakeEmbedding("TypeScript static");
 		const neighborEmb = fakeEmbedding("neighbor content");
+		// A truly orthogonal vector for the synthesized principle so reconsolidate()
+		// treats it as novel (sim=0, well below RECONSOLIDATION_THRESHOLD=0.82).
+		// fakeEmbedding() only uses the first 3 chars of a string and its 8-dim unit
+		// vectors can end up very close regardless of content — use an explicit vector.
+		const synthEmb = [0, 0, 0, 0, 0, 0, 0, 1]; // orthogonal to all fakeEmbedding() outputs
 		db.insertEntry(
 			makeEntry({
 				id: "ts-entry",
@@ -866,7 +870,7 @@ describe("ConsolidationEngine.reconsolidate() — synthesis trigger on 'keep'", 
 				lastSynthesizedObservationCount: null,
 			}),
 		);
-		// Insert a neighbor so attemptSynthesis has entries to look at
+		// Insert a neighbor so runKBSynthesis has entries to look at
 		db.insertEntry(
 			makeEntry({
 				id: "neighbor-1",
@@ -883,7 +887,13 @@ describe("ConsolidationEngine.reconsolidate() — synthesis trigger on 'keep'", 
 		]);
 		spyOn(OpenCodeEpisodeReader.prototype, "getNewEpisodes").mockReturnValue([makeEpisode()]);
 		spyOn(activation, "ensureEmbeddings").mockResolvedValue(0);
-		spyOn(activation.embeddings, "embed").mockResolvedValue(emb);
+		// First call: embed for the extracted entry (in reconsolidate, uses formatEmbeddingText).
+		// Second call: embed for the synthesized principle in runKBSynthesis — return orthogonal vec.
+		let embedCallCount = 0;
+		spyOn(activation.embeddings, "embed").mockImplementation(async () => {
+			embedCallCount++;
+			return embedCallCount === 1 ? emb : synthEmb;
+		});
 		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockResolvedValue([
 			{ type: "fact", content: "TypeScript uses static types.", topics: ["typescript"], confidence: 0.88, scope: "personal", source: "test" },
 		]);
@@ -896,8 +906,8 @@ describe("ConsolidationEngine.reconsolidate() — synthesis trigger on 'keep'", 
 			sourceIds: ["neighbor-1"],
 		});
 
+		// Synthesis now runs synchronously inside consolidate() — no setTimeout needed.
 		await engine.consolidate();
-		await new Promise((r) => setTimeout(r, 50));
 
 		// A synthesized entry should now exist
 		const allEntries = db.getEntries({});
@@ -1038,8 +1048,8 @@ describe("ConsolidationEngine.reconsolidate() — synthesis trigger on 'update'"
 		});
 		const synthSpy = spyOn(ConsolidationLLM.prototype, "synthesizePrinciple").mockResolvedValue(null);
 
+		// Synthesis runs synchronously inside consolidate() — no setTimeout needed.
 		await engine.consolidate();
-		await new Promise((r) => setTimeout(r, 50));
 
 		// obs=2 → update increments to 3 = threshold → synthesis fires
 		expect(synthSpy).toHaveBeenCalledTimes(1);
@@ -1080,8 +1090,8 @@ describe("ConsolidationEngine.reconsolidate() — synthesis trigger on 'update'"
 		});
 		const synthSpy = spyOn(ConsolidationLLM.prototype, "synthesizePrinciple").mockResolvedValue(null);
 
+		// Synthesis runs synchronously inside consolidate() — no setTimeout needed.
 		await engine.consolidate();
-		await new Promise((r) => setTimeout(r, 10));
 
 		expect(synthSpy).not.toHaveBeenCalled();
 	});

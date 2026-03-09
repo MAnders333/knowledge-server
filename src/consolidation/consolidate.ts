@@ -177,6 +177,13 @@ export class ConsolidationEngine {
 			`[consolidation] Generated embeddings for ${embeddedCount} entries.`,
 		);
 
+		// KB-wide synthesis pass: cluster well-reinforced entries and attempt to
+		// synthesize higher-order principles. Runs after ensureEmbeddings so all
+		// entries (including those just inserted this run) have embeddings.
+		// Synthesis results go through reconsolidate() for deduplication — existing
+		// equivalent principles block duplicate insertion.
+		await this.reconsolidator.runKBSynthesis();
+
 		this.db.updateConsolidationState({
 			lastConsolidatedAt: Date.now(),
 			totalSessionsProcessed:

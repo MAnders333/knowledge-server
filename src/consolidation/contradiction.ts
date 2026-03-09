@@ -30,8 +30,22 @@ export class ContradictionScanner {
 	/**
 	 * Run the contradiction scan for all changed entries in a chunk.
 	 *
-	 * Only scans entries that were inserted or updated during this chunk (changedIds).
-	 * Pre-existing entries were already checked in a prior consolidation run.
+	 * Two passes:
+	 *
+	 * Pass 1 — pre-existing vs new (DB query).
+	 *   For each newly changed entry, query the DB for topic-overlapping pre-existing
+	 *   entries (changedIds excluded). Pre-existing entries were already checked in a
+	 *   prior consolidation run so they're only candidates, not initiators.
+	 *
+	 * Pass 2 — intra-chunk pairs (entriesMap).
+	 *   Entries inserted or updated in the same chunk are excluded from the DB query
+	 *   (decideMerge handles the sim ≥ 0.82 paths; entries that fall in the mid-band
+	 *   between two chunk-inserted entries are never scanned otherwise). This pass
+	 *   checks changedIds entries against each other using the in-memory entriesMap.
+	 *   Only pairs where NEITHER has been through decideMerge together are candidates:
+	 *   if two entries were compared by decideMerge, they were at sim ≥ 0.82 and the
+	 *   result was "insert" (both kept) — decideMerge already handled the merge question
+	 *   so only the mid-band [minSim, 0.82) pairs are worth scanning here too.
 	 *
 	 * Returns counts of detected and resolved contradictions.
 	 */
@@ -58,10 +72,9 @@ export class ContradictionScanner {
 			if (supersededInThisScan.has(entry.id)) continue;
 			if (!entry.topics.length || !entry.embedding) continue;
 
-			// Find topic-overlapping active entries, excluding only entries changed this chunk.
-			// Pre-existing entries NOT changed this chunk are valid contradiction candidates.
-			// Changed entries are excluded because decideMerge already handled them (sim ≥ 0.82
-			// paths) or they're the entry we're checking right now.
+			// Pass 1: Find topic-overlapping pre-existing entries from DB.
+			// Exclude all changedIds — they were either handled by decideMerge (sim ≥ 0.82)
+			// or will be covered in pass 2 (intra-chunk pairs, below).
 			const candidates = this.db.getEntriesWithOverlappingTopics(
 				entry.topics,
 				[...changedIds], // only exclude chunk-changed entries, not all of entriesMap
@@ -170,6 +183,130 @@ export class ContradictionScanner {
 			}
 
 			if (entrySuperseded) continue;
+		}
+
+		// Pass 2 — intra-chunk pairs.
+		// Scan each changedId against all later changedIds (upper triangle only — each
+		// unordered pair is checked exactly once). Uses the in-memory entriesMap so
+		// entries that exist only in memory (not yet committed via ensureEmbeddings)
+		// are still visible. The DB query in pass 1 excluded all changedIds, so any
+		// mid-band contradiction between two chunk-inserted entries was missed above.
+		const changedArr = [...changedIds];
+		for (let i = 0; i < changedArr.length; i++) {
+			const entryA = entriesMap.get(changedArr[i]);
+			if (!entryA) continue; // deleted (superseded in pass 1 or earlier in this pass)
+			if (supersededInThisScan.has(entryA.id)) continue;
+			if (!entryA.topics.length || !entryA.embedding) continue;
+
+			const intraChunkCandidates: Array<
+				KnowledgeEntry & { embedding: number[] }
+			> = [];
+			for (let j = i + 1; j < changedArr.length; j++) {
+				const entryB = entriesMap.get(changedArr[j]);
+				if (!entryB) continue;
+				if (supersededInThisScan.has(entryB.id)) continue;
+				if (!entryB.embedding) continue;
+
+				// Only topic-overlapping pairs are worth scanning
+				const hasTopicOverlap = entryA.topics.some((t) =>
+					entryB.topics.includes(t),
+				);
+				if (!hasTopicOverlap) continue;
+
+				const sim = cosineSimilarity(entryA.embedding, entryB.embedding);
+				// Only mid-band: sim ≥ 0.82 was already handled by decideMerge (the
+				// "insert" decision means decideMerge considered them distinct; contradiction
+				// scan is the right follow-up for mid-band pairs that weren't compared at all).
+				if (sim >= minSim && sim < RECONSOLIDATION_THRESHOLD) {
+					intraChunkCandidates.push(entryB);
+				}
+			}
+
+			if (intraChunkCandidates.length === 0) continue;
+
+			logger.log(
+				`[contradiction] Intra-chunk: checking ${intraChunkCandidates.length} same-chunk candidates for "${entryA.content.slice(0, 60)}..."`,
+			);
+
+			const validCandidateIds = new Set(intraChunkCandidates.map((c) => c.id));
+			const llmStart = Date.now();
+			const results = await this.llm.detectAndResolveContradiction(
+				{
+					id: entryA.id,
+					content: entryA.content,
+					type: entryA.type,
+					topics: entryA.topics,
+					confidence: entryA.confidence,
+					createdAt: entryA.createdAt,
+				},
+				intraChunkCandidates.map((c) => ({
+					id: c.id,
+					content: c.content,
+					type: c.type,
+					topics: c.topics,
+					confidence: c.confidence,
+					createdAt: c.createdAt,
+				})),
+			);
+			logger.log(
+				`[contradiction] Intra-chunk LLM responded in ${((Date.now() - llmStart) / 1000).toFixed(1)}s (${intraChunkCandidates.length} candidates).`,
+			);
+
+			let entryASuperseded = false;
+			for (const result of results) {
+				if (!validCandidateIds.has(result.candidateId)) {
+					logger.warn(
+						`[contradiction] Intra-chunk: LLM returned candidateId "${result.candidateId}" not in candidate list — skipping`,
+					);
+					continue;
+				}
+				detected++;
+				logger.log(
+					`[contradiction] Intra-chunk ${result.resolution}: "${entryA.content.slice(0, 50)}..." vs candidate ${result.candidateId.slice(0, 8)}... — ${result.reason}`,
+				);
+
+				const mergedData =
+					result.resolution === "merge" &&
+					result.mergedContent &&
+					result.mergedType &&
+					result.mergedTopics &&
+					result.mergedConfidence !== undefined
+						? {
+								content: result.mergedContent,
+								type: result.mergedType,
+								topics: result.mergedTopics,
+								confidence: result.mergedConfidence,
+							}
+						: undefined;
+
+				this.db.applyContradictionResolution(
+					result.resolution,
+					entryA.id,
+					result.candidateId,
+					mergedData,
+				);
+
+				if (result.resolution !== "irresolvable") {
+					resolved++;
+				}
+
+				if (
+					result.resolution === "supersede_old" ||
+					result.resolution === "merge"
+				) {
+					supersededInThisScan.add(result.candidateId);
+					entriesMap.delete(result.candidateId);
+				}
+
+				if (result.resolution === "supersede_new") {
+					supersededInThisScan.add(entryA.id);
+					entriesMap.delete(entryA.id);
+					entryASuperseded = true;
+					break;
+				}
+			}
+
+			if (entryASuperseded) continue;
 		}
 
 		if (detected > 0) {
