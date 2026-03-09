@@ -9,7 +9,7 @@
  * - procedure: A learned workflow or process ("to deploy to prod, first run X then Y")
  */
 /** Single source of truth for valid entry types — mirrors the SQLite CHECK constraint in schema.ts. */
-export const KNOWLEDGE_TYPES = [
+const KNOWLEDGE_TYPES = [
 	"fact",
 	"principle",
 	"pattern",
@@ -56,7 +56,7 @@ export type KnowledgeStatus =
 	| "tombstoned";
 
 /** Single source of truth for valid entry scopes — mirrors the SQLite CHECK constraint in schema.ts. */
-export const KNOWLEDGE_SCOPES = ["personal", "team"] as const;
+const KNOWLEDGE_SCOPES = ["personal", "team"] as const;
 
 /**
  * Whether this knowledge is relevant only to the individual or to the whole team.

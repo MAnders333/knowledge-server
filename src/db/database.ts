@@ -306,24 +306,6 @@ export class KnowledgeDB {
 		return row ? this.rowToEntry(row) : null;
 	}
 
-	/**
-	 * Fetch only the embedding for a single entry. Used as a cheap fallback
-	 * when the entry object is available but its embedding field is absent —
-	 * avoids loading the entire active KB just to find one vector.
-	 */
-	getEntryEmbedding(id: string): number[] | null {
-		const row = this.db
-			.prepare("SELECT embedding FROM knowledge_entry WHERE id = ?")
-			.get(id) as { embedding: Uint8Array | null } | null;
-		if (!row?.embedding) return null;
-		const float32 = new Float32Array(
-			row.embedding.buffer,
-			row.embedding.byteOffset,
-			row.embedding.byteLength / 4,
-		);
-		return Array.from(float32);
-	}
-
 	getActiveEntries(): KnowledgeEntry[] {
 		const rows = this.db
 			.prepare(

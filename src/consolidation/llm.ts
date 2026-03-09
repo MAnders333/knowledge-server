@@ -7,7 +7,6 @@ import { logger } from "../logger.js";
 import { clampKnowledgeScope, clampKnowledgeType } from "../types.js";
 import type {
 	Episode,
-	KnowledgeEntry,
 	KnowledgeScope,
 	KnowledgeType,
 } from "../types.js";
@@ -727,20 +726,6 @@ export interface ContradictionResult {
 // ── Prompt formatting helpers ─────────────────────────────────────────────────
 // These live here because they produce text that goes directly into LLM prompts.
 // Keeping them adjacent to the LLM call methods makes prompt changes easy to review.
-
-/**
- * Format existing knowledge entries for the LLM context.
- * This is the "existing mental model" that new episodes are consolidated against.
- */
-export function formatExistingKnowledge(entries: KnowledgeEntry[]): string {
-	if (entries.length === 0) return "";
-	return entries
-		.map(
-			(e) =>
-				`- [${e.type}] ${e.content} (topics: ${e.topics.join(", ")}; confidence: ${e.confidence}; scope: ${e.scope})`,
-		)
-		.join("\n");
-}
 
 /**
  * Format a batch of episodes into a text summary for the LLM.

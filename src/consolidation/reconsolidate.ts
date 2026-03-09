@@ -13,13 +13,6 @@ import { computeStrength } from "./decay.js";
 import type { ConsolidationLLM, ExtractedKnowledge } from "./llm.js";
 
 /**
- * Maximum number of existing knowledge entries to include as context
- * for each chunk's LLM call. Using embedding similarity to select
- * only the most relevant entries keeps the context focused and fast.
- */
-const MAX_RELEVANT_KNOWLEDGE = 50;
-
-/**
  * Number of KB neighbors to include in a synthesis call.
  * Analogous to the hippocampal neighborhood — enough to find structural
  * commonality without diluting the synthesis with distant entries.
@@ -35,7 +28,6 @@ const SYNTHESIS_NEIGHBORS = 5;
  * - Find the nearest existing entry by cosine similarity
  * - If above RECONSOLIDATION_THRESHOLD: ask the LLM to decide keep/update/replace/insert
  * - If below threshold: insert directly as a novel entry
- * - Also provides getRelevantKnowledge() to select a focused subset of the KB for the LLM prompt
  */
 export class Reconsolidator {
 	private db: KnowledgeDB;
@@ -528,40 +520,4 @@ export class Reconsolidator {
 		return newEntry;
 	}
 
-	/**
-	 * Retrieve existing knowledge entries that are relevant to a chunk of episodes.
-	 *
-	 * Instead of sending ALL existing knowledge to the LLM (which grows linearly
-	 * and bloats the prompt), we embed the chunk content and use cosine similarity
-	 * to find only the most relevant entries. This:
-	 * - Keeps the prompt focused (better conflict detection)
-	 * - Reduces token cost
-	 * - Scales to thousands of entries without degradation
-	 */
-	async getRelevantKnowledge(
-		chunkSummary: string,
-		allEntries: Array<KnowledgeEntry & { embedding: number[] }>,
-	): Promise<KnowledgeEntry[]> {
-		if (allEntries.length === 0) return [];
-
-		// If the knowledge base is small enough, just return everything
-		if (allEntries.length <= MAX_RELEVANT_KNOWLEDGE) {
-			return allEntries;
-		}
-
-		// Embed the chunk content (truncated to a reasonable size for embedding)
-		const embeddingText = chunkSummary.slice(0, 8000);
-		const chunkEmbedding = await this.embeddings.embed(embeddingText);
-
-		// Score all entries by similarity to the chunk
-		const scored = allEntries
-			.map((entry) => ({
-				entry,
-				similarity: cosineSimilarity(chunkEmbedding, entry.embedding),
-			}))
-			.sort((a, b) => b.similarity - a.similarity)
-			.slice(0, MAX_RELEVANT_KNOWLEDGE);
-
-		return scored.map((s) => s.entry);
-	}
 }

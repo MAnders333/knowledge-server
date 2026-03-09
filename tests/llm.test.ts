@@ -6,14 +6,13 @@
  *   - JSON parsing strategies (clean JSON, code-fenced, bracket-match, partial-array)
  *   - Response filtering (bad types, missing fields, no_conflict elision)
  *   - Safe defaults on parse failure (decideMerge → "insert", extractKnowledge → [])
- *   - formatEpisodes / formatExistingKnowledge output shape
+ *   - formatEpisodes output shape
  */
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as aiModule from "ai";
 import {
 	ConsolidationLLM,
 	formatEpisodes,
-	formatExistingKnowledge,
 } from "../src/consolidation/llm";
 import type { Episode } from "../src/types";
 
@@ -91,51 +90,6 @@ describe("formatEpisodes", () => {
 	});
 });
 
-// ── formatExistingKnowledge ───────────────────────────────────────────────────
-
-describe("formatExistingKnowledge", () => {
-	const entry = {
-		id: "e1",
-		type: "fact" as const,
-		content: "The server runs on port 8080.",
-		topics: ["server", "config"],
-		confidence: 0.9,
-		scope: "team" as const,
-		status: "active" as const,
-		strength: 0.9,
-		createdAt: Date.now(),
-		updatedAt: Date.now(),
-		lastAccessedAt: Date.now(),
-		accessCount: 0,
-		observationCount: 1,
-		supersededBy: null,
-		derivedFrom: [],
-	};
-
-	it("formats entries with type, content, topics, confidence, scope", () => {
-		const out = formatExistingKnowledge([entry]);
-		expect(out).toContain("[fact]");
-		expect(out).toContain("port 8080");
-		expect(out).toContain("server");
-		expect(out).toContain("0.9");
-		expect(out).toContain("team");
-	});
-
-	it("returns empty string for empty array", () => {
-		expect(formatExistingKnowledge([])).toBe("");
-	});
-
-	it("emits one line per entry", () => {
-		const lines = formatExistingKnowledge([
-			entry,
-			{ ...entry, id: "e2", content: "Another fact." },
-		])
-			.split("\n")
-			.filter(Boolean);
-		expect(lines.length).toBe(2);
-	});
-});
-
 // ── ConsolidationLLM.extractKnowledge ────────────────────────────────────────
 
 describe("ConsolidationLLM.extractKnowledge", () => {
@@ -157,7 +111,7 @@ describe("ConsolidationLLM.extractKnowledge", () => {
 				},
 			]),
 		);
-		const result = await llm.extractKnowledge("episodes", "existing");
+		const result = await llm.extractKnowledge("episodes");
 		expect(result.length).toBe(1);
 		expect(result[0].content).toBe("TypeScript is statically typed.");
 	});
@@ -174,7 +128,7 @@ describe("ConsolidationLLM.extractKnowledge", () => {
 			},
 		]);
 		mockGenerateText(`\`\`\`json\n${body}\n\`\`\``);
-		const result = await llm.extractKnowledge("episodes", "existing");
+		const result = await llm.extractKnowledge("episodes");
 		expect(result.length).toBe(1);
 		expect(result[0].type).toBe("principle");
 	});
@@ -191,7 +145,7 @@ describe("ConsolidationLLM.extractKnowledge", () => {
 			},
 		]);
 		mockGenerateText(`Here is the result:\n${json}\nThat's all.`);
-		const result = await llm.extractKnowledge("episodes", "existing");
+		const result = await llm.extractKnowledge("episodes");
 		expect(result.length).toBe(1);
 	});
 
@@ -199,7 +153,7 @@ describe("ConsolidationLLM.extractKnowledge", () => {
 		// Simulate a response truncated mid-second-object
 		const partial = `[{"type":"fact","content":"Entry one.","topics":["a"],"confidence":0.9,"scope":"personal","source":"t"},{"type":"fact","content":"Entry two tr`;
 		mockGenerateText(partial);
-		const result = await llm.extractKnowledge("episodes", "existing");
+		const result = await llm.extractKnowledge("episodes");
 		// Strategy 4 should recover the first complete object
 		expect(result.length).toBeGreaterThanOrEqual(1);
 		expect(result[0].content).toBe("Entry one.");
@@ -207,7 +161,7 @@ describe("ConsolidationLLM.extractKnowledge", () => {
 
 	it("returns [] when the response is unparseable", async () => {
 		mockGenerateText("I'm sorry, I cannot help with that.");
-		const result = await llm.extractKnowledge("episodes", "existing");
+		const result = await llm.extractKnowledge("episodes");
 		expect(result).toEqual([]);
 	});
 
@@ -234,7 +188,7 @@ describe("ConsolidationLLM.extractKnowledge", () => {
 				},
 			]),
 		);
-		const result = await llm.extractKnowledge("episodes", "existing");
+		const result = await llm.extractKnowledge("episodes");
 		expect(result.length).toBe(2);
 		expect(result[0].type).toBe("fact"); // clamped from "INVALID"
 		expect(result[1].content).toBe("Good entry.");
@@ -261,7 +215,7 @@ describe("ConsolidationLLM.extractKnowledge", () => {
 				},
 			]),
 		);
-		const result = await llm.extractKnowledge("episodes", "existing");
+		const result = await llm.extractKnowledge("episodes");
 		expect(result.length).toBe(1);
 	});
 
@@ -278,7 +232,7 @@ describe("ConsolidationLLM.extractKnowledge", () => {
 				},
 			]),
 		);
-		const result = await llm.extractKnowledge("episodes", "existing");
+		const result = await llm.extractKnowledge("episodes");
 		expect(result.length).toBe(1);
 		expect(result[0].scope).toBe("team");
 	});
@@ -296,7 +250,7 @@ describe("ConsolidationLLM.extractKnowledge", () => {
 				},
 			]),
 		);
-		const result = await llm.extractKnowledge("episodes", "existing");
+		const result = await llm.extractKnowledge("episodes");
 		expect(result.length).toBe(1);
 		expect(result[0].scope).toBe("personal");
 	});
@@ -316,7 +270,7 @@ describe("ConsolidationLLM.extractKnowledge", () => {
 				},
 			]),
 		);
-		const result = await llm.extractKnowledge("episodes", "existing");
+		const result = await llm.extractKnowledge("episodes");
 		expect(result.length).toBe(1);
 		expect(result[0].scope).toBe("personal");
 	});

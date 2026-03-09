@@ -23,8 +23,6 @@ import { ConsolidationEngine } from "../src/consolidation/consolidate";
 import { ConsolidationLLM } from "../src/consolidation/llm";
 import { OpenCodeEpisodeReader } from "../src/consolidation/readers/opencode";
 import { KnowledgeDB } from "../src/db/database";
-import { RECONSOLIDATION_THRESHOLD } from "../src/types";
-
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 import { fakeEmbedding, makeEntry } from "./fixtures";
