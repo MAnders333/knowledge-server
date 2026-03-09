@@ -1,5 +1,27 @@
 # Changelog
 
+## [2.5.0](https://github.com/MAnders333/knowledge-server/compare/v2.4.1...v2.5.0) (2026-03-09)
+
+
+### Features
+
+* **consolidation:** cross-session synthesis via observation threshold ([42e480b](https://github.com/MAnders333/knowledge-server/commit/42e480bcc8791a696a9fd5ba7970be97bcc76202))
+* **embedding:** auto re-embed all entries when embedding model changes ([5576a91](https://github.com/MAnders333/knowledge-server/commit/5576a9158a85fe2f5b33eb8410b1f42f0323332e))
+* **embedding:** auto re-embed all entries when embedding model changes ([#30](https://github.com/MAnders333/knowledge-server/issues/30)) ([1fa5e82](https://github.com/MAnders333/knowledge-server/commit/1fa5e820f540fa87b24de1b19d8218130fe274ef))
+* **synthesis:** add dedicated LLM_SYNTHESIS_MODEL config slot ([0920f4d](https://github.com/MAnders333/knowledge-server/commit/0920f4d94e6a8017967ef576144efdc88c25e317))
+* **synthesis:** replace per-entry trigger with KB-wide cluster synthesis pass ([145daef](https://github.com/MAnders333/knowledge-server/commit/145daefb728156f653effa92c2e23b5cc32e58e8))
+
+
+### Bug Fixes
+
+* **embedding:** address post-merge review findings ([8d88e5d](https://github.com/MAnders333/knowledge-server/commit/8d88e5db8ab19e3a9ab6c01134c5902dd319f6f1))
+* **embedding:** address review findings — correct v7/v8 references, harden migrations ([09a715e](https://github.com/MAnders333/knowledge-server/commit/09a715e747d7f73de1c7684c1fd137fa040d0e72))
+* **embedding:** re-embed in-place to avoid broken activation on failure ([f9dee69](https://github.com/MAnders333/knowledge-server/commit/f9dee69b93a48fddce8ff897a08236976620c445))
+* **stop:** show progress message when draining in-flight consolidation ([4144956](https://github.com/MAnders333/knowledge-server/commit/4144956bdb2dcce44878cee8381e623c4f0cd752))
+* **synthesis:** address post-merge reviewer warnings ([1313cbd](https://github.com/MAnders333/knowledge-server/commit/1313cbd35e87869259cac7daf97e76e8f593b7ad))
+* **synthesis:** address reviewer criticals + embeddings timing gap ([ab02062](https://github.com/MAnders333/knowledge-server/commit/ab02062926d21b68c727f1764e4edfd89789caef))
+* **synthesis:** update stale attemptSynthesis comment to runKBSynthesis ([d106548](https://github.com/MAnders333/knowledge-server/commit/d10654827f10a56dd2f2d8bface5603142bedd1b))
+
 ## [2.4.1](https://github.com/MAnders333/knowledge-server/compare/v2.4.0...v2.4.1) (2026-03-08)
 
 
