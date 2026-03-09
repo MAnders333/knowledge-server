@@ -350,6 +350,186 @@ describe("KnowledgeDB", () => {
 		expect(relations[0].targetId).toBe("e2");
 	});
 
+	// ── Embedding Metadata ──
+
+	it("getEmbeddingMetadata returns null when no metadata exists", () => {
+		const meta = db.getEmbeddingMetadata();
+		expect(meta).toBeNull();
+	});
+
+	it("setEmbeddingMetadata creates singleton row and getEmbeddingMetadata reads it", () => {
+		db.setEmbeddingMetadata("text-embedding-3-small", 1536);
+		const meta = db.getEmbeddingMetadata();
+		expect(meta).not.toBeNull();
+		expect(meta?.model).toBe("text-embedding-3-small");
+		expect(meta?.dimensions).toBe(1536);
+		expect(meta?.recordedAt).toBeGreaterThan(0);
+	});
+
+	it("setEmbeddingMetadata overwrites previous metadata (upsert)", () => {
+		db.setEmbeddingMetadata("text-embedding-3-small", 1536);
+		db.setEmbeddingMetadata("text-embedding-3-large", 3072);
+		const meta = db.getEmbeddingMetadata();
+		expect(meta?.model).toBe("text-embedding-3-large");
+		expect(meta?.dimensions).toBe(3072);
+	});
+
+	// ── clearAllEmbeddings ──
+
+	it("clearAllEmbeddings NULLs embeddings on active and conflicted entries", () => {
+		const now = Date.now();
+		const emb = [0.1, 0.2, 0.3];
+		db.insertEntry({
+			id: "e1",
+			type: "fact",
+			content: "Active entry",
+			topics: ["t"],
+			confidence: 0.8,
+			source: "test",
+			scope: "personal",
+			status: "active",
+			strength: 1.0,
+			createdAt: now,
+			updatedAt: now,
+			lastAccessedAt: now,
+			accessCount: 0,
+			observationCount: 1,
+			supersededBy: null,
+			derivedFrom: [],
+			embedding: emb,
+		});
+		db.insertEntry({
+			id: "e2",
+			type: "fact",
+			content: "Conflicted entry",
+			topics: ["t"],
+			confidence: 0.8,
+			source: "test",
+			scope: "personal",
+			status: "conflicted",
+			strength: 1.0,
+			createdAt: now,
+			updatedAt: now,
+			lastAccessedAt: now,
+			accessCount: 0,
+			observationCount: 1,
+			supersededBy: null,
+			derivedFrom: [],
+			embedding: emb,
+		});
+		db.insertEntry({
+			id: "e3",
+			type: "fact",
+			content: "Superseded entry",
+			topics: ["t"],
+			confidence: 0.8,
+			source: "test",
+			scope: "personal",
+			status: "superseded",
+			strength: 1.0,
+			createdAt: now,
+			updatedAt: now,
+			lastAccessedAt: now,
+			accessCount: 0,
+			observationCount: 1,
+			supersededBy: "e1",
+			derivedFrom: [],
+			embedding: emb,
+		});
+
+		const cleared = db.clearAllEmbeddings();
+		expect(cleared).toBe(2); // only active + conflicted
+
+		expect(db.getEntry("e1")?.embedding).toBeUndefined();
+		expect(db.getEntry("e2")?.embedding).toBeUndefined();
+		// Superseded entry should retain its embedding
+		expect(db.getEntry("e3")?.embedding).toBeDefined();
+	});
+
+	it("clearAllEmbeddings returns 0 when no embeddings exist", () => {
+		const cleared = db.clearAllEmbeddings();
+		expect(cleared).toBe(0);
+	});
+
+	// ── getEntriesMissingEmbeddings ──
+
+	it("getEntriesMissingEmbeddings returns only active/conflicted entries without embeddings", () => {
+		const now = Date.now();
+		// Active with embedding — should NOT be returned
+		db.insertEntry({
+			id: "has-emb",
+			type: "fact",
+			content: "Has embedding",
+			topics: ["t"],
+			confidence: 0.8,
+			source: "test",
+			scope: "personal",
+			status: "active",
+			strength: 1.0,
+			createdAt: now,
+			updatedAt: now,
+			lastAccessedAt: now,
+			accessCount: 0,
+			observationCount: 1,
+			supersededBy: null,
+			derivedFrom: [],
+			embedding: [0.1, 0.2],
+		});
+		// Active without embedding — should be returned
+		db.insertEntry({
+			id: "no-emb",
+			type: "fact",
+			content: "No embedding",
+			topics: ["t"],
+			confidence: 0.8,
+			source: "test",
+			scope: "personal",
+			status: "active",
+			strength: 1.0,
+			createdAt: now,
+			updatedAt: now,
+			lastAccessedAt: now,
+			accessCount: 0,
+			observationCount: 1,
+			supersededBy: null,
+			derivedFrom: [],
+		});
+		// Superseded without embedding — should NOT be returned
+		db.insertEntry({
+			id: "superseded-no-emb",
+			type: "fact",
+			content: "Superseded",
+			topics: ["t"],
+			confidence: 0.8,
+			source: "test",
+			scope: "personal",
+			status: "superseded",
+			strength: 1.0,
+			createdAt: now,
+			updatedAt: now,
+			lastAccessedAt: now,
+			accessCount: 0,
+			observationCount: 1,
+			supersededBy: "has-emb",
+			derivedFrom: [],
+		});
+
+		const missing = db.getEntriesMissingEmbeddings();
+		expect(missing.length).toBe(1);
+		expect(missing[0].id).toBe("no-emb");
+	});
+
+	// ── reinitialize clears embedding_metadata ──
+
+	it("reinitialize clears embedding_metadata", () => {
+		db.setEmbeddingMetadata("test-model", 128);
+		expect(db.getEmbeddingMetadata()).not.toBeNull();
+
+		db.reinitialize();
+
+		expect(db.getEmbeddingMetadata()).toBeNull();
+	});
+
 	it("should return correct stats", () => {
 		const now = Date.now();
 		const makeEntry = (id: string, status: string) => ({
