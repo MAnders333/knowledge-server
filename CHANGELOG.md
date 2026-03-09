@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.6.1](https://github.com/MAnders333/knowledge-server/compare/v2.6.0...v2.6.1) (2026-03-09)
+
+
+### Bug Fixes
+
+* **logs:** route synthesis reconsolidation under [synthesis] prefix; wrap user content with JSON.stringify; fix switch-case indentation regression ([e97487b](https://github.com/MAnders333/knowledge-server/commit/e97487b22cf8765f0eabe978660b846d26fb6187))
+* **stop:** replace misleading consolidation-specific drain message ([a5f8937](https://github.com/MAnders333/knowledge-server/commit/a5f8937fef9182561f569c5e4a346d767dd87fd2))
+
 ## [2.6.0](https://github.com/MAnders333/knowledge-server/compare/v2.5.0...v2.6.0) (2026-03-09)
 
 
