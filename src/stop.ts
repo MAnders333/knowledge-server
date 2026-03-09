@@ -74,7 +74,12 @@ export async function runStop(pidPath: string): Promise<void> {
 	// declare failure while the server is still draining in-flight LLM calls.
 	const STOP_TIMEOUT_MS = 35_000;
 	const POLL_INTERVAL_MS = 100;
-	const CONSOLIDATION_NOTICE_MS = 2_000; // warn after this long that we're draining
+	// Print a notice if the server is still alive after this long. The server
+	// drains in-flight LLM/consolidation work before exiting, so a slow shutdown
+	// is normal and expected — this message tells the user to keep waiting rather
+	// than Ctrl-C prematurely. Note: the notice fires based on elapsed time only;
+	// we have no direct visibility into whether consolidation is actually running.
+	const NOTICE_MS = 2_000;
 	const deadline = Date.now() + STOP_TIMEOUT_MS;
 	const start = Date.now();
 	let noticePrinted = false;
@@ -83,11 +88,9 @@ export async function runStop(pidPath: string): Promise<void> {
 		await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
 		try {
 			process.kill(pid, 0); // still alive — keep waiting
-			// Print a one-time notice if we've been waiting longer than expected
-			// (i.e. a consolidation batch is in-flight and draining gracefully).
-			if (!noticePrinted && Date.now() - start >= CONSOLIDATION_NOTICE_MS) {
+			if (!noticePrinted && Date.now() - start >= NOTICE_MS) {
 				console.log(
-					`Waiting for in-flight consolidation to finish (up to ${Math.round(STOP_TIMEOUT_MS / 1000)}s)...`,
+					`Server is taking a moment to shut down — draining any in-flight work (up to ${Math.round(STOP_TIMEOUT_MS / 1000)}s)...`,
 				);
 				noticePrinted = true;
 			}
