@@ -98,12 +98,18 @@ export class KnowledgeDB {
 					d.table === "knowledge_entry" &&
 					d.column === "last_synthesized_observation_count",
 			) &&
-			// Only attempt if the sole entry-level drift is the synthesis column —
-			// if other knowledge_entry columns are also absent we fall through to the
-			// full reset so all gaps are resolved. The embedding_metadata table drift
-			// is expected (handled by the v7→v8 migration below) and excluded.
-			missingColumns.filter((d) => d.table !== "embedding_metadata").length ===
-				1
+			// Only attempt if the sole non-embedding_metadata drift is the synthesis
+			// column — if other knowledge_entry columns are also absent we fall
+			// through to the full reset so all gaps are resolved. Drift from new
+			// tables (e.g. embedding_metadata) introduced by later migrations is
+			// excluded so it doesn't block this migration.
+			missingColumns
+				.filter((d) => d.table !== "embedding_metadata")
+				.every(
+					(d) =>
+						d.table === "knowledge_entry" &&
+						d.column === "last_synthesized_observation_count",
+				)
 		) {
 			logger.log(
 				"[db] Applying incremental migration v6 → v7: adding last_synthesized_observation_count column.",
@@ -154,7 +160,7 @@ export class KnowledgeDB {
 					.prepare(
 						"INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
 					)
-					.run(SCHEMA_VERSION, Date.now());
+					.run(8, Date.now());
 			})();
 			incrementalMigrationApplied = true;
 			logger.log("[db] Incremental migration v7 → v8 complete.");
@@ -385,6 +391,25 @@ export class KnowledgeDB {
 			.filter(
 				(e): e is KnowledgeEntry & { embedding: number[] } => !!e.embedding,
 			);
+	}
+
+	/**
+	 * Get a single active or conflicted entry that has an embedding.
+	 * Used to probe embedding dimensions without loading all entries into memory.
+	 */
+	getOneEntryWithEmbedding(): (KnowledgeEntry & { embedding: number[] }) | null {
+		const row = this.db
+			.prepare(
+				"SELECT * FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL LIMIT 1",
+			)
+			.get() as RawEntryRow | undefined;
+
+		if (!row) return null;
+
+		const entry = this.rowToEntry(row);
+		if (!entry.embedding) return null;
+
+		return entry as KnowledgeEntry & { embedding: number[] };
 	}
 
 	/**
@@ -1248,7 +1273,7 @@ export class KnowledgeDB {
 
 	/**
 	 * Get the stored embedding model metadata.
-	 * Returns null if no metadata has been recorded yet (first run, or pre-v7 DB).
+	 * Returns null if no metadata has been recorded yet (first run, or pre-v8 DB).
 	 */
 	getEmbeddingMetadata(): {
 		model: string;
@@ -1288,8 +1313,9 @@ export class KnowledgeDB {
 
 	/**
 	 * NULL out all embeddings on active and conflicted entries.
-	 * Used when the embedding model changes — forces ensureEmbeddings() to
-	 * regenerate every vector with the new model.
+	 * Retained as an escape hatch for manual recovery (e.g. corrupted embeddings)
+	 * even though the normal model-change path uses in-place re-embed via
+	 * checkAndReEmbed() instead of clearing.
 	 *
 	 * Returns the number of entries whose embeddings were cleared.
 	 */

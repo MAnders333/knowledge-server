@@ -183,14 +183,14 @@ export class ConsolidationEngine {
 		const embeddingMeta = this.db.getEmbeddingMetadata();
 		const metadataStale = embeddingMeta && embeddingMeta.model !== config.embedding.model;
 		if (embeddedCount > 0 && (!embeddingMeta || metadataStale)) {
-			const sample = this.db.getActiveEntriesWithEmbeddings();
-			if (sample.length > 0) {
+			const sample = this.db.getOneEntryWithEmbedding();
+			if (sample) {
 				this.db.setEmbeddingMetadata(
 					config.embedding.model,
-					sample[0].embedding.length,
+					sample.embedding.length,
 				);
 				logger.log(
-					`[embedding] Recorded embedding model: ${config.embedding.model} (${sample[0].embedding.length} dimensions).`,
+					`[embedding] Recorded embedding model: ${config.embedding.model} (${sample.embedding.length} dimensions).`,
 				);
 			}
 		}
