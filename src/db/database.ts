@@ -51,8 +51,7 @@ export class KnowledgeDB {
 	}
 
 	private initialize(): void {
-		// Bootstrap schema_version table first (no IF NOT EXISTS risk since it's fresh here).
-		// We need it to exist before we can check the version.
+		// Bootstrap schema_version table first so we can read the current version.
 		this.db.exec(`
       CREATE TABLE IF NOT EXISTS schema_version (
         version INTEGER NOT NULL,
@@ -60,174 +59,125 @@ export class KnowledgeDB {
       );
     `);
 
-		const row = this.db
-			.prepare(
-				"SELECT version FROM schema_version ORDER BY version DESC LIMIT 1",
-			)
-			.get() as { version: number } | null;
+		const currentVersion =
+			(
+				this.db
+					.prepare(
+						"SELECT version FROM schema_version ORDER BY version DESC LIMIT 1",
+					)
+					.get() as { version: number } | null
+			)?.version ?? 0;
 
-		const existingVersion = row?.version ?? 0;
-
-		// v6 → v7: additive migration — create embedding_metadata table.
-		// No data loss needed: the table is new and CREATE IF NOT EXISTS is safe.
-		// The drift check below would otherwise see the missing table columns and
-		// trigger a full destructive reset — this migration prevents that.
-		if (existingVersion === 6) {
-			logger.log(
-				"[db] Migrating schema v6 → v7: adding embedding_metadata table.",
-			);
-			this.db.exec(`
-				CREATE TABLE IF NOT EXISTS embedding_metadata (
-					id INTEGER PRIMARY KEY DEFAULT 1 CHECK(id = 1),
-					model TEXT NOT NULL,
-					dimensions INTEGER NOT NULL,
-					recorded_at INTEGER NOT NULL
-				);
-			`);
-			this.db
-				.prepare(
-					"INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
-				)
-				.run(7, Date.now());
-		}
-
-		// Detect schema drift: compare actual DB columns against EXPECTED_TABLE_COLUMNS
-		// for every table. This is the authoritative check — the version number alone
-		// can be stale if a prior startup wrote the new version to schema_version before
-		// the DROP+recreate completed (e.g. partial run, crash, or reinitialize race).
-		// Keeping EXPECTED_TABLE_COLUMNS in sync with CREATE_TABLES means adding a new
-		// column to the DDL automatically gets caught here without touching this method.
-		const missingColumns = this.getSchemaDrift();
-
-		// ── Incremental migrations ────────────────────────────────────────────────
-		// For additive-only changes (new nullable columns, new tables) we can
-		// ALTER TABLE / CREATE TABLE instead of wiping the DB, preserving existing
-		// knowledge data. Each migration is idempotent: if the column/table already
-		// exists the ALTER/CREATE is skipped (detected via getSchemaDrift before
-		// reaching this block).
+		// ── Migration registry ────────────────────────────────────────────────────
+		// Each entry runs when the DB version is below the target. Migrations are
+		// applied sequentially, each in its own transaction so a crash mid-migration
+		// leaves the DB at the last successfully committed version (re-runnable).
 		//
-		// v6 → v7: adds last_synthesized_observation_count (nullable INTEGER).
-		//   No data loss: existing entries get NULL (= never synthesized), which is
-		//   the correct initial state. Synthesis works correctly from day one.
-		//   ALTER TABLE and version bump are wrapped in a single transaction so a
-		//   crash between them cannot leave the DB in a half-migrated state (column
-		//   added but version still 6, which would re-trigger the wipe path on next
-		//   startup instead of re-running the safe ALTER).
-		//
-		// v7 → v8: adds embedding_metadata table (singleton row tracking the model
-		//   and dimensions of the current embeddings). CREATE TABLE is safe — no
-		//   existing data is touched.
-		let incrementalMigrationApplied = false;
-		if (
-			existingVersion === 6 &&
-			missingColumns.some(
-				(d) =>
-					d.table === "knowledge_entry" &&
-					d.column === "last_synthesized_observation_count",
-			) &&
-			// Only attempt if the sole non-embedding_metadata drift is the synthesis
-			// column — if other knowledge_entry columns are also absent we fall
-			// through to the full reset so all gaps are resolved. Drift from new
-			// tables (e.g. embedding_metadata) introduced by later migrations is
-			// excluded so it doesn't block this migration.
-			missingColumns
-				.filter((d) => d.table !== "embedding_metadata")
-				.every(
-					(d) =>
-						d.table === "knowledge_entry" &&
-						d.column === "last_synthesized_observation_count",
-				)
-		) {
+		// Rules for adding a new migration:
+		//  1. Append a new { version, up } entry — never reorder or modify existing ones.
+		//  2. `up` must be idempotent (use IF NOT EXISTS, PRAGMA checks, etc.).
+		//  3. Only additive changes (new tables, new nullable columns) are safe here.
+		//     Destructive changes (column drops, renames, type changes) that cannot
+		//     be expressed idempotently should fall through to the full reset below.
+		const MIGRATIONS: Array<{
+			version: number;
+			label: string;
+			up: (db: Database) => void;
+		}> = [
+		{
+				version: 8,
+				label: "add embedding_metadata table",
+				up: (db) => {
+					db.exec(`
+						CREATE TABLE IF NOT EXISTS embedding_metadata (
+							id INTEGER PRIMARY KEY DEFAULT 1 CHECK(id = 1),
+							model TEXT NOT NULL,
+							dimensions INTEGER NOT NULL,
+							recorded_at INTEGER NOT NULL
+						);
+					`);
+				},
+			},
+			{
+				version: 9,
+				label: "add cluster tables, drop per-entry synthesis column",
+				up: (db) => {
+					db.exec(`
+						CREATE TABLE IF NOT EXISTS knowledge_cluster (
+							id                         TEXT    PRIMARY KEY,
+							centroid                   BLOB    NOT NULL,
+							member_count               INTEGER NOT NULL DEFAULT 0,
+							last_synthesized_at        INTEGER,
+							last_membership_changed_at INTEGER NOT NULL,
+							created_at                 INTEGER NOT NULL
+						);
+						CREATE TABLE IF NOT EXISTS knowledge_cluster_member (
+							cluster_id  TEXT    NOT NULL REFERENCES knowledge_cluster(id) ON DELETE CASCADE,
+							entry_id    TEXT    NOT NULL REFERENCES knowledge_entry(id)   ON DELETE CASCADE,
+							joined_at   INTEGER NOT NULL,
+							PRIMARY KEY (cluster_id, entry_id)
+						);
+						CREATE INDEX IF NOT EXISTS idx_cluster_membership_changed
+							ON knowledge_cluster(last_membership_changed_at);
+						CREATE INDEX IF NOT EXISTS idx_cluster_member_entry
+							ON knowledge_cluster_member(entry_id);
+					`);
+					// DROP COLUMN requires SQLite ≥ 3.35; Bun ships 3.46+.
+					const hasSynthCol = (
+						db.prepare("PRAGMA table_info(knowledge_entry)").all() as Array<{ name: string }>
+					).some((c) => c.name === "last_synthesized_observation_count");
+					if (hasSynthCol) {
+						db.exec(
+							"ALTER TABLE knowledge_entry DROP COLUMN last_synthesized_observation_count",
+						);
+					}
+				},
+			},
+		];
+
+		let migratedTo = currentVersion;
+		for (const migration of MIGRATIONS) {
+			if (migratedTo >= migration.version) continue;
 			logger.log(
-				"[db] Applying incremental migration v6 → v7: adding last_synthesized_observation_count column.",
+				`[db] Applying incremental migration v${migratedTo} → v${migration.version}: ${migration.label}.`,
 			);
-			// Atomic: if the process crashes mid-transaction, SQLite rolls back both
-			// the ALTER and the version insert, leaving the DB at v6 (re-migratable).
 			this.db.transaction(() => {
-				this.db.exec(
-					"ALTER TABLE knowledge_entry ADD COLUMN last_synthesized_observation_count INTEGER",
-				);
+				migration.up(this.db);
 				this.db
 					.prepare(
 						"INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
 					)
-					.run(7, Date.now());
+					.run(migration.version, Date.now());
 			})();
-			incrementalMigrationApplied = true;
-			logger.log("[db] Incremental migration v6 → v7 complete.");
-		}
-
-		// v7 → v8: additive migration — create embedding_metadata table.
-		// Re-read version in case v6→v7 ran above.
-		const postV7Row = this.db
-			.prepare(
-				"SELECT version FROM schema_version ORDER BY version DESC LIMIT 1",
-			)
-			.get() as { version: number } | null;
-		const postV7Version = postV7Row?.version ?? 0;
-
-		if (postV7Version === 7) {
+			migratedTo = migration.version;
 			logger.log(
-				"[db] Applying incremental migration v7 → v8: adding embedding_metadata table.",
+				`[db] Incremental migration → v${migration.version} complete.`,
 			);
-			this.db.transaction(() => {
-				this.db.exec(`
-					CREATE TABLE IF NOT EXISTS embedding_metadata (
-						id INTEGER PRIMARY KEY DEFAULT 1 CHECK(id = 1),
-						model TEXT NOT NULL,
-						dimensions INTEGER NOT NULL,
-						recorded_at INTEGER NOT NULL
-					);
-				`);
-				this.db
-					.prepare(
-						"INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
-					)
-					.run(8, Date.now());
-			})();
-			incrementalMigrationApplied = true;
-			logger.log("[db] Incremental migration v7 → v8 complete.");
 		}
 		// ─────────────────────────────────────────────────────────────────────────
 
-		// Re-read the current state after any incremental migrations above.
-		// Skipped when an incremental migration succeeded — we know the state is clean.
-		const currentVersion = incrementalMigrationApplied
-			? SCHEMA_VERSION
-			: ((
-					this.db
-						.prepare(
-							"SELECT version FROM schema_version ORDER BY version DESC LIMIT 1",
-						)
-						.get() as { version: number } | null
-				)?.version ?? 0);
-		const remainingMissingColumns = incrementalMigrationApplied
-			? []
-			: this.getSchemaDrift();
+		// After migrations, check whether the DB is still behind or has schema drift.
+		// This handles DBs that are too old for incremental migration (pre-v6) or
+		// where a migration left an inconsistent state.
+		const postMigrationVersion = migratedTo;
+		const remainingDrift =
+			postMigrationVersion >= SCHEMA_VERSION ? [] : this.getSchemaDrift();
 
 		const needsReset =
-			!incrementalMigrationApplied &&
-			// Explicit version lag: recorded version is older than current code
-			((currentVersion > 0 && currentVersion < SCHEMA_VERSION) ||
-				// Schema drift: a table exists but is missing one or more required columns
-				remainingMissingColumns.length > 0);
+			(postMigrationVersion > 0 && postMigrationVersion < SCHEMA_VERSION) ||
+			remainingDrift.length > 0;
 
 		if (needsReset) {
-			// Existing DB is from an older schema with no incremental migration path.
-			// Drop all tables and start fresh — the caller is expected to run
-			// POST /consolidate after the server starts to rebuild the knowledge graph.
 			const driftDetail =
-				remainingMissingColumns.length > 0
-					? ` (missing columns: ${remainingMissingColumns.map((d) => `${d.table}.${d.column}`).join(", ")})`
+				remainingDrift.length > 0
+					? ` (missing columns: ${remainingDrift.map((d) => `${d.table}.${d.column}`).join(", ")})`
 					: "";
 			logger.warn(
-				`[db] Schema mismatch: DB is v${currentVersion}, code expects v${SCHEMA_VERSION}${driftDetail}. Dropping and recreating all tables. All existing knowledge data has been cleared.`,
+				`[db] Schema mismatch: DB is v${postMigrationVersion}, code expects v${SCHEMA_VERSION}${driftDetail}. Dropping and recreating all tables. All existing knowledge data has been cleared.`,
 			);
-			// Wrap in a transaction so a crash mid-drop leaves the DB in its original
-			// state (all tables intact) rather than a half-torn-down state.
-			// SQLite DDL (including DROP TABLE) is fully transactional: if the process
-			// crashes before COMMIT, SQLite rolls back all drops on the next open.
 			this.db.transaction(() => {
+				this.db.exec("DROP TABLE IF EXISTS knowledge_cluster_member");
+				this.db.exec("DROP TABLE IF EXISTS knowledge_cluster");
 				this.db.exec("DROP TABLE IF EXISTS knowledge_relation");
 				this.db.exec("DROP TABLE IF EXISTS knowledge_entry");
 				this.db.exec("DROP TABLE IF EXISTS consolidated_episode");
@@ -238,17 +188,20 @@ export class KnowledgeDB {
 			})();
 		}
 
-		// Create all tables (idempotent on a fresh DB; re-creates after a version-triggered drop).
+		// Create all tables (idempotent on a fresh DB; re-creates after reset).
 		this.db.exec(CREATE_TABLES);
 
-		// Record current schema version.
-		const currentRow = this.db
-			.prepare(
-				"SELECT version FROM schema_version ORDER BY version DESC LIMIT 1",
-			)
-			.get() as { version: number } | null;
+		// Stamp the current schema version if not already recorded.
+		const stampedVersion =
+			(
+				this.db
+					.prepare(
+						"SELECT version FROM schema_version ORDER BY version DESC LIMIT 1",
+					)
+					.get() as { version: number } | null
+			)?.version ?? 0;
 
-		if (!currentRow || currentRow.version < SCHEMA_VERSION) {
+		if (stampedVersion < SCHEMA_VERSION) {
 			this.db
 				.prepare(
 					"INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
@@ -271,8 +224,8 @@ export class KnowledgeDB {
 				`INSERT INTO knowledge_entry 
          (id, type, content, topics, confidence, source, scope, status, strength,
           created_at, updated_at, last_accessed_at, access_count, observation_count,
-          last_synthesized_observation_count, superseded_by, derived_from, embedding)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          superseded_by, derived_from, embedding)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			)
 			.run(
 				entry.id,
@@ -289,26 +242,10 @@ export class KnowledgeDB {
 				entry.lastAccessedAt,
 				entry.accessCount,
 				entry.observationCount,
-				entry.lastSynthesizedObservationCount ?? null,
 				entry.supersededBy,
 				JSON.stringify(entry.derivedFrom),
 				embeddingBlob,
 			);
-	}
-
-	/**
-	 * Mark an entry as synthesized at its current observation_count.
-	 * Called after a successful synthesizePrinciple() call to prevent
-	 * re-synthesis at the same evidence level.
-	 */
-	markSynthesized(id: string, observationCount: number): void {
-		this.db
-			.prepare(
-				`UPDATE knowledge_entry
-         SET last_synthesized_observation_count = ?, updated_at = ?
-         WHERE id = ?`,
-			)
-			.run(observationCount, Date.now(), id);
 	}
 
 	updateEntry(id: string, updates: Partial<KnowledgeEntry>): void {
@@ -923,6 +860,50 @@ export class KnowledgeDB {
 	}
 
 	/**
+	 * Batch fetch all entries that are sources for the given synthesized entry IDs.
+	 *
+	 * A synthesized `principle` or `pattern` entry has `supports` relations pointing
+	 * to the source entries it was distilled from. This method returns those source
+	 * entries for a set of synthesized IDs in a single query.
+	 *
+	 * Returns a Map<synthesizedId, sourceEntry[]>. Entries with no `supports`
+	 * relations are absent from the map.
+	 *
+	 * Used by the activation engine for relation-aware retrieval: when a synthesized
+	 * principle activates, its source entries are surfaced alongside it so the agent
+	 * can see both the abstraction and the evidence that produced it.
+	 */
+	getSupportSourcesForIds(
+		synthesizedIds: string[],
+	): Map<string, KnowledgeEntry[]> {
+		if (synthesizedIds.length === 0) return new Map();
+
+		// `supports` relations: source_id = synthesized entry, target_id = source entry
+		const rows = this.db
+			.prepare(
+				`SELECT kr.source_id AS synth_id, ke.*
+         FROM knowledge_relation kr
+         JOIN knowledge_entry ke ON ke.id = kr.target_id
+         WHERE kr.type = 'supports'
+           AND kr.source_id IN (SELECT value FROM json_each(?))
+           AND ke.status IN ('active', 'conflicted')`,
+			)
+			.all(JSON.stringify(synthesizedIds)) as Array<
+			RawEntryRow & { synth_id: string }
+		>;
+
+		const result = new Map<string, KnowledgeEntry[]>();
+		for (const row of rows) {
+			const { synth_id, ...entryRow } = row;
+			const entry = this.rowToEntry(entryRow as RawEntryRow);
+			const arr = result.get(synth_id);
+			if (arr) arr.push(entry);
+			else result.set(synth_id, [entry]);
+		}
+		return result;
+	}
+
+	/**
 	 * Batch fetch all 'contradicts' relations that involve any of the given entry IDs.
 	 * Returns a map from each entry ID to its conflict counterpart ID.
 	 *
@@ -1186,7 +1167,6 @@ export class KnowledgeDB {
 			lastAccessedAt: row.last_accessed_at,
 			accessCount: row.access_count,
 			observationCount: row.observation_count,
-			lastSynthesizedObservationCount: row.last_synthesized_observation_count,
 			supersededBy: row.superseded_by,
 			derivedFrom: JSON.parse(row.derived_from),
 			embedding,
@@ -1258,6 +1238,8 @@ export class KnowledgeDB {
 		// All operations must succeed atomically — a crash mid-wipe would leave
 		// entries deleted but cursors not reset (or vice versa).
 		this.db.transaction(() => {
+			this.db.exec("DELETE FROM knowledge_cluster_member");
+			this.db.exec("DELETE FROM knowledge_cluster");
 			this.db.exec("DELETE FROM knowledge_relation");
 			this.db.exec("DELETE FROM knowledge_entry");
 			this.db.exec("DELETE FROM consolidated_episode");
@@ -1314,6 +1296,171 @@ export class KnowledgeDB {
 				"INSERT OR REPLACE INTO embedding_metadata (id, model, dimensions, recorded_at) VALUES (1, ?, ?, ?)",
 			)
 			.run(model, dimensions, Date.now());
+	}
+
+	// ── Cluster Management ──
+
+	/**
+	 * Load all persisted clusters with their current member entry IDs.
+	 */
+	getClustersWithMembers(): Array<{
+		id: string;
+		centroid: number[];
+		memberCount: number;
+		lastSynthesizedAt: number | null;
+		lastMembershipChangedAt: number;
+		createdAt: number;
+		memberIds: string[];
+	}> {
+		const clusterRows = this.db
+			.prepare("SELECT * FROM knowledge_cluster ORDER BY created_at ASC")
+			.all() as Array<{
+			id: string;
+			centroid: Uint8Array;
+			member_count: number;
+			last_synthesized_at: number | null;
+			last_membership_changed_at: number;
+			created_at: number;
+		}>;
+
+		if (clusterRows.length === 0) return [];
+
+		const memberRows = this.db
+			.prepare(
+				`SELECT cluster_id, entry_id FROM knowledge_cluster_member
+         WHERE cluster_id IN (SELECT value FROM json_each(?))`,
+			)
+			.all(JSON.stringify(clusterRows.map((r) => r.id))) as Array<{
+			cluster_id: string;
+			entry_id: string;
+		}>;
+
+		const membersByCluster = new Map<string, string[]>();
+		for (const m of memberRows) {
+			const arr = membersByCluster.get(m.cluster_id);
+			if (arr) arr.push(m.entry_id);
+			else membersByCluster.set(m.cluster_id, [m.entry_id]);
+		}
+
+		return clusterRows.map((r) => ({
+			id: r.id,
+			centroid: blobToFloats(r.centroid),
+			memberCount: r.member_count,
+			lastSynthesizedAt: r.last_synthesized_at,
+			lastMembershipChangedAt: r.last_membership_changed_at,
+			createdAt: r.created_at,
+			memberIds: membersByCluster.get(r.id) ?? [],
+		}));
+	}
+
+	/**
+	 * Persist the full cluster state produced by a single clustering pass.
+	 *
+	 * Replaces cluster membership atomically:
+	 * - Upserts each cluster row (insert new, update centroid/count/timestamps for existing).
+	 * - Replaces membership rows for each cluster with the new member set.
+	 * - Deletes cluster rows that are no longer present (entries have dispersed).
+	 *
+	 * @param clusters  New cluster state from the clustering pass.
+	 */
+	persistClusters(
+		clusters: Array<{
+			id: string;
+			centroid: number[];
+			memberIds: string[];
+			isNew: boolean;
+			membershipChanged: boolean;
+		}>,
+	): void {
+		const now = Date.now();
+		const newClusterIds = new Set(clusters.map((c) => c.id));
+
+		this.db.transaction(() => {
+			// Remove stale clusters (their entries have dispersed into other clusters).
+			const existingIds = (
+				this.db
+					.prepare("SELECT id FROM knowledge_cluster")
+					.all() as Array<{ id: string }>
+			).map((r) => r.id);
+
+			for (const existingId of existingIds) {
+				if (!newClusterIds.has(existingId)) {
+					this.db
+						.prepare("DELETE FROM knowledge_cluster WHERE id = ?")
+						.run(existingId);
+				}
+			}
+
+			for (const cluster of clusters) {
+				const centroidBlob = new Uint8Array(
+					new Float32Array(cluster.centroid).buffer,
+				);
+
+				if (cluster.isNew) {
+					this.db
+						.prepare(
+							`INSERT INTO knowledge_cluster
+               (id, centroid, member_count, last_synthesized_at, last_membership_changed_at, created_at)
+               VALUES (?, ?, ?, NULL, ?, ?)`,
+						)
+						.run(
+							cluster.id,
+							centroidBlob,
+							cluster.memberIds.length,
+							now,
+							now,
+						);
+				} else {
+					// Update centroid and member count; bump last_membership_changed_at only
+					// if membership actually changed.
+					if (cluster.membershipChanged) {
+						this.db
+							.prepare(
+								`UPDATE knowledge_cluster
+                 SET centroid = ?, member_count = ?, last_membership_changed_at = ?
+                 WHERE id = ?`,
+							)
+							.run(centroidBlob, cluster.memberIds.length, now, cluster.id);
+					} else {
+						this.db
+							.prepare(
+								`UPDATE knowledge_cluster
+                 SET centroid = ?, member_count = ?
+                 WHERE id = ?`,
+							)
+							.run(centroidBlob, cluster.memberIds.length, cluster.id);
+					}
+				}
+
+				// Replace membership: delete existing rows, insert new set.
+				this.db
+					.prepare(
+						"DELETE FROM knowledge_cluster_member WHERE cluster_id = ?",
+					)
+					.run(cluster.id);
+
+				for (const entryId of cluster.memberIds) {
+					this.db
+						.prepare(
+							`INSERT OR IGNORE INTO knowledge_cluster_member (cluster_id, entry_id, joined_at)
+               VALUES (?, ?, ?)`,
+						)
+						.run(cluster.id, entryId, now);
+				}
+			}
+		})();
+	}
+
+	/**
+	 * Stamp a cluster as synthesized at the current time.
+	 * Called after a successful synthesis pass for that cluster.
+	 */
+	markClusterSynthesized(clusterId: string): void {
+		this.db
+			.prepare(
+				"UPDATE knowledge_cluster SET last_synthesized_at = ? WHERE id = ?",
+			)
+			.run(Date.now(), clusterId);
 	}
 
 	/**
@@ -1380,6 +1527,15 @@ export class KnowledgeDB {
 }
 
 /**
+ * Convert a SQLite BLOB (Uint8Array of raw float32 bytes) to a number[] array.
+ * Used when reading centroid columns from knowledge_cluster rows.
+ */
+function blobToFloats(blob: Uint8Array): number[] {
+	const float32 = new Float32Array(blob.buffer, blob.byteOffset, blob.byteLength / 4);
+	return Array.from(float32);
+}
+
+/**
  * Raw row shape from SQLite (snake_case columns).
  */
 interface RawEntryRow {
@@ -1397,7 +1553,6 @@ interface RawEntryRow {
 	last_accessed_at: number;
 	access_count: number;
 	observation_count: number;
-	last_synthesized_observation_count: number | null;
 	superseded_by: string | null;
 	derived_from: string;
 	embedding: Uint8Array | null;

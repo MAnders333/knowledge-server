@@ -4,7 +4,6 @@ import {
 	cosineSimilarity,
 	formatEmbeddingText,
 } from "../activation/embeddings.js";
-import { config } from "../config.js";
 import type { KnowledgeDB } from "../db/database.js";
 import { logger } from "../logger.js";
 import { RECONSOLIDATION_THRESHOLD, clampKnowledgeType } from "../types.js";
@@ -13,11 +12,22 @@ import { computeStrength } from "./decay.js";
 import type { ConsolidationLLM, ExtractedKnowledge } from "./llm.js";
 
 /**
- * Number of KB neighbors to include in a synthesis call.
- * Analogous to the hippocampal neighborhood — enough to find structural
- * commonality without diluting the synthesis with distant entries.
+ * Cosine similarity threshold for matching an in-memory cluster centroid to a
+ * persisted cluster row. Above this threshold, the persisted cluster ID is reused;
+ * below it, a new cluster ID is created.
  */
-const SYNTHESIS_NEIGHBORS = 5;
+const CLUSTER_IDENTITY_THRESHOLD = 0.9;
+
+/**
+ * Cosine similarity threshold for assigning an entry to an existing cluster
+ * during greedy clustering. Below this threshold a new cluster is started.
+ */
+const CLUSTER_ASSIGNMENT_THRESHOLD = 0.5;
+
+/**
+ * Minimum number of members a cluster must have to be eligible for synthesis.
+ */
+const CLUSTER_MIN_MEMBERS = 3;
 
 /**
  * Handles the reconsolidation of a single extracted knowledge entry
@@ -223,233 +233,320 @@ export class Reconsolidator {
 	}
 
 	/**
-	 * KB-wide cross-session synthesis pass.
+	 * KB-wide cluster-first cross-session synthesis pass.
 	 *
 	 * Called once per consolidation cycle, AFTER ensureEmbeddings() so all entries
-	 * have embeddings. Replaces the previous per-entry trigger that fired on each
-	 * keep/update event — clustering the entire KB produces better anchors (the
-	 * most-evidenced entry per cluster rather than whichever one happened to be
-	 * reinforced last) and avoids duplicate principles from concurrent triggers.
+	 * have embeddings.
 	 *
 	 * Algorithm:
-	 * 1. Select "ripe" anchors: active entries whose observationCount has crossed a
-	 *    new synthesis threshold multiple since last synthesis (same eligibility
-	 *    condition as the old per-entry trigger, now evaluated in bulk).
-	 * 2. For each ripe anchor (sorted by observationCount desc — most-evidenced first):
-	 *    a. Skip if anchor was already claimed by an earlier cluster this pass.
-	 *    b. Find the SYNTHESIS_NEIGHBORS nearest neighbors by cosine similarity.
-	 *    c. If no neighbors → skip (KB too sparse; retry next cycle).
-	 *    d. Mark anchor as synthesized (stamp = current observationCount).
-	 *    e. Call synthesizePrinciple. If the LLM returns null → bar not met.
-	 *    f. If a result is returned, embed it and route through reconsolidate() so
-	 *       existing equivalent principles block duplicate insertion (dedup fix).
-	 *    g. Mark neighbors as "claimed" so they don't become anchors in the same pass
-	 *       (they're semantically covered by this cluster).
+	 * 1. CLUSTER FORMATION (in-memory, O(n×k)):
+	 *    - Sort all active entries by observationCount desc (most-evidenced anchor first).
+	 *    - Greedy assign each entry to nearest existing cluster if centroid similarity
+	 *      ≥ CLUSTER_ASSIGNMENT_THRESHOLD (0.5), else start a new cluster.
+	 *    - Update centroid as running average after each assignment.
 	 *
-	 * Returns the number of synthesis LLM calls that produced a non-null result.
+	 * 2. CLUSTER IDENTITY RECONCILIATION (against DB):
+	 *    - Match each in-memory cluster to persisted cluster by centroid similarity
+	 *      ≥ CLUSTER_IDENTITY_THRESHOLD (0.9) → reuse ID.
+	 *    - No match → new cluster ID.
+	 *    - Persisted clusters with no match → deleted (entries dispersed).
+	 *
+	 * 3. RIPENESS CHECK:
+	 *    - last_membership_changed_at > last_synthesized_at OR last_synthesized_at IS NULL.
+	 *    - Minimum CLUSTER_MIN_MEMBERS (3) members.
+	 *
+	 * 4. SYNTHESIS (per ripe cluster):
+	 *    - All members are peers (no anchor/neighbor distinction).
+	 *    - LLM returns array of zero or more principles.
+	 *    - Each result routed through reconsolidate() for deduplication.
+	 *    - Write last_synthesized_at on cluster after successful synthesis attempt.
+	 *
+	 * Returns the number of synthesis calls that produced at least one principle.
 	 */
 	async runKBSynthesis(): Promise<number> {
-		const threshold = config.consolidation.synthesisObservationThreshold;
-		if (threshold === 0) return 0;
-
 		// Load all active entries with embeddings (ensureEmbeddings just ran).
 		const allEntries = this.db.getActiveEntriesWithEmbeddings();
-		if (allEntries.length < 2) return 0; // need at least anchor + 1 neighbor
+		if (allEntries.length < CLUSTER_MIN_MEMBERS) return 0;
 
-		// Build a shared entriesMap for the synthesis reconsolidate() calls.
-		// This allows synthesized principles to see each other within the same pass —
-		// if cluster A produces principle P and cluster B would produce a near-duplicate,
-		// P is already in entriesMap and reconsolidate() routes the duplicate to decideMerge.
-		const entriesMap = new Map(allEntries.map((e) => [e.id, e]));
+		// ── Step 1: Greedy clustering ──────────────────────────────────────────────
 
-		// Select ripe anchors: entries that have accumulated new evidence since last synthesis.
-		// Sort descending by observationCount so the most-reinforced entries anchor first.
-		const ripeAnchors = allEntries
-			.filter((e) => {
-				const lastSynth = e.lastSynthesizedObservationCount ?? 0;
-				return e.observationCount >= lastSynth + threshold;
-			})
-			.sort((a, b) => b.observationCount - a.observationCount);
-
-		if (ripeAnchors.length === 0) return 0;
-
-		logger.log(
-			`[synthesis] KB pass: ${ripeAnchors.length} ripe anchor(s) from ${allEntries.length} total entries (threshold=${threshold}).`,
+		// Sort descending by observationCount so well-evidenced entries form cluster
+		// seeds first.
+		const sorted = [...allEntries].sort(
+			(a, b) => b.observationCount - a.observationCount,
 		);
 
-		// Track entries claimed as neighbors in this pass so they are not also used as
-		// anchors. An entry that is a neighbor in one cluster should not independently
-		// trigger its own synthesis in the same pass — it's already covered.
-		const claimedAsNeighbor = new Set<string>();
+		// In-memory clusters: { centroid, memberIds }
+		const inMemoryClusters: Array<{
+			centroid: number[];
+			memberIds: string[];
+		}> = [];
+
+		for (const entry of sorted) {
+			// Find nearest cluster
+			let nearestIdx = -1;
+			let nearestSim = -1;
+			for (let i = 0; i < inMemoryClusters.length; i++) {
+				const sim = cosineSimilarity(entry.embedding, inMemoryClusters[i].centroid);
+				if (sim > nearestSim) {
+					nearestSim = sim;
+					nearestIdx = i;
+				}
+			}
+
+			if (nearestIdx >= 0 && nearestSim >= CLUSTER_ASSIGNMENT_THRESHOLD) {
+				// Assign to existing cluster, update centroid as running average
+				const cluster = inMemoryClusters[nearestIdx];
+				const n = cluster.memberIds.length;
+				cluster.centroid = cluster.centroid.map(
+					(v, i) => (v * n + entry.embedding[i]) / (n + 1),
+				);
+				cluster.memberIds.push(entry.id);
+			} else {
+				// Start a new cluster seeded by this entry
+				inMemoryClusters.push({
+					centroid: [...entry.embedding],
+					memberIds: [entry.id],
+				});
+			}
+		}
+
+		logger.log(
+			`[synthesis] Formed ${inMemoryClusters.length} clusters from ${allEntries.length} entries.`,
+		);
+
+		// ── Step 2: Identity reconciliation ───────────────────────────────────────
+
+		const persistedClusters = this.db.getClustersWithMembers();
+
+		// Build a lookup: persisted cluster ID → matched in-memory cluster index
+		const persistedToInMemory = new Map<string, number>();
+		// Track which in-memory clusters have been matched to avoid double-matching
+		const inMemoryMatched = new Set<number>();
+
+		for (const persisted of persistedClusters) {
+			let bestIdx = -1;
+			let bestSim = -1;
+			for (let i = 0; i < inMemoryClusters.length; i++) {
+				if (inMemoryMatched.has(i)) continue;
+				const sim = cosineSimilarity(persisted.centroid, inMemoryClusters[i].centroid);
+				if (sim > bestSim) {
+					bestSim = sim;
+					bestIdx = i;
+				}
+			}
+			if (bestIdx >= 0 && bestSim >= CLUSTER_IDENTITY_THRESHOLD) {
+				persistedToInMemory.set(persisted.id, bestIdx);
+				inMemoryMatched.add(bestIdx);
+			}
+		}
+
+		// Map in-memory cluster index → resolved ID + membership-changed flag
+		const resolvedClusters: Array<{
+			id: string;
+			centroid: number[];
+			memberIds: string[];
+			isNew: boolean;
+			membershipChanged: boolean;
+			lastSynthesizedAt: number | null;
+		}> = inMemoryClusters.map((cluster, idx) => {
+			// Find the persisted cluster that matched this in-memory cluster (if any)
+			let matchedId: string | null = null;
+			let lastSynthesizedAt: number | null = null;
+			let previousMemberIds: string[] = [];
+
+			for (const [persistedId, inMemIdx] of persistedToInMemory) {
+				if (inMemIdx === idx) {
+					matchedId = persistedId;
+					const persistedCluster = persistedClusters.find(
+						(p) => p.id === persistedId,
+					);
+					if (persistedCluster) {
+						lastSynthesizedAt = persistedCluster.lastSynthesizedAt;
+						previousMemberIds = persistedCluster.memberIds;
+					}
+					break;
+				}
+			}
+
+			const id = matchedId ?? randomUUID();
+			const isNew = matchedId === null;
+
+			// Membership changed if set of member IDs differs from persisted
+			const membershipChanged =
+				isNew ||
+				cluster.memberIds.length !== previousMemberIds.length ||
+				cluster.memberIds.some((mid) => !previousMemberIds.includes(mid));
+
+			return {
+				id,
+				centroid: cluster.centroid,
+				memberIds: cluster.memberIds,
+				isNew,
+				membershipChanged,
+				lastSynthesizedAt: isNew ? null : lastSynthesizedAt,
+			};
+		});
+
+		// Persist new cluster state (upsert clusters, delete stale ones)
+		this.db.persistClusters(
+			resolvedClusters.map((c) => ({
+				id: c.id,
+				centroid: c.centroid,
+				memberIds: c.memberIds,
+				isNew: c.isNew,
+				membershipChanged: c.membershipChanged,
+			})),
+		);
+
+		// ── Step 3 & 4: Ripeness check and synthesis ──────────────────────────────
+
+		// Build a shared entriesMap for reconsolidate() calls so synthesized principles
+		// see each other within the same pass (dedup between clusters).
+		const entriesMap = new Map(allEntries.map((e) => [e.id, e]));
 
 		let synthesized = 0;
 
-		for (const anchor of ripeAnchors) {
-			if (claimedAsNeighbor.has(anchor.id)) continue;
+		for (const cluster of resolvedClusters) {
+			// Ripeness: must have changed membership since last synthesis (or never synthesized)
+			// AND meet minimum member count.
+			const isRipe =
+				cluster.memberIds.length >= CLUSTER_MIN_MEMBERS &&
+				(cluster.lastSynthesizedAt === null || cluster.membershipChanged);
 
-			// Find nearest neighbors from the full KB, excluding the anchor itself.
-			const scored: Array<{
-				entry: KnowledgeEntry & { embedding: number[] };
-				sim: number;
-			}> = [];
-			for (const candidate of entriesMap.values()) {
-				if (candidate.id === anchor.id) continue;
-				scored.push({
-					entry: candidate,
-					sim: cosineSimilarity(anchor.embedding, candidate.embedding),
-				});
-			}
-			scored.sort((a, b) => b.sim - a.sim);
-			const neighbors = scored.slice(0, SYNTHESIS_NEIGHBORS).map((s) => s.entry);
+			if (!isRipe) continue;
 
-			if (neighbors.length === 0) {
-				logger.log(
-					`[synthesis] Skipping anchor ${anchor.id} — no neighbors with embeddings.`,
+			// Collect peer entries for this cluster
+			const peers = cluster.memberIds
+				.map((id) => entriesMap.get(id))
+				.filter(
+					(e): e is KnowledgeEntry & { embedding: number[] } => e !== undefined,
 				);
-				continue;
-			}
 
-			// Stamp the anchor as synthesized BEFORE the async LLM call to prevent
-			// concurrent consolidation runs from triggering duplicate synthesis.
-			this.db.markSynthesized(anchor.id, anchor.observationCount);
-			// Update entriesMap so later clusters in this pass see the stamp.
-			entriesMap.set(anchor.id, {
-				...anchor,
-				lastSynthesizedObservationCount: anchor.observationCount,
-			});
+			if (peers.length < CLUSTER_MIN_MEMBERS) continue;
 
 			logger.log(
-				`[synthesis] Attempting synthesis for "${anchor.content.slice(0, 60)}..." (obs=${anchor.observationCount}) with ${neighbors.length} neighbors.`,
+				`[synthesis] Attempting synthesis for cluster ${cluster.id} (${peers.length} peers).`,
 			);
 
 			const synthStart = Date.now();
-			let result: Awaited<
-				ReturnType<typeof this.llm.synthesizePrinciple>
-			>;
+			let results: Awaited<ReturnType<typeof this.llm.synthesizePrinciple>>;
 			try {
-				result = await this.llm.synthesizePrinciple(
-					{
-						content: anchor.content,
-						type: anchor.type,
-						topics: anchor.topics,
-						observationCount: anchor.observationCount,
-					},
-					neighbors.map((n) => ({
-						id: n.id,
-						content: n.content,
-						type: n.type,
-						topics: n.topics,
+				results = await this.llm.synthesizePrinciple(
+					peers.map((p) => ({
+						id: p.id,
+						content: p.content,
+						type: p.type,
+						topics: p.topics,
 					})),
 				);
 			} catch (err) {
 				logger.warn(
-					`[synthesis] synthesizePrinciple failed for ${anchor.id} (stamp persisted at obs=${anchor.observationCount}; next attempt at obs=${anchor.observationCount + threshold}): ${err instanceof Error ? err.message : String(err)}`,
+					`[synthesis] synthesizePrinciple failed for cluster ${cluster.id}: ${err instanceof Error ? err.message : String(err)}`,
 				);
-				// Don't claim neighbors on failure — they remain eligible as anchors.
+				// Mark as synthesized anyway to avoid hammering on a bad cluster next run.
+				this.db.markClusterSynthesized(cluster.id);
 				continue;
 			}
 
 			logger.log(
-				`[synthesis] synthesizePrinciple responded in ${((Date.now() - synthStart) / 1000).toFixed(1)}s.`,
+				`[synthesis] synthesizePrinciple responded in ${((Date.now() - synthStart) / 1000).toFixed(1)}s — ${results.length} result(s).`,
 			);
 
-			if (!result) {
+			// Mark cluster as synthesized regardless of results (bar was applied, nothing met it)
+			this.db.markClusterSynthesized(cluster.id);
+
+			if (results.length === 0) {
 				logger.log(
-					`[synthesis] No synthesis emerged for "${anchor.content.slice(0, 60)}..." — bar not met.`,
+					`[synthesis] No synthesis emerged for cluster ${cluster.id} — bar not met.`,
 				);
-				// Don't claim neighbors on a null result — the cluster didn't produce a
-				// principle, so neighbors remain eligible as anchors in this same pass.
 				continue;
 			}
 
-			// Principle was produced: claim neighbors as covered to prevent the same
-			// cluster from being re-attempted via a neighbor anchor in this pass.
-			for (const n of neighbors) {
-				claimedAsNeighbor.add(n.id);
-			}
+			// Process each synthesized principle
+			for (const result of results) {
+				logger.log(
+					`[synthesis] Synthesized ${result.type}: "${result.content.slice(0, 80)}..."`,
+				);
 
-			logger.log(
-				`[synthesis] Synthesized ${result.type}: "${result.content.slice(0, 80)}..."`,
-			);
+				// Embed and reconsolidate for deduplication
+				const synthEmbedding = await this.embeddings.embed(
+					formatEmbeddingText(result.type, result.content, result.topics),
+				);
 
-			// Embed and reconsolidate — see inline comments in the reconsolidate call below.
-			const synthEmbedding = await this.embeddings.embed(
-				formatEmbeddingText(result.type, result.content, result.topics),
-			);
+				// Validate sourceIds are from the cluster member set (hallucination guard)
+				const memberIdSet = new Set(cluster.memberIds);
+				const validatedSourceIds = result.sourceIds.filter((id) =>
+					memberIdSet.has(id),
+				);
+				const droppedCount = result.sourceIds.length - validatedSourceIds.length;
+				if (droppedCount > 0) {
+					logger.warn(
+						`[synthesis] Dropped ${droppedCount} sourceId(s) from LLM result for cluster ${cluster.id} (not cluster members).`,
+					);
+				}
 
-			// Filter sourceIds to only IDs that exist in entriesMap (avoids dangling FKs),
-			// and exclude anchor.id from result.sourceIds to prevent duplicate supports
-			// relations if the LLM echoes the anchor back in its sourceIds list.
-			const filteredSourceIds = result.sourceIds.filter(
-				(id) => id !== anchor.id && entriesMap.has(id),
-			);
-			const droppedCount = result.sourceIds.length - filteredSourceIds.length;
-			if (droppedCount > 0) {
-				logger.warn(
-					`[synthesis] Dropped ${droppedCount} sourceId(s) from LLM result for anchor ${anchor.id} (unknown or duplicate).`,
+				// Pick a representative peer for scope (highest observationCount)
+				const repPeer = peers.reduce((best, p) =>
+					p.observationCount > best.observationCount ? p : best,
+				);
+
+				await this.reconsolidate(
+					{
+						type: result.type,
+						content: result.content,
+						topics: result.topics,
+						confidence: result.confidence,
+						scope: repPeer.scope,
+						source: `synthesis:cluster:${cluster.id}`,
+					},
+					[], // no session IDs — KB-derived provenance
+					entriesMap,
+					{
+						onInsert: (inserted) => {
+							if (!inserted.embedding) {
+								throw new Error(
+									`[synthesis] Synthesized entry ${inserted.id} has no embedding — this is a bug.`,
+								);
+							}
+							entriesMap.set(
+								inserted.id,
+								inserted as KnowledgeEntry & { embedding: number[] },
+							);
+							// Write supports relations from synthesized entry → source entries
+							for (const sourceId of validatedSourceIds) {
+								this.db.insertRelation({
+									id: randomUUID(),
+									sourceId: inserted.id,
+									targetId: sourceId,
+									type: "supports",
+									createdAt: Date.now(),
+								});
+							}
+							synthesized++;
+							logger.log(
+								`[synthesis] Inserted synthesized entry ${inserted.id} with ${validatedSourceIds.length} supports relations.`,
+							);
+						},
+						onUpdate: (id, _updated, freshEmbedding) => {
+							const existing = entriesMap.get(id);
+							if (existing) {
+								entriesMap.set(id, { ...existing, embedding: freshEmbedding });
+							}
+							logger.log(
+								`[synthesis] Refined existing principle ${id} via synthesis.`,
+							);
+						},
+						onKeep: () => {
+							logger.log(
+								"[synthesis] Synthesis result matches existing principle — kept (no duplicate inserted).",
+							);
+						},
+					},
+					undefined, // no sessionTimestamp — synthesized entries stamped at now
+					synthEmbedding,
 				);
 			}
-			const validatedSourceIds = [anchor.id, ...filteredSourceIds];
-
-			// Route through reconsolidate() for deduplication: if an equivalent principle
-			// already exists in the KB (or was produced earlier in this same pass),
-			// decideMerge decides keep/update/replace rather than inserting a duplicate.
-			await this.reconsolidate(
-				{
-					type: result.type,
-					content: result.content,
-					topics: result.topics,
-					confidence: result.confidence,
-					scope: anchor.scope,
-					source: `synthesis:${anchor.id}`,
-				},
-				[], // no session IDs — KB-derived provenance
-				entriesMap,
-				{
-					onInsert: (inserted) => {
-						// synthEmbedding is always set here since we embed before reconsolidate().
-						// If it were ever missing, entriesMap would be stale for subsequent clusters.
-						if (!inserted.embedding) {
-							throw new Error(
-								`[synthesis] Synthesized entry ${inserted.id} has no embedding — this is a bug.`,
-							);
-						}
-						entriesMap.set(
-							inserted.id,
-							inserted as KnowledgeEntry & { embedding: number[] },
-						);
-						for (const sourceId of validatedSourceIds) {
-							this.db.insertRelation({
-								id: randomUUID(),
-								sourceId: inserted.id,
-								targetId: sourceId,
-								type: "supports",
-								createdAt: Date.now(),
-							});
-						}
-						synthesized++;
-						logger.log(
-							`[synthesis] Inserted synthesized entry ${inserted.id} with ${validatedSourceIds.length} supports relations.`,
-						);
-					},
-					onUpdate: (id, _updated, freshEmbedding) => {
-						const existing = entriesMap.get(id);
-						if (existing) {
-							entriesMap.set(id, { ...existing, embedding: freshEmbedding });
-						}
-						logger.log(
-							`[synthesis] Refined existing principle ${id} via synthesis.`,
-						);
-					},
-					onKeep: () => {
-						logger.log(
-							"[synthesis] Synthesis result matches existing principle — kept (no duplicate inserted).",
-						);
-					},
-				},
-				undefined, // no sessionTimestamp — synthesized entries stamped at now
-				synthEmbedding,
-			);
 		}
 
 		if (synthesized > 0) {
@@ -513,7 +610,6 @@ export class Reconsolidator {
 			lastAccessedAt: entryTime,
 			accessCount: 0,
 			observationCount: 1,
-			lastSynthesizedObservationCount: null,
 			supersededBy: null,
 			derivedFrom: sessionIds,
 			embedding,
@@ -525,5 +621,4 @@ export class Reconsolidator {
 		this.db.insertEntry(newEntry);
 		return newEntry;
 	}
-
 }

@@ -11,17 +11,6 @@
  * knowledge), kept separate from access_count (retrieval signal). Removed all
  * migration code — single clean schema, DB is reinitialized on upgrade.
  *
- * v7: Cross-session synthesis.
- * - knowledge_entry gains `last_synthesized_observation_count` (INTEGER, NULL).
- *   NULL = never synthesized. When synthesis fires, this is set to the entry's
- *   current observation_count. Re-synthesis triggers when observation_count
- *   crosses the next threshold multiple (e.g. 10, 20, 30, ... with default threshold=10)
- *   beyond the stored value.
- *   Tracked per-entry so synthesis never fires twice for the same evidence level.
- * - MIGRATION: v6 → v7 is incremental (ALTER TABLE, no data loss). Existing
- *   entries receive NULL for last_synthesized_observation_count, which is the
- *   correct initial state. All earlier version upgrades still wipe and recreate.
- *
  * v6: Multi-source support.
  * - consolidated_episode gains a `source` column (e.g. "opencode", "claude-code")
  *   and a new composite PK (source, session_id, start_message_id, end_message_id).
@@ -31,15 +20,31 @@
  * - consolidation_state retains the global counters and lastConsolidatedAt but
  *   last_message_time_created is removed (superseded by source_cursor).
  *
- * v7: Embedding metadata.
+ * v7: Cross-session synthesis (per-entry trigger).
+ * - knowledge_entry gains `last_synthesized_observation_count` (INTEGER, NULL).
+ *   MIGRATION: v6 → v7 is incremental (ALTER TABLE, no data loss).
+ *
+ * v8: Embedding metadata.
  * - New embedding_metadata singleton table stores the model name and dimension
  *   count used to produce the current embeddings. On startup, the server compares
  *   the stored model against the configured EMBEDDING_MODEL — if they differ, all
  *   entry embeddings are regenerated automatically (re-embed) so cosine similarity
  *   remains valid across model changes.
+ *   MIGRATION: v7 → v8 is incremental (CREATE TABLE, no data loss).
+ *
+ * v9: Cluster-first synthesis.
+ * - Replaces per-entry synthesis trigger (observation_count threshold) with
+ *   persistent cluster tables. Each consolidation run greedily clusters active
+ *   entries by embedding similarity, matches clusters to persisted rows by centroid
+ *   similarity, and synthesizes any cluster whose membership changed since last
+ *   synthesis (last_membership_changed_at > last_synthesized_at).
+ * - New tables: knowledge_cluster, knowledge_cluster_member.
+ * - knowledge_entry loses `last_synthesized_observation_count` (no longer needed).
+ * - MIGRATION: v8 → v9 is incremental: DROP COLUMN on knowledge_entry, CREATE TABLE
+ *   for both cluster tables. No knowledge data is lost.
  */
 
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 9;
 
 /**
  * Expected columns for each table, derived from the DDL below.
@@ -68,12 +73,20 @@ export const EXPECTED_TABLE_COLUMNS: Readonly<
 		"last_accessed_at",
 		"access_count",
 		"observation_count",
-		"last_synthesized_observation_count",
 		"superseded_by",
 		"derived_from",
 		"embedding",
 	],
 	knowledge_relation: ["id", "source_id", "target_id", "type", "created_at"],
+	knowledge_cluster: [
+		"id",
+		"centroid",
+		"member_count",
+		"last_synthesized_at",
+		"last_membership_changed_at",
+		"created_at",
+	],
+	knowledge_cluster_member: ["cluster_id", "entry_id", "joined_at"],
 	consolidation_state: [
 		"id",
 		"last_consolidated_at",
@@ -128,12 +141,6 @@ export const CREATE_TABLES = `
     superseded_by TEXT,
     derived_from TEXT NOT NULL DEFAULT '[]',  -- JSON array of session/entry IDs
 
-    -- Cross-session synthesis tracking.
-    -- NULL = never synthesized. Set to observation_count when synthesis fires.
-    -- Re-synthesis triggers when observation_count reaches the next threshold
-    -- multiple beyond this value (e.g. threshold=3 → fires at 3, 6, 9, ...).
-    last_synthesized_observation_count INTEGER,
-
     -- Embedding (float32 array stored as blob)
     embedding BLOB
   );
@@ -151,7 +158,7 @@ export const CREATE_TABLES = `
     id TEXT PRIMARY KEY,
     source_id TEXT NOT NULL,
     target_id TEXT NOT NULL,
-    type TEXT NOT NULL CHECK(type IN ('supports', 'contradicts', 'refines', 'depends_on', 'supersedes')),
+    type TEXT NOT NULL CHECK(type IN ('supports', 'contradicts', 'supersedes')),
     created_at INTEGER NOT NULL,
     FOREIGN KEY (source_id) REFERENCES knowledge_entry(id) ON DELETE CASCADE,
     FOREIGN KEY (target_id) REFERENCES knowledge_entry(id) ON DELETE CASCADE
@@ -198,6 +205,31 @@ export const CREATE_TABLES = `
 
   CREATE INDEX IF NOT EXISTS idx_episode_source_session ON consolidated_episode(source, session_id);
   CREATE INDEX IF NOT EXISTS idx_episode_processed ON consolidated_episode(processed_at);
+
+  -- Synthesis clusters — persistent embedding-similarity groups of knowledge entries.
+  -- Rebuilt each consolidation run (greedy agglomerative clustering). Matched to
+  -- existing rows by centroid similarity so stable clusters keep their ID across runs.
+  -- A cluster is ripe for synthesis when last_membership_changed_at > last_synthesized_at
+  -- (or last_synthesized_at IS NULL). Synthesized entries are regular knowledge_entry
+  -- rows and participate in future cluster formation just like extracted entries.
+  CREATE TABLE IF NOT EXISTS knowledge_cluster (
+    id                         TEXT    PRIMARY KEY,
+    centroid                   BLOB    NOT NULL,   -- running-average embedding of members (float32)
+    member_count               INTEGER NOT NULL DEFAULT 0,
+    last_synthesized_at        INTEGER,            -- NULL = never synthesized
+    last_membership_changed_at INTEGER NOT NULL,   -- updated on any member add/remove
+    created_at                 INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS knowledge_cluster_member (
+    cluster_id  TEXT    NOT NULL REFERENCES knowledge_cluster(id) ON DELETE CASCADE,
+    entry_id    TEXT    NOT NULL REFERENCES knowledge_entry(id)   ON DELETE CASCADE,
+    joined_at   INTEGER NOT NULL,
+    PRIMARY KEY (cluster_id, entry_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_cluster_membership_changed ON knowledge_cluster(last_membership_changed_at);
+  CREATE INDEX IF NOT EXISTS idx_cluster_member_entry ON knowledge_cluster_member(entry_id);
 
   -- Embedding metadata — singleton row tracking the model and dimensions used
   -- to produce the current embeddings. Compared against the configured model at

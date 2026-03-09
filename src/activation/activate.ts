@@ -164,6 +164,63 @@ export class ActivationEngine {
 			this.db.recordAccess(entry.id);
 		}
 
+		// ── Relation-aware activation: pull in supports sources ───────────────────
+		// When a synthesized principle/pattern activates, surface its source entries
+		// alongside it. This lets the agent see both the abstraction and the
+		// concrete evidence it was distilled from.
+		//
+		// Design:
+		// - Collect IDs of activated synthesized entries (principle or pattern type)
+		// - Batch-fetch their supports source entries from the DB
+		// - For each source entry not already in the scored set, compute its score
+		//   as the synthesized entry's similarity × 0.9 (slightly lower to rank it
+		//   below the principle itself, but still nearby)
+		// - Add sources to the result (but do NOT exceed maxResults)
+		const synthesizedIds = scored
+			.filter(({ entry }) => entry.type === "principle" || entry.type === "pattern")
+			.map(({ entry }) => entry.id);
+
+		const scoredIdSet = new Set(scored.map(({ entry }) => entry.id));
+
+		if (synthesizedIds.length > 0) {
+			const sourcesMap = this.db.getSupportSourcesForIds(synthesizedIds);
+
+			for (const { entry, rawSimilarity, similarity: synthSimilarity } of scored) {
+				if (entry.type !== "principle" && entry.type !== "pattern") continue;
+				const sources = sourcesMap.get(entry.id);
+				if (!sources) continue;
+
+				for (const source of sources) {
+					if (scoredIdSet.has(source.id)) continue; // already activated
+					if (scored.length >= maxResults) break;
+
+					const liveStrength = computeStrength(source, now);
+					const ageDays = (now - source.createdAt) / DAY_MS;
+					const lastAccessedDaysAgo = (now - source.lastAccessedAt) / DAY_MS;
+					const halfLife =
+						config.decay.typeHalfLife[source.type] ||
+						config.decay.typeHalfLife.fact;
+
+					// Use the synthesized entry's rawSimilarity as the source's signal.
+					// This ensures source entries rank slightly below their synthesized principle.
+					scored.push({
+						entry: source,
+						rawSimilarity,
+						similarity: synthSimilarity * 0.9 * liveStrength,
+						staleness: {
+							ageDays: Math.round(ageDays),
+							strength: liveStrength,
+							lastAccessedDaysAgo: Math.round(lastAccessedDaysAgo),
+							mayBeStale: ageDays > halfLife && source.accessCount < 3,
+						},
+					});
+					scoredIdSet.add(source.id);
+					this.db.recordAccess(source.id);
+				}
+			}
+		}
+		// ─────────────────────────────────────────────────────────────────────────
+
 		// Build a map of activated entries for fast lookup during annotation.
 		// Used to determine whether a conflicted entry's counterpart also activated
 		// (we only annotate when both sides of the conflict are relevant to this query),

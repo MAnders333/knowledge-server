@@ -565,6 +565,149 @@ describe("KnowledgeDB", () => {
 	});
 });
 
+describe("KnowledgeDB — cluster CRUD", () => {
+	let db: KnowledgeDB;
+	let tempDir: string;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(join(tmpdir(), "knowledge-cluster-test-"));
+		db = new KnowledgeDB(join(tempDir, "test.db"));
+	});
+
+	afterEach(() => {
+		db.close();
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	function insertEntry(id: string, embedding: number[]) {
+		const now = Date.now();
+		db.insertEntry({
+			id,
+			type: "fact",
+			content: `Entry ${id}`,
+			topics: ["test"],
+			confidence: 0.8,
+			source: "test",
+			scope: "personal",
+			status: "active",
+			strength: 1.0,
+			createdAt: now,
+			updatedAt: now,
+			lastAccessedAt: now,
+			accessCount: 0,
+			observationCount: 1,
+			supersededBy: null,
+			derivedFrom: [],
+			embedding,
+		});
+	}
+
+	it("getClustersWithMembers returns empty array when no clusters exist", () => {
+		expect(db.getClustersWithMembers()).toEqual([]);
+	});
+
+	it("persistClusters inserts a new cluster with members", () => {
+		const centroid = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+		insertEntry("e1", centroid);
+		insertEntry("e2", centroid);
+
+		db.persistClusters([
+			{
+				id: "cluster-1",
+				centroid,
+				memberIds: ["e1", "e2"],
+				isNew: true,
+				membershipChanged: true,
+			},
+		]);
+
+		const clusters = db.getClustersWithMembers();
+		expect(clusters).toHaveLength(1);
+		expect(clusters[0].id).toBe("cluster-1");
+		expect(clusters[0].memberIds.sort()).toEqual(["e1", "e2"]);
+		expect(clusters[0].memberCount).toBe(2);
+		expect(clusters[0].lastSynthesizedAt).toBeNull();
+		// centroid round-trips through float32 — values should be close
+		expect(clusters[0].centroid[0]).toBeCloseTo(1.0);
+	});
+
+	it("persistClusters updates centroid and member count on re-run, does not bump last_membership_changed_at when membership is stable", () => {
+		const centroid = [0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+		insertEntry("e1", centroid);
+		insertEntry("e2", centroid);
+
+		// First persist — new cluster
+		db.persistClusters([
+			{ id: "cluster-1", centroid, memberIds: ["e1", "e2"], isNew: true, membershipChanged: true },
+		]);
+		const before = db.getClustersWithMembers()[0].lastMembershipChangedAt;
+
+		// Small delay to ensure timestamps differ if the code is wrong
+		const newCentroid = [0.6, 0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+		// Re-persist same cluster, same members, membershipChanged=false
+		db.persistClusters([
+			{ id: "cluster-1", centroid: newCentroid, memberIds: ["e1", "e2"], isNew: false, membershipChanged: false },
+		]);
+
+		const after = db.getClustersWithMembers()[0];
+		expect(after.lastMembershipChangedAt).toBe(before); // unchanged
+		expect(after.centroid[0]).toBeCloseTo(0.6); // centroid updated
+	});
+
+	it("persistClusters deletes stale clusters not in the new set", () => {
+		const centroid = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+		insertEntry("e1", centroid);
+
+		db.persistClusters([
+			{ id: "cluster-old", centroid, memberIds: ["e1"], isNew: true, membershipChanged: true },
+		]);
+		expect(db.getClustersWithMembers()).toHaveLength(1);
+
+		// New pass produces a different cluster (cluster-old disappears)
+		db.persistClusters([
+			{ id: "cluster-new", centroid, memberIds: ["e1"], isNew: true, membershipChanged: true },
+		]);
+
+		const clusters = db.getClustersWithMembers();
+		expect(clusters).toHaveLength(1);
+		expect(clusters[0].id).toBe("cluster-new");
+	});
+
+	it("markClusterSynthesized stamps last_synthesized_at", () => {
+		const centroid = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+		insertEntry("e1", centroid);
+
+		db.persistClusters([
+			{ id: "cluster-1", centroid, memberIds: ["e1"], isNew: true, membershipChanged: true },
+		]);
+
+		expect(db.getClustersWithMembers()[0].lastSynthesizedAt).toBeNull();
+
+		const before = Date.now();
+		db.markClusterSynthesized("cluster-1");
+		const after = Date.now();
+
+		const stamped = db.getClustersWithMembers()[0].lastSynthesizedAt;
+		expect(stamped).not.toBeNull();
+		expect(stamped).toBeGreaterThanOrEqual(before);
+		expect(stamped).toBeLessThanOrEqual(after);
+	});
+
+	it("reinitialize clears cluster tables", () => {
+		const centroid = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+		insertEntry("e1", centroid);
+		db.persistClusters([
+			{ id: "cluster-1", centroid, memberIds: ["e1"], isNew: true, membershipChanged: true },
+		]);
+		expect(db.getClustersWithMembers()).toHaveLength(1);
+
+		db.reinitialize();
+
+		expect(db.getClustersWithMembers()).toHaveLength(0);
+	});
+});
+
 describe("EXPECTED_TABLE_COLUMNS sync with CREATE_TABLES DDL", () => {
 	it("every column in EXPECTED_TABLE_COLUMNS exists in the DDL schema", () => {
 		// Spin up an in-memory DB, apply CREATE_TABLES, then PRAGMA each table.

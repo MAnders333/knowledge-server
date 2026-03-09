@@ -153,9 +153,9 @@ export const config = {
 		mergeModel: process.env.LLM_MERGE_MODEL || "anthropic/claude-haiku-4-5",
 		contradictionModel:
 			process.env.LLM_CONTRADICTION_MODEL || "anthropic/claude-sonnet-4-6",
-		// Synthesis fires rarely (at obs=10, 20, 30, ...) and produces abstract
-		// principles — worth using a capable model. Defaults to extractionModel
-		// so existing deployments are unaffected without LLM_SYNTHESIS_MODEL set.
+		// Synthesis fires per cluster when membership changes since last synthesis.
+		// Defaults to extractionModel so existing deployments are unaffected without
+		// LLM_SYNTHESIS_MODEL set.
 		synthesisModel:
 			process.env.LLM_SYNTHESIS_MODEL ||
 			process.env.LLM_EXTRACTION_MODEL ||
@@ -243,19 +243,6 @@ export const config = {
 		contradictionMinSimilarity: parseFloatEnv(
 			process.env.CONTRADICTION_MIN_SIMILARITY,
 			0.4,
-		),
-		// Observation count threshold for triggering cross-session knowledge synthesis.
-		// When an entry's observation_count reaches this value (or the next multiple of it),
-		// the system looks at its KB neighbors and attempts to synthesize a higher-order
-		// principle. Set to 0 to disable synthesis entirely.
-		// Default: 10 (fires at obs=10, 20, 30, ... — 9 reinforcements for the first trigger).
-		// observationCount starts at 1 (insertion), so threshold=10 means 9 reinforcements.
-		// Lower values fire more aggressively but with weaker evidence — 3 fires after only
-		// 2 confirmations, which is too weak a signal for reliable principle extraction.
-		synthesisObservationThreshold: parseIntEnv(
-			process.env.CONSOLIDATION_SYNTHESIS_THRESHOLD,
-			10,
-			0,
 		),
 		// Polling interval for background auto-consolidation while the server is running.
 		// 0 (default) disables polling — consolidation only runs on startup and via API.

@@ -709,19 +709,7 @@ describe("ConsolidationEngine.reconsolidate() — 'keep' decision (above thresho
 	});
 });
 
-describe("ConsolidationEngine.reconsolidate() — synthesis trigger on 'keep'", () => {
-	// Override synthesis threshold to 3 for all tests in this block so they run
-	// quickly without needing obs=9 → 10 setups. Restored in afterEach.
-	const SYNTH_THRESHOLD = 3;
-	let originalThreshold: number;
-	beforeEach(() => {
-		originalThreshold = config.consolidation.synthesisObservationThreshold;
-		config.consolidation.synthesisObservationThreshold = SYNTH_THRESHOLD;
-	});
-	afterEach(() => {
-		config.consolidation.synthesisObservationThreshold = originalThreshold;
-	});
-
+describe("ConsolidationEngine — cluster-based synthesis (runKBSynthesis)", () => {
 	function makeEpisode() {
 		const now = Date.now();
 		return {
@@ -739,62 +727,34 @@ describe("ConsolidationEngine.reconsolidate() — synthesis trigger on 'keep'", 
 		};
 	}
 
-	it("does not call synthesizePrinciple when observation_count is below threshold", async () => {
-		// Entry starts at observationCount=1; after keep it becomes 2 — below threshold of 3
-		const emb = fakeEmbedding("TypeScript static");
-		db.insertEntry(
-			makeEntry({
-				id: "ts-entry",
-				content: "TypeScript is statically typed.",
-				topics: ["typescript"],
-				embedding: emb,
-				observationCount: 1,
-				lastSynthesizedObservationCount: null,
-			}),
-		);
+	it("does not call synthesizePrinciple when cluster has fewer than 3 members", async () => {
+		// Insert 2 entries — not enough to form a ripe cluster (min=3)
+		const emb1 = fakeEmbedding("TypeScript static");
+		const emb2 = fakeEmbedding("TypeScript types");
+		db.insertEntry(makeEntry({ id: "e1", content: "TypeScript is statically typed.", topics: ["typescript"], embedding: emb1 }));
+		db.insertEntry(makeEntry({ id: "e2", content: "TypeScript has structural types.", topics: ["typescript"], embedding: emb2 }));
 
 		spyOn(OpenCodeEpisodeReader.prototype, "getCandidateSessions").mockReturnValue([
 			{ id: "session-1", maxMessageTime: Date.now() },
 		]);
 		spyOn(OpenCodeEpisodeReader.prototype, "getNewEpisodes").mockReturnValue([makeEpisode()]);
 		spyOn(activation, "ensureEmbeddings").mockResolvedValue(0);
-		spyOn(activation.embeddings, "embed").mockResolvedValue(emb);
-		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockResolvedValue([
-			{ type: "fact", content: "TypeScript uses static types.", topics: ["typescript"], confidence: 0.88, scope: "personal", source: "test" },
-		]);
-		spyOn(ConsolidationLLM.prototype, "decideMerge").mockResolvedValue({ action: "keep" });
-		const synthSpy = spyOn(ConsolidationLLM.prototype, "synthesizePrinciple").mockResolvedValue(null);
+		spyOn(activation.embeddings, "embed").mockResolvedValue(emb1);
+		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockResolvedValue([]);
+		const synthSpy = spyOn(ConsolidationLLM.prototype, "synthesizePrinciple").mockResolvedValue([]);
 
 		await engine.consolidate();
 
-		// obs=2 < threshold=3 → synthesis should not fire
+		// 2 entries → 1-2 member cluster → below CLUSTER_MIN_MEMBERS=3 → no synthesis
 		expect(synthSpy).not.toHaveBeenCalled();
 	});
 
-	it("calls synthesizePrinciple when observation_count reaches the threshold", async () => {
-		// Entry starts at observationCount=2; after keep it becomes 3 = threshold
+	it("calls synthesizePrinciple when a new cluster with ≥ 3 members forms", async () => {
+		// Insert 3 semantically similar entries — they should cluster together
 		const emb = fakeEmbedding("TypeScript static");
-		db.insertEntry(
-			makeEntry({
-				id: "ts-entry",
-				content: "TypeScript is statically typed.",
-				topics: ["typescript"],
-				embedding: emb,
-				observationCount: 2,
-				lastSynthesizedObservationCount: null,
-			}),
-		);
-		// A neighbor entry is required so runKBSynthesis has candidates to look at
-		db.insertEntry(
-			makeEntry({
-				id: "neighbor-entry",
-				content: "neighbor content about static analysis",
-				topics: ["analysis"],
-				embedding: fakeEmbedding("neighbor content"),
-				observationCount: 1,
-				lastSynthesizedObservationCount: null,
-			}),
-		);
+		db.insertEntry(makeEntry({ id: "e1", content: "TypeScript is statically typed.", topics: ["typescript"], embedding: emb }));
+		db.insertEntry(makeEntry({ id: "e2", content: "TypeScript has structural types.", topics: ["typescript"], embedding: emb }));
+		db.insertEntry(makeEntry({ id: "e3", content: "TypeScript checks types at compile time.", topics: ["typescript"], embedding: emb }));
 
 		spyOn(OpenCodeEpisodeReader.prototype, "getCandidateSessions").mockReturnValue([
 			{ id: "session-1", maxMessageTime: Date.now() },
@@ -802,119 +762,47 @@ describe("ConsolidationEngine.reconsolidate() — synthesis trigger on 'keep'", 
 		spyOn(OpenCodeEpisodeReader.prototype, "getNewEpisodes").mockReturnValue([makeEpisode()]);
 		spyOn(activation, "ensureEmbeddings").mockResolvedValue(0);
 		spyOn(activation.embeddings, "embed").mockResolvedValue(emb);
-		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockResolvedValue([
-			{ type: "fact", content: "TypeScript uses static types.", topics: ["typescript"], confidence: 0.88, scope: "personal", source: "test" },
-		]);
-		spyOn(ConsolidationLLM.prototype, "decideMerge").mockResolvedValue({ action: "keep" });
-		const synthSpy = spyOn(ConsolidationLLM.prototype, "synthesizePrinciple").mockResolvedValue(null);
+		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockResolvedValue([]);
+		const synthSpy = spyOn(ConsolidationLLM.prototype, "synthesizePrinciple").mockResolvedValue([]);
 
-		// Synthesis runs synchronously inside consolidate() — no setTimeout needed.
 		await engine.consolidate();
 
-		// obs=2 → reinforced to 3 = threshold → synthesis fires
+		// 3 identical-embedding entries → 1 cluster with 3 members → ripe (new) → synthesis fires
 		expect(synthSpy).toHaveBeenCalledTimes(1);
-	});
-
-	it("does not re-synthesize when already synthesized at same observation level", async () => {
-		// Entry starts at obs=3, lastSynth=3. After keep it becomes obs=4.
-		// Next threshold = 3+3=6. obs(4) < 6 → synthesis must NOT fire.
-		// This tests the guard: "already synthesized at threshold=3, next level is 6".
-		const emb = fakeEmbedding("TypeScript static");
-		db.insertEntry(
-			makeEntry({
-				id: "ts-entry",
-				content: "TypeScript is statically typed.",
-				topics: ["typescript"],
-				embedding: emb,
-				observationCount: 3, // already AT the threshold=3 level
-				lastSynthesizedObservationCount: 3, // synthesis already fired here
-			}),
-		);
-
-		spyOn(OpenCodeEpisodeReader.prototype, "getCandidateSessions").mockReturnValue([
-			{ id: "session-1", maxMessageTime: Date.now() },
-		]);
-		spyOn(OpenCodeEpisodeReader.prototype, "getNewEpisodes").mockReturnValue([makeEpisode()]);
-		spyOn(activation, "ensureEmbeddings").mockResolvedValue(0);
-		spyOn(activation.embeddings, "embed").mockResolvedValue(emb);
-		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockResolvedValue([
-			{ type: "fact", content: "TypeScript uses static types.", topics: ["typescript"], confidence: 0.88, scope: "personal", source: "test" },
-		]);
-		spyOn(ConsolidationLLM.prototype, "decideMerge").mockResolvedValue({ action: "keep" });
-		const synthSpy = spyOn(ConsolidationLLM.prototype, "synthesizePrinciple").mockResolvedValue(null);
-
-		// Synthesis runs synchronously inside consolidate() — no setTimeout needed.
-		await engine.consolidate();
-
-		// Next threshold would be 3+3=6, obs=4 < 6 → no re-synthesis
-		expect(synthSpy).not.toHaveBeenCalled();
 	});
 
 	it("inserts a synthesized entry and supports relations when synthesis returns a result", async () => {
 		const emb = fakeEmbedding("TypeScript static");
-		const neighborEmb = fakeEmbedding("neighbor content");
-		// A truly orthogonal vector for the synthesized principle so reconsolidate()
-		// treats it as novel (sim=0, well below RECONSOLIDATION_THRESHOLD=0.82).
-		// fakeEmbedding() only uses the first 3 chars of a string and its 8-dim unit
-		// vectors can end up very close regardless of content — use an explicit vector.
 		const synthEmb = [0, 0, 0, 0, 0, 0, 0, 1]; // orthogonal to all fakeEmbedding() outputs
-		db.insertEntry(
-			makeEntry({
-				id: "ts-entry",
-				content: "TypeScript is statically typed.",
-				topics: ["typescript"],
-				embedding: emb,
-				observationCount: 2,
-				lastSynthesizedObservationCount: null,
-			}),
-		);
-		// Insert a neighbor so runKBSynthesis has entries to look at
-		db.insertEntry(
-			makeEntry({
-				id: "neighbor-1",
-				content: "neighbor content about types",
-				topics: ["types"],
-				embedding: neighborEmb,
-				observationCount: 1,
-				lastSynthesizedObservationCount: null,
-			}),
-		);
+
+		db.insertEntry(makeEntry({ id: "e1", content: "TypeScript is statically typed.", topics: ["typescript"], embedding: emb }));
+		db.insertEntry(makeEntry({ id: "e2", content: "TypeScript has structural types.", topics: ["typescript"], embedding: emb }));
+		db.insertEntry(makeEntry({ id: "e3", content: "TypeScript checks types at compile time.", topics: ["typescript"], embedding: emb }));
 
 		spyOn(OpenCodeEpisodeReader.prototype, "getCandidateSessions").mockReturnValue([
 			{ id: "session-1", maxMessageTime: Date.now() },
 		]);
 		spyOn(OpenCodeEpisodeReader.prototype, "getNewEpisodes").mockReturnValue([makeEpisode()]);
 		spyOn(activation, "ensureEmbeddings").mockResolvedValue(0);
-		// First call: embed for the extracted entry (in reconsolidate, uses formatEmbeddingText).
-		// Second call: embed for the synthesized principle in runKBSynthesis — return orthogonal vec.
-		let embedCallCount = 0;
-		spyOn(activation.embeddings, "embed").mockImplementation(async () => {
-			embedCallCount++;
-			return embedCallCount === 1 ? emb : synthEmb;
-		});
-		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockResolvedValue([
-			{ type: "fact", content: "TypeScript uses static types.", topics: ["typescript"], confidence: 0.88, scope: "personal", source: "test" },
+		// embed is called to embed the synthesized entry; return orthogonal vec to avoid dedupe
+		spyOn(activation.embeddings, "embed").mockResolvedValue(synthEmb);
+		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockResolvedValue([]);
+		spyOn(ConsolidationLLM.prototype, "synthesizePrinciple").mockResolvedValue([
+			{
+				type: "principle",
+				content: "Static typing produces more reliable code.",
+				topics: ["typescript", "types"],
+				confidence: 0.75,
+				sourceIds: ["e1", "e2"],
+			},
 		]);
-		spyOn(ConsolidationLLM.prototype, "decideMerge").mockResolvedValue({ action: "keep" });
-		spyOn(ConsolidationLLM.prototype, "synthesizePrinciple").mockResolvedValue({
-			type: "principle",
-			content: "Static typing produces more reliable code.",
-			topics: ["typescript", "types"],
-			confidence: 0.75,
-			sourceIds: ["neighbor-1"],
-		});
 
-		// Synthesis now runs synchronously inside consolidate() — no setTimeout needed.
 		await engine.consolidate();
 
-		// A synthesized entry should now exist
 		const allEntries = db.getEntries({});
 		const synthesized = allEntries.find((e) => e.content === "Static typing produces more reliable code.");
 		expect(synthesized).toBeDefined();
 		expect(synthesized?.type).toBe("principle");
-		// anchor should be marked as synthesized at obs=3
-		const anchor = db.getEntry("ts-entry");
-		expect(anchor?.lastSynthesizedObservationCount).toBe(3);
 	});
 });
 
@@ -975,125 +863,7 @@ describe("ConsolidationEngine.reconsolidate() — 'update' decision (above thres
 	});
 });
 
-describe("ConsolidationEngine.reconsolidate() — synthesis trigger on 'update'", () => {
-	// Override synthesis threshold to 3 for all tests in this block.
-	const SYNTH_THRESHOLD = 3;
-	let originalThreshold: number;
-	beforeEach(() => {
-		originalThreshold = config.consolidation.synthesisObservationThreshold;
-		config.consolidation.synthesisObservationThreshold = SYNTH_THRESHOLD;
-	});
-	afterEach(() => {
-		config.consolidation.synthesisObservationThreshold = originalThreshold;
-	});
-
-	function makeEpisode() {
-		const now = Date.now();
-		return {
-			sessionId: "s1",
-			startMessageId: "m1",
-			endMessageId: "m2",
-			sessionTitle: "Test",
-			projectName: "test",
-			directory: "/tmp",
-			timeCreated: now,
-			maxMessageTime: now,
-			content: "user: hello\nassistant: world",
-			contentType: "messages" as const,
-			approxTokens: 10,
-		};
-	}
-
-	it("calls synthesizePrinciple when update pushes observation_count to threshold", async () => {
-		// Entry at obs=2; mergeEntry increments to 3 = threshold → synthesis fires
-		const emb = fakeEmbedding("TypeScript static");
-		db.insertEntry(
-			makeEntry({
-				id: "ts-entry",
-				content: "TypeScript is statically typed.",
-				topics: ["typescript"],
-				embedding: emb,
-				observationCount: 2,
-				lastSynthesizedObservationCount: null,
-			}),
-		);
-		db.insertEntry(
-			makeEntry({
-				id: "neighbor-entry",
-				content: "neighbor content about static analysis",
-				topics: ["analysis"],
-				embedding: fakeEmbedding("neighbor content"),
-				observationCount: 1,
-				lastSynthesizedObservationCount: null,
-			}),
-		);
-
-		spyOn(OpenCodeEpisodeReader.prototype, "getCandidateSessions").mockReturnValue([
-			{ id: "session-1", maxMessageTime: Date.now() },
-		]);
-		spyOn(OpenCodeEpisodeReader.prototype, "getNewEpisodes").mockReturnValue([makeEpisode()]);
-		spyOn(activation, "ensureEmbeddings").mockResolvedValue(0);
-		spyOn(activation.embeddings, "embed").mockResolvedValue(emb);
-		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockResolvedValue([
-			{ type: "fact", content: "TypeScript uses static types.", topics: ["typescript"], confidence: 0.88, scope: "personal", source: "test" },
-		]);
-		spyOn(ConsolidationLLM.prototype, "decideMerge").mockResolvedValue({
-			action: "update",
-			content: "TypeScript is statically typed (confirmed).",
-			type: "fact",
-			topics: ["typescript"],
-			confidence: 0.9,
-		});
-		const synthSpy = spyOn(ConsolidationLLM.prototype, "synthesizePrinciple").mockResolvedValue(null);
-
-		// Synthesis runs synchronously inside consolidate() — no setTimeout needed.
-		await engine.consolidate();
-
-		// obs=2 → update increments to 3 = threshold → synthesis fires
-		expect(synthSpy).toHaveBeenCalledTimes(1);
-		// anchor should be stamped as synthesized at obs=3
-		const anchor = db.getEntry("ts-entry");
-		expect(anchor?.lastSynthesizedObservationCount).toBe(3);
-	});
-
-	it("does not call synthesizePrinciple when update does not reach threshold", async () => {
-		// Entry at obs=1; after update it becomes 2 < threshold(3) → no synthesis
-		const emb = fakeEmbedding("TypeScript static");
-		db.insertEntry(
-			makeEntry({
-				id: "ts-entry",
-				content: "TypeScript is statically typed.",
-				topics: ["typescript"],
-				embedding: emb,
-				observationCount: 1,
-				lastSynthesizedObservationCount: null,
-			}),
-		);
-
-		spyOn(OpenCodeEpisodeReader.prototype, "getCandidateSessions").mockReturnValue([
-			{ id: "session-1", maxMessageTime: Date.now() },
-		]);
-		spyOn(OpenCodeEpisodeReader.prototype, "getNewEpisodes").mockReturnValue([makeEpisode()]);
-		spyOn(activation, "ensureEmbeddings").mockResolvedValue(0);
-		spyOn(activation.embeddings, "embed").mockResolvedValue(emb);
-		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockResolvedValue([
-			{ type: "fact", content: "TypeScript uses static types.", topics: ["typescript"], confidence: 0.88, scope: "personal", source: "test" },
-		]);
-		spyOn(ConsolidationLLM.prototype, "decideMerge").mockResolvedValue({
-			action: "update",
-			content: "TypeScript is statically typed (confirmed).",
-			type: "fact",
-			topics: ["typescript"],
-			confidence: 0.9,
-		});
-		const synthSpy = spyOn(ConsolidationLLM.prototype, "synthesizePrinciple").mockResolvedValue(null);
-
-		// Synthesis runs synchronously inside consolidate() — no setTimeout needed.
-		await engine.consolidate();
-
-		expect(synthSpy).not.toHaveBeenCalled();
-	});
-});
+// (synthesis trigger on 'update' tests consolidated into "cluster-based synthesis" describe above)
 
 describe("ConsolidationEngine.reconsolidate() — 'insert' decision (above threshold but distinct)", () => {
 	it("inserts a new entry even when similarity exceeds the threshold", async () => {

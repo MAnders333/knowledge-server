@@ -427,89 +427,80 @@ Respond with one of:
 	}
 
 	/**
-	 * Cross-session synthesis: given a well-reinforced entry and its KB neighbors,
-	 * attempt to synthesize a higher-order principle that spans them.
+	 * Cluster-based cross-session synthesis.
 	 *
-	 * Only called when an entry's observation_count crosses a synthesis threshold
-	 * (e.g. 3, 6, 9, ...) — evidence-gated, not per-consolidation-run.
+	 * Given a set of peer entries that form a cluster (no anchor/neighbor distinction),
+	 * attempt to synthesize zero or more higher-order principles that none of the
+	 * individual entries states explicitly.
 	 *
-	 * The synthesis is intentionally lossy: it should extract structural invariants
-	 * and discard instance-specific details. Think hippocampal schema formation —
-	 * the schema suppresses exceptions and highlights what recurs across episodes.
+	 * Called once per ripe cluster (last_membership_changed_at > last_synthesized_at).
+	 * The synthesis is intentionally lossy: structural invariants only, no instance
+	 * details. Results are type "principle" or "pattern" — never "fact".
 	 *
-	 * Returns null when no meaningful synthesis is possible (high bar — most calls
-	 * should return null). A non-null result should always be type "principle" or
-	 * "pattern" — never a fact (facts are concrete, not synthesized).
+	 * Returns an array (empty when the bar is not met — the common case).
 	 */
 	async synthesizePrinciple(
-		anchor: {
-			content: string;
-			type: string;
-			topics: string[];
-			observationCount: number;
-		},
-		neighbors: Array<{
+		peers: Array<{
 			id: string;
 			content: string;
 			type: string;
 			topics: string[];
 		}>,
-	): Promise<SynthesisResult | null> {
-		if (neighbors.length === 0) return null;
+	): Promise<SynthesisResult[]> {
+		if (peers.length === 0) return [];
 
-		// type, topics, and content come from LLM-sourced DB entries — wrap in XML
-		// to prevent a malicious/hallucinating prior extraction from breaking the
-		// prompt structure. n.id is always a randomUUID() value generated at
-		// insertion time (never LLM-sourced), so it is safe to embed unescaped.
-		const neighborList = neighbors
+		// Content fields come from LLM-sourced DB entries — wrap in XML to prevent
+		// a malicious prior extraction from breaking the prompt structure.
+		// peer.id is always a randomUUID() value (never LLM-sourced), safe to embed raw.
+		const peerList = peers
 			.map(
-				(n, i) =>
-					`[${i + 1}] id: ${n.id}
-type: <neighbor_type>${n.type}</neighbor_type> | topics: <neighbor_topics>${n.topics.join(", ")}</neighbor_topics>
-content: <neighbor_content>${n.content}</neighbor_content>`,
+				(p, i) =>
+					`[${i + 1}] id: ${p.id}
+type: <peer_type>${p.type}</peer_type> | topics: <peer_topics>${p.topics.join(", ")}</peer_topics>
+content: <peer_content>${p.content}</peer_content>`,
 			)
 			.join("\n\n");
 
-		const systemPrompt = `You are a meta-cognitive knowledge synthesizer. You will be shown one ANCHOR knowledge entry that has been confirmed across ${anchor.observationCount} independent sessions, plus several NEIGHBORING entries from the same knowledge base.
+		const systemPrompt = `You are a meta-cognitive knowledge synthesizer. You will be shown a cluster of peer knowledge entries from the same knowledge base that were grouped together by embedding similarity.
 
-Your job is to identify whether a HIGHER-ORDER PRINCIPLE or PATTERN emerges from the anchor and its neighbors — something that none of them states explicitly but that is visible in their aggregate.
+Your job is to identify whether any HIGHER-ORDER PRINCIPLES or PATTERNS emerge from these entries together — things that none of them states explicitly but that are visible in their aggregate.
 
 Think of this like the brain during sleep consolidation: schemas form by extracting what is INVARIANT across many distinct episodes, suppressing the specific details. The result is always more abstract and more general than any individual entry.
 
-THE BAR IS VERY HIGH. Return null (respond with {}) unless:
-- A genuine structural invariant is visible across at least the anchor and 2+ neighbors
+THE BAR IS VERY HIGH. Return an empty array [] unless:
+- A genuine structural invariant is visible across at least 3 of the cluster members
 - The synthesized principle would be useful to an agent BEYOND any specific instance
 - The synthesis says something that NONE of the source entries says individually
 
 DO NOT synthesize if:
-- The entries are all about the same specific topic and the synthesis would just be a summary
-- The pattern is already stated in one of the source entries (that's a fact, not a synthesis)
+- The entries are all about the same specific instance and the synthesis would just be a summary
+- The pattern is already stated verbatim in one of the source entries (that's a fact, not a synthesis)
 - The connection is superficial (shared keywords but no structural commonality)
 - You would need to stretch or speculate to connect them
 
 When synthesis IS warranted, be LOSSY — drop all instance-specific details (dates, names, numbers, file paths). Extract only the structural pattern that generalizes.
 
-The synthesized entry must be type "principle" or "pattern" — never "fact".
+Each synthesized entry must be type "principle" or "pattern" — never "fact".
 
-Respond ONLY with a JSON object. Return {} if no meaningful synthesis is possible.`;
+Respond ONLY with a JSON array. Return [] if no meaningful synthesis is possible.`;
 
-		const userPrompt = `ANCHOR ENTRY (confirmed ${anchor.observationCount}× across independent sessions):
-type: <anchor_type>${anchor.type}</anchor_type> | topics: <anchor_topics>${anchor.topics.join(", ")}</anchor_topics>
-content: <anchor_content>${anchor.content}</anchor_content>
+		const userPrompt = `CLUSTER ENTRIES (grouped by semantic similarity):
+${peerList}
 
-NEIGHBORING ENTRIES (semantically related, from the same knowledge base):
-${neighborList}
+Do these entries together imply a higher-order principle or pattern that none of them states individually?
 
-If a higher-order principle or pattern emerges across these entries that none of them states individually, return:
-{
-  "type": "principle|pattern",
-  "content": "The synthesized abstraction (1-3 sentences, no specific dates/names/numbers)",
-  "topics": ["shared", "abstract", "topics"],
-  "confidence": 0.5-0.85,
-  "sourceIds": ["id1", "id2", ...]
-}
+If yes, return an array of synthesized principles (can be more than one if warranted):
+[
+  {
+    "type": "principle|pattern",
+    "content": "The synthesized abstraction (1-3 sentences, no specific dates/names/numbers)",
+    "topics": ["shared", "abstract", "topics"],
+    "confidence": 0.5-0.85,
+    "sourceIds": ["id1", "id2", ...]
+  }
+]
 
-If no meaningful synthesis is possible, return: {}`;
+If no meaningful synthesis is possible, return: []`;
 
 		const response = await complete(
 			config.llm.synthesisModel,
@@ -518,44 +509,42 @@ If no meaningful synthesis is possible, return: {}`;
 			2048,
 		);
 
-		const parsed = parseJSON<Partial<SynthesisResult> & { sourceIds?: string[] }>(response, false);
+		const parsed = parseJSON<Array<Partial<SynthesisResult> & { sourceIds?: string[] }>>(response, true);
 
-		// {} or missing required fields → no synthesis
-		if (
-			!parsed ||
-			!parsed.content ||
-			!parsed.type ||
-			!["principle", "pattern"].includes(parsed.type)
-		) {
-			return null;
+		if (!parsed || !Array.isArray(parsed) || parsed.length === 0) {
+			return [];
 		}
 
-		// Re-validate after clamping — clampKnowledgeType can return any KnowledgeType
-		// (e.g. "fact") if the LLM embeds an unexpected word in the type field.
-		// The pre-clamp check above only guards the raw string; the clamped result
-		// must also be a synthesis-appropriate type before we allow the unsafe cast.
-		const clampedType = clampKnowledgeType(parsed.type);
-		if (clampedType !== "principle" && clampedType !== "pattern") {
-			return null;
+		// Validate and normalise each result
+		const validIds = new Set(peers.map((p) => p.id));
+		const results: SynthesisResult[] = [];
+
+		for (const item of parsed) {
+			if (!item.content || !item.type) continue;
+			if (!["principle", "pattern"].includes(item.type)) continue;
+
+			// Re-validate after clamping — clampKnowledgeType can return any KnowledgeType.
+			const clampedType = clampKnowledgeType(item.type);
+			if (clampedType !== "principle" && clampedType !== "pattern") continue;
+
+			// Validate sourceIds are from the provided peer list (hallucination guard)
+			const safeSourceIds = (item.sourceIds ?? []).filter((id) =>
+				validIds.has(id),
+			);
+
+			results.push({
+				type: clampedType,
+				content: item.content,
+				topics: Array.isArray(item.topics) ? item.topics : [],
+				confidence:
+					typeof item.confidence === "number" && !Number.isNaN(item.confidence)
+						? Math.min(0.85, Math.max(0.5, item.confidence))
+						: 0.7,
+				sourceIds: safeSourceIds,
+			});
 		}
 
-		// Validate sourceIds are from the provided neighbor list (hallucination guard)
-		const validIds = new Set(neighbors.map((n) => n.id));
-		const safeSourceIds = (parsed.sourceIds ?? []).filter((id) =>
-			validIds.has(id),
-		);
-
-		return {
-			type: clampedType,
-			content: parsed.content,
-			topics: Array.isArray(parsed.topics) ? parsed.topics : anchor.topics,
-			confidence:
-				typeof parsed.confidence === "number" &&
-				!Number.isNaN(parsed.confidence)
-					? Math.min(0.85, Math.max(0.5, parsed.confidence))
-					: 0.7,
-			sourceIds: safeSourceIds,
-		};
+		return results;
 	}
 
 	/**

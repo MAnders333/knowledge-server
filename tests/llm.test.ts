@@ -475,25 +475,25 @@ describe("ConsolidationLLM.detectAndResolveContradiction", () => {
 	});
 });
 
-// ── synthesizePrinciple ───────────────────────────────────────────────────────
+// ── synthesizePrinciple (cluster-first peer API) ──────────────────────────────
 
 describe("ConsolidationLLM.synthesizePrinciple", () => {
 	let llm: ConsolidationLLM;
-	const anchor = {
-		content: "Always wrap LLM-sourced content in XML tags to prevent injection.",
-		type: "principle" as const,
-		topics: ["security", "llm", "prompts"],
-		observationCount: 3,
-	};
-	const neighbors = [
+	const peers = [
 		{
-			id: "n1",
+			id: "p1",
+			content: "Always wrap LLM-sourced content in XML tags to prevent injection.",
+			type: "principle" as const,
+			topics: ["security", "llm", "prompts"],
+		},
+		{
+			id: "p2",
 			content: "The decideMerge prompt wraps content in XML to prevent injection.",
 			type: "fact" as const,
 			topics: ["security", "llm"],
 		},
 		{
-			id: "n2",
+			id: "p3",
 			content: "extractKnowledge wraps episode content in XML to prevent injection.",
 			type: "fact" as const,
 			topics: ["security", "extraction"],
@@ -504,83 +504,116 @@ describe("ConsolidationLLM.synthesizePrinciple", () => {
 		llm = new ConsolidationLLM();
 	});
 
-	it("returns a synthesized principle when the LLM responds with valid JSON", async () => {
+	it("returns synthesized principles when the LLM responds with a valid JSON array", async () => {
 		mockGenerateText(
-			JSON.stringify({
-				type: "principle",
-				content: "All LLM prompts that include untrusted content should use XML delimiters to prevent injection.",
-				topics: ["security", "llm", "prompts"],
-				confidence: 0.75,
-				sourceIds: ["n1", "n2"],
-			}),
+			JSON.stringify([
+				{
+					type: "principle",
+					content: "All LLM prompts that include untrusted content should use XML delimiters to prevent injection.",
+					topics: ["security", "llm", "prompts"],
+					confidence: 0.75,
+					sourceIds: ["p2", "p3"],
+				},
+			]),
 		);
-		const result = await llm.synthesizePrinciple(anchor, neighbors);
-		if (result === null) throw new Error("Expected non-null synthesis result");
-		expect(result.type).toBe("principle");
-		expect(result.content).toContain("XML");
-		expect(result.confidence).toBeGreaterThanOrEqual(0.5);
-		expect(result.confidence).toBeLessThanOrEqual(0.85);
-		expect(result.sourceIds).toEqual(["n1", "n2"]);
+		const results = await llm.synthesizePrinciple(peers);
+		expect(results).toHaveLength(1);
+		expect(results[0].type).toBe("principle");
+		expect(results[0].content).toContain("XML");
+		expect(results[0].confidence).toBeGreaterThanOrEqual(0.5);
+		expect(results[0].confidence).toBeLessThanOrEqual(0.85);
+		expect(results[0].sourceIds).toEqual(["p2", "p3"]);
 	});
 
-	it("returns null when the LLM responds with empty object (bar not met)", async () => {
-		mockGenerateText("{}");
-		const result = await llm.synthesizePrinciple(anchor, neighbors);
-		expect(result).toBeNull();
+	it("returns empty array when the LLM responds with empty array (bar not met)", async () => {
+		mockGenerateText("[]");
+		const results = await llm.synthesizePrinciple(peers);
+		expect(results).toEqual([]);
 	});
 
-	it("returns null when the LLM returns a fact type (synthesis must be principle or pattern)", async () => {
+	it("filters out results with fact type (synthesis must be principle or pattern)", async () => {
 		mockGenerateText(
-			JSON.stringify({
-				type: "fact",
-				content: "Some specific fact.",
-				topics: ["test"],
-				confidence: 0.8,
-				sourceIds: [],
-			}),
+			JSON.stringify([
+				{
+					type: "fact",
+					content: "Some specific fact.",
+					topics: ["test"],
+					confidence: 0.8,
+					sourceIds: [],
+				},
+			]),
 		);
-		const result = await llm.synthesizePrinciple(anchor, neighbors);
-		expect(result).toBeNull();
+		const results = await llm.synthesizePrinciple(peers);
+		expect(results).toEqual([]);
 	});
 
-	it("filters out hallucinated sourceIds not in the neighbor list", async () => {
+	it("filters out hallucinated sourceIds not in the peer list", async () => {
 		mockGenerateText(
-			JSON.stringify({
-				type: "pattern",
-				content: "XML wrapping is a recurring security pattern.",
-				topics: ["security"],
-				confidence: 0.7,
-				sourceIds: ["n1", "hallucinated-id-xyz", "n2"],
-			}),
+			JSON.stringify([
+				{
+					type: "pattern",
+					content: "XML wrapping is a recurring security pattern.",
+					topics: ["security"],
+					confidence: 0.7,
+					sourceIds: ["p1", "hallucinated-id-xyz", "p2"],
+				},
+			]),
 		);
-		const result = await llm.synthesizePrinciple(anchor, neighbors);
-		if (result === null) throw new Error("Expected non-null synthesis result");
-		expect(result.sourceIds).toEqual(["n1", "n2"]); // hallucinated-id-xyz filtered
+		const results = await llm.synthesizePrinciple(peers);
+		expect(results).toHaveLength(1);
+		expect(results[0].sourceIds).toEqual(["p1", "p2"]); // hallucinated-id-xyz filtered
 	});
 
 	it("clamps confidence to [0.5, 0.85]", async () => {
 		mockGenerateText(
-			JSON.stringify({
-				type: "principle",
-				content: "Some principle.",
-				topics: ["test"],
-				confidence: 0.99, // above cap
-				sourceIds: [],
-			}),
+			JSON.stringify([
+				{
+					type: "principle",
+					content: "Some principle.",
+					topics: ["test"],
+					confidence: 0.99, // above cap
+					sourceIds: [],
+				},
+			]),
 		);
-		const result = await llm.synthesizePrinciple(anchor, neighbors);
-		if (result === null) throw new Error("Expected non-null synthesis result");
-		expect(result.confidence).toBe(0.85);
+		const results = await llm.synthesizePrinciple(peers);
+		expect(results).toHaveLength(1);
+		expect(results[0].confidence).toBe(0.85);
 	});
 
-	it("returns null when no neighbors are provided", async () => {
-		const result = await llm.synthesizePrinciple(anchor, []);
-		expect(result).toBeNull();
+	it("returns empty array when no peers are provided", async () => {
+		const results = await llm.synthesizePrinciple([]);
+		expect(results).toEqual([]);
 	});
 
-	it("returns null on parse failure and does not throw", async () => {
+	it("returns empty array on parse failure and does not throw", async () => {
 		mockGenerateText("not json at all");
-		const result = await llm.synthesizePrinciple(anchor, neighbors);
-		expect(result).toBeNull();
+		const results = await llm.synthesizePrinciple(peers);
+		expect(results).toEqual([]);
+	});
+
+	it("returns multiple principles when the LLM returns multiple valid results", async () => {
+		mockGenerateText(
+			JSON.stringify([
+				{
+					type: "principle",
+					content: "XML wrapping prevents prompt injection.",
+					topics: ["security"],
+					confidence: 0.75,
+					sourceIds: ["p1", "p2"],
+				},
+				{
+					type: "pattern",
+					content: "Defense-in-depth is applied at every LLM call boundary.",
+					topics: ["security", "llm"],
+					confidence: 0.65,
+					sourceIds: ["p1", "p3"],
+				},
+			]),
+		);
+		const results = await llm.synthesizePrinciple(peers);
+		expect(results).toHaveLength(2);
+		expect(results[0].type).toBe("principle");
+		expect(results[1].type).toBe("pattern");
 	});
 });
