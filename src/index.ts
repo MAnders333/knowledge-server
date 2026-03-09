@@ -182,6 +182,21 @@ Options:
 		);
 	}
 
+	// Check if the embedding model has changed and re-embed if necessary.
+	// Runs before consolidation so all vectors are consistent when the
+	// reconsolidation step compares new extractions against existing entries.
+	try {
+		const didReEmbed = await activation.checkAndReEmbed();
+		if (didReEmbed) {
+			logger.log("All embeddings are now consistent with the configured model.");
+		}
+	} catch (e) {
+		logger.error(
+			"[embedding] Re-embed check failed — activation and consolidation may produce dimension mismatch errors.",
+			e,
+		);
+	}
+
 	// Check for pending sessions
 	const pending = consolidation.checkPending();
 	if (pending.pendingSessions > 0) {

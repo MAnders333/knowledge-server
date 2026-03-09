@@ -30,6 +30,13 @@
  *   (last_message_time_created) and the last time that source was consolidated.
  * - consolidation_state retains the global counters and lastConsolidatedAt but
  *   last_message_time_created is removed (superseded by source_cursor).
+ *
+ * v7: Embedding metadata.
+ * - New embedding_metadata singleton table stores the model name and dimension
+ *   count used to produce the current embeddings. On startup, the server compares
+ *   the stored model against the configured EMBEDDING_MODEL — if they differ, all
+ *   entry embeddings are regenerated automatically (re-embed) so cosine similarity
+ *   remains valid across model changes.
  */
 
 export const SCHEMA_VERSION = 7;
@@ -88,6 +95,7 @@ export const EXPECTED_TABLE_COLUMNS: Readonly<
 		"processed_at",
 		"entries_created",
 	],
+	embedding_metadata: ["id", "model", "dimensions", "recorded_at"],
 };
 
 export const CREATE_TABLES = `
@@ -190,4 +198,14 @@ export const CREATE_TABLES = `
 
   CREATE INDEX IF NOT EXISTS idx_episode_source_session ON consolidated_episode(source, session_id);
   CREATE INDEX IF NOT EXISTS idx_episode_processed ON consolidated_episode(processed_at);
+
+  -- Embedding metadata — singleton row tracking the model and dimensions used
+  -- to produce the current embeddings. Compared against the configured model at
+  -- startup; a mismatch triggers a full re-embed of all entries.
+  CREATE TABLE IF NOT EXISTS embedding_metadata (
+    id INTEGER PRIMARY KEY DEFAULT 1 CHECK(id = 1),  -- singleton row
+    model TEXT NOT NULL,
+    dimensions INTEGER NOT NULL,
+    recorded_at INTEGER NOT NULL
+  );
 `;

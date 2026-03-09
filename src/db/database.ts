@@ -68,6 +68,29 @@ export class KnowledgeDB {
 
 		const existingVersion = row?.version ?? 0;
 
+		// v6 → v7: additive migration — create embedding_metadata table.
+		// No data loss needed: the table is new and CREATE IF NOT EXISTS is safe.
+		// The drift check below would otherwise see the missing table columns and
+		// trigger a full destructive reset — this migration prevents that.
+		if (existingVersion === 6) {
+			logger.log(
+				"[db] Migrating schema v6 → v7: adding embedding_metadata table.",
+			);
+			this.db.exec(`
+				CREATE TABLE IF NOT EXISTS embedding_metadata (
+					id INTEGER PRIMARY KEY DEFAULT 1 CHECK(id = 1),
+					model TEXT NOT NULL,
+					dimensions INTEGER NOT NULL,
+					recorded_at INTEGER NOT NULL
+				);
+			`);
+			this.db
+				.prepare(
+					"INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+				)
+				.run(7, Date.now());
+		}
+
 		// Detect schema drift: compare actual DB columns against EXPECTED_TABLE_COLUMNS
 		// for every table. This is the authoritative check — the version number alone
 		// can be stale if a prior startup wrote the new version to schema_version before
@@ -77,10 +100,11 @@ export class KnowledgeDB {
 		const missingColumns = this.getSchemaDrift();
 
 		// ── Incremental migrations ────────────────────────────────────────────────
-		// For additive-only changes (new nullable columns, new indices) we can
-		// ALTER TABLE instead of wiping the DB, preserving existing knowledge data.
-		// Each migration is idempotent: if the column already exists the ALTER is
-		// skipped (detected via getSchemaDrift before reaching this block).
+		// For additive-only changes (new nullable columns, new tables) we can
+		// ALTER TABLE / CREATE TABLE instead of wiping the DB, preserving existing
+		// knowledge data. Each migration is idempotent: if the column/table already
+		// exists the ALTER/CREATE is skipped (detected via getSchemaDrift before
+		// reaching this block).
 		//
 		// v6 → v7: adds last_synthesized_observation_count (nullable INTEGER).
 		//   No data loss: existing entries get NULL (= never synthesized), which is
@@ -89,6 +113,10 @@ export class KnowledgeDB {
 		//   crash between them cannot leave the DB in a half-migrated state (column
 		//   added but version still 6, which would re-trigger the wipe path on next
 		//   startup instead of re-running the safe ALTER).
+		//
+		// v7 → v8: adds embedding_metadata table (singleton row tracking the model
+		//   and dimensions of the current embeddings). CREATE TABLE is safe — no
+		//   existing data is touched.
 		let incrementalMigrationApplied = false;
 		if (
 			existingVersion === 6 &&
@@ -97,9 +125,18 @@ export class KnowledgeDB {
 					d.table === "knowledge_entry" &&
 					d.column === "last_synthesized_observation_count",
 			) &&
-			// Only attempt if this is the sole missing column — if other columns are
-			// also absent we fall through to the full reset so all gaps are resolved.
-			missingColumns.length === 1
+			// Only attempt if the sole non-embedding_metadata drift is the synthesis
+			// column — if other knowledge_entry columns are also absent we fall
+			// through to the full reset so all gaps are resolved. Drift from new
+			// tables (e.g. embedding_metadata) introduced by later migrations is
+			// excluded so it doesn't block this migration.
+			missingColumns
+				.filter((d) => d.table !== "embedding_metadata")
+				.every(
+					(d) =>
+						d.table === "knowledge_entry" &&
+						d.column === "last_synthesized_observation_count",
+				)
 		) {
 			logger.log(
 				"[db] Applying incremental migration v6 → v7: adding last_synthesized_observation_count column.",
@@ -114,19 +151,42 @@ export class KnowledgeDB {
 					.prepare(
 						"INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
 					)
-					.run(SCHEMA_VERSION, Date.now());
+					.run(7, Date.now());
 			})();
-			// Re-check drift after migration — should now be clean.
-			const remainingDrift = this.getSchemaDrift();
-			if (remainingDrift.length === 0) {
-				incrementalMigrationApplied = true;
-				logger.log("[db] Incremental migration v6 → v7 complete.");
-			} else {
-				// Unexpected: migration ran but drift persists — fall through to reset.
-				logger.warn(
-					`[db] Incremental migration v6 → v7 left unexpected drift: ${remainingDrift.map((d) => `${d.table}.${d.column}`).join(", ")}. Falling through to full reset.`,
-				);
-			}
+			incrementalMigrationApplied = true;
+			logger.log("[db] Incremental migration v6 → v7 complete.");
+		}
+
+		// v7 → v8: additive migration — create embedding_metadata table.
+		// Re-read version in case v6→v7 ran above.
+		const postV7Row = this.db
+			.prepare(
+				"SELECT version FROM schema_version ORDER BY version DESC LIMIT 1",
+			)
+			.get() as { version: number } | null;
+		const postV7Version = postV7Row?.version ?? 0;
+
+		if (postV7Version === 7) {
+			logger.log(
+				"[db] Applying incremental migration v7 → v8: adding embedding_metadata table.",
+			);
+			this.db.transaction(() => {
+				this.db.exec(`
+					CREATE TABLE IF NOT EXISTS embedding_metadata (
+						id INTEGER PRIMARY KEY DEFAULT 1 CHECK(id = 1),
+						model TEXT NOT NULL,
+						dimensions INTEGER NOT NULL,
+						recorded_at INTEGER NOT NULL
+					);
+				`);
+				this.db
+					.prepare(
+						"INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+					)
+					.run(8, Date.now());
+			})();
+			incrementalMigrationApplied = true;
+			logger.log("[db] Incremental migration v7 → v8 complete.");
 		}
 		// ─────────────────────────────────────────────────────────────────────────
 
@@ -173,6 +233,7 @@ export class KnowledgeDB {
 				this.db.exec("DROP TABLE IF EXISTS consolidated_episode");
 				this.db.exec("DROP TABLE IF EXISTS source_cursor");
 				this.db.exec("DROP TABLE IF EXISTS consolidation_state");
+				this.db.exec("DROP TABLE IF EXISTS embedding_metadata");
 				this.db.exec("DROP TABLE IF EXISTS schema_version");
 			})();
 		}
@@ -335,6 +396,25 @@ export class KnowledgeDB {
 			.filter(
 				(e): e is KnowledgeEntry & { embedding: number[] } => !!e.embedding,
 			);
+	}
+
+	/**
+	 * Get a single active or conflicted entry that has an embedding.
+	 * Used to probe embedding dimensions without loading all entries into memory.
+	 */
+	getOneEntryWithEmbedding(): (KnowledgeEntry & { embedding: number[] }) | null {
+		const row = this.db
+			.prepare(
+				"SELECT * FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL LIMIT 1",
+			)
+			.get() as RawEntryRow | undefined;
+
+		if (!row) return null;
+
+		const entry = this.rowToEntry(row);
+		if (!entry.embedding) return null;
+
+		return entry as KnowledgeEntry & { embedding: number[] };
 	}
 
 	/**
@@ -1182,6 +1262,7 @@ export class KnowledgeDB {
 			this.db.exec("DELETE FROM knowledge_entry");
 			this.db.exec("DELETE FROM consolidated_episode");
 			this.db.exec("DELETE FROM source_cursor");
+			this.db.exec("DELETE FROM embedding_metadata");
 			this.db.exec(
 				`UPDATE consolidation_state SET
           last_consolidated_at = 0,
@@ -1191,6 +1272,65 @@ export class KnowledgeDB {
          WHERE id = 1`,
 			);
 		})();
+	}
+
+	// ── Embedding Metadata ──
+
+	/**
+	 * Get the stored embedding model metadata.
+	 * Returns null if no metadata has been recorded yet (first run, or pre-v8 DB).
+	 */
+	getEmbeddingMetadata(): {
+		model: string;
+		dimensions: number;
+		recordedAt: number;
+	} | null {
+		const row = this.db
+			.prepare(
+				"SELECT model, dimensions, recorded_at FROM embedding_metadata WHERE id = 1",
+			)
+			.get() as {
+			model: string;
+			dimensions: number;
+			recorded_at: number;
+		} | null;
+
+		if (!row) return null;
+
+		return {
+			model: row.model,
+			dimensions: row.dimensions,
+			recordedAt: row.recorded_at,
+		};
+	}
+
+	/**
+	 * Record the embedding model and dimensions currently in use.
+	 * Uses INSERT OR REPLACE so the first call creates the singleton row.
+	 */
+	setEmbeddingMetadata(model: string, dimensions: number): void {
+		this.db
+			.prepare(
+				"INSERT OR REPLACE INTO embedding_metadata (id, model, dimensions, recorded_at) VALUES (1, ?, ?, ?)",
+			)
+			.run(model, dimensions, Date.now());
+	}
+
+	/**
+	 * NULL out all embeddings on active and conflicted entries.
+	 * Retained as an escape hatch for manual recovery (e.g. corrupted embeddings)
+	 * even though the normal model-change path uses in-place re-embed via
+	 * checkAndReEmbed() instead of clearing.
+	 *
+	 * Returns the number of entries whose embeddings were cleared.
+	 */
+	clearAllEmbeddings(): number {
+		const result = this.db
+			.prepare(
+				"UPDATE knowledge_entry SET embedding = NULL WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL",
+			)
+			.run();
+		return result.changes;
 	}
 
 	close(): void {

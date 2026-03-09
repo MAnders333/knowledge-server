@@ -8,13 +8,21 @@ import { bodyLimit } from "hono/body-limit";
 import pkg from "../../package.json" with { type: "json" };
 import type { ActivationEngine } from "../activation/activate.js";
 import { splitIntoCues } from "../activation/activate.js";
-import { contradictionTagBlock, contradictionTagInline, staleTag } from "../activation/format.js";
+import {
+	contradictionTagBlock,
+	contradictionTagInline,
+	staleTag,
+} from "../activation/format.js";
 import { config } from "../config.js";
 import type { ConsolidationEngine } from "../consolidation/consolidate.js";
 import type { KnowledgeDB } from "../db/database.js";
 import { logger } from "../logger.js";
 import { activateInputSchema } from "../mcp/index.js";
-import type { ActivationResult, KnowledgeEntry, KnowledgeStatus } from "../types.js";
+import type {
+	ActivationResult,
+	KnowledgeEntry,
+	KnowledgeStatus,
+} from "../types.js";
 
 /**
  * HTTP API for the knowledge server.
@@ -84,7 +92,12 @@ export function createApp(
 
 				if (result.entries.length === 0) {
 					return {
-						content: [{ type: "text" as const, text: "No relevant knowledge found for these cues." }],
+						content: [
+							{
+								type: "text" as const,
+								text: "No relevant knowledge found for these cues.",
+							},
+						],
 					};
 				}
 
@@ -97,21 +110,28 @@ export function createApp(
 					)
 					.join("\n\n");
 
-				const conflictCount = result.entries.filter((r) => r.contradiction).length;
-				const conflictNote = conflictCount > 0
-					? ` — ${conflictCount} conflicted, do not act on those without clarifying which version is correct`
-					: "";
+				const conflictCount = result.entries.filter(
+					(r) => r.contradiction,
+				).length;
+				const conflictNote =
+					conflictCount > 0
+						? ` — ${conflictCount} conflicted, do not act on those without clarifying which version is correct`
+						: "";
 
 				return {
-					content: [{
-						type: "text" as const,
-						text: `## Activated Knowledge (${result.entries.length} entries, ${result.totalActive} total active${conflictNote})\n\n${formatted}`,
-					}],
+					content: [
+						{
+							type: "text" as const,
+							text: `## Activated Knowledge (${result.entries.length} entries, ${result.totalActive} total active${conflictNote})\n\n${formatted}`,
+						},
+					],
 				};
 			} catch (e) {
 				logger.error("[mcp/activate] Error:", e);
 				return {
-					content: [{ type: "text" as const, text: `Error activating knowledge: ${e}` }],
+					content: [
+						{ type: "text" as const, text: `Error activating knowledge: ${e}` },
+					],
 					isError: true,
 				};
 			}
@@ -343,6 +363,8 @@ export function createApp(
 		// with partial data; the config block is simply omitted.
 		const isAdmin = requireAdminToken(c);
 
+		const embeddingMeta = db.getEmbeddingMetadata();
+
 		return c.json({
 			status: "ok",
 			version: pkg.version,
@@ -355,6 +377,13 @@ export function createApp(
 				totalEntriesCreated: consolidationState.totalEntriesCreated,
 				sources: sourceCursors,
 			},
+			embedding: embeddingMeta
+				? {
+						model: embeddingMeta.model,
+						dimensions: embeddingMeta.dimensions,
+						recordedAt: new Date(embeddingMeta.recordedAt).toISOString(),
+					}
+				: null,
 			...(isAdmin && {
 				config: {
 					port: config.port,
