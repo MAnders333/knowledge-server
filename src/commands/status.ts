@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import pkg from "../../package.json" with { type: "json" };
 import { ActivationEngine } from "../activation/activate.js";
 import { ConsolidationEngine } from "../consolidation/consolidate.js";
 import { createEpisodeReaders } from "../consolidation/readers/index.js";
@@ -48,6 +49,7 @@ export function runStatus(pidPath: string): void {
 
 		console.log("Knowledge Server Status");
 		console.log("───────────────────────────────────────");
+		console.log(`  Version:            ${pkg.version}`);
 		console.log(`  Server:             ${serverLine}`);
 		console.log(
 			`  Knowledge entries:  ${stats.total ?? 0} total, ${stats.active ?? 0} active`,
