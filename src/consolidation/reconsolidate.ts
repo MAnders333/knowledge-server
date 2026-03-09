@@ -103,7 +103,7 @@ export class Reconsolidator {
 		 * Pre-computed embedding for the entry content.
 		 *
 		 * When provided, skips the embed() call for the new entry. Used by
-		 * attemptSynthesis, which already embeds the synthesized content to feed
+		 * runKBSynthesis, which already embeds the synthesized content to feed
 		 * reconsolidate() — passing it here avoids a redundant second API call.
 		 *
 		 * The caller is responsible for ensuring this embedding was produced with
