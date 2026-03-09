@@ -474,6 +474,7 @@ export class Reconsolidator {
 			// Process each synthesized principle.
 			// markClusterSynthesized was already called unconditionally above —
 			// the cluster will not be retried even if all results fail here.
+			let clusterReconsolidated = 0;
 			for (const result of results) {
 				logger.log(
 					`[synthesis] Synthesized ${result.type}: ${JSON.stringify(result.content)}`,
@@ -537,6 +538,7 @@ export class Reconsolidator {
 									});
 								}
 								synthesized++;
+								clusterReconsolidated++;
 								logger.log(
 									`[synthesis] Inserted synthesized entry ${inserted.id} with ${validatedSourceIds.length} supports relations.`,
 								);
@@ -546,11 +548,13 @@ export class Reconsolidator {
 								if (existing) {
 									entriesMap.set(id, { ...existing, embedding: freshEmbedding });
 								}
+								clusterReconsolidated++;
 								logger.log(
 									`[synthesis] Refined existing principle ${id} via synthesis.`,
 								);
 							},
 							onKeep: () => {
+								clusterReconsolidated++;
 								logger.log(
 									"[synthesis] Synthesis result matches existing principle — kept (no duplicate inserted).",
 								);
@@ -569,6 +573,11 @@ export class Reconsolidator {
 						err,
 					);
 				}
+			}
+			if (clusterReconsolidated === 0) {
+				logger.warn(
+					`[synthesis] All ${results.length} result(s) for cluster ${cluster.id} failed reconsolidation — cluster marked synthesized but nothing persisted.`,
+				);
 			}
 		}
 
