@@ -236,6 +236,16 @@ export const config = {
 			process.env.CONTRADICTION_MIN_SIMILARITY,
 			0.4,
 		),
+		// Observation count threshold for triggering cross-session knowledge synthesis.
+		// When an entry's observation_count reaches this value (or the next multiple of it),
+		// the system looks at its KB neighbors and attempts to synthesize a higher-order
+		// principle. Set to 0 to disable synthesis entirely.
+		// Default: 3 (fires after 3 independent session confirmations, then at 6, 9, ...).
+		synthesisObservationThreshold: parseIntEnv(
+			process.env.CONSOLIDATION_SYNTHESIS_THRESHOLD,
+			3,
+			0,
+		),
 		// Polling interval for background auto-consolidation while the server is running.
 		// 0 (default) disables polling — consolidation only runs on startup and via API.
 		// Example: 1800000 = 30 minutes. Only triggers when pending sessions exist.

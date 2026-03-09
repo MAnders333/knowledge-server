@@ -141,8 +141,8 @@ export class KnowledgeDB {
 				`INSERT INTO knowledge_entry 
          (id, type, content, topics, confidence, source, scope, status, strength,
           created_at, updated_at, last_accessed_at, access_count, observation_count,
-          superseded_by, derived_from, embedding)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          last_synthesized_observation_count, superseded_by, derived_from, embedding)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			)
 			.run(
 				entry.id,
@@ -159,10 +159,26 @@ export class KnowledgeDB {
 				entry.lastAccessedAt,
 				entry.accessCount,
 				entry.observationCount,
+				entry.lastSynthesizedObservationCount ?? null,
 				entry.supersededBy,
 				JSON.stringify(entry.derivedFrom),
 				embeddingBlob,
 			);
+	}
+
+	/**
+	 * Mark an entry as synthesized at its current observation_count.
+	 * Called after a successful synthesizePrinciple() call to prevent
+	 * re-synthesis at the same evidence level.
+	 */
+	markSynthesized(id: string, observationCount: number): void {
+		this.db
+			.prepare(
+				`UPDATE knowledge_entry
+         SET last_synthesized_observation_count = ?, updated_at = ?
+         WHERE id = ?`,
+			)
+			.run(observationCount, Date.now(), id);
 	}
 
 	updateEntry(id: string, updates: Partial<KnowledgeEntry>): void {
@@ -219,6 +235,24 @@ export class KnowledgeDB {
 			.get(id) as RawEntryRow | null;
 
 		return row ? this.rowToEntry(row) : null;
+	}
+
+	/**
+	 * Fetch only the embedding for a single entry. Used as a cheap fallback
+	 * when the entry object is available but its embedding field is absent —
+	 * avoids loading the entire active KB just to find one vector.
+	 */
+	getEntryEmbedding(id: string): number[] | null {
+		const row = this.db
+			.prepare("SELECT embedding FROM knowledge_entry WHERE id = ?")
+			.get(id) as { embedding: Uint8Array | null } | null;
+		if (!row?.embedding) return null;
+		const float32 = new Float32Array(
+			row.embedding.buffer,
+			row.embedding.byteOffset,
+			row.embedding.byteLength / 4,
+		);
+		return Array.from(float32);
 	}
 
 	getActiveEntries(): KnowledgeEntry[] {
@@ -1021,6 +1055,7 @@ export class KnowledgeDB {
 			lastAccessedAt: row.last_accessed_at,
 			accessCount: row.access_count,
 			observationCount: row.observation_count,
+			lastSynthesizedObservationCount: row.last_synthesized_observation_count,
 			supersededBy: row.superseded_by,
 			derivedFrom: JSON.parse(row.derived_from),
 			embedding,
@@ -1168,6 +1203,7 @@ interface RawEntryRow {
 	last_accessed_at: number;
 	access_count: number;
 	observation_count: number;
+	last_synthesized_observation_count: number | null;
 	superseded_by: string | null;
 	derived_from: string;
 	embedding: Uint8Array | null;

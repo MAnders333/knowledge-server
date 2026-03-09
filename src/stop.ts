@@ -87,7 +87,7 @@ export async function runStop(pidPath: string): Promise<void> {
 			// (i.e. a consolidation batch is in-flight and draining gracefully).
 			if (!noticePrinted && Date.now() - start >= CONSOLIDATION_NOTICE_MS) {
 				console.log(
-					"Waiting for in-flight consolidation to finish (up to 30s)...",
+					`Waiting for in-flight consolidation to finish (up to ${Math.round(STOP_TIMEOUT_MS / 1000)}s)...`,
 				);
 				noticePrinted = true;
 			}

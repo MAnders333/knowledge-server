@@ -520,3 +520,113 @@ describe("ConsolidationLLM.detectAndResolveContradiction", () => {
 		expect(result.some((r) => r.candidateId === "old-1")).toBe(true);
 	});
 });
+
+// ── synthesizePrinciple ───────────────────────────────────────────────────────
+
+describe("ConsolidationLLM.synthesizePrinciple", () => {
+	let llm: ConsolidationLLM;
+	const anchor = {
+		content: "Always wrap LLM-sourced content in XML tags to prevent injection.",
+		type: "principle" as const,
+		topics: ["security", "llm", "prompts"],
+		observationCount: 3,
+	};
+	const neighbors = [
+		{
+			id: "n1",
+			content: "The decideMerge prompt wraps content in XML to prevent injection.",
+			type: "fact" as const,
+			topics: ["security", "llm"],
+		},
+		{
+			id: "n2",
+			content: "extractKnowledge wraps episode content in XML to prevent injection.",
+			type: "fact" as const,
+			topics: ["security", "extraction"],
+		},
+	];
+
+	beforeEach(() => {
+		llm = new ConsolidationLLM();
+	});
+
+	it("returns a synthesized principle when the LLM responds with valid JSON", async () => {
+		mockGenerateText(
+			JSON.stringify({
+				type: "principle",
+				content: "All LLM prompts that include untrusted content should use XML delimiters to prevent injection.",
+				topics: ["security", "llm", "prompts"],
+				confidence: 0.75,
+				sourceIds: ["n1", "n2"],
+			}),
+		);
+		const result = await llm.synthesizePrinciple(anchor, neighbors);
+		if (result === null) throw new Error("Expected non-null synthesis result");
+		expect(result.type).toBe("principle");
+		expect(result.content).toContain("XML");
+		expect(result.confidence).toBeGreaterThanOrEqual(0.5);
+		expect(result.confidence).toBeLessThanOrEqual(0.85);
+		expect(result.sourceIds).toEqual(["n1", "n2"]);
+	});
+
+	it("returns null when the LLM responds with empty object (bar not met)", async () => {
+		mockGenerateText("{}");
+		const result = await llm.synthesizePrinciple(anchor, neighbors);
+		expect(result).toBeNull();
+	});
+
+	it("returns null when the LLM returns a fact type (synthesis must be principle or pattern)", async () => {
+		mockGenerateText(
+			JSON.stringify({
+				type: "fact",
+				content: "Some specific fact.",
+				topics: ["test"],
+				confidence: 0.8,
+				sourceIds: [],
+			}),
+		);
+		const result = await llm.synthesizePrinciple(anchor, neighbors);
+		expect(result).toBeNull();
+	});
+
+	it("filters out hallucinated sourceIds not in the neighbor list", async () => {
+		mockGenerateText(
+			JSON.stringify({
+				type: "pattern",
+				content: "XML wrapping is a recurring security pattern.",
+				topics: ["security"],
+				confidence: 0.7,
+				sourceIds: ["n1", "hallucinated-id-xyz", "n2"],
+			}),
+		);
+		const result = await llm.synthesizePrinciple(anchor, neighbors);
+		if (result === null) throw new Error("Expected non-null synthesis result");
+		expect(result.sourceIds).toEqual(["n1", "n2"]); // hallucinated-id-xyz filtered
+	});
+
+	it("clamps confidence to [0.5, 0.85]", async () => {
+		mockGenerateText(
+			JSON.stringify({
+				type: "principle",
+				content: "Some principle.",
+				topics: ["test"],
+				confidence: 0.99, // above cap
+				sourceIds: [],
+			}),
+		);
+		const result = await llm.synthesizePrinciple(anchor, neighbors);
+		if (result === null) throw new Error("Expected non-null synthesis result");
+		expect(result.confidence).toBe(0.85);
+	});
+
+	it("returns null when no neighbors are provided", async () => {
+		const result = await llm.synthesizePrinciple(anchor, []);
+		expect(result).toBeNull();
+	});
+
+	it("returns null on parse failure and does not throw", async () => {
+		mockGenerateText("not json at all");
+		const result = await llm.synthesizePrinciple(anchor, neighbors);
+		expect(result).toBeNull();
+	});
+});

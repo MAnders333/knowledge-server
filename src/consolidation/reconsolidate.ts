@@ -4,6 +4,7 @@ import {
 	cosineSimilarity,
 	formatEmbeddingText,
 } from "../activation/embeddings.js";
+import { config } from "../config.js";
 import type { KnowledgeDB } from "../db/database.js";
 import { logger } from "../logger.js";
 import { RECONSOLIDATION_THRESHOLD, clampKnowledgeType } from "../types.js";
@@ -17,6 +18,13 @@ import type { ConsolidationLLM, ExtractedKnowledge } from "./llm.js";
  * only the most relevant entries keeps the context focused and fast.
  */
 const MAX_RELEVANT_KNOWLEDGE = 50;
+
+/**
+ * Number of KB neighbors to include in a synthesis call.
+ * Analogous to the hippocampal neighborhood — enough to find structural
+ * commonality without diluting the synthesis with distant entries.
+ */
+const SYNTHESIS_NEIGHBORS = 5;
 
 /**
  * Handles the reconsolidation of a single extracted knowledge entry
@@ -142,7 +150,7 @@ export class Reconsolidator {
 		);
 
 		switch (decision.action) {
-			case "keep":
+			case "keep": {
 				// The same knowledge surfaced again in a new episode — reinforce it as evidence.
 				// This increments observation_count (the evidence signal that extends half-life)
 				// and resets last_accessed_at so decay restarts from now.
@@ -153,7 +161,41 @@ export class Reconsolidator {
 					`[consolidation] Keep existing (reinforced): "${nearestEntry.content.slice(0, 60)}..."`,
 				);
 				callbacks.onKeep();
+
+				// Cross-session synthesis: when a well-reinforced entry reaches a new
+				// threshold multiple, look at its KB neighborhood and attempt to synthesize
+				// a higher-order principle across them.
+				// Fires at observation_count = threshold, 2×threshold, 3×threshold, ...
+				// Each firing level is tracked via last_synthesized_observation_count so
+				// we never synthesize twice for the same evidence level.
+				const threshold = config.consolidation.synthesisObservationThreshold;
+				if (threshold > 0) {
+					// observation_count was just incremented — read the fresh value
+					const freshEntry = this.db.getEntry(nearestEntry.id);
+					if (freshEntry) {
+						const obs = freshEntry.observationCount;
+						const lastSynth = freshEntry.lastSynthesizedObservationCount ?? 0;
+						// Fire when obs has crossed a new threshold multiple since last synthesis
+						const nextThreshold = lastSynth + threshold;
+						if (obs >= nextThreshold) {
+							// Don't await — synthesis is best-effort and should not block
+							// the consolidation loop. Errors are logged and swallowed.
+							// Note: attemptSynthesis calls markSynthesized before the LLM call.
+							// A transient LLM failure will therefore suppress a retry for the
+							// current threshold cycle. This is an intentional trade-off — the
+							// alternative (marking after) risks duplicate synthesis under concurrent
+							// keep events. The next threshold multiple (obs + threshold) will trigger
+							// a fresh attempt.
+							this.attemptSynthesis(freshEntry, entriesMap).catch((err) => {
+								logger.warn(
+									`[consolidation] Synthesis failed for entry ${freshEntry.id}: ${err instanceof Error ? err.message : String(err)}`,
+								);
+							});
+						}
+					}
+				}
 				break;
+			}
 
 			case "update":
 			case "replace": {
@@ -194,6 +236,144 @@ export class Reconsolidator {
 				break;
 			}
 		}
+	}
+
+	/**
+	 * Attempt cross-session synthesis for a well-reinforced entry.
+	 *
+	 * Finds the entry's nearest KB neighbors (by embedding similarity),
+	 * asks the LLM whether a higher-order principle emerges across them,
+	 * and if so inserts it as a new entry with `supports` relations back
+	 * to the anchor and contributing neighbors.
+	 *
+	 * This is intentionally fire-and-forget (called without await) so it
+	 * never blocks the consolidation loop. Errors are caught by the caller.
+	 */
+	private async attemptSynthesis(
+		anchor: KnowledgeEntry & { embedding?: number[] },
+		entriesMap: Map<string, KnowledgeEntry & { embedding: number[] }>,
+	): Promise<void> {
+		// Need anchor embedding to find neighbors. Prefer the in-memory cache
+		// (entriesMap) to avoid a DB round-trip; fall back to a single-row DB
+		// query only if the anchor is absent from the map (e.g. first insertion
+		// within this consolidation run before the map was populated).
+		const anchorEmbedding =
+			entriesMap.get(anchor.id)?.embedding ??
+			anchor.embedding ??
+			this.db.getEntryEmbedding(anchor.id);
+		if (!anchorEmbedding) {
+			logger.warn(
+				`[synthesis] Skipping synthesis for ${anchor.id} — no embedding available.`,
+			);
+			return;
+		}
+
+		// Find top-N neighbors by cosine similarity (excluding anchor itself)
+		const scored: Array<{ entry: KnowledgeEntry & { embedding: number[] }; sim: number }> = [];
+		for (const candidate of entriesMap.values()) {
+			if (candidate.id === anchor.id) continue;
+			scored.push({
+				entry: candidate,
+				sim: cosineSimilarity(anchorEmbedding, candidate.embedding),
+			});
+		}
+		scored.sort((a, b) => b.sim - a.sim);
+		const neighbors = scored.slice(0, SYNTHESIS_NEIGHBORS).map((s) => s.entry);
+
+		if (neighbors.length === 0) {
+			logger.log(
+				`[synthesis] Skipping synthesis for ${anchor.id} — no neighbors in current chunk.`,
+			);
+			// Don't mark synthesized here — the KB may gain neighbors on future runs.
+			// Unlike the null-result path (bar not met), this is a data-availability
+			// gap, not a signal that synthesis was attempted and failed. We want to
+			// retry when context is richer.
+			return;
+		}
+
+		// Stamp the anchor as synthesized NOW — before the async LLM call — so
+		// concurrent keep events for the same entry (possible with parallel source
+		// readers) don't trigger a second synthesis call at the same evidence level.
+		// Using the current observationCount as the stamp ensures the next threshold
+		// check correctly computes: nextThreshold = observationCount + threshold.
+		this.db.markSynthesized(anchor.id, anchor.observationCount);
+
+		logger.log(
+			`[synthesis] Attempting synthesis for "${anchor.content.slice(0, 60)}..." (obs=${anchor.observationCount}) with ${neighbors.length} neighbors.`,
+		);
+
+		const synthStart = Date.now();
+		const result = await this.llm.synthesizePrinciple(
+			{
+				content: anchor.content,
+				type: anchor.type,
+				topics: anchor.topics,
+				observationCount: anchor.observationCount,
+			},
+			neighbors.map((n) => ({
+				id: n.id,
+				content: n.content,
+				type: n.type,
+				topics: n.topics,
+			})),
+		);
+
+		logger.log(
+			`[synthesis] synthesizePrinciple responded in ${((Date.now() - synthStart) / 1000).toFixed(1)}s.`,
+		);
+
+		if (!result) {
+			logger.log(
+				`[synthesis] No synthesis emerged for "${anchor.content.slice(0, 60)}..." — bar not met.`,
+			);
+			// markSynthesized was already called above — nothing else to do.
+			return;
+		}
+
+		logger.log(
+			`[synthesis] Synthesized ${result.type}: "${result.content.slice(0, 80)}..."`,
+		);
+
+		// Insert the synthesized entry. It inherits no session derivation —
+		// its provenance is the source KB entry IDs it was derived from.
+		const synthEntry = this.insertNewEntry(
+			{
+				type: result.type,
+				content: result.content,
+				topics: result.topics,
+				confidence: result.confidence,
+				scope: anchor.scope,
+				source: `synthesis:${anchor.id}`,
+			},
+			[], // no session IDs — this is KB-derived, not episode-derived
+			undefined, // no pre-computed embedding — ensureEmbeddings picks this up next run
+		);
+
+		// The synthesized entry has no embedding yet (computed by ensureEmbeddings on
+		// the next server cycle). We therefore cannot add it to entriesMap (which
+		// requires a number[] embedding). This means within the current consolidation
+		// batch: (a) later extractions cannot dedup against this entry, and (b) the
+		// contradiction scan won't see it. Both are acceptable — synthesis produces
+		// high-level principles unlikely to be re-extracted in the same batch, and the
+		// entry will be fully indexed before the next consolidation run.
+
+		// Write `supports` relations: synthesized entry ← anchor + contributing neighbors.
+		// Direction: synthesized (source) → evidence entry (target), type "supports".
+		// Reads as: "this synthesis is supported by the evidence in those entries."
+		const allSourceIds = [anchor.id, ...result.sourceIds];
+		for (const sourceId of allSourceIds) {
+			this.db.insertRelation({
+				id: randomUUID(),
+				sourceId: synthEntry.id,
+				targetId: sourceId,
+				type: "supports",
+				createdAt: Date.now(),
+			});
+		}
+
+		logger.log(
+			`[synthesis] Inserted synthesized entry ${synthEntry.id} with ${allSourceIds.length} supports relations.`,
+		);
 	}
 
 	/**
@@ -250,6 +430,7 @@ export class Reconsolidator {
 			lastAccessedAt: entryTime,
 			accessCount: 0,
 			observationCount: 1,
+			lastSynthesizedObservationCount: null,
 			supersededBy: null,
 			derivedFrom: sessionIds,
 			embedding,

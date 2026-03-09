@@ -426,6 +426,136 @@ Respond with one of:
 	}
 
 	/**
+	 * Cross-session synthesis: given a well-reinforced entry and its KB neighbors,
+	 * attempt to synthesize a higher-order principle that spans them.
+	 *
+	 * Only called when an entry's observation_count crosses a synthesis threshold
+	 * (e.g. 3, 6, 9, ...) — evidence-gated, not per-consolidation-run.
+	 *
+	 * The synthesis is intentionally lossy: it should extract structural invariants
+	 * and discard instance-specific details. Think hippocampal schema formation —
+	 * the schema suppresses exceptions and highlights what recurs across episodes.
+	 *
+	 * Returns null when no meaningful synthesis is possible (high bar — most calls
+	 * should return null). A non-null result should always be type "principle" or
+	 * "pattern" — never a fact (facts are concrete, not synthesized).
+	 */
+	async synthesizePrinciple(
+		anchor: {
+			content: string;
+			type: string;
+			topics: string[];
+			observationCount: number;
+		},
+		neighbors: Array<{
+			id: string;
+			content: string;
+			type: string;
+			topics: string[];
+		}>,
+	): Promise<SynthesisResult | null> {
+		if (neighbors.length === 0) return null;
+
+		// type and topics come from LLM-sourced DB entries — wrap in XML to prevent
+		// a malicious/hallucinating prior extraction from breaking the prompt structure.
+		const neighborList = neighbors
+			.map(
+				(n, i) =>
+					`[${i + 1}] id: ${n.id}
+type: <neighbor_type>${n.type}</neighbor_type> | topics: <neighbor_topics>${n.topics.join(", ")}</neighbor_topics>
+content: <neighbor_content>${n.content}</neighbor_content>`,
+			)
+			.join("\n\n");
+
+		const systemPrompt = `You are a meta-cognitive knowledge synthesizer. You will be shown one ANCHOR knowledge entry that has been confirmed across ${anchor.observationCount} independent sessions, plus several NEIGHBORING entries from the same knowledge base.
+
+Your job is to identify whether a HIGHER-ORDER PRINCIPLE or PATTERN emerges from the anchor and its neighbors — something that none of them states explicitly but that is visible in their aggregate.
+
+Think of this like the brain during sleep consolidation: schemas form by extracting what is INVARIANT across many distinct episodes, suppressing the specific details. The result is always more abstract and more general than any individual entry.
+
+THE BAR IS VERY HIGH. Return null (respond with {}) unless:
+- A genuine structural invariant is visible across at least the anchor and 2+ neighbors
+- The synthesized principle would be useful to an agent BEYOND any specific instance
+- The synthesis says something that NONE of the source entries says individually
+
+DO NOT synthesize if:
+- The entries are all about the same specific topic and the synthesis would just be a summary
+- The pattern is already stated in one of the source entries (that's a fact, not a synthesis)
+- The connection is superficial (shared keywords but no structural commonality)
+- You would need to stretch or speculate to connect them
+
+When synthesis IS warranted, be LOSSY — drop all instance-specific details (dates, names, numbers, file paths). Extract only the structural pattern that generalizes.
+
+The synthesized entry must be type "principle" or "pattern" — never "fact".
+
+Respond ONLY with a JSON object. Return {} if no meaningful synthesis is possible.`;
+
+		const userPrompt = `ANCHOR ENTRY (confirmed ${anchor.observationCount}× across independent sessions):
+type: <anchor_type>${anchor.type}</anchor_type> | topics: <anchor_topics>${anchor.topics.join(", ")}</anchor_topics>
+content: <anchor_content>${anchor.content}</anchor_content>
+
+NEIGHBORING ENTRIES (semantically related, from the same knowledge base):
+${neighborList}
+
+If a higher-order principle or pattern emerges across these entries that none of them states individually, return:
+{
+  "type": "principle|pattern",
+  "content": "The synthesized abstraction (1-3 sentences, no specific dates/names/numbers)",
+  "topics": ["shared", "abstract", "topics"],
+  "confidence": 0.5-0.85,
+  "sourceIds": ["id1", "id2", ...]
+}
+
+If no meaningful synthesis is possible, return: {}`;
+
+		const response = await complete(
+			config.llm.extractionModel,
+			systemPrompt,
+			userPrompt,
+			2048,
+		);
+
+		const parsed = parseJSON<Partial<SynthesisResult> & { sourceIds?: string[] }>(response, false);
+
+		// {} or missing required fields → no synthesis
+		if (
+			!parsed ||
+			!parsed.content ||
+			!parsed.type ||
+			!["principle", "pattern"].includes(parsed.type)
+		) {
+			return null;
+		}
+
+		// Re-validate after clamping — clampKnowledgeType can return any KnowledgeType
+		// (e.g. "fact") if the LLM embeds an unexpected word in the type field.
+		// The pre-clamp check above only guards the raw string; the clamped result
+		// must also be a synthesis-appropriate type before we allow the unsafe cast.
+		const clampedType = clampKnowledgeType(parsed.type);
+		if (clampedType !== "principle" && clampedType !== "pattern") {
+			return null;
+		}
+
+		// Validate sourceIds are from the provided neighbor list (hallucination guard)
+		const validIds = new Set(neighbors.map((n) => n.id));
+		const safeSourceIds = (parsed.sourceIds ?? []).filter((id) =>
+			validIds.has(id),
+		);
+
+		return {
+			type: clampedType,
+			content: parsed.content,
+			topics: Array.isArray(parsed.topics) ? parsed.topics : anchor.topics,
+			confidence:
+				typeof parsed.confidence === "number" &&
+				!Number.isNaN(parsed.confidence)
+					? Math.min(0.85, Math.max(0.5, parsed.confidence))
+					: 0.7,
+			sourceIds: safeSourceIds,
+		};
+	}
+
+	/**
 	 * Post-extraction contradiction scan.
 	 *
 	 * For a newly inserted/updated entry, checks a set of topic-overlapping
@@ -570,6 +700,15 @@ export type MergeDecision =
 			confidence: number;
 	  }
 	| { action: "insert" };
+
+export interface SynthesisResult {
+	type: "principle" | "pattern";
+	content: string;
+	topics: string[];
+	confidence: number;
+	/** IDs of neighbor entries that contributed to this synthesis (validated against input list). */
+	sourceIds: string[];
+}
 
 export interface ContradictionResult {
 	candidateId: string;

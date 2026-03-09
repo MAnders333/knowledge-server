@@ -11,6 +11,13 @@
  * knowledge), kept separate from access_count (retrieval signal). Removed all
  * migration code — single clean schema, DB is reinitialized on upgrade.
  *
+ * v7: Cross-session synthesis.
+ * - knowledge_entry gains `last_synthesized_observation_count` (INTEGER, NULL).
+ *   NULL = never synthesized. When synthesis fires, this is set to the entry's
+ *   current observation_count. Re-synthesis triggers when observation_count
+ *   crosses the next threshold multiple (e.g. 3, 6, 9, ...) beyond the stored value.
+ *   Tracked per-entry so synthesis never fires twice for the same evidence level.
+ *
  * v6: Multi-source support.
  * - consolidated_episode gains a `source` column (e.g. "opencode", "claude-code")
  *   and a new composite PK (source, session_id, start_message_id, end_message_id).
@@ -21,7 +28,7 @@
  *   last_message_time_created is removed (superseded by source_cursor).
  */
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 /**
  * Expected columns for each table, derived from the DDL below.
@@ -50,6 +57,7 @@ export const EXPECTED_TABLE_COLUMNS: Readonly<
 		"last_accessed_at",
 		"access_count",
 		"observation_count",
+		"last_synthesized_observation_count",
 		"superseded_by",
 		"derived_from",
 		"embedding",
@@ -107,7 +115,13 @@ export const CREATE_TABLES = `
     -- Provenance
     superseded_by TEXT,
     derived_from TEXT NOT NULL DEFAULT '[]',  -- JSON array of session/entry IDs
-    
+
+    -- Cross-session synthesis tracking.
+    -- NULL = never synthesized. Set to observation_count when synthesis fires.
+    -- Re-synthesis triggers when observation_count reaches the next threshold
+    -- multiple beyond this value (e.g. threshold=3 → fires at 3, 6, 9, ...).
+    last_synthesized_observation_count INTEGER,
+
     -- Embedding (float32 array stored as blob)
     embedding BLOB
   );
