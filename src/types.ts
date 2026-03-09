@@ -17,21 +17,6 @@ const KNOWLEDGE_TYPES = [
 	"procedure",
 ] as const;
 
-/**
- * Default cosine similarity threshold above which two entries are considered
- * near-duplicates and routed to decideMerge for an LLM merge decision, rather
- * than inserted as novel. Also serves as the upper bound of the contradiction
- * scan band — entries above this threshold are already handled by decideMerge
- * and excluded from the scan.
- *
- * Override at runtime via the RECONSOLIDATION_SIMILARITY_THRESHOLD env var. The active
- * value lives in config.consolidation.reconsolidationThreshold.
- *
- * Calibrated for text-embedding-3-large. Run `knowledge-server calibrate` to
- * find the right value for a different embedding model.
- */
-export const DEFAULT_RECONSOLIDATION_THRESHOLD = 0.82;
-
 export type KnowledgeType = (typeof KNOWLEDGE_TYPES)[number];
 
 /**

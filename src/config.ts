@@ -1,7 +1,6 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { DEFAULT_RECONSOLIDATION_THRESHOLD } from "./types.js";
 
 /**
  * Parse an integer environment variable with a fallback default and optional
@@ -35,8 +34,21 @@ function parseFloatEnv(
 	return min !== undefined ? Math.max(min, value) : value;
 }
 
-/** Re-export for local use — single source of truth lives in types.ts. */
-const RECONSOLIDATION_THRESHOLD_DEFAULT = DEFAULT_RECONSOLIDATION_THRESHOLD;
+// ── Threshold defaults ───────────────────────────────────────────────────────
+// Single source of truth for all similarity-threshold defaults. Calibrated for
+// text-embedding-3-large. Run `knowledge-server calibrate` to find the right
+// values for a different embedding model.
+//
+// Override at runtime via the corresponding env vars:
+//   RECONSOLIDATION_SIMILARITY_THRESHOLD, CONTRADICTION_MIN_SIMILARITY,
+//   ACTIVATION_SIMILARITY_THRESHOLD.
+
+/** Near-duplicate merge cutoff (upper bound of contradiction scan band). */
+export const DEFAULT_RECONSOLIDATION_THRESHOLD = 0.82;
+/** Lower bound of the contradiction scan band. */
+export const DEFAULT_CONTRADICTION_MIN_SIMILARITY = 0.4;
+/** Minimum raw cosine similarity to activate an entry. */
+export const DEFAULT_ACTIVATION_SIMILARITY_THRESHOLD = 0.3;
 
 export const config = {
 	// Server
@@ -228,11 +240,11 @@ export const config = {
 		// This value is sensitive to the embedding model in use. Models with a broader
 		// similarity distribution (e.g. small local models) may need a lower value to avoid
 		// over-merging; high-quality dense models (e.g. text-embedding-3-large) work well at
-		// the default 0.82. Run `knowledge-server calibrate` to find the right value for a
+		// the default. Run `knowledge-server calibrate` to find the right value for a
 		// different embedding model.
 		reconsolidationThreshold: parseFloatEnv(
 			process.env.RECONSOLIDATION_SIMILARITY_THRESHOLD,
-			RECONSOLIDATION_THRESHOLD_DEFAULT,
+			DEFAULT_RECONSOLIDATION_THRESHOLD,
 		),
 		chunkSize: parseIntEnv(process.env.CONSOLIDATION_CHUNK_SIZE, 10, 1),
 		maxSessionsPerRun: parseIntEnv(
@@ -259,7 +271,7 @@ export const config = {
 		// The band in between gets the contradiction LLM call.
 		contradictionMinSimilarity: parseFloatEnv(
 			process.env.CONTRADICTION_MIN_SIMILARITY,
-			0.4,
+			DEFAULT_CONTRADICTION_MIN_SIMILARITY,
 		),
 		// Polling interval for background auto-consolidation while the server is running.
 		// 0 (default) disables polling — consolidation only runs on startup and via API.
@@ -281,13 +293,12 @@ export const config = {
 		// Minimum raw cosine similarity (NOT decay-weighted) to activate an entry.
 		// Filtering on rawSimilarity means entry age/staleness never prevents a
 		// semantically relevant entry from activating — decay only affects ranking.
-		// 0.30 favors recall over precision: text-embedding-3-large has a low noise
-		// floor at this range, so the risk of irrelevant entries is acceptable compared
-		// to the cost of silently missing useful knowledge. Raise to 0.35 if noise
-		// becomes a problem in practice.
+		// The default favors recall over precision: text-embedding-3-large has a low
+		// noise floor at this range, so the risk of irrelevant entries is acceptable
+		// compared to the cost of silently missing useful knowledge.
 		similarityThreshold: parseFloatEnv(
 			process.env.ACTIVATION_SIMILARITY_THRESHOLD,
-			0.3,
+			DEFAULT_ACTIVATION_SIMILARITY_THRESHOLD,
 		),
 	},
 } as const;
@@ -530,7 +541,7 @@ export function validateConfig(): string[] {
 		// RECONSOLIDATION_SIMILARITY_THRESHOLD doesn't generate a spurious
 		// second error blaming CONTRADICTION_MIN_SIMILARITY.
 		return Number.isNaN(parsed) || parsed <= 0 || parsed > 1
-			? RECONSOLIDATION_THRESHOLD_DEFAULT
+			? DEFAULT_RECONSOLIDATION_THRESHOLD
 			: parsed;
 	})();
 	validateFloatRange(
