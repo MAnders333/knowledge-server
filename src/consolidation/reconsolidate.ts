@@ -113,6 +113,12 @@ export class Reconsolidator {
 		 * formatEmbeddingText(type, content, topics) — the same format used internally.
 		 */
 		precomputedEmbedding?: number[],
+		/**
+		 * Log prefix used in all logger calls from this invocation.
+		 * Defaults to "consolidation". Pass "synthesis" when called from runKBSynthesis
+		 * so synthesis-time reconsolidation doesn't appear as consolidation activity in logs.
+		 */
+		logPrefix: "consolidation" | "synthesis" = "consolidation",
 	): Promise<void> {
 		// Embed the extracted entry content (skip if pre-computed by caller)
 		const entryEmbedding =
@@ -143,14 +149,14 @@ export class Reconsolidator {
 			);
 			callbacks.onInsert(inserted);
 			logger.log(
-				`[consolidation] Insert (novel, sim=${nearestSimilarity.toFixed(3)}): "${entry.content.slice(0, 60)}..."`,
+				`[${logPrefix}] Insert (novel, sim=${nearestSimilarity.toFixed(3)}): ${JSON.stringify(entry.content)}`,
 			);
 			return;
 		}
 
 		// Above threshold → ask LLM for a focused merge decision
 		logger.log(
-			`[consolidation] Reconsolidation candidate (sim=${nearestSimilarity.toFixed(3)}): "${entry.content.slice(0, 60)}..." vs "${nearestEntry.content.slice(0, 60)}..."`,
+			`[${logPrefix}] Reconsolidation candidate (sim=${nearestSimilarity.toFixed(3)}): ${JSON.stringify(entry.content)} vs ${JSON.stringify(nearestEntry.content)}`,
 		);
 
 		const mergeStart = Date.now();
@@ -169,7 +175,7 @@ export class Reconsolidator {
 			},
 		);
 		logger.log(
-			`[consolidation] decideMerge responded in ${((Date.now() - mergeStart) / 1000).toFixed(1)}s.`,
+			`[${logPrefix}] decideMerge responded in ${((Date.now() - mergeStart) / 1000).toFixed(1)}s.`,
 		);
 
 		switch (decision.action) {
@@ -181,7 +187,7 @@ export class Reconsolidator {
 				// event; it's confirmation that the knowledge is still true.
 				this.db.reinforceObservation(nearestEntry.id);
 				logger.log(
-					`[consolidation] Keep existing (reinforced): "${nearestEntry.content.slice(0, 60)}..."`,
+					`[${logPrefix}] Keep existing (reinforced): ${JSON.stringify(nearestEntry.content)}`,
 				);
 				callbacks.onKeep();
 				break;
@@ -211,7 +217,7 @@ export class Reconsolidator {
 				);
 				this.db.mergeEntry(nearestEntry.id, mergeUpdates, freshEmbedding);
 				logger.log(
-					`[consolidation] ${decision.action === "update" ? "Updated" : "Replaced"}: "${nearestEntry.content.slice(0, 60)}..." → "${decision.content.slice(0, 60)}..."`,
+					`[${logPrefix}] ${decision.action === "update" ? "Updated" : "Replaced"}: ${JSON.stringify(nearestEntry.content)} → ${JSON.stringify(decision.content)}`,
 				);
 				callbacks.onUpdate(nearestEntry.id, mergeUpdates, freshEmbedding);
 				break;
@@ -225,7 +231,7 @@ export class Reconsolidator {
 					sessionTimestamp,
 				);
 				logger.log(
-					`[consolidation] Insert (distinct despite similarity): "${entry.content.slice(0, 60)}..."`,
+					`[${logPrefix}] Insert (distinct despite similarity): ${JSON.stringify(entry.content)}`,
 				);
 				callbacks.onInsert(inserted);
 				break;
@@ -466,9 +472,9 @@ export class Reconsolidator {
 
 			// Process each synthesized principle
 			for (const result of results) {
-				logger.log(
-					`[synthesis] Synthesized ${result.type}: "${result.content.slice(0, 80)}..."`,
-				);
+			logger.log(
+				`[synthesis] Synthesized ${result.type}: ${JSON.stringify(result.content)}`,
+			);
 
 				// Embed and reconsolidate for deduplication
 				const synthEmbedding = await this.embeddings.embed(
@@ -544,9 +550,10 @@ export class Reconsolidator {
 							);
 						},
 					},
-					undefined, // no sessionTimestamp — synthesized entries stamped at now
-					synthEmbedding,
-				);
+				undefined, // no sessionTimestamp — synthesized entries stamped at now
+				synthEmbedding,
+				"synthesis", // logPrefix — keeps synthesis reconsolidation out of [consolidation] logs
+			);
 			}
 		}
 
@@ -586,7 +593,7 @@ export class Reconsolidator {
 			// JSON.stringify escapes control characters and ANSI codes so LLM-sourced
 			// content cannot inject structured tokens into the log stream.
 			logger.warn(
-				`[consolidation] sessionTimestamp = 0 (epoch) — likely a corrupt or uninitialised session record. Entry will be stamped at 1970-01-01 and may archive immediately. Preview: ${JSON.stringify(entry.content.slice(0, 60))}`,
+				`[consolidation] sessionTimestamp = 0 (epoch) — likely a corrupt or uninitialised session record. Entry will be stamped at 1970-01-01 and may archive immediately. Entry: ${JSON.stringify(entry.content)}`,
 			);
 		}
 		const entryTime =

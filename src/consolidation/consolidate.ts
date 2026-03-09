@@ -538,10 +538,10 @@ export class ConsolidationEngine {
 				// Rethrowing would skip recordEpisode for the whole chunk, causing all
 				// entries in this chunk to be re-processed on the next run and producing
 				// duplicates for the entries that were already successfully inserted.
-				logger.error(
-					`[consolidation/${source}] Failed to reconsolidate entry "${String(entry.content ?? "").slice(0, 60)}..." — skipping:`,
-					err,
-				);
+			logger.error(
+				`[consolidation/${source}] Failed to reconsolidate entry ${JSON.stringify(entry.content ?? "")} — skipping:`,
+				err,
+			);
 			}
 		}
 
@@ -598,7 +598,7 @@ export class ConsolidationEngine {
 				});
 				archived++;
 				logger.log(
-					`[decay] Archived: "${entry.content.slice(0, 60)}..." (strength: ${newStrength.toFixed(3)})`,
+					`[decay] Archived: ${JSON.stringify(entry.content)} (strength: ${newStrength.toFixed(3)})`,
 				);
 			} else if (Math.abs(newStrength - entry.strength) > 0.01) {
 				// Only update if strength changed meaningfully
@@ -615,7 +615,7 @@ export class ConsolidationEngine {
 			if (entry.updatedAt < tombstoneThreshold) {
 				this.db.updateEntry(entry.id, { status: "tombstoned" });
 				logger.log(
-					`[decay] Tombstoned: "${entry.content.slice(0, 60)}..." (archived for ${config.decay.tombstoneAfterDays}+ days)`,
+					`[decay] Tombstoned: ${JSON.stringify(entry.content)} (archived for ${config.decay.tombstoneAfterDays}+ days)`,
 				);
 			}
 		}

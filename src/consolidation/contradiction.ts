@@ -125,9 +125,9 @@ export class ContradictionScanner {
 					continue;
 				}
 				detected++;
-				logger.log(
-					`[contradiction] ${logPrefix}${result.resolution}: "${entry.content.slice(0, 50)}..." vs candidate ${result.candidateId.slice(0, 8)}... — ${result.reason}`,
-				);
+			logger.log(
+				`[contradiction] ${logPrefix}${result.resolution}: ${JSON.stringify(entry.content)} vs candidate ${result.candidateId} — ${result.reason}`,
+			);
 
 				const mergedData =
 					result.resolution === "merge" &&
@@ -242,9 +242,9 @@ export class ContradictionScanner {
 
 			if (midBandCandidates.length === 0) continue;
 
-			logger.log(
-				`[contradiction] Checking ${midBandCandidates.length} candidates for "${entry.content.slice(0, 60)}..."`,
-			);
+		logger.log(
+			`[contradiction] Checking ${midBandCandidates.length} candidates for ${JSON.stringify(entry.content)}`,
+		);
 
 			const { entrySuperseded, detected: d, resolved: r } = await this.runBatched(
 				entry,
@@ -299,9 +299,9 @@ export class ContradictionScanner {
 
 			if (intraChunkCandidates.length === 0) continue;
 
-			logger.log(
-				`[contradiction] Intra-chunk: checking ${intraChunkCandidates.length} same-chunk candidates for "${entryA.content.slice(0, 60)}..."`,
-			);
+		logger.log(
+			`[contradiction] Intra-chunk: checking ${intraChunkCandidates.length} same-chunk candidates for ${JSON.stringify(entryA.content)}`,
+		);
 
 			const { entrySuperseded: entryASuperseded, detected: d, resolved: r } = await this.runBatched(
 				entryA,
