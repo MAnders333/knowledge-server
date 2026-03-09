@@ -265,10 +265,12 @@ export class ActivationEngine {
 	 * 3. If stored model matches configured model → no-op
 	 * 4. If stored model differs:
 	 *    a. Log the model change clearly
-	 *    b. NULL out all existing embeddings (clearAllEmbeddings)
-	 *    c. Re-embed all entries in batches (ensureEmbeddings)
-	 *    d. Probe the new dimensions from the first generated embedding
-	 *    e. Update embedding metadata with the new model + dimensions
+	 *    b. Re-embed all entries in-place (each entry's embedding is only
+	 *       overwritten after the new vector is computed, so a failure mid-way
+	 *       leaves already-processed entries with valid new embeddings and
+	 *       remaining entries with their old embeddings — activation stays
+	 *       functional throughout)
+	 *    c. Update embedding metadata with the new model + dimensions
 	 *
 	 * Called at startup before consolidation so all vectors are consistent.
 	 * Returns true if a re-embed was performed, false otherwise.
@@ -314,7 +316,7 @@ export class ActivationEngine {
 			return false;
 		}
 
-		// ── Model has changed — re-embed all entries ──
+		// ── Model has changed — re-embed all entries in-place ──
 
 		const entriesWithEmbeddings = this.db.getActiveEntriesWithEmbeddings();
 		const totalEntries = entriesWithEmbeddings.length;
@@ -346,24 +348,37 @@ export class ActivationEngine {
 			`[embedding] Re-embedding ${totalEntries} entries with new model "${configuredModel}"...`,
 		);
 
-		// Step 1: NULL all existing embeddings so ensureEmbeddings picks them all up.
-		const cleared = this.db.clearAllEmbeddings();
-		logger.log(`[embedding] Cleared ${cleared} existing embeddings.`);
-
-		// Step 2: Re-embed in batches using ensureEmbeddings (reuses existing batch logic).
+		// Re-embed in-place: compute new embeddings and overwrite each entry's
+		// vector atomically. This avoids the NULL-gap problem — if the process
+		// fails mid-way (network error, rate limit), already-processed entries
+		// have valid new embeddings and remaining entries keep their old ones.
+		// Activation continues to work throughout (possibly with mixed-model
+		// vectors, which is imperfect but functional). On next startup the
+		// metadata mismatch will still be detected and re-embed will retry
+		// from scratch.
 		const reEmbedStart = Date.now();
-		const reEmbedded = await this.ensureEmbeddings();
+
+		const texts = entriesWithEmbeddings.map((e) =>
+			formatEmbeddingText(e.type, e.content, e.topics),
+		);
+		const newEmbeddings = await this.embeddings.embedBatch(texts);
+
+		let reEmbedded = 0;
+		for (let i = 0; i < entriesWithEmbeddings.length; i++) {
+			this.db.updateEntry(entriesWithEmbeddings[i].id, {
+				embedding: newEmbeddings[i],
+			});
+			reEmbedded++;
+		}
+
 		const durationSec = ((Date.now() - reEmbedStart) / 1000).toFixed(1);
 
-		// Step 3: Probe dimensions from a freshly embedded entry.
-		const freshEntry = this.db.getActiveEntriesWithEmbeddings();
-		const newDimensions =
-			freshEntry.length > 0 ? freshEntry[0].embedding.length : 0;
+		// Probe dimensions from the first new embedding.
+		const newDimensions = newEmbeddings.length > 0 ? newEmbeddings[0].length : 0;
 
-		// Step 4: Update metadata.
-		if (newDimensions > 0) {
-			this.db.setEmbeddingMetadata(configuredModel, newDimensions);
-		}
+		// Update metadata — always update after a successful re-embed, even if
+		// dimensions happen to be 0 (shouldn't happen with valid embeddings).
+		this.db.setEmbeddingMetadata(configuredModel, newDimensions);
 
 		logger.log(
 			`[embedding] Re-embed complete: ${reEmbedded} entries re-embedded in ${durationSec}s ` +

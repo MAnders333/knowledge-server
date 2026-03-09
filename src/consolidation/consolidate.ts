@@ -178,8 +178,11 @@ export class ConsolidationEngine {
 		);
 
 		// If embedding metadata is missing (e.g. startup probe failed, or first
-		// consolidation after a pre-v7 upgrade), record it now from a fresh entry.
-		if (embeddedCount > 0 && !this.db.getEmbeddingMetadata()) {
+		// consolidation after a pre-v7 upgrade) or stale (e.g. checkAndReEmbed
+		// failed before updating metadata), record it now from a fresh entry.
+		const embeddingMeta = this.db.getEmbeddingMetadata();
+		const metadataStale = embeddingMeta && embeddingMeta.model !== config.embedding.model;
+		if (embeddedCount > 0 && (!embeddingMeta || metadataStale)) {
 			const sample = this.db.getActiveEntriesWithEmbeddings();
 			if (sample.length > 0) {
 				this.db.setEmbeddingMetadata(
