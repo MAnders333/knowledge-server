@@ -258,7 +258,7 @@ export class ActivationEngine {
 	 *
 	 * Flow:
 	 * 1. Read stored embedding metadata (model + dimensions) from DB
-	 * 2. If no metadata exists (first run or pre-v7 upgrade):
+	 * 2. If no metadata exists (first run or pre-v8 upgrade):
 	 *    - If entries with embeddings exist, probe the first one's dimension count
 	 *      and record the current model as the baseline
 	 *    - If no entries exist, just record the current model
@@ -280,7 +280,7 @@ export class ActivationEngine {
 		const stored = this.db.getEmbeddingMetadata();
 
 		if (!stored) {
-			// First run or upgrade from pre-v7 schema — seed metadata.
+			// First run or upgrade from pre-v8 schema — seed metadata.
 			// Probe dimensions from an existing entry if available.
 			const existing = this.db.getActiveEntriesWithEmbeddings();
 			if (existing.length > 0) {
@@ -348,14 +348,11 @@ export class ActivationEngine {
 			`[embedding] Re-embedding ${totalEntries} entries with new model "${configuredModel}"...`,
 		);
 
-		// Re-embed in-place: compute new embeddings and overwrite each entry's
-		// vector atomically. This avoids the NULL-gap problem — if the process
-		// fails mid-way (network error, rate limit), already-processed entries
-		// have valid new embeddings and remaining entries keep their old ones.
-		// Activation continues to work throughout (possibly with mixed-model
-		// vectors, which is imperfect but functional). On next startup the
-		// metadata mismatch will still be detected and re-embed will retry
-		// from scratch.
+		// Re-embed in-place: compute all new embeddings in one batch call, then
+		// overwrite each entry's vector. This is effectively all-or-nothing — if
+		// embedBatch fails (network error, rate limit), no entries are modified
+		// and old embeddings remain intact. On next startup the metadata mismatch
+		// will still be detected and re-embed will retry.
 		const reEmbedStart = Date.now();
 
 		const texts = entriesWithEmbeddings.map((e) =>
@@ -363,12 +360,10 @@ export class ActivationEngine {
 		);
 		const newEmbeddings = await this.embeddings.embedBatch(texts);
 
-		let reEmbedded = 0;
 		for (let i = 0; i < entriesWithEmbeddings.length; i++) {
 			this.db.updateEntry(entriesWithEmbeddings[i].id, {
 				embedding: newEmbeddings[i],
 			});
-			reEmbedded++;
 		}
 
 		const durationSec = ((Date.now() - reEmbedStart) / 1000).toFixed(1);
@@ -381,7 +376,7 @@ export class ActivationEngine {
 		this.db.setEmbeddingMetadata(configuredModel, newDimensions);
 
 		logger.log(
-			`[embedding] Re-embed complete: ${reEmbedded} entries re-embedded in ${durationSec}s ` +
+			`[embedding] Re-embed complete: ${totalEntries} entries re-embedded in ${durationSec}s ` +
 				`(${stored.dimensions} → ${newDimensions} dimensions).`,
 		);
 

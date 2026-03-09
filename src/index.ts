@@ -188,11 +188,7 @@ Options:
 	try {
 		const didReEmbed = await activation.checkAndReEmbed();
 		if (didReEmbed) {
-			// Re-read stats — entry count hasn't changed but embeddings are fresh.
-			const freshStats = db.getStats();
-			logger.log(
-				`Knowledge graph after re-embed: ${freshStats.total || 0} entries (${freshStats.active || 0} active)`,
-			);
+			logger.log("All embeddings are now consistent with the configured model.");
 		}
 	} catch (e) {
 		logger.error(

@@ -399,6 +399,25 @@ export class KnowledgeDB {
 	}
 
 	/**
+	 * Get a single active or conflicted entry that has an embedding.
+	 * Used to probe embedding dimensions without loading all entries into memory.
+	 */
+	getOneEntryWithEmbedding(): (KnowledgeEntry & { embedding: number[] }) | null {
+		const row = this.db
+			.prepare(
+				"SELECT * FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL LIMIT 1",
+			)
+			.get() as RawEntryRow | undefined;
+
+		if (!row) return null;
+
+		const entry = this.rowToEntry(row);
+		if (!entry.embedding) return null;
+
+		return entry as KnowledgeEntry & { embedding: number[] };
+	}
+
+	/**
 	 * Get all active and conflicted entries in a single query.
 	 * Used by applyDecay — avoids the TOCTOU window of two separate queries
 	 * (an entry transitioning between statuses between calls could be processed twice).
@@ -1259,7 +1278,7 @@ export class KnowledgeDB {
 
 	/**
 	 * Get the stored embedding model metadata.
-	 * Returns null if no metadata has been recorded yet (first run, or pre-v7 DB).
+	 * Returns null if no metadata has been recorded yet (first run, or pre-v8 DB).
 	 */
 	getEmbeddingMetadata(): {
 		model: string;
@@ -1299,8 +1318,9 @@ export class KnowledgeDB {
 
 	/**
 	 * NULL out all embeddings on active and conflicted entries.
-	 * Used when the embedding model changes — forces ensureEmbeddings() to
-	 * regenerate every vector with the new model.
+	 * Retained as an escape hatch for manual recovery (e.g. corrupted embeddings)
+	 * even though the normal model-change path uses in-place re-embed via
+	 * checkAndReEmbed() instead of clearing.
 	 *
 	 * Returns the number of entries whose embeddings were cleared.
 	 */
