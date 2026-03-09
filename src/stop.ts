@@ -74,12 +74,23 @@ export async function runStop(pidPath: string): Promise<void> {
 	// declare failure while the server is still draining in-flight LLM calls.
 	const STOP_TIMEOUT_MS = 35_000;
 	const POLL_INTERVAL_MS = 100;
+	const CONSOLIDATION_NOTICE_MS = 2_000; // warn after this long that we're draining
 	const deadline = Date.now() + STOP_TIMEOUT_MS;
+	const start = Date.now();
+	let noticePrinted = false;
 
 	while (Date.now() < deadline) {
 		await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
 		try {
 			process.kill(pid, 0); // still alive — keep waiting
+			// Print a one-time notice if we've been waiting longer than expected
+			// (i.e. a consolidation batch is in-flight and draining gracefully).
+			if (!noticePrinted && Date.now() - start >= CONSOLIDATION_NOTICE_MS) {
+				console.log(
+					`Waiting for in-flight consolidation to finish (up to ${Math.round(STOP_TIMEOUT_MS / 1000)}s)...`,
+				);
+				noticePrinted = true;
+			}
 		} catch (e) {
 			if ((e as NodeJS.ErrnoException).code === "EPERM") continue; // alive, no permission
 			// ESRCH or other — process is gone.

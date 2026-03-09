@@ -11,6 +11,25 @@
  * knowledge), kept separate from access_count (retrieval signal). Removed all
  * migration code — single clean schema, DB is reinitialized on upgrade.
  *
+ * v7: Cross-session synthesis.
+ * - knowledge_entry gains `last_synthesized_observation_count` (INTEGER, NULL).
+ *   NULL = never synthesized. When synthesis fires, this is set to the entry's
+ *   current observation_count. Re-synthesis triggers when observation_count
+ *   crosses the next threshold multiple (e.g. 10, 20, 30, ... with default threshold=10)
+ *   beyond the stored value.
+ *   Tracked per-entry so synthesis never fires twice for the same evidence level.
+ * - MIGRATION: v6 → v7 is incremental (ALTER TABLE, no data loss). Existing
+ *   entries receive NULL for last_synthesized_observation_count, which is the
+ *   correct initial state. All earlier version upgrades still wipe and recreate.
+ *
+ * v8: Embedding metadata.
+ * - New embedding_metadata singleton table stores the model name and dimension
+ *   count used to produce the current embeddings. On startup, the server compares
+ *   the stored model against the configured EMBEDDING_MODEL — if they differ, all
+ *   entry embeddings are regenerated automatically (re-embed) so cosine similarity
+ *   remains valid across model changes.
+ * - MIGRATION: v7 → v8 is incremental (CREATE TABLE, no data loss).
+ *
  * v6: Multi-source support.
  * - consolidated_episode gains a `source` column (e.g. "opencode", "claude-code")
  *   and a new composite PK (source, session_id, start_message_id, end_message_id).
@@ -19,16 +38,9 @@
  *   (last_message_time_created) and the last time that source was consolidated.
  * - consolidation_state retains the global counters and lastConsolidatedAt but
  *   last_message_time_created is removed (superseded by source_cursor).
- *
- * v7: Embedding metadata.
- * - New embedding_metadata singleton table stores the model name and dimension
- *   count used to produce the current embeddings. On startup, the server compares
- *   the stored model against the configured EMBEDDING_MODEL — if they differ, all
- *   entry embeddings are regenerated automatically (re-embed) so cosine similarity
- *   remains valid across model changes.
  */
 
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 /**
  * Expected columns for each table, derived from the DDL below.
@@ -57,6 +69,7 @@ export const EXPECTED_TABLE_COLUMNS: Readonly<
 		"last_accessed_at",
 		"access_count",
 		"observation_count",
+		"last_synthesized_observation_count",
 		"superseded_by",
 		"derived_from",
 		"embedding",
@@ -115,7 +128,13 @@ export const CREATE_TABLES = `
     -- Provenance
     superseded_by TEXT,
     derived_from TEXT NOT NULL DEFAULT '[]',  -- JSON array of session/entry IDs
-    
+
+    -- Cross-session synthesis tracking.
+    -- NULL = never synthesized. Set to observation_count when synthesis fires.
+    -- Re-synthesis triggers when observation_count reaches the next threshold
+    -- multiple beyond this value (e.g. threshold=3 → fires at 3, 6, 9, ...).
+    last_synthesized_observation_count INTEGER,
+
     -- Embedding (float32 array stored as blob)
     embedding BLOB
   );

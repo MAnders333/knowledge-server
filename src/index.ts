@@ -417,6 +417,11 @@ Options:
 		logger.log(`[${signal}] Shutting down gracefully...`);
 		shutdownRequested = true;
 		const TIMED_OUT = Symbol("timed_out");
+		if (activeLoops.length > 0) {
+			logger.log(
+				`[shutdown] Waiting for ${activeLoops.length} active consolidation loop(s) to finish...`,
+			);
+		}
 		const result = await Promise.race([
 			Promise.all(activeLoops).then(() => null),
 			new Promise<typeof TIMED_OUT>((r) =>

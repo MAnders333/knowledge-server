@@ -178,7 +178,7 @@ export class ConsolidationEngine {
 		);
 
 		// If embedding metadata is missing (e.g. startup probe failed, or first
-		// consolidation after a pre-v7 upgrade) or stale (e.g. checkAndReEmbed
+		// consolidation after a pre-v8 upgrade) or stale (e.g. checkAndReEmbed
 		// failed before updating metadata), record it now from a fresh entry.
 		const embeddingMeta = this.db.getEmbeddingMetadata();
 		const metadataStale = embeddingMeta && embeddingMeta.model !== config.embedding.model;

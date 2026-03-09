@@ -94,6 +94,9 @@ export interface KnowledgeEntry {
 	lastAccessedAt: number;
 	accessCount: number; // retrieval-only: incremented on activate, never during consolidation
 	observationCount: number; // evidence-only: incremented on keep/update/insert, never on activate
+	/** observation_count value at the time synthesis last fired. null = never synthesized.
+	 *  Re-synthesis triggers when observationCount reaches the next threshold multiple. */
+	lastSynthesizedObservationCount: number | null;
 
 	// Provenance
 	supersededBy: string | null;

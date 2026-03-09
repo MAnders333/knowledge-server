@@ -68,29 +68,6 @@ export class KnowledgeDB {
 
 		const existingVersion = row?.version ?? 0;
 
-		// v6 → v7: additive migration — create embedding_metadata table.
-		// No data loss needed: the table is new and CREATE IF NOT EXISTS is safe.
-		// The drift check below would otherwise see the missing table columns and
-		// trigger a full destructive reset — this migration prevents that.
-		if (existingVersion === 6) {
-			logger.log(
-				"[db] Migrating schema v6 → v7: adding embedding_metadata table.",
-			);
-			this.db.exec(`
-				CREATE TABLE IF NOT EXISTS embedding_metadata (
-					id INTEGER PRIMARY KEY DEFAULT 1 CHECK(id = 1),
-					model TEXT NOT NULL,
-					dimensions INTEGER NOT NULL,
-					recorded_at INTEGER NOT NULL
-				);
-			`);
-			this.db
-				.prepare(
-					"INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
-				)
-				.run(7, Date.now());
-		}
-
 		// Detect schema drift: compare actual DB columns against EXPECTED_TABLE_COLUMNS
 		// for every table. This is the authoritative check — the version number alone
 		// can be stale if a prior startup wrote the new version to schema_version before
@@ -99,32 +76,123 @@ export class KnowledgeDB {
 		// column to the DDL automatically gets caught here without touching this method.
 		const missingColumns = this.getSchemaDrift();
 
-		// Re-read version after potential migration above.
-		const postMigrationRow = this.db
+		// ── Incremental migrations ────────────────────────────────────────────────
+		// For additive-only changes (new nullable columns, new tables) we can
+		// ALTER TABLE / CREATE TABLE instead of wiping the DB, preserving existing
+		// knowledge data. Each migration is idempotent: if the column/table already
+		// exists the ALTER/CREATE is skipped (detected via getSchemaDrift before
+		// reaching this block).
+		//
+		// v6 → v7: adds last_synthesized_observation_count (nullable INTEGER).
+		//   No data loss: existing entries get NULL (= never synthesized), which is
+		//   the correct initial state. Synthesis works correctly from day one.
+		//   ALTER TABLE and version bump are wrapped in a single transaction so a
+		//   crash between them cannot leave the DB in a half-migrated state (column
+		//   added but version still 6, which would re-trigger the wipe path on next
+		//   startup instead of re-running the safe ALTER).
+		let incrementalMigrationApplied = false;
+		if (
+			existingVersion === 6 &&
+			missingColumns.some(
+				(d) =>
+					d.table === "knowledge_entry" &&
+					d.column === "last_synthesized_observation_count",
+			) &&
+			// Only attempt if the sole entry-level drift is the synthesis column —
+			// if other knowledge_entry columns are also absent we fall through to the
+			// full reset so all gaps are resolved. The embedding_metadata table drift
+			// is expected (handled by the v7→v8 migration below) and excluded.
+			missingColumns.filter((d) => d.table !== "embedding_metadata").length ===
+				1
+		) {
+			logger.log(
+				"[db] Applying incremental migration v6 → v7: adding last_synthesized_observation_count column.",
+			);
+			// Atomic: if the process crashes mid-transaction, SQLite rolls back both
+			// the ALTER and the version insert, leaving the DB at v6 (re-migratable).
+			this.db.transaction(() => {
+				this.db.exec(
+					"ALTER TABLE knowledge_entry ADD COLUMN last_synthesized_observation_count INTEGER",
+				);
+				this.db
+					.prepare(
+						"INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+					)
+					.run(7, Date.now());
+			})();
+			incrementalMigrationApplied = true;
+			logger.log("[db] Incremental migration v6 → v7 complete.");
+		}
+
+		// v7 → v8: additive migration — create embedding_metadata table.
+		// No data loss needed: the table is new and CREATE IF NOT EXISTS is safe.
+		// The drift check below would otherwise see the missing table columns and
+		// trigger a full destructive reset — this migration prevents that.
+		//
+		// Re-read version after v6→v7 may have run above.
+		const postV7Row = this.db
 			.prepare(
 				"SELECT version FROM schema_version ORDER BY version DESC LIMIT 1",
 			)
 			.get() as { version: number } | null;
-		const postMigrationVersion = postMigrationRow?.version ?? 0;
+		const postV7Version = postV7Row?.version ?? 0;
+
+		if (postV7Version === 7) {
+			logger.log(
+				"[db] Applying incremental migration v7 → v8: adding embedding_metadata table.",
+			);
+			this.db.transaction(() => {
+				this.db.exec(`
+					CREATE TABLE IF NOT EXISTS embedding_metadata (
+						id INTEGER PRIMARY KEY DEFAULT 1 CHECK(id = 1),
+						model TEXT NOT NULL,
+						dimensions INTEGER NOT NULL,
+						recorded_at INTEGER NOT NULL
+					);
+				`);
+				this.db
+					.prepare(
+						"INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+					)
+					.run(SCHEMA_VERSION, Date.now());
+			})();
+			incrementalMigrationApplied = true;
+			logger.log("[db] Incremental migration v7 → v8 complete.");
+		}
+		// ─────────────────────────────────────────────────────────────────────────
+
+		// Re-read the current state after any incremental migrations above.
+		// Skipped when an incremental migration succeeded — we know the state is clean.
+		const currentVersion = incrementalMigrationApplied
+			? SCHEMA_VERSION
+			: ((
+					this.db
+						.prepare(
+							"SELECT version FROM schema_version ORDER BY version DESC LIMIT 1",
+						)
+						.get() as { version: number } | null
+				)?.version ?? 0);
+		const remainingMissingColumns = incrementalMigrationApplied
+			? []
+			: this.getSchemaDrift();
 
 		const needsReset =
+			!incrementalMigrationApplied &&
 			// Explicit version lag: recorded version is older than current code
-			// (but skip versions handled by incremental migrations above)
-			(postMigrationVersion > 0 && postMigrationVersion < SCHEMA_VERSION) ||
-			// Schema drift: a table exists but is missing one or more required columns
-			missingColumns.length > 0;
+			((currentVersion > 0 && currentVersion < SCHEMA_VERSION) ||
+				// Schema drift: a table exists but is missing one or more required columns
+				remainingMissingColumns.length > 0);
 
 		if (needsReset) {
-			// Existing DB is from an older schema. Since we have no incremental migrations
-			// for this version gap, drop all tables and start fresh.
-			// This is a hard reset — the caller is expected to run POST /consolidate
-			// after the server starts to rebuild the knowledge graph.
+			// Existing DB is from an older schema with no incremental migration path.
+			// Drop all tables and start fresh — the caller is expected to run
+			// POST /consolidate after the server starts to rebuild the knowledge graph.
 			const driftDetail =
-				missingColumns.length > 0
-					? ` (missing columns: ${missingColumns.map((d) => `${d.table}.${d.column}`).join(", ")})`
+				remainingMissingColumns.length > 0
+					? ` (missing columns: ${remainingMissingColumns.map((d) => `${d.table}.${d.column}`).join(", ")})`
 					: "";
 			logger.warn(
-				`[db] Schema mismatch: DB is v${postMigrationVersion}, code expects v${SCHEMA_VERSION}${driftDetail}. Dropping and recreating all tables. All existing knowledge data has been cleared.`,
+				`[db] Schema mismatch: DB is v${currentVersion}, code expects v${SCHEMA_VERSION}${driftDetail}. Dropping and recreating all tables. All existing knowledge data has been cleared.`,
 			);
 			// Wrap in a transaction so a crash mid-drop leaves the DB in its original
 			// state (all tables intact) rather than a half-torn-down state.
@@ -174,8 +242,8 @@ export class KnowledgeDB {
 				`INSERT INTO knowledge_entry 
          (id, type, content, topics, confidence, source, scope, status, strength,
           created_at, updated_at, last_accessed_at, access_count, observation_count,
-          superseded_by, derived_from, embedding)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          last_synthesized_observation_count, superseded_by, derived_from, embedding)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			)
 			.run(
 				entry.id,
@@ -192,10 +260,26 @@ export class KnowledgeDB {
 				entry.lastAccessedAt,
 				entry.accessCount,
 				entry.observationCount,
+				entry.lastSynthesizedObservationCount ?? null,
 				entry.supersededBy,
 				JSON.stringify(entry.derivedFrom),
 				embeddingBlob,
 			);
+	}
+
+	/**
+	 * Mark an entry as synthesized at its current observation_count.
+	 * Called after a successful synthesizePrinciple() call to prevent
+	 * re-synthesis at the same evidence level.
+	 */
+	markSynthesized(id: string, observationCount: number): void {
+		this.db
+			.prepare(
+				`UPDATE knowledge_entry
+         SET last_synthesized_observation_count = ?, updated_at = ?
+         WHERE id = ?`,
+			)
+			.run(observationCount, Date.now(), id);
 	}
 
 	updateEntry(id: string, updates: Partial<KnowledgeEntry>): void {
@@ -252,6 +336,24 @@ export class KnowledgeDB {
 			.get(id) as RawEntryRow | null;
 
 		return row ? this.rowToEntry(row) : null;
+	}
+
+	/**
+	 * Fetch only the embedding for a single entry. Used as a cheap fallback
+	 * when the entry object is available but its embedding field is absent —
+	 * avoids loading the entire active KB just to find one vector.
+	 */
+	getEntryEmbedding(id: string): number[] | null {
+		const row = this.db
+			.prepare("SELECT embedding FROM knowledge_entry WHERE id = ?")
+			.get(id) as { embedding: Uint8Array | null } | null;
+		if (!row?.embedding) return null;
+		const float32 = new Float32Array(
+			row.embedding.buffer,
+			row.embedding.byteOffset,
+			row.embedding.byteLength / 4,
+		);
+		return Array.from(float32);
 	}
 
 	getActiveEntries(): KnowledgeEntry[] {
@@ -1054,6 +1156,7 @@ export class KnowledgeDB {
 			lastAccessedAt: row.last_accessed_at,
 			accessCount: row.access_count,
 			observationCount: row.observation_count,
+			lastSynthesizedObservationCount: row.last_synthesized_observation_count,
 			supersededBy: row.superseded_by,
 			derivedFrom: JSON.parse(row.derived_from),
 			embedding,
@@ -1260,6 +1363,7 @@ interface RawEntryRow {
 	last_accessed_at: number;
 	access_count: number;
 	observation_count: number;
+	last_synthesized_observation_count: number | null;
 	superseded_by: string | null;
 	derived_from: string;
 	embedding: Uint8Array | null;
