@@ -154,7 +154,7 @@ Hono-based HTTP server. Starts on `127.0.0.1:3179` by default.
 | `/activate?q=...` | GET | — | Activate knowledge entries by query |
 | `/consolidate` | POST | admin | Run a consolidation batch |
 | `/reinitialize?confirm=yes` | POST | admin | Wipe all entries and reset cursor |
-| `/status` | GET | — (config block requires admin) | Health check and stats. Admin token additionally exposes model config and embedding metadata (`model`, `dimensions`, `recordedAt`). |
+| `/status` | GET | — (config block requires admin) | Health check and stats. Always returns entry counts, uptime, and embedding metadata (`model`, `dimensions`, `recordedAt`). Admin token additionally exposes the `config` block (model names, port). |
 | `/entries` | GET | — | List entries (filter by `status`, `type`, `scope`) |
 | `/entries/:id` | GET | — | Get a specific entry with relations |
 | `/entries/:id` | PATCH | admin | Update content, topics, confidence, status, scope |
