@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.6.2](https://github.com/MAnders333/knowledge-server/compare/v2.6.1...v2.6.2) (2026-03-09)
+
+
+### Bug Fixes
+
+* **consolidate-cmd:** run synthesis even when no sessions pending; guard synthesis errors ([49729c5](https://github.com/MAnders333/knowledge-server/commit/49729c54dd5d17feefec5720e5fdc2886259f05c))
+* **consolidation:** add synthesis to CLI command; fix test guards; run synthesis unconditionally after drain ([d83511d](https://github.com/MAnders333/knowledge-server/commit/d83511ded7c9a4009136b3a4df311f0fb236638e))
+* **opencode-reader:** exclude synthetic (injected) text parts from consolidation ([2d8375b](https://github.com/MAnders333/knowledge-server/commit/2d8375b9f89a8cfc93c7de657c675f4d0fc6d9a9))
+* **synthesis:** count onUpdate path toward synthesized total ([9d8cf54](https://github.com/MAnders333/knowledge-server/commit/9d8cf54af327f0f0d8682ee2936273d40817572f))
+* **synthesis:** guard per-result reconsolidate() in try/catch; fix result.reason log injection; fix indentation regressions; extract stale threshold constant; O(n) membership check ([7f0af66](https://github.com/MAnders333/knowledge-server/commit/7f0af661f526b70c0c7879f18912d96205167f21))
+* **synthesis:** warn when all results for a cluster fail reconsolidation ([5367433](https://github.com/MAnders333/knowledge-server/commit/5367433e8ee0243645006cc72fc19299a68ca214))
+
 ## [2.6.1](https://github.com/MAnders333/knowledge-server/compare/v2.6.0...v2.6.1) (2026-03-09)
 
 
