@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.6.0](https://github.com/MAnders333/knowledge-server/compare/v2.5.0...v2.6.0) (2026-03-09)
+
+
+### Features
+
+* **config:** make reconsolidation similarity threshold configurable via env var ([b3d1fd9](https://github.com/MAnders333/knowledge-server/commit/b3d1fd9b61d31a8a1a85e5d1bf093304ef76455b))
+* **status:** show version in knowledge-server status output ([51ef29a](https://github.com/MAnders333/knowledge-server/commit/51ef29a80f4ece6a9912cf4b8981b0909c930614))
+* **synthesis:** cluster-first synthesis with persistent cluster tables and relation-aware activation ([ee02b76](https://github.com/MAnders333/knowledge-server/commit/ee02b7668229f6638073a65c6a1981618c4debdc))
+
+
+### Bug Fixes
+
+* **activation:** snapshot scored array before iterating to prevent cascade and maxResults violation ([f328fa2](https://github.com/MAnders333/knowledge-server/commit/f328fa2de66da0fb1c5ea78374471b74110e4957))
+* **config:** guard liveReconsolidationThreshold against out-of-range values ([d2b282e](https://github.com/MAnders333/knowledge-server/commit/d2b282e7f167a4f5810c5f61a482f191d53c4847))
+* **contradiction:** address post-review findings from batching refactor ([4672842](https://github.com/MAnders333/knowledge-server/commit/4672842ac4c32d8207fbef87d08391585cd63ab8))
+* **contradiction:** batch LLM calls to prevent timeouts as KB grows ([ba4c3d1](https://github.com/MAnders333/knowledge-server/commit/ba4c3d1b487938d15f4e5a8d992b082a3c02fa95))
+* iterate a [...scored] snapshot; add outer-loop maxResults break. ([f328fa2](https://github.com/MAnders333/knowledge-server/commit/f328fa2de66da0fb1c5ea78374471b74110e4957))
+* **types:** resolve tsc TS2322 in activate.ts; remove dead KnowledgeType import; clean stale comments ([638d9d3](https://github.com/MAnders333/knowledge-server/commit/638d9d3ab5a5444e72eeac6f53cba86d5e131bab))
+
 ## [2.5.0](https://github.com/MAnders333/knowledge-server/compare/v2.4.1...v2.5.0) (2026-03-09)
 
 
