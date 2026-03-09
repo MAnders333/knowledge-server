@@ -123,6 +123,8 @@ export class OpenCodeEpisodeReader implements IEpisodeReader {
        FROM part
        WHERE message_id = ?
          AND json_extract(data, '$.type') = 'text'
+         AND (json_extract(data, '$.synthetic') IS NULL
+              OR json_extract(data, '$.synthetic') = 0)
        ORDER BY time_created ASC`,
 		);
 		return this._textPartsStmt;
