@@ -1,8 +1,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-
-
+import { DEFAULT_RECONSOLIDATION_THRESHOLD } from "./types.js";
 /**
  * Parse an integer environment variable with a fallback default and optional
  * minimum clamp. Returns `defaultVal` when the variable is absent, empty, or
@@ -35,9 +34,8 @@ function parseFloatEnv(
 	return min !== undefined ? Math.max(min, value) : value;
 }
 
-/** Default reconsolidation threshold — single source of truth used by both
- *  the config object and the live re-parse in validateConfig(). */
-const RECONSOLIDATION_THRESHOLD_DEFAULT = 0.82;
+/** Re-export for local use — single source of truth lives in types.ts. */
+const RECONSOLIDATION_THRESHOLD_DEFAULT = DEFAULT_RECONSOLIDATION_THRESHOLD;
 
 export const config = {
 	// Server

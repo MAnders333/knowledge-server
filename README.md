@@ -97,7 +97,7 @@ That's the rough model here. Three properties follow from it:
 
 Entries have a strength score that decays with time and inactivity, and increases with repeated access. Entries that fall below the archive threshold are eventually removed. There is no manual pruning.
 
-The similarity thresholds (0.82 for reconsolidation, 0.4 for the contradiction scan band) were calibrated against `text-embedding-3-large` and may need adjustment for other embedding models. Extraction quality depends on the LLM — cheaper models tend to over-extract or miss nuance.
+The similarity thresholds (0.82 for reconsolidation, 0.4 for the contradiction scan band) were calibrated against `text-embedding-3-large`. Run `knowledge-server calibrate` to find the right values for a different embedding model. Extraction quality depends on the LLM — cheaper models tend to over-extract or miss nuance.
 
 ## Architecture
 
@@ -352,7 +352,7 @@ Two options — set one or the other (or both; per-provider credentials take pre
 | `CONSOLIDATION_MIN_MESSAGES` | `4` | Minimum messages a session must have to be eligible for consolidation. |
 | `CONSOLIDATION_POLL_INTERVAL_MS` | `0` (disabled) | Auto-consolidation polling interval in ms while the server runs. `0` = disabled; e.g. `1800000` = every 30 min. |
 | `CONSOLIDATION_INCLUDE_TOOL_OUTPUTS` | *(empty)* | Comma-separated tool names whose completed outputs are included in knowledge extraction (e.g. `atlassian_confluence_get_page`). Empty by default — most tool outputs are not worth encoding. |
-| `RECONSOLIDATION_SIMILARITY_THRESHOLD` | `0.82` | Cosine similarity above which two entries are considered near-duplicates and routed to an LLM merge decision. Also the exclusive upper bound of the contradiction scan band. **Tune this when switching embedding models** — models with broader similarity distributions need a lower value to avoid over-merging. |
+| `RECONSOLIDATION_SIMILARITY_THRESHOLD` | `0.82` | Cosine similarity above which two entries are considered near-duplicates and routed to an LLM merge decision. Also the exclusive upper bound of the contradiction scan band. Run `knowledge-server calibrate` to find the right value for your embedding model. |
 | `CONTRADICTION_MIN_SIMILARITY` | `0.4` | Lower bound of the contradiction scan similarity band. Must be strictly below `RECONSOLIDATION_SIMILARITY_THRESHOLD`. |
 
 ### Decay
@@ -415,6 +415,16 @@ knowledge-server activate "how do we handle authentication"
 ```
 
 Shows which knowledge entries would be injected into a conversation for a given query, with similarity scores.
+
+### Calibrate similarity thresholds
+
+```bash
+knowledge-server calibrate
+```
+
+Embeds a set of pre-defined calibration pairs (near-duplicates, topically related, unrelated) using the active embedding model and derives recommended values for `RECONSOLIDATION_SIMILARITY_THRESHOLD`, `CONTRADICTION_MIN_SIMILARITY`, and `ACTIVATION_SIMILARITY_THRESHOLD`. Outputs ready-to-paste `.env` lines when any value differs from the current config.
+
+Run this when switching to a different embedding model — different models produce different similarity distributions, and the default thresholds (calibrated for `text-embedding-3-large`) may not be appropriate.
 
 ### Reinitialize the knowledge store
 

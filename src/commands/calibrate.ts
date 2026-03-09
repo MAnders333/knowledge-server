@@ -350,7 +350,7 @@ export async function runCalibrate(): Promise<void> {
 			sims: ndSims,
 			stats: ndStats,
 			title: "Near-Duplicate Pairs (should trigger merge)",
-			desc: "Informs RECONSOLIDATION_THRESHOLD — entries above this are routed to decideMerge.",
+			desc: "Informs RECONSOLIDATION_SIMILARITY_THRESHOLD — entries above this are routed to decideMerge.",
 		},
 		{
 			sims: trSims,
@@ -423,7 +423,7 @@ export async function runCalibrate(): Promise<void> {
 	console.log("  Recommended Thresholds");
 	console.log("───────────────────────────────────────");
 	console.log("");
-	console.log(`  RECONSOLIDATION_THRESHOLD          ${reconsolidation.toFixed(2)}`);
+	console.log(`  RECONSOLIDATION_SIMILARITY_THRESHOLD          ${reconsolidation.toFixed(2)}`);
 	console.log("    Near-duplicate merge cutoff. Entries above this \u2192 decideMerge LLM call.");
 	console.log(`    Derived from: P10(near-duplicates)=${ndP10.toFixed(4)}, max(topical)+0.03=${trMaxPlusMargin.toFixed(4)}`);
 	console.log("");
@@ -465,7 +465,7 @@ export async function runCalibrate(): Promise<void> {
 		console.log("  To apply, add these to your .env file:");
 		console.log("");
 		if (reconsolidation !== currentReconsolidation) {
-			console.log(`    RECONSOLIDATION_THRESHOLD=${reconsolidation.toFixed(2)}`);
+			console.log(`    RECONSOLIDATION_SIMILARITY_THRESHOLD=${reconsolidation.toFixed(2)}`);
 		}
 		if (contradictionMin !== currentContradictionMin) {
 			console.log(`    CONTRADICTION_MIN_SIMILARITY=${contradictionMin.toFixed(2)}`);
