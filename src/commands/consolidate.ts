@@ -31,15 +31,15 @@ export async function runConsolidate(): Promise<void> {
 		}
 
 		const { pendingSessions } = consolidation.checkPending();
-		if (pendingSessions === 0) {
-			console.log("Nothing to consolidate — knowledge graph is up to date.");
-			return;
-		}
 
-		console.log(
-			`${pendingSessions} sessions pending — starting consolidation...`,
-		);
-		console.log("");
+		if (pendingSessions > 0) {
+			console.log(
+				`${pendingSessions} sessions pending — starting consolidation...`,
+			);
+			console.log("");
+		} else {
+			console.log("No new sessions to consolidate. Running KB synthesis pass...");
+		}
 
 		let batch = 1;
 		let totalSessions = 0;
@@ -90,15 +90,25 @@ export async function runConsolidate(): Promise<void> {
 		}
 
 		// Run KB synthesis once after all batches, same as the server-side drain.
-		if (totalSessions > 0) {
-			console.log("\nRunning KB synthesis pass...");
+		// Runs unconditionally — existing entries may still be ripe even when no
+		// new sessions were processed (e.g. after a re-embedding pass).
+		// Wrapped in its own try/catch so a synthesis failure doesn't suppress the
+		// completion summary.
+		if (pendingSessions > 0) console.log("\nRunning KB synthesis pass...");
+		try {
 			if (consolidation.tryLock()) {
 				try {
 					await consolidation.runSynthesis();
 				} finally {
 					consolidation.unlock();
 				}
+			} else {
+				console.warn("Warning: could not acquire lock for synthesis — skipping.");
 			}
+		} catch (e) {
+			console.error(
+				`Warning: KB synthesis failed — ${e instanceof Error ? e.message : String(e)}`,
+			);
 		}
 
 		console.log("");
