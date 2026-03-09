@@ -554,12 +554,12 @@ export class Reconsolidator {
 									`[synthesis] Refined existing principle ${id} via synthesis.`,
 								);
 							},
-							onKeep: () => {
-								clusterReconsolidated++;
-								logger.log(
-									"[synthesis] Synthesis result matches existing principle — kept (no duplicate inserted).",
-								);
-							},
+						onKeep: () => {
+							clusterReconsolidated++; // Not synthesized++: no change to KB content
+							logger.log(
+								"[synthesis] Synthesis result matches existing principle — kept (no duplicate inserted).",
+							);
+						},
 						},
 						undefined, // no sessionTimestamp — synthesized entries stamped at now
 						synthEmbedding,
