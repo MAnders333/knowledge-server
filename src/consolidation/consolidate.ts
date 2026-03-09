@@ -177,6 +177,24 @@ export class ConsolidationEngine {
 			`[consolidation] Generated embeddings for ${embeddedCount} entries.`,
 		);
 
+		// If embedding metadata is missing (e.g. startup probe failed, or first
+		// consolidation after a pre-v8 upgrade), record it now from a fresh entry.
+		// Only seeds when metadata is absent — the model-change path is handled
+		// exclusively by checkAndReEmbed() at startup to avoid overwriting metadata
+		// with a stale model name while old-model vectors are still in the DB.
+		if (embeddedCount > 0 && !this.db.getEmbeddingMetadata()) {
+			const sample = this.db.getOneEntryWithEmbedding();
+			if (sample) {
+				this.db.setEmbeddingMetadata(
+					config.embedding.model,
+					sample.embedding.length,
+				);
+				logger.log(
+					`[embedding] Recorded embedding model: ${config.embedding.model} (${sample.embedding.length} dimensions).`,
+				);
+			}
+		}
+
 		// KB-wide synthesis pass: cluster well-reinforced entries and attempt to
 		// synthesize higher-order principles. Runs after ensureEmbeddings so all
 		// entries (including those just inserted this run) have embeddings.
@@ -462,7 +480,9 @@ export class ConsolidationEngine {
 			(max, e) => Math.max(max, e.maxMessageTime),
 			Number.NEGATIVE_INFINITY,
 		);
-		const chunkSessionTimestamp = Number.isFinite(reduced) ? reduced : Date.now();
+		const chunkSessionTimestamp = Number.isFinite(reduced)
+			? reduced
+			: Date.now();
 		// Reuse the entries already loaded above — no second DB read.
 		const entriesMap = new Map(allEntriesForChunk.map((e) => [e.id, e]));
 		let chunkCreated = 0;
@@ -475,38 +495,43 @@ export class ConsolidationEngine {
 
 		for (const entry of extracted) {
 			try {
-				await this.reconsolidator.reconsolidate(entry, sessionIds, entriesMap, {
-					onInsert: (inserted) => {
-						chunkCreated++;
-						changedIds.add(inserted.id);
-						// Add to cache so subsequent entries in this chunk can deduplicate against it.
-						// Embedding is available immediately since insertNewEntry stores it.
-						if (inserted.embedding) {
-							entriesMap.set(
-								inserted.id,
-								inserted as KnowledgeEntry & { embedding: number[] },
-							);
-						}
+				await this.reconsolidator.reconsolidate(
+					entry,
+					sessionIds,
+					entriesMap,
+					{
+						onInsert: (inserted) => {
+							chunkCreated++;
+							changedIds.add(inserted.id);
+							// Add to cache so subsequent entries in this chunk can deduplicate against it.
+							// Embedding is available immediately since insertNewEntry stores it.
+							if (inserted.embedding) {
+								entriesMap.set(
+									inserted.id,
+									inserted as KnowledgeEntry & { embedding: number[] },
+								);
+							}
+						},
+						onUpdate: (id, updated, freshEmbedding) => {
+							chunkUpdated++;
+							changedIds.add(id);
+							// Update the cache with the new content and fresh embedding.
+							const existing = entriesMap.get(id);
+							if (existing) {
+								entriesMap.set(id, {
+									...existing,
+									content: updated.content ?? existing.content,
+									type:
+										(updated.type as KnowledgeEntry["type"]) ?? existing.type,
+									topics: updated.topics ?? existing.topics,
+									confidence: updated.confidence ?? existing.confidence,
+									embedding: freshEmbedding,
+								});
+							}
+						},
+						onKeep: () => {},
 					},
-					onUpdate: (id, updated, freshEmbedding) => {
-						chunkUpdated++;
-						changedIds.add(id);
-						// Update the cache with the new content and fresh embedding.
-						const existing = entriesMap.get(id);
-						if (existing) {
-							entriesMap.set(id, {
-								...existing,
-								content: updated.content ?? existing.content,
-								type: (updated.type as KnowledgeEntry["type"]) ?? existing.type,
-								topics: updated.topics ?? existing.topics,
-								confidence: updated.confidence ?? existing.confidence,
-								embedding: freshEmbedding,
-							});
-						}
-					},
-					onKeep: () => {},
-				},
-				chunkSessionTimestamp,
+					chunkSessionTimestamp,
 				);
 			} catch (err) {
 				// Log and skip this extracted entry — do NOT rethrow.

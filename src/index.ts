@@ -182,6 +182,25 @@ Options:
 		);
 	}
 
+	// Check if the embedding model has changed and re-embed if necessary.
+	// Runs before consolidation so all vectors are consistent when the
+	// reconsolidation step compares new extractions against existing entries.
+	try {
+		const didReEmbed = await activation.checkAndReEmbed();
+		if (didReEmbed) {
+			// Re-read stats — entry count hasn't changed but embeddings are fresh.
+			const freshStats = db.getStats();
+			logger.log(
+				`Knowledge graph after re-embed: ${freshStats.total || 0} entries (${freshStats.active || 0} active)`,
+			);
+		}
+	} catch (e) {
+		logger.error(
+			"[embedding] Re-embed check failed — activation and consolidation may produce dimension mismatch errors.",
+			e,
+		);
+	}
+
 	// Check for pending sessions
 	const pending = consolidation.checkPending();
 	if (pending.pendingSessions > 0) {

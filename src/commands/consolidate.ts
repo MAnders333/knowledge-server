@@ -19,13 +19,26 @@ export async function runConsolidate(): Promise<void> {
 	const consolidation = new ConsolidationEngine(db, activation, readers);
 
 	try {
+		// Check for embedding model change before consolidating — ensures all
+		// vectors are consistent when reconsolidation compares new extractions
+		// against existing entries.
+		try {
+			await activation.checkAndReEmbed();
+		} catch (e) {
+			console.error(
+				`Warning: embedding model check failed — ${e instanceof Error ? e.message : String(e)}`,
+			);
+		}
+
 		const { pendingSessions } = consolidation.checkPending();
 		if (pendingSessions === 0) {
 			console.log("Nothing to consolidate — knowledge graph is up to date.");
 			return;
 		}
 
-		console.log(`${pendingSessions} sessions pending — starting consolidation...`);
+		console.log(
+			`${pendingSessions} sessions pending — starting consolidation...`,
+		);
 		console.log("");
 
 		let batch = 1;
