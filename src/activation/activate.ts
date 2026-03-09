@@ -265,12 +265,9 @@ export class ActivationEngine {
 	 * 3. If stored model matches configured model → no-op
 	 * 4. If stored model differs:
 	 *    a. Log the model change clearly
-	 *    b. Re-embed all entries in-place (each entry's embedding is only
-	 *       overwritten after the new vector is computed, so a failure mid-way
-	 *       leaves already-processed entries with valid new embeddings and
-	 *       remaining entries with their old embeddings — activation stays
-	 *       functional throughout)
-	 *    c. Update embedding metadata with the new model + dimensions
+	 *    b. Write embedding metadata with the new model + dimensions FIRST
+	 *       (see inline comments on crash-recovery trade-offs below)
+	 *    c. Overwrite each entry's embedding vector with the new-model vector
 	 *
 	 * Called at startup before consolidation so all vectors are consistent.
 	 * Returns true if a re-embed was performed, false otherwise.
@@ -352,19 +349,16 @@ export class ActivationEngine {
 		// then overwrite each entry's vector individually.
 		//
 		// Failure modes:
-		// - If embedBatch throws (network error, rate limit): no entries are
-		//   modified, old embeddings remain intact, metadata still points to the
-		//   old model → next startup detects mismatch and retries. Safe.
-		// - If the process crashes mid-loop (after some entries are updated but
-		//   before all are done): metadata already points to the new model (written
-		//   below before the loop), so the next startup will NOT re-run the re-embed
-		//   — partial state persists until the next manual trigger. To avoid this,
-		//   the metadata is written BEFORE the loop so a crash mid-loop still leaves
-		//   a detectable mismatch: entries whose embedding dimension doesn't match
-		//   the metadata dimensions will produce degraded (but not silently wrong)
-		//   similarity scores. Full correctness requires an atomic all-or-nothing
-		//   transaction, which would require holding all new embeddings in memory
-		//   before any DB write — acceptable trade-off for typical KB sizes.
+		// - embedBatch throws (network error, rate limit): setEmbeddingMetadata is
+		//   never reached → metadata still points to the old model → next startup
+		//   detects mismatch and retries in full. Safe.
+		// - Process crashes mid-loop: entries updated so far have new-model
+		//   embeddings; remaining entries still carry old-model embeddings (non-NULL).
+		//   Because metadata is written BEFORE the loop, next startup sees
+		//   stored.model === configuredModel and skips the re-embed. ensureEmbeddings
+		//   also skips them (not NULL). Mixed-dimension state persists silently until
+		//   a manual model toggle or clearAllEmbeddings(). Accepted trade-off: full
+		//   atomicity would require buffering all new embeddings before any DB write.
 		const reEmbedStart = Date.now();
 
 		const texts = entriesWithEmbeddings.map((e) =>
@@ -376,12 +370,9 @@ export class ActivationEngine {
 		// with what we're about to write (not what was there before).
 		const newDimensions = newEmbeddings.length > 0 ? newEmbeddings[0].length : 0;
 
-		// Write metadata FIRST: if we crash mid-loop and restart, the stored model
-		// will match the configured model so we won't re-embed from scratch — the
-		// partial state will be resolved naturally by ensureEmbeddings on the next
-		// consolidation run (any entry with a NULL embedding gets re-embedded then).
-		// If embedBatch had thrown above, we never reach this line, so metadata
-		// still points to the old model and next startup retries the full re-embed.
+		// Write metadata BEFORE the loop. See failure-modes comment above for
+		// the crash-recovery trade-offs. embedBatch throwing above means we never
+		// reach this line, so the old-model metadata remains and next startup retries.
 		this.db.setEmbeddingMetadata(configuredModel, newDimensions);
 
 		for (let i = 0; i < entriesWithEmbeddings.length; i++) {

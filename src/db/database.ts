@@ -1321,8 +1321,8 @@ export class KnowledgeDB {
 	 *
 	 * @internal — exposed for tests and manual recovery only. Production code
 	 * should never call this: clearing embeddings without immediately regenerating
-	 * them leaves activation returning zero results until the next consolidation
-	 * run. The normal model-change path uses in-place re-embed via
+	 * them leaves similarity-based activation returning zero results until the
+	 * next consolidation run. The normal model-change path uses in-place re-embed via
 	 * checkAndReEmbed() instead.
 	 *
 	 * Returns the number of entries whose embeddings were cleared.
