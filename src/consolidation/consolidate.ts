@@ -177,6 +177,21 @@ export class ConsolidationEngine {
 			`[consolidation] Generated embeddings for ${embeddedCount} entries.`,
 		);
 
+		// If embedding metadata is missing (e.g. startup probe failed, or first
+		// consolidation after a pre-v7 upgrade), record it now from a fresh entry.
+		if (embeddedCount > 0 && !this.db.getEmbeddingMetadata()) {
+			const sample = this.db.getActiveEntriesWithEmbeddings();
+			if (sample.length > 0) {
+				this.db.setEmbeddingMetadata(
+					config.embedding.model,
+					sample[0].embedding.length,
+				);
+				logger.log(
+					`[embedding] Recorded embedding model: ${config.embedding.model} (${sample[0].embedding.length} dimensions).`,
+				);
+			}
+		}
+
 		this.db.updateConsolidationState({
 			lastConsolidatedAt: Date.now(),
 			totalSessionsProcessed:
@@ -455,7 +470,9 @@ export class ConsolidationEngine {
 			(max, e) => Math.max(max, e.maxMessageTime),
 			Number.NEGATIVE_INFINITY,
 		);
-		const chunkSessionTimestamp = Number.isFinite(reduced) ? reduced : Date.now();
+		const chunkSessionTimestamp = Number.isFinite(reduced)
+			? reduced
+			: Date.now();
 		// Reuse the entries already loaded above — no second DB read.
 		const entriesMap = new Map(allEntriesForChunk.map((e) => [e.id, e]));
 		let chunkCreated = 0;
@@ -468,38 +485,43 @@ export class ConsolidationEngine {
 
 		for (const entry of extracted) {
 			try {
-				await this.reconsolidator.reconsolidate(entry, sessionIds, entriesMap, {
-					onInsert: (inserted) => {
-						chunkCreated++;
-						changedIds.add(inserted.id);
-						// Add to cache so subsequent entries in this chunk can deduplicate against it.
-						// Embedding is available immediately since insertNewEntry stores it.
-						if (inserted.embedding) {
-							entriesMap.set(
-								inserted.id,
-								inserted as KnowledgeEntry & { embedding: number[] },
-							);
-						}
+				await this.reconsolidator.reconsolidate(
+					entry,
+					sessionIds,
+					entriesMap,
+					{
+						onInsert: (inserted) => {
+							chunkCreated++;
+							changedIds.add(inserted.id);
+							// Add to cache so subsequent entries in this chunk can deduplicate against it.
+							// Embedding is available immediately since insertNewEntry stores it.
+							if (inserted.embedding) {
+								entriesMap.set(
+									inserted.id,
+									inserted as KnowledgeEntry & { embedding: number[] },
+								);
+							}
+						},
+						onUpdate: (id, updated, freshEmbedding) => {
+							chunkUpdated++;
+							changedIds.add(id);
+							// Update the cache with the new content and fresh embedding.
+							const existing = entriesMap.get(id);
+							if (existing) {
+								entriesMap.set(id, {
+									...existing,
+									content: updated.content ?? existing.content,
+									type:
+										(updated.type as KnowledgeEntry["type"]) ?? existing.type,
+									topics: updated.topics ?? existing.topics,
+									confidence: updated.confidence ?? existing.confidence,
+									embedding: freshEmbedding,
+								});
+							}
+						},
+						onKeep: () => {},
 					},
-					onUpdate: (id, updated, freshEmbedding) => {
-						chunkUpdated++;
-						changedIds.add(id);
-						// Update the cache with the new content and fresh embedding.
-						const existing = entriesMap.get(id);
-						if (existing) {
-							entriesMap.set(id, {
-								...existing,
-								content: updated.content ?? existing.content,
-								type: (updated.type as KnowledgeEntry["type"]) ?? existing.type,
-								topics: updated.topics ?? existing.topics,
-								confidence: updated.confidence ?? existing.confidence,
-								embedding: freshEmbedding,
-							});
-						}
-					},
-					onKeep: () => {},
-				},
-				chunkSessionTimestamp,
+					chunkSessionTimestamp,
 				);
 			} catch (err) {
 				// Log and skip this extracted entry — do NOT rethrow.

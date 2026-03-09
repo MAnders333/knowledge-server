@@ -1,6 +1,7 @@
 import { config } from "../config.js";
 import { computeStrength } from "../consolidation/decay.js";
 import type { KnowledgeDB } from "../db/database.js";
+import { logger } from "../logger.js";
 import type {
 	ActivationResult,
 	ContradictionAnnotation,
@@ -248,5 +249,127 @@ export class ActivationEngine {
 		}
 
 		return needsEmbedding.length;
+	}
+
+	/**
+	 * Check whether the configured embedding model differs from the model that
+	 * produced the stored embeddings. If it has changed, re-embed all active and
+	 * conflicted entries with the new model.
+	 *
+	 * Flow:
+	 * 1. Read stored embedding metadata (model + dimensions) from DB
+	 * 2. If no metadata exists (first run or pre-v7 upgrade):
+	 *    - If entries with embeddings exist, probe the first one's dimension count
+	 *      and record the current model as the baseline
+	 *    - If no entries exist, just record the current model
+	 * 3. If stored model matches configured model → no-op
+	 * 4. If stored model differs:
+	 *    a. Log the model change clearly
+	 *    b. NULL out all existing embeddings (clearAllEmbeddings)
+	 *    c. Re-embed all entries in batches (ensureEmbeddings)
+	 *    d. Probe the new dimensions from the first generated embedding
+	 *    e. Update embedding metadata with the new model + dimensions
+	 *
+	 * Called at startup before consolidation so all vectors are consistent.
+	 * Returns true if a re-embed was performed, false otherwise.
+	 */
+	async checkAndReEmbed(): Promise<boolean> {
+		const configuredModel = config.embedding.model;
+		const stored = this.db.getEmbeddingMetadata();
+
+		if (!stored) {
+			// First run or upgrade from pre-v7 schema — seed metadata.
+			// Probe dimensions from an existing entry if available.
+			const existing = this.db.getActiveEntriesWithEmbeddings();
+			if (existing.length > 0) {
+				const dims = existing[0].embedding.length;
+				logger.log(
+					`[embedding] No embedding metadata found. Recording current model: ${configuredModel} (${dims} dimensions, from ${existing.length} existing entries).`,
+				);
+				this.db.setEmbeddingMetadata(configuredModel, dims);
+			} else {
+				// No entries yet — probe the API for dimensions.
+				logger.log(
+					"[embedding] No embedding metadata found and no entries exist. Probing model for dimensions...",
+				);
+				try {
+					const probe = await this.embeddings.embed("dimension probe");
+					this.db.setEmbeddingMetadata(configuredModel, probe.length);
+					logger.log(
+						`[embedding] Recorded embedding model: ${configuredModel} (${probe.length} dimensions).`,
+					);
+				} catch (e) {
+					// Non-fatal at this stage — metadata will be recorded on first
+					// successful consolidation or activation. Log and continue.
+					logger.warn(
+						`[embedding] Could not probe embedding dimensions: ${e instanceof Error ? e.message : String(e)}. Metadata will be recorded on first successful embedding call.`,
+					);
+				}
+			}
+			return false;
+		}
+
+		// Model matches — nothing to do.
+		if (stored.model === configuredModel) {
+			return false;
+		}
+
+		// ── Model has changed — re-embed all entries ──
+
+		const entriesWithEmbeddings = this.db.getActiveEntriesWithEmbeddings();
+		const totalEntries = entriesWithEmbeddings.length;
+
+		logger.log(
+			`[embedding] Model change detected: "${stored.model}" → "${configuredModel}".`,
+		);
+
+		if (totalEntries === 0) {
+			// No entries to re-embed — just update metadata.
+			logger.log(
+				"[embedding] No entries with embeddings to re-embed — updating metadata only.",
+			);
+			try {
+				const probe = await this.embeddings.embed("dimension probe");
+				this.db.setEmbeddingMetadata(configuredModel, probe.length);
+				logger.log(
+					`[embedding] Recorded new embedding model: ${configuredModel} (${probe.length} dimensions).`,
+				);
+			} catch (e) {
+				logger.warn(
+					`[embedding] Could not probe new model dimensions: ${e instanceof Error ? e.message : String(e)}. Metadata will be recorded on first successful embedding call.`,
+				);
+			}
+			return false;
+		}
+
+		logger.log(
+			`[embedding] Re-embedding ${totalEntries} entries with new model "${configuredModel}"...`,
+		);
+
+		// Step 1: NULL all existing embeddings so ensureEmbeddings picks them all up.
+		const cleared = this.db.clearAllEmbeddings();
+		logger.log(`[embedding] Cleared ${cleared} existing embeddings.`);
+
+		// Step 2: Re-embed in batches using ensureEmbeddings (reuses existing batch logic).
+		const reEmbedStart = Date.now();
+		const reEmbedded = await this.ensureEmbeddings();
+		const durationSec = ((Date.now() - reEmbedStart) / 1000).toFixed(1);
+
+		// Step 3: Probe dimensions from a freshly embedded entry.
+		const freshEntry = this.db.getActiveEntriesWithEmbeddings();
+		const newDimensions =
+			freshEntry.length > 0 ? freshEntry[0].embedding.length : 0;
+
+		// Step 4: Update metadata.
+		if (newDimensions > 0) {
+			this.db.setEmbeddingMetadata(configuredModel, newDimensions);
+		}
+
+		logger.log(
+			`[embedding] Re-embed complete: ${reEmbedded} entries re-embedded in ${durationSec}s ` +
+				`(${stored.dimensions} → ${newDimensions} dimensions).`,
+		);
+
+		return true;
 	}
 }
