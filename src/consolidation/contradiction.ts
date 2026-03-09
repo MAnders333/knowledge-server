@@ -188,13 +188,14 @@ export class ContradictionScanner {
 	 *
 	 * Pass 2 — intra-chunk pairs (entriesMap).
 	 *   Entries inserted or updated in the same chunk are excluded from the DB query
-	 *   (decideMerge handles the sim ≥ 0.82 paths; entries that fall in the mid-band
-	 *   between two chunk-inserted entries are never scanned otherwise). This pass
-	 *   checks changedIds entries against each other using the in-memory entriesMap.
-	 *   Only pairs where NEITHER has been through decideMerge together are candidates:
-	 *   if two entries were compared by decideMerge, they were at sim ≥ 0.82 and the
-	 *   result was "insert" (both kept) — decideMerge already handled the merge question
-	 *   so only the mid-band [minSim, 0.82) pairs are worth scanning here too.
+	 *   (decideMerge handles the sim ≥ reconsolidation-threshold paths; entries that
+	 *   fall in the mid-band between two chunk-inserted entries are never scanned
+	 *   otherwise). This pass checks changedIds entries against each other using the
+	 *   in-memory entriesMap. Only pairs where NEITHER has been through decideMerge
+	 *   together are candidates: if two entries were compared by decideMerge, they
+	 *   were at sim ≥ reconsolidation-threshold and the result was "insert" (both
+	 *   kept) — decideMerge already handled the merge question so only the mid-band
+	 *   [minSim, reconsolidation-threshold) pairs are worth scanning here too.
 	 *
 	 * Returns counts of detected and resolved contradictions.
 	 */
@@ -222,7 +223,7 @@ export class ContradictionScanner {
 			if (!entry.topics.length || !entry.embedding) continue;
 
 			// Pass 1: Find topic-overlapping pre-existing entries from DB.
-			// Exclude all changedIds — they were either handled by decideMerge (sim ≥ 0.82)
+			// Exclude all changedIds — they were either handled by decideMerge (sim ≥ threshold)
 			// or will be covered in pass 2 (intra-chunk pairs, below).
 			const candidates = this.db.getEntriesWithOverlappingTopics(
 				entry.topics,

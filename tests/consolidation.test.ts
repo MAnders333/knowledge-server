@@ -23,6 +23,7 @@ import { ConsolidationEngine } from "../src/consolidation/consolidate";
 import { ConsolidationLLM } from "../src/consolidation/llm";
 import { OpenCodeEpisodeReader } from "../src/consolidation/readers/opencode";
 import { KnowledgeDB } from "../src/db/database";
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 import { fakeEmbedding, makeEntry } from "./fixtures";
@@ -605,7 +606,7 @@ describe("ConsolidationEngine.reconsolidate() — novel entry (below threshold)"
 		expect(entries[0].status).toBe("active");
 	});
 
-	it("inserts a new entry when nearest neighbour is below RECONSOLIDATION_THRESHOLD", async () => {
+	it("inserts a new entry when nearest neighbour is below RECONSOLIDATION_SIMILARITY_THRESHOLD", async () => {
 		// Pre-populate one entry with an orthogonal embedding (similarity = 0)
 		const existingEmb = [1, 0, 0, 0, 0, 0, 0, 0];
 		db.insertEntry(
@@ -937,8 +938,8 @@ describe("ConsolidationEngine.runContradictionScan() — hallucinated candidateI
 		]);
 		spyOn(activation, "ensureEmbeddings").mockResolvedValue(0);
 
-		// The new entry's embedding must be in the mid-band [contradictionMinSimilarity, RECONSOLIDATION_THRESHOLD)
-		// against existingEmb so the contradiction scan fires, but below RECONSOLIDATION_THRESHOLD so
+		// The new entry's embedding must be in the mid-band [contradictionMinSimilarity, reconsolidationThreshold)
+		// against existingEmb so the contradiction scan fires, but below reconsolidationThreshold so
 		// reconsolidate inserts it (novel path, no decideMerge).
 		//
 		// existingEmb = fakeEmbedding("ser") ≈ [0.603, 0.529, 0.598, 0, ...]
@@ -987,7 +988,7 @@ describe("ConsolidationEngine.runContradictionScan() — supersede_new stops fur
 		// against both candidates:
 		//   candidateEmb = [1, 0, 0, 0, 0, 0, 0, 0]  (unit vector along dim-0)
 		//   newEmb        = [0.6, 0.8, 0, 0, 0, 0, 0, 0]  unit; cos(new, candidate) = 0.6
-		// 0.6 is in [contradictionMinSimilarity=0.4, RECONSOLIDATION_THRESHOLD=0.82) → mid-band.
+		// 0.6 is in [contradictionMinSimilarity=0.4, reconsolidationThreshold=0.82) → mid-band.
 		const candidateEmb = [1, 0, 0, 0, 0, 0, 0, 0];
 		const newEmb = [0.6, 0.8, 0, 0, 0, 0, 0, 0]; // already unit (0.36+0.64=1)
 
@@ -1017,7 +1018,7 @@ describe("ConsolidationEngine.runContradictionScan() — supersede_new stops fur
 		]);
 		spyOn(activation, "ensureEmbeddings").mockResolvedValue(0);
 
-		// embed returns newEmb → cos(newEmb, candidateEmb) = 0.6 → below RECONSOLIDATION_THRESHOLD
+		// embed returns newEmb → cos(newEmb, candidateEmb) = 0.6 → below reconsolidationThreshold
 		// → reconsolidate inserts; scan then finds candidates in mid-band
 		spyOn(activation.embeddings, "embed").mockResolvedValue(newEmb);
 
@@ -1076,7 +1077,7 @@ describe("ConsolidationEngine.runContradictionScan() — superseded_in_scan trac
 		const candidateEmb = [1, 0, 0, 0, 0, 0, 0, 0];
 		const newEmb1 = [0.6, 0.8, 0, 0, 0, 0, 0, 0]; // unit: 0.36+0.64=1
 		const newEmb2 = [0.6, 0, 0.8, 0, 0, 0, 0, 0]; // unit: 0.36+0.64=1
-		// cos(newEmb1, newEmb2) = 0.6*0.6 + 0.8*0 + 0*0.8 = 0.36 < RECONSOLIDATION_THRESHOLD (0.82)
+		// cos(newEmb1, newEmb2) = 0.6*0.6 + 0.8*0 + 0*0.8 = 0.36 < reconsolidationThreshold (0.82)
 
 		db.insertEntry(
 			makeEntry({
@@ -1262,8 +1263,8 @@ describe("ConsolidationEngine.consolidate() — full pipeline with mocked LLM + 
 		// Start with one pre-existing entry.
 		// Its embedding is [1,0,0,...] (unit on dim-0).
 		// The new entry will use embedding [0.6,0.8,0,...] → cos = 0.6 with existing-port.
-		// 0.6 is in [contradictionMinSimilarity=0.4, RECONSOLIDATION_THRESHOLD=0.82) → mid-band.
-		// cos = 0.6 < 0.82 → reconsolidate inserts (below RECONSOLIDATION_THRESHOLD).
+		// 0.6 is in [contradictionMinSimilarity=0.4, reconsolidationThreshold=0.82) → mid-band.
+		// cos = 0.6 < 0.82 → reconsolidate inserts (below reconsolidationThreshold).
 		const existingEmb = [1, 0, 0, 0, 0, 0, 0, 0];
 		db.insertEntry(
 			makeEntry({

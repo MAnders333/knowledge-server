@@ -499,8 +499,8 @@ export class KnowledgeDB {
 	 * can supersede the loser and clear the conflict.
 	 *
 	 * Used by the post-extraction contradiction scan to find candidates in the
-	 * mid-similarity band (0.4–0.82) — entries that are topic-related but not
-	 * similar enough to have been caught by the reconsolidation threshold.
+	 * mid-similarity band — entries that are topic-related but not similar enough
+	 * to have been caught by the reconsolidation threshold.
 	 *
 	 * Uses json_each() on both sides to avoid variable-limit issues.
 	 * Excludes a set of IDs already handled (e.g. the new entry itself, entries

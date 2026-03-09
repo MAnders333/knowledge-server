@@ -343,7 +343,7 @@ If there is nothing new worth extracting, return an empty array: []`;
 	}
 
 	/**
-	 * Focused reconsolidation decision for near-duplicate entries (sim ≥ 0.82).
+	 * Focused reconsolidation decision for near-duplicate entries (sim ≥ reconsolidation threshold).
 	 * Uses the merge model (cheaper — this is essentially a classification task).
 	 *
 	 * Returns one of:
@@ -551,7 +551,7 @@ If no meaningful synthesis is possible, return: []`;
 	 * Post-extraction contradiction scan.
 	 *
 	 * For a newly inserted/updated entry, checks a set of topic-overlapping
-	 * candidates (in the 0.4–0.82 similarity band — too dissimilar for decideMerge,
+	 * candidates (in the contradiction scan band — too dissimilar for decideMerge,
 	 * but related enough to potentially contradict) and attempts resolution.
 	 *
 	 * Uses the contradiction model (Sonnet — nuanced semantic reasoning).
