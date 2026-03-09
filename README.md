@@ -125,7 +125,14 @@ OpenCode    Claude Code    Cursor    Codex CLI    VSCode
               KnowledgeDB (SQLite)   persistent graph with embeddings, strength, decay, relations
                         │
                         ▼
+              Synthesis pass         KB-wide cluster synthesis → higher-order principles
+              [synthesisModel]       (fires at obs=10, 20, 30, ... per entry)
+                        │
+                        ▼
               ActivationEngine       cosine similarity search over embeddings
+              (startup: re-embeds    auto-detects EMBEDDING_MODEL changes; re-embeds
+               all entries if        all active+conflicted entries before first query)
+               model changed)
                         │
                    ┌────┴────┐
                     ▼         ▼
@@ -149,7 +156,7 @@ Hono-based HTTP server. Starts on `127.0.0.1:3179` by default.
 | `/activate?q=...` | GET | — | Activate knowledge entries by query |
 | `/consolidate` | POST | admin | Run a consolidation batch |
 | `/reinitialize?confirm=yes` | POST | admin | Wipe all entries and reset cursor |
-| `/status` | GET | — (config block requires admin) | Health check and stats |
+| `/status` | GET | — (config block requires admin) | Health check and stats. Always returns entry counts and uptime; admin token additionally exposes model config and `embedding.model`, `embedding.dimensions`, `embedding.recordedAt`. |
 | `/entries` | GET | — | List entries (filter by `status`, `type`, `scope`) |
 | `/entries/:id` | GET | — | Get a specific entry with relations |
 | `/entries/:id` | PATCH | admin | Update content, topics, confidence, status, scope |
@@ -200,7 +207,7 @@ Registered automatically by `setup-tool claude-code`.
 - `readers/cursor.ts` — reads Cursor's SQLite state DB (`state.vscdb`), handles both inline (Format A) and bubble-per-KV (Format B) conversation layouts
 - `readers/codex.ts` — reads Codex CLI JSONL rollout files, two-pass parse for stable session IDs, skips injected context blocks
 - `readers/vscode.ts` — reads VSCode / GitHub Copilot Chat session JSON files from per-workspace `chatSessions/` directories, extracts user messages and assistant text responses
-- `consolidate.ts` — orchestrates the full cycle: read → extract → reconsolidate → contradiction scan → decay → embed → advance cursor (per source)
+- `consolidate.ts` — orchestrates the full cycle: read → extract → reconsolidate → contradiction scan → decay (once after all sources) → embed → seed embedding metadata (if absent) → KB-wide synthesis pass → advance cursor
 - `llm.ts` — four LLM calls across four model slots: `extractKnowledge` (extraction model), `decideMerge` (merge model — cheaper), `detectAndResolveContradiction` (contradiction model), `synthesizePrinciple` (synthesis model — fires rarely on high-observation entries)
 - `decay.ts` — forgetting curve with type-specific half-lives (facts decay faster than procedures)
 
@@ -306,8 +313,8 @@ Two options — set one or the other (or both; per-provider credentials take pre
 
 | Variable | Default | Description |
 |---|---|---|
-| `EMBEDDING_MODEL` | `text-embedding-3-large` | Embedding model (OpenAI-compatible `/v1/embeddings` API). |
-| `EMBEDDING_DIMENSIONS` | *(model default)* | Override embedding output dimensions. Only valid for `text-embedding-3-*` models; omit for all others. |
+| `EMBEDDING_MODEL` | `text-embedding-3-large` | Embedding model (OpenAI-compatible `/v1/embeddings` API). **Changing this value triggers automatic re-embedding of all entries on next startup or consolidation run.** |
+| `EMBEDDING_DIMENSIONS` | *(model default)* | Truncated output dimensions. Only valid for `text-embedding-3-*` models (which support Matryoshka truncation); omit for all other models. |
 | `EMBEDDING_BASE_URL` | *(see priority below)* | Dedicated embedding endpoint. Priority: `EMBEDDING_BASE_URL` → `OPENAI_BASE_URL` → `LLM_BASE_ENDPOINT/openai/v1`. Use this to point at a local model (e.g. Ollama) while using a cloud LLM for extraction. |
 | `EMBEDDING_API_KEY` | *(see priority below)* | API key for the embedding endpoint. Falls back to `OPENAI_API_KEY` then `LLM_API_KEY`. Local endpoints (Ollama, llama.cpp) work without a key. |
 
