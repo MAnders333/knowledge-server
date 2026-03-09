@@ -456,8 +456,10 @@ Respond with one of:
 	): Promise<SynthesisResult | null> {
 		if (neighbors.length === 0) return null;
 
-		// type and topics come from LLM-sourced DB entries — wrap in XML to prevent
-		// a malicious/hallucinating prior extraction from breaking the prompt structure.
+		// type, topics, and content come from LLM-sourced DB entries — wrap in XML
+		// to prevent a malicious/hallucinating prior extraction from breaking the
+		// prompt structure. n.id is always a randomUUID() value generated at
+		// insertion time (never LLM-sourced), so it is safe to embed unescaped.
 		const neighborList = neighbors
 			.map(
 				(n, i) =>

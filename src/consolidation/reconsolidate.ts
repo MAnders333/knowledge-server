@@ -177,21 +177,24 @@ export class Reconsolidator {
 						const lastSynth = freshEntry.lastSynthesizedObservationCount ?? 0;
 						// Fire when obs has crossed a new threshold multiple since last synthesis
 						const nextThreshold = lastSynth + threshold;
-						if (obs >= nextThreshold) {
-							// Don't await — synthesis is best-effort and should not block
-							// the consolidation loop. Errors are logged and swallowed.
-							// Note: attemptSynthesis calls markSynthesized before the LLM call.
-							// A transient LLM failure will therefore suppress a retry for the
-							// current threshold cycle. This is an intentional trade-off — the
-							// alternative (marking after) risks duplicate synthesis under concurrent
-							// keep events. The next threshold multiple (obs + threshold) will trigger
-							// a fresh attempt.
-							this.attemptSynthesis(freshEntry, entriesMap).catch((err) => {
-								logger.warn(
-									`[consolidation] Synthesis failed for entry ${freshEntry.id}: ${err instanceof Error ? err.message : String(err)}`,
-								);
-							});
-						}
+					if (obs >= nextThreshold) {
+						// Don't await — synthesis is best-effort and should not block
+						// the consolidation loop. Errors are logged and swallowed.
+						// Note: attemptSynthesis calls markSynthesized before the LLM call.
+						// A transient LLM failure will therefore suppress a retry for the
+						// current threshold cycle. This is an intentional trade-off — the
+						// alternative (marking after) risks duplicate synthesis under concurrent
+						// keep events. The next threshold multiple (obs + threshold) will trigger
+						// a fresh attempt.
+						this.attemptSynthesis(freshEntry, entriesMap).catch((err) => {
+							// markSynthesized was called before the LLM attempt, so the stamp
+							// is persisted even on failure. The next retry fires at
+							// obs = freshEntry.observationCount + threshold.
+							logger.warn(
+								`[consolidation] Synthesis failed for entry ${freshEntry.id} (stamp persisted at obs=${freshEntry.observationCount}; next attempt at obs=${freshEntry.observationCount + threshold}): ${err instanceof Error ? err.message : String(err)}`,
+							);
+						});
+					}
 					}
 				}
 				break;
@@ -299,7 +302,7 @@ export class Reconsolidator {
 		this.db.markSynthesized(anchor.id, anchor.observationCount);
 
 		logger.log(
-			`[synthesis] Attempting synthesis for "${anchor.content.slice(0, 60)}..." (obs=${anchor.observationCount}) with ${neighbors.length} neighbors.`,
+			`[synthesis] Attempting synthesis for "${anchor.content.slice(0, 60)}..." (obs=${anchor.observationCount}) with ${neighbors.length}/${SYNTHESIS_NEIGHBORS} neighbors.`,
 		);
 
 		const synthStart = Date.now();
