@@ -185,7 +185,11 @@ export class ActivationEngine {
 		if (synthesizedIds.length > 0) {
 			const sourcesMap = this.db.getSupportSourcesForIds(synthesizedIds);
 
-			for (const { entry, rawSimilarity, similarity: synthSimilarity } of scored) {
+			// Snapshot the array before iterating — we push source entries into `scored`
+			// during the loop and don't want to visit newly-added entries (which could
+			// cascade if a source is itself a principle with its own supports relations).
+			const snapshot = [...scored];
+			for (const { entry, rawSimilarity, similarity: synthSimilarity } of snapshot) {
 				if (entry.type !== "principle" && entry.type !== "pattern") continue;
 				const sources = sourcesMap.get(entry.id);
 				if (!sources) continue;
@@ -217,6 +221,9 @@ export class ActivationEngine {
 					scoredIdSet.add(source.id);
 					this.db.recordAccess(source.id);
 				}
+
+				// Respect maxResults cap for the outer loop too.
+				if (scored.length >= maxResults) break;
 			}
 		}
 		// ─────────────────────────────────────────────────────────────────────────
