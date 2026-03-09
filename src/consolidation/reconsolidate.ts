@@ -379,11 +379,12 @@ export class Reconsolidator {
 			const id = matchedId ?? randomUUID();
 			const isNew = matchedId === null;
 
-			// Membership changed if set of member IDs differs from persisted
+		// Membership changed if set of member IDs differs from persisted
+			const previousMemberSet = new Set(previousMemberIds);
 			const membershipChanged =
 				isNew ||
 				cluster.memberIds.length !== previousMemberIds.length ||
-				cluster.memberIds.some((mid) => !previousMemberIds.includes(mid));
+				cluster.memberIds.some((mid) => !previousMemberSet.has(mid));
 
 			return {
 				id,
@@ -470,90 +471,104 @@ export class Reconsolidator {
 				continue;
 			}
 
-			// Process each synthesized principle
+			// Process each synthesized principle.
+			// markClusterSynthesized was already called unconditionally above —
+			// the cluster will not be retried even if all results fail here.
 			for (const result of results) {
-			logger.log(
-				`[synthesis] Synthesized ${result.type}: ${JSON.stringify(result.content)}`,
-			);
-
-				// Embed and reconsolidate for deduplication
-				const synthEmbedding = await this.embeddings.embed(
-					formatEmbeddingText(result.type, result.content, result.topics),
+				logger.log(
+					`[synthesis] Synthesized ${result.type}: ${JSON.stringify(result.content)}`,
 				);
 
-				// Validate sourceIds are from the cluster member set (hallucination guard)
-				const memberIdSet = new Set(cluster.memberIds);
-				const validatedSourceIds = result.sourceIds.filter((id) =>
-					memberIdSet.has(id),
-				);
-				const droppedCount = result.sourceIds.length - validatedSourceIds.length;
-				if (droppedCount > 0) {
-					logger.warn(
-						`[synthesis] Dropped ${droppedCount} sourceId(s) from LLM result for cluster ${cluster.id} (not cluster members).`,
+				try {
+					// Embed and reconsolidate for deduplication.
+					// Both embed() and reconsolidate() are inside the try so a transient
+					// API error on either path does not abort the cluster loop.
+					const synthEmbedding = await this.embeddings.embed(
+						formatEmbeddingText(result.type, result.content, result.topics),
+					);
+
+					// Validate sourceIds are from the cluster member set (hallucination guard)
+					const memberIdSet = new Set(cluster.memberIds);
+					const validatedSourceIds = result.sourceIds.filter((id) =>
+						memberIdSet.has(id),
+					);
+					const droppedCount = result.sourceIds.length - validatedSourceIds.length;
+					if (droppedCount > 0) {
+						logger.warn(
+							`[synthesis] Dropped ${droppedCount} sourceId(s) from LLM result for cluster ${cluster.id} (not cluster members).`,
+						);
+					}
+
+					// Pick a representative peer for scope (highest observationCount)
+					const repPeer = peers.reduce((best, p) =>
+						p.observationCount > best.observationCount ? p : best,
+					);
+
+					await this.reconsolidate(
+						{
+							type: result.type,
+							content: result.content,
+							topics: result.topics,
+							confidence: result.confidence,
+							scope: repPeer.scope,
+							source: `synthesis:cluster:${cluster.id}`,
+						},
+						[], // no session IDs — KB-derived provenance
+						entriesMap,
+						{
+							onInsert: (inserted) => {
+								if (!inserted.embedding) {
+									throw new Error(
+										`[synthesis] Synthesized entry ${inserted.id} has no embedding — this is a bug.`,
+									);
+								}
+								entriesMap.set(
+									inserted.id,
+									inserted as KnowledgeEntry & { embedding: number[] },
+								);
+								// Write supports relations from synthesized entry → source entries
+								for (const sourceId of validatedSourceIds) {
+									this.db.insertRelation({
+										id: randomUUID(),
+										sourceId: inserted.id,
+										targetId: sourceId,
+										type: "supports",
+										createdAt: Date.now(),
+									});
+								}
+								synthesized++;
+								logger.log(
+									`[synthesis] Inserted synthesized entry ${inserted.id} with ${validatedSourceIds.length} supports relations.`,
+								);
+							},
+							onUpdate: (id, _updated, freshEmbedding) => {
+								const existing = entriesMap.get(id);
+								if (existing) {
+									entriesMap.set(id, { ...existing, embedding: freshEmbedding });
+								}
+								logger.log(
+									`[synthesis] Refined existing principle ${id} via synthesis.`,
+								);
+							},
+							onKeep: () => {
+								logger.log(
+									"[synthesis] Synthesis result matches existing principle — kept (no duplicate inserted).",
+								);
+							},
+						},
+						undefined, // no sessionTimestamp — synthesized entries stamped at now
+						synthEmbedding,
+						"synthesis", // logPrefix — keeps synthesis reconsolidation out of [consolidation] logs
+					);
+				} catch (err) {
+					// Log and skip this result — do NOT rethrow.
+					// A single bad synthesized entry must not abort the remaining results
+					// in this cluster.
+					logger.error(
+						`[synthesis] Failed to reconsolidate synthesized entry for cluster ${cluster.id} — skipping:`,
+						err,
 					);
 				}
-
-				// Pick a representative peer for scope (highest observationCount)
-				const repPeer = peers.reduce((best, p) =>
-					p.observationCount > best.observationCount ? p : best,
-				);
-
-				await this.reconsolidate(
-					{
-						type: result.type,
-						content: result.content,
-						topics: result.topics,
-						confidence: result.confidence,
-						scope: repPeer.scope,
-						source: `synthesis:cluster:${cluster.id}`,
-					},
-					[], // no session IDs — KB-derived provenance
-					entriesMap,
-					{
-						onInsert: (inserted) => {
-							if (!inserted.embedding) {
-								throw new Error(
-									`[synthesis] Synthesized entry ${inserted.id} has no embedding — this is a bug.`,
-								);
-							}
-							entriesMap.set(
-								inserted.id,
-								inserted as KnowledgeEntry & { embedding: number[] },
-							);
-							// Write supports relations from synthesized entry → source entries
-							for (const sourceId of validatedSourceIds) {
-								this.db.insertRelation({
-									id: randomUUID(),
-									sourceId: inserted.id,
-									targetId: sourceId,
-									type: "supports",
-									createdAt: Date.now(),
-								});
-							}
-							synthesized++;
-							logger.log(
-								`[synthesis] Inserted synthesized entry ${inserted.id} with ${validatedSourceIds.length} supports relations.`,
-							);
-						},
-						onUpdate: (id, _updated, freshEmbedding) => {
-							const existing = entriesMap.get(id);
-							if (existing) {
-								entriesMap.set(id, { ...existing, embedding: freshEmbedding });
-							}
-							logger.log(
-								`[synthesis] Refined existing principle ${id} via synthesis.`,
-							);
-						},
-						onKeep: () => {
-							logger.log(
-								"[synthesis] Synthesis result matches existing principle — kept (no duplicate inserted).",
-							);
-						},
-					},
-				undefined, // no sessionTimestamp — synthesized entries stamped at now
-				synthEmbedding,
-				"synthesis", // logPrefix — keeps synthesis reconsolidation out of [consolidation] logs
-			);
 			}
 		}
 

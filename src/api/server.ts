@@ -25,6 +25,12 @@ import type {
 } from "../types.js";
 
 /**
+ * Strength below which an active entry is considered stale and surfaced in /review.
+ * Distinct from DECAY_ARCHIVE_THRESHOLD (0.15) — entries here are active but fading.
+ */
+const REVIEW_STALE_STRENGTH_THRESHOLD = 0.3;
+
+/**
  * HTTP API for the knowledge server.
  *
  * Endpoints:
@@ -318,7 +324,7 @@ export function createApp(
 
 		// Find stale entries (active but low strength)
 		const stale = active
-			.filter((e) => e.strength < 0.3)
+			.filter((e) => e.strength < REVIEW_STALE_STRENGTH_THRESHOLD)
 			.sort((a, b) => a.strength - b.strength);
 
 		// Find team-relevant entries that might need external documentation

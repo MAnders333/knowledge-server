@@ -529,19 +529,19 @@ export class ConsolidationEngine {
 								});
 							}
 						},
-						onKeep: () => {},
-					},
-					chunkSessionTimestamp,
-				);
+					onKeep: () => {},
+				},
+				chunkSessionTimestamp,
+			);
 			} catch (err) {
 				// Log and skip this extracted entry — do NOT rethrow.
 				// Rethrowing would skip recordEpisode for the whole chunk, causing all
 				// entries in this chunk to be re-processed on the next run and producing
 				// duplicates for the entries that were already successfully inserted.
-			logger.error(
-				`[consolidation/${source}] Failed to reconsolidate entry ${JSON.stringify(entry.content ?? "")} — skipping:`,
-				err,
-			);
+				logger.error(
+					`[consolidation/${source}] Failed to reconsolidate entry ${JSON.stringify(entry.content ?? "")} — skipping:`,
+					err,
+				);
 			}
 		}
 
