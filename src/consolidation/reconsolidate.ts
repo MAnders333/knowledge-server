@@ -463,6 +463,7 @@ export class Reconsolidator {
             content: p.content,
             type: p.type,
             topics: p.topics,
+            isSynthesized: p.source.startsWith("synthesis:"),
           })),
         );
       } catch (err) {

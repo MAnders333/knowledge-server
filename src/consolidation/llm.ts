@@ -446,6 +446,7 @@ Respond with one of:
 			content: string;
 			type: string;
 			topics: string[];
+			isSynthesized: boolean;
 		}>,
 	): Promise<SynthesisResult[]> {
 		if (peers.length === 0) return [];
@@ -457,12 +458,16 @@ Respond with one of:
 			.map(
 				(p, i) =>
 					`[${i + 1}] id: ${p.id}
-type: <peer_type>${p.type}</peer_type> | topics: <peer_topics>${p.topics.join(", ")}</peer_topics>
+type: <peer_type>${p.type}</peer_type> | origin: ${p.isSynthesized ? "synthesized-principle" : "raw-observation"} | topics: <peer_topics>${p.topics.join(", ")}</peer_topics>
 content: <peer_content>${p.content}</peer_content>`,
 			)
 			.join("\n\n");
 
 		const systemPrompt = `You are a meta-cognitive knowledge synthesizer. You will be shown a cluster of peer knowledge entries from the same knowledge base that were grouped together by embedding similarity.
+
+Each entry is tagged with its origin:
+- "raw-observation": extracted directly from a real session or work episode
+- "synthesized-principle": already a prior synthesis pass output (an abstraction over raw observations)
 
 Your job is to identify whether any HIGHER-ORDER PRINCIPLES or PATTERNS emerge from these entries together — things that none of them states explicitly but that are visible in their aggregate.
 
@@ -472,6 +477,8 @@ THE BAR IS VERY HIGH. Return an empty array [] unless:
 - A genuine structural invariant is visible across at least 3 of the cluster members
 - The synthesized principle would be useful to an agent BEYOND any specific instance
 - The synthesis says something that NONE of the source entries says individually
+
+If the cluster contains synthesized-principles, the bar is HIGHER: you are synthesizing abstractions over abstractions. Only proceed if a genuine meta-pattern emerges that none of the existing principles captures — do not merely restate or combine them.
 
 DO NOT synthesize if:
 - The entries are all about the same specific instance and the synthesis would just be a summary
@@ -490,7 +497,7 @@ ${peerList}
 
 Do these entries together imply a higher-order principle or pattern that none of them states individually?
 
-If yes, return an array of synthesized principles (can be more than one if warranted):
+If yes, return an array of synthesized principles. Return at most 2–3 entries — if you find yourself generating more, you are not abstracting enough and should merge them into a single higher-order principle instead:
 [
   {
     "type": "principle|pattern",
