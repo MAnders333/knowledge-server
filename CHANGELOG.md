@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.7.0](https://github.com/MAnders333/knowledge-server/compare/v2.6.3...v2.7.0) (2026-03-11)
+
+
+### Features
+
+* **schema:** add is_synthesized column to knowledge_entry (v10) ([e79caae](https://github.com/MAnders333/knowledge-server/commit/e79caae7c92988f75ce2fcb343bcbfdec97b62af))
+* **synthesis:** expose entry origin to synthesis LLM ([02d1cee](https://github.com/MAnders333/knowledge-server/commit/02d1ceea913feabf20459ca32e805eb0c81c5483))
+* **synthesis:** make cluster thresholds env-configurable; tighten defaults ([570cc0c](https://github.com/MAnders333/knowledge-server/commit/570cc0c4d09e548ee7209ad63ca5dbba38af5042))
+
+
+### Bug Fixes
+
+* **synthesis:** correctly propagate isSynthesized flag through all insert/update paths ([c711d8d](https://github.com/MAnders333/knowledge-server/commit/c711d8d8969491a742187ea3fd8036d9da554827))
+* **tests:** update synthesis cluster tests for CLUSTER_MIN_MEMBERS=5 ([a2322a7](https://github.com/MAnders333/knowledge-server/commit/a2322a7c9123e81eeeda52c53869d47e182dbe18))
+
 ## [2.6.3](https://github.com/MAnders333/knowledge-server/compare/v2.6.2...v2.6.3) (2026-03-10)
 
 
