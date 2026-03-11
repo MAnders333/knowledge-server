@@ -532,6 +532,7 @@ export class Reconsolidator {
               confidence: result.confidence,
               scope: repPeer.scope,
               source: `synthesis:cluster:${cluster.id}`,
+              isSynthesized: true,
             },
             [], // no session IDs — KB-derived provenance
             entriesMap,
@@ -563,10 +564,14 @@ export class Reconsolidator {
                 );
               },
               onUpdate: (id, _updated, freshEmbedding) => {
+                // Mark the updated entry as synthesized — mergeEntry does not set
+                // this flag, so we patch it here on the synthesis-specific path.
+                this.db.updateEntry(id, { isSynthesized: true });
                 const existing = entriesMap.get(id);
                 if (existing) {
                   entriesMap.set(id, {
                     ...existing,
+                    isSynthesized: true,
                     embedding: freshEmbedding,
                   });
                 }
@@ -662,7 +667,7 @@ export class Reconsolidator {
         `consolidation ${new Date(entryTime).toISOString().split("T")[0]}`,
       scope: entry.scope || "personal",
       status: "active",
-      isSynthesized: (entry.source ?? "").startsWith("synthesis:"),
+      isSynthesized: entry.isSynthesized ?? false,
       // Compute real initial strength using the session timestamp so decay is
       // pre-applied for old sessions. A new entry (obs=1, access=0) from a
       // session N days ago already has N days of decay factored into its strength.

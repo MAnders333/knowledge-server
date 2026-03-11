@@ -304,6 +304,10 @@ export class KnowledgeDB {
 			fields.push("embedding = ?");
 			values.push(new Uint8Array(new Float32Array(updates.embedding).buffer));
 		}
+		if (updates.isSynthesized !== undefined) {
+			fields.push("is_synthesized = ?");
+			values.push(updates.isSynthesized ? 1 : 0);
+		}
 
 		// Always update timestamp
 		fields.push("updated_at = ?");

@@ -813,6 +813,7 @@ describe("ConsolidationEngine — cluster-based synthesis (runKBSynthesis)", () 
 		const synthesized = allEntries.find((e) => e.content === "Static typing produces more reliable code.");
 		expect(synthesized).toBeDefined();
 		expect(synthesized?.type).toBe("principle");
+		expect(synthesized?.isSynthesized).toBe(true);
 	});
 });
 

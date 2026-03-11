@@ -681,6 +681,8 @@ export interface ExtractedKnowledge {
 	confidence: number;
 	scope: KnowledgeScope;
 	source: string;
+	/** Set to true when this entry was produced by synthesis rather than LLM extraction from an episode. */
+	isSynthesized?: boolean;
 }
 
 export type MergeDecision =
