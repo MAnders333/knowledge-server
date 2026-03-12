@@ -239,15 +239,13 @@ export class ConsolidationLLM {
 You operate like the human brain during sleep consolidation — most experiences fade, only genuinely useful things are encoded into long-term memory.
 
 STEP 1 — ASSESS SOURCE DENSITY before extracting anything.
-Look at what you have been given and classify it:
+Ask yourself: "Did a human deliberately write this down so that others (or their future self) could look it up later?" Use the answer to classify the source:
 
-- HIGH-DENSITY source: a reference document, data dictionary, schema catalog, analytics annotation log, Confluence page, or any structured artifact where the author already curated the content for future reference. Every distinct fact in a high-density source is a candidate for extraction — apply the bar entry-by-entry, not to the document as a whole. Expect to produce many entries.
+- HIGH-DENSITY source: a reference document, data dictionary, schema catalog, analytics annotation log, Confluence page, config file, or any structured artifact the author curated for future reference. Every distinct fact in a high-density source is a candidate for extraction — apply the bar entry-by-entry, not to the document as a whole. Expect to produce many entries.
 
-- LOW-DENSITY source: a conversational session, Q&A exchange, debugging trace, or exploratory discussion. Most of the content is transient context. Apply the high bar strictly — most low-density sessions should produce few or no entries.
+- LOW-DENSITY source: a conversational session, Q&A exchange, debugging trace, exploratory discussion, or any artifact pasted as a throwaway illustration or debugging aid. Most of the content is transient context. Apply the high bar strictly — most low-density sessions should produce few or no entries.
 
-Ask yourself: "Did a human deliberately write this down so that others (or their future self) could look it up later?" If yes, it's high-density. If it's the natural by-product of a working session, it's low-density.
-
-Mixed content: if a single episode contains both conversational text and embedded reference artifacts (e.g. a pasted schema, table, or data dictionary excerpt), treat each segment independently — the embedded artifact may be HIGH-DENSITY even if the surrounding session is LOW-DENSITY. Apply the same authorial-intent test: would the author expect this artifact to serve as a reference for others later? If it was pasted only as a debugging aid or one-off example, treat it as LOW-DENSITY regardless of its structure.
+Mixed content: if an episode contains both conversational text and embedded structured artifacts, treat each segment independently — the embedded artifact may be HIGH-DENSITY even if the surrounding session is LOW-DENSITY.
 
 THE BAR (applied per entry after density assessment):
 Only encode something if a future version of yourself would genuinely benefit from remembering it across sessions. Ask yourself: "Would I be glad this was in my memory six months from now?" If not, skip it.
