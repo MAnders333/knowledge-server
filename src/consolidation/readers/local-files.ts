@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { type Dirent, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, extname, join } from "node:path";
 import { config } from "../../config.js";
 import { logger } from "../../logger.js";
@@ -151,9 +151,9 @@ export class LocalFilesEpisodeReader implements IEpisodeReader {
 	 * Returns an empty array if the directory does not exist.
 	 */
 	private scanMarkdownFiles(): Array<{ path: string; mtimeMs: number }> {
-		let entries: ReturnType<typeof readdirSync>;
+		let entries: Dirent<string>[];
 		try {
-			entries = readdirSync(this.dir, { withFileTypes: true });
+			entries = readdirSync(this.dir, { withFileTypes: true, encoding: "utf8" });
 		} catch {
 			// Directory does not exist — opt-in feature, silently return empty.
 			return [];
