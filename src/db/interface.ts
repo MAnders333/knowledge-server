@@ -138,9 +138,7 @@ export interface IKnowledgeDB {
 	/**
 	 * Batch fetch all 'contradicts' relations that involve any of the given entry IDs.
 	 */
-	getContradictPairsForIds(
-		entryIds: string[],
-	): Promise<Map<string, string>>;
+	getContradictPairsForIds(entryIds: string[]): Promise<Map<string, string>>;
 
 	// ── Episode Tracking ──
 
@@ -171,9 +169,7 @@ export interface IKnowledgeDB {
 
 	getConsolidationState(): Promise<ConsolidationState>;
 
-	updateConsolidationState(
-		state: Partial<ConsolidationState>,
-	): Promise<void>;
+	updateConsolidationState(state: Partial<ConsolidationState>): Promise<void>;
 
 	// ── Entry Merge ──
 
@@ -205,10 +201,7 @@ export interface IKnowledgeDB {
 		recordedAt: number;
 	} | null>;
 
-	setEmbeddingMetadata(
-		model: string,
-		dimensions: number,
-	): Promise<void>;
+	setEmbeddingMetadata(model: string, dimensions: number): Promise<void>;
 
 	// ── Cluster Management ──
 

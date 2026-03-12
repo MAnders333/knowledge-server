@@ -11,25 +11,32 @@
  *   PG_TEST_URI=postgres://ks:ks@localhost:5433/knowledge bun test tests/pg-integration.test.ts
  */
 
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import {
+	afterAll,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+} from "bun:test";
 import postgres from "postgres";
-import { PostgresKnowledgeDB } from "../src/db/pg-database";
 import type { IKnowledgeDB } from "../src/db/interface";
+import { PostgresKnowledgeDB } from "../src/db/pg-database";
 
 const PG_URI = process.env.PG_TEST_URI;
 
 // Helper: truncate all tables between tests for isolation.
 async function truncateAll(uri: string) {
 	const sql = postgres(uri);
-	await sql`TRUNCATE knowledge_cluster_member, knowledge_cluster, knowledge_relation, knowledge_entry, consolidated_episode, source_cursor, consolidation_state, embedding_metadata, schema_version CASCADE`;
-	await sql.end();
+	try {
+		await sql`TRUNCATE knowledge_cluster_member, knowledge_cluster, knowledge_relation, knowledge_entry, consolidated_episode, source_cursor, consolidation_state, embedding_metadata, schema_version CASCADE`;
+	} finally {
+		await sql.end();
+	}
 }
 
 // Helper: create a standard test entry object
-function makeEntry(
-	id: string,
-	overrides: Record<string, unknown> = {},
-) {
+function makeEntry(id: string, overrides: Record<string, unknown> = {}) {
 	const now = Date.now();
 	return {
 		id,
@@ -55,7 +62,6 @@ function makeEntry(
 
 describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 	let db: IKnowledgeDB;
-	// biome-ignore lint: PG_URI is guaranteed non-null inside skipIf(!PG_URI)
 	const uri = PG_URI as string;
 
 	beforeAll(async () => {
@@ -66,10 +72,9 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 	beforeEach(async () => {
 		// Wipe data between tests for isolation
 		await truncateAll(uri);
-		// Re-initialize to re-stamp schema_version (truncated above)
-		// Reset the initialized flag so initialize() re-runs
-		// biome-ignore lint: accessing private field for test reset
-		(db as unknown as { initialized: boolean }).initialized = false;
+		// Re-initialize to re-stamp schema_version (truncated above).
+		// Clear initPromise (private field) so initialize() re-runs on next call.
+		(db as unknown as { initPromise: null }).initPromise = null;
 		await (db as PostgresKnowledgeDB).initialize();
 	});
 
@@ -110,7 +115,9 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 	});
 
 	it("updates entry fields", async () => {
-		await db.insertEntry(makeEntry("test-2", { content: "Old content", confidence: 0.5 }));
+		await db.insertEntry(
+			makeEntry("test-2", { content: "Old content", confidence: 0.5 }),
+		);
 
 		await db.updateEntry("test-2", {
 			content: "New content",
@@ -185,9 +192,19 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 	});
 
 	it("getEntries with filters", async () => {
-		await db.insertEntry(makeEntry("f1", { status: "active", type: "fact", scope: "team" }));
-		await db.insertEntry(makeEntry("f2", { status: "active", type: "principle", scope: "personal" }));
-		await db.insertEntry(makeEntry("f3", { status: "archived", type: "fact", scope: "team" }));
+		await db.insertEntry(
+			makeEntry("f1", { status: "active", type: "fact", scope: "team" }),
+		);
+		await db.insertEntry(
+			makeEntry("f2", {
+				status: "active",
+				type: "principle",
+				scope: "personal",
+			}),
+		);
+		await db.insertEntry(
+			makeEntry("f3", { status: "archived", type: "fact", scope: "team" }),
+		);
 
 		const byStatus = await db.getEntries({ status: "active" });
 		expect(byStatus.length).toBe(2);
@@ -198,7 +215,11 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		const byScope = await db.getEntries({ scope: "team" });
 		expect(byScope.length).toBe(2);
 
-		const combined = await db.getEntries({ status: "active", type: "fact", scope: "team" });
+		const combined = await db.getEntries({
+			status: "active",
+			type: "fact",
+			scope: "team",
+		});
 		expect(combined.length).toBe(1);
 		expect(combined[0].id).toBe("f1");
 	});
@@ -225,7 +246,9 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		expect(entry?.embedding).toBeDefined();
 		expect(entry?.embedding?.length).toBe(5);
 		for (let i = 0; i < embedding.length; i++) {
-			expect(Math.abs((entry?.embedding?.[i] ?? 0) - embedding[i])).toBeLessThan(0.0001);
+			expect(
+				Math.abs((entry?.embedding?.[i] ?? 0) - embedding[i]),
+			).toBeLessThan(0.0001);
 		}
 	});
 
@@ -251,7 +274,12 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 	it("getEntriesMissingEmbeddings returns active/conflicted entries without embeddings", async () => {
 		await db.insertEntry(makeEntry("has-emb", { embedding: [0.1, 0.2] }));
 		await db.insertEntry(makeEntry("no-emb"));
-		await db.insertEntry(makeEntry("superseded-no-emb", { status: "superseded", supersededBy: "has-emb" }));
+		await db.insertEntry(
+			makeEntry("superseded-no-emb", {
+				status: "superseded",
+				supersededBy: "has-emb",
+			}),
+		);
 
 		const missing = await db.getEntriesMissingEmbeddings();
 		expect(missing.length).toBe(1);
@@ -261,8 +289,16 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 	it("clearAllEmbeddings NULLs embeddings on active/conflicted entries only", async () => {
 		const emb = [0.1, 0.2, 0.3];
 		await db.insertEntry(makeEntry("e1", { status: "active", embedding: emb }));
-		await db.insertEntry(makeEntry("e2", { status: "conflicted", embedding: emb }));
-		await db.insertEntry(makeEntry("e3", { status: "superseded", supersededBy: "e1", embedding: emb }));
+		await db.insertEntry(
+			makeEntry("e2", { status: "conflicted", embedding: emb }),
+		);
+		await db.insertEntry(
+			makeEntry("e3", {
+				status: "superseded",
+				supersededBy: "e1",
+				embedding: emb,
+			}),
+		);
 
 		const cleared = await db.clearAllEmbeddings();
 		expect(cleared).toBe(2);
@@ -331,17 +367,51 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 	// ── Episode Tracking ──
 
 	it("records and retrieves episode ranges", async () => {
-		await db.recordEpisode("opencode", "session-1", "msg-start-1", "msg-end-1", "messages", 3);
-		await db.recordEpisode("opencode", "session-1", "msg-start-2", "msg-end-2", "compaction_summary", 1);
-		await db.recordEpisode("opencode", "session-2", "msg-start-3", "msg-end-3", "messages", 0);
+		await db.recordEpisode(
+			"opencode",
+			"session-1",
+			"msg-start-1",
+			"msg-end-1",
+			"messages",
+			3,
+		);
+		await db.recordEpisode(
+			"opencode",
+			"session-1",
+			"msg-start-2",
+			"msg-end-2",
+			"compaction_summary",
+			1,
+		);
+		await db.recordEpisode(
+			"opencode",
+			"session-2",
+			"msg-start-3",
+			"msg-end-3",
+			"messages",
+			0,
+		);
 
-		const ranges = await db.getProcessedEpisodeRanges("opencode", ["session-1", "session-2"]);
+		const ranges = await db.getProcessedEpisodeRanges("opencode", [
+			"session-1",
+			"session-2",
+		]);
 
 		expect(ranges.size).toBe(2);
 		const s1 = ranges.get("session-1") ?? [];
 		expect(s1).toHaveLength(2);
-		expect(s1.some((r) => r.startMessageId === "msg-start-1" && r.endMessageId === "msg-end-1")).toBe(true);
-		expect(s1.some((r) => r.startMessageId === "msg-start-2" && r.endMessageId === "msg-end-2")).toBe(true);
+		expect(
+			s1.some(
+				(r) =>
+					r.startMessageId === "msg-start-1" && r.endMessageId === "msg-end-1",
+			),
+		).toBe(true);
+		expect(
+			s1.some(
+				(r) =>
+					r.startMessageId === "msg-start-2" && r.endMessageId === "msg-end-2",
+			),
+		).toBe(true);
 
 		const s2 = ranges.get("session-2") ?? [];
 		expect(s2).toHaveLength(1);
@@ -349,16 +419,46 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 	});
 
 	it("recordEpisode is idempotent", async () => {
-		await db.recordEpisode("opencode", "session-1", "msg-a", "msg-b", "messages", 2);
-		await db.recordEpisode("opencode", "session-1", "msg-a", "msg-b", "messages", 2);
+		await db.recordEpisode(
+			"opencode",
+			"session-1",
+			"msg-a",
+			"msg-b",
+			"messages",
+			2,
+		);
+		await db.recordEpisode(
+			"opencode",
+			"session-1",
+			"msg-a",
+			"msg-b",
+			"messages",
+			2,
+		);
 
-		const ranges = await db.getProcessedEpisodeRanges("opencode", ["session-1"]);
+		const ranges = await db.getProcessedEpisodeRanges("opencode", [
+			"session-1",
+		]);
 		expect(ranges.get("session-1")).toHaveLength(1);
 	});
 
 	it("episodes from different sources are isolated", async () => {
-		await db.recordEpisode("opencode", "session-1", "msg-a", "msg-b", "messages", 2);
-		await db.recordEpisode("claude-code", "session-1", "msg-a", "msg-b", "messages", 2);
+		await db.recordEpisode(
+			"opencode",
+			"session-1",
+			"msg-a",
+			"msg-b",
+			"messages",
+			2,
+		);
+		await db.recordEpisode(
+			"claude-code",
+			"session-1",
+			"msg-a",
+			"msg-b",
+			"messages",
+			2,
+		);
 
 		const oc = await db.getProcessedEpisodeRanges("opencode", ["session-1"]);
 		const cc = await db.getProcessedEpisodeRanges("claude-code", ["session-1"]);
@@ -367,7 +467,9 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 	});
 
 	it("getProcessedEpisodeRanges returns empty map for unknown session", async () => {
-		const ranges = await db.getProcessedEpisodeRanges("opencode", ["no-such-session"]);
+		const ranges = await db.getProcessedEpisodeRanges("opencode", [
+			"no-such-session",
+		]);
 		expect(ranges.size).toBe(0);
 	});
 
@@ -434,7 +536,11 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		await db.insertEntry(makeEntry("new-entry"));
 		await db.insertEntry(makeEntry("old-entry"));
 
-		await db.applyContradictionResolution("supersede_old", "new-entry", "old-entry");
+		await db.applyContradictionResolution(
+			"supersede_old",
+			"new-entry",
+			"old-entry",
+		);
 
 		const oldEntry = await db.getEntry("old-entry");
 		expect(oldEntry?.status).toBe("superseded");
@@ -448,7 +554,11 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		await db.insertEntry(makeEntry("new-entry"));
 		await db.insertEntry(makeEntry("old-entry"));
 
-		await db.applyContradictionResolution("supersede_new", "new-entry", "old-entry");
+		await db.applyContradictionResolution(
+			"supersede_new",
+			"new-entry",
+			"old-entry",
+		);
 
 		const newEntry = await db.getEntry("new-entry");
 		expect(newEntry?.status).toBe("superseded");
@@ -478,7 +588,11 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		await db.insertEntry(makeEntry("new-entry"));
 		await db.insertEntry(makeEntry("old-entry"));
 
-		await db.applyContradictionResolution("irresolvable", "new-entry", "old-entry");
+		await db.applyContradictionResolution(
+			"irresolvable",
+			"new-entry",
+			"old-entry",
+		);
 
 		expect((await db.getEntry("new-entry"))?.status).toBe("conflicted");
 		expect((await db.getEntry("old-entry"))?.status).toBe("conflicted");
@@ -487,11 +601,13 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 	// ── Merge Entry ──
 
 	it("merges new content into an existing entry", async () => {
-		await db.insertEntry(makeEntry("merge-target", {
-			content: "Original",
-			topics: ["old"],
-			derivedFrom: ["session-1"],
-		}));
+		await db.insertEntry(
+			makeEntry("merge-target", {
+				content: "Original",
+				topics: ["old"],
+				derivedFrom: ["session-1"],
+			}),
+		);
 
 		await db.mergeEntry("merge-target", {
 			content: "Merged content",
@@ -535,11 +651,20 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 	// ── Overlapping Topics ──
 
 	it("getEntriesWithOverlappingTopics finds entries sharing topics", async () => {
-		await db.insertEntry(makeEntry("ot1", { topics: ["alpha", "beta"], embedding: [0.1, 0.2] }));
-		await db.insertEntry(makeEntry("ot2", { topics: ["beta", "gamma"], embedding: [0.3, 0.4] }));
-		await db.insertEntry(makeEntry("ot3", { topics: ["delta"], embedding: [0.5, 0.6] }));
+		await db.insertEntry(
+			makeEntry("ot1", { topics: ["alpha", "beta"], embedding: [0.1, 0.2] }),
+		);
+		await db.insertEntry(
+			makeEntry("ot2", { topics: ["beta", "gamma"], embedding: [0.3, 0.4] }),
+		);
+		await db.insertEntry(
+			makeEntry("ot3", { topics: ["delta"], embedding: [0.5, 0.6] }),
+		);
 
-		const overlapping = await db.getEntriesWithOverlappingTopics(["beta"], ["ot1"]);
+		const overlapping = await db.getEntriesWithOverlappingTopics(
+			["beta"],
+			["ot1"],
+		);
 		expect(overlapping.length).toBe(1);
 		expect(overlapping[0].id).toBe("ot2");
 		expect(overlapping[0].embedding).toBeDefined();
@@ -602,13 +727,26 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		await db.insertEntry(makeEntry("ce4", { embedding: centroid }));
 
 		await db.persistClusters([
-			{ id: "cluster-2", centroid, memberIds: ["ce3", "ce4"], isNew: true, membershipChanged: true },
+			{
+				id: "cluster-2",
+				centroid,
+				memberIds: ["ce3", "ce4"],
+				isNew: true,
+				membershipChanged: true,
+			},
 		]);
-		const before = (await db.getClustersWithMembers())[0].lastMembershipChangedAt;
+		const before = (await db.getClustersWithMembers())[0]
+			.lastMembershipChangedAt;
 
 		const newCentroid = [0.6, 0.4, 0.0, 0.0];
 		await db.persistClusters([
-			{ id: "cluster-2", centroid: newCentroid, memberIds: ["ce3", "ce4"], isNew: false, membershipChanged: false },
+			{
+				id: "cluster-2",
+				centroid: newCentroid,
+				memberIds: ["ce3", "ce4"],
+				isNew: false,
+				membershipChanged: false,
+			},
 		]);
 
 		const after = (await db.getClustersWithMembers())[0];
@@ -621,12 +759,24 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		await db.insertEntry(makeEntry("ce5", { embedding: centroid }));
 
 		await db.persistClusters([
-			{ id: "cluster-old", centroid, memberIds: ["ce5"], isNew: true, membershipChanged: true },
+			{
+				id: "cluster-old",
+				centroid,
+				memberIds: ["ce5"],
+				isNew: true,
+				membershipChanged: true,
+			},
 		]);
 		expect(await db.getClustersWithMembers()).toHaveLength(1);
 
 		await db.persistClusters([
-			{ id: "cluster-new", centroid, memberIds: ["ce5"], isNew: true, membershipChanged: true },
+			{
+				id: "cluster-new",
+				centroid,
+				memberIds: ["ce5"],
+				isNew: true,
+				membershipChanged: true,
+			},
 		]);
 
 		const clusters = await db.getClustersWithMembers();
@@ -639,7 +789,13 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		await db.insertEntry(makeEntry("ce6", { embedding: centroid }));
 
 		await db.persistClusters([
-			{ id: "cluster-synth", centroid, memberIds: ["ce6"], isNew: true, membershipChanged: true },
+			{
+				id: "cluster-synth",
+				centroid,
+				memberIds: ["ce6"],
+				isNew: true,
+				membershipChanged: true,
+			},
 		]);
 
 		expect((await db.getClustersWithMembers())[0].lastSynthesizedAt).toBeNull();
@@ -659,13 +815,22 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 	it("reinitialize clears all data", async () => {
 		await db.insertEntry(makeEntry("ri-1"));
 		await db.setEmbeddingMetadata("test-model", 128);
-		await db.recordEpisode("opencode", "session-1", "msg-a", "msg-b", "messages", 2);
+		await db.recordEpisode(
+			"opencode",
+			"session-1",
+			"msg-a",
+			"msg-b",
+			"messages",
+			2,
+		);
 
 		await db.reinitialize();
 
 		expect((await db.getStats()).total).toBe(0);
 		expect(await db.getEmbeddingMetadata()).toBeNull();
-		const ranges = await db.getProcessedEpisodeRanges("opencode", ["session-1"]);
+		const ranges = await db.getProcessedEpisodeRanges("opencode", [
+			"session-1",
+		]);
 		expect(ranges.size).toBe(0);
 	});
 
@@ -673,7 +838,13 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		const centroid = [1.0, 0.0];
 		await db.insertEntry(makeEntry("ri-cluster-e1", { embedding: centroid }));
 		await db.persistClusters([
-			{ id: "ri-cluster", centroid, memberIds: ["ri-cluster-e1"], isNew: true, membershipChanged: true },
+			{
+				id: "ri-cluster",
+				centroid,
+				memberIds: ["ri-cluster-e1"],
+				isNew: true,
+				membershipChanged: true,
+			},
 		]);
 		expect(await db.getClustersWithMembers()).toHaveLength(1);
 

@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import postgres from "postgres";
-import type { Sql } from "postgres";
 import { logger } from "../logger.js";
 import { clampKnowledgeType } from "../types.js";
 import type {
@@ -88,12 +87,30 @@ function toNum(val: number | string): number {
  */
 export class PostgresKnowledgeDB implements IKnowledgeDB {
 	private sql: postgres.Sql;
-	private initialized = false;
+	/**
+	 * Promise-based init lock: null = not started, pending Promise = in-flight,
+	 * resolved Promise = complete. All callers await the same Promise so
+	 * concurrent initialize() calls are safe.
+	 */
+	private initPromise: Promise<void> | null = null;
 
-	constructor(connectionUri: string) {
+	/**
+	 * @param connectionUri  Full postgres:// connection string.
+	 * @param poolMax        Maximum pool connections. Defaults to POSTGRES_POOL_MAX
+	 *                       env var if set, otherwise 10. Useful for hosted services
+	 *                       with tight connection limits (Supabase free, Railway, Neon).
+	 */
+	constructor(
+		connectionUri: string,
+		poolMax = (() => {
+			const v = Number.parseInt(process.env.POSTGRES_POOL_MAX ?? "", 10);
+			return Number.isNaN(v) || v < 1 ? 10 : v;
+		})(),
+	) {
 		this.sql = postgres(connectionUri, {
-			max: 10,
-			idle_timeout: 30,
+			max: poolMax,
+			idle_timeout: 30, // seconds
+			connect_timeout: 10, // seconds — surface cold-start failures early
 		});
 	}
 
@@ -101,16 +118,34 @@ export class PostgresKnowledgeDB implements IKnowledgeDB {
 	 * Initialize the database schema. Must be called after construction and
 	 * awaited before any other operations.
 	 *
-	 * Uses the same incremental migration strategy as the SQLite backend:
-	 * each migration is applied sequentially within a transaction, so a crash
-	 * mid-migration leaves the DB at the last successfully committed version.
-	 * Only falls back to a destructive drop+recreate when the DB version is
-	 * too old for any registered migration (pre-v8) or when migrations don't
-	 * bring the schema fully up to date.
+	 * Concurrent calls are safe: all callers share the same Promise, so
+	 * initialization runs exactly once.
+	 *
+	 * Bootstrap logic:
+	 * - Fresh DB (currentVersion === 0): run PG_CREATE_TABLES directly and stamp
+	 *   the current SCHEMA_VERSION. Migrations are skipped — they assume tables
+	 *   already exist and are idempotent no-ops on a fresh DB, but the core
+	 *   tables (knowledge_entry etc.) would never be created.
+	 * - Existing DB below SCHEMA_VERSION: apply incremental migrations to bring
+	 *   schema up to date.
+	 * - After migrations, fall back to destructive drop+recreate only if the
+	 *   schema is still behind (unreachable with current migration set, but kept
+	 *   as a safety net for future schema changes that require it).
 	 */
 	async initialize(): Promise<void> {
-		if (this.initialized) return;
+		if (!this.initPromise) {
+			// Attach the null-reset *before* any caller awaits, so concurrent
+			// callers who share this promise all see the same rejection and the
+			// next fresh call can retry rather than getting a stale rejected promise.
+			this.initPromise = this._initialize().catch((err) => {
+				this.initPromise = null;
+				throw err;
+			});
+		}
+		return this.initPromise;
+	}
 
+	private async _initialize(): Promise<void> {
 		// Create schema_version table first
 		await this.sql`
 			CREATE TABLE IF NOT EXISTS schema_version (
@@ -125,17 +160,36 @@ export class PostgresKnowledgeDB implements IKnowledgeDB {
 		const currentVersion =
 			versionRows.length > 0 ? Number(versionRows[0].version) : 0;
 
+		// ── Fresh database: go straight to full create ──────────────────────
+		// Migrations assume their target tables already exist (they add columns
+		// to knowledge_entry, create cluster tables on top of it, etc.). On a
+		// fresh PG instance with no tables, running migrations produces only
+		// schema_version + embedding_metadata + cluster tables — the core
+		// tables (knowledge_entry, knowledge_relation, ...) are never created.
+		// Always bootstrap a fresh DB with PG_CREATE_TABLES and skip migrations.
+		if (currentVersion === 0) {
+			logger.log(
+				`[pg-db] Fresh database — creating schema at v${SCHEMA_VERSION}.`,
+			);
+			await this.sql.unsafe(PG_CREATE_TABLES);
+			await this.sql`
+				INSERT INTO schema_version (version, applied_at)
+				VALUES (${SCHEMA_VERSION}, ${Date.now()})
+			`;
+			return;
+		}
+
+		// ── Existing database: apply incremental migrations ─────────────────
+		// Each migration runs in its own transaction; a crash mid-migration
+		// leaves the DB at the last committed version (re-runnable on restart).
+		//
+		// Rules for adding a new migration:
+		//  1. Append a new { version, up } entry — never reorder or modify existing ones.
+		//  2. `up` must be idempotent (IF NOT EXISTS, information_schema checks, etc.).
+		//  3. Only additive changes (new tables, new nullable columns) are safe.
+		//     Destructive changes that can't be expressed idempotently should fall
+		//     through to the drop+recreate path below.
 		if (currentVersion < SCHEMA_VERSION) {
-			// ── Migration registry ──────────────────────────────────────────
-			// Mirrors the SQLite migration registry. Each entry runs when the
-			// DB version is below the target. Migrations are applied
-			// sequentially, each in its own transaction.
-			//
-			// Rules for adding a new migration:
-			//  1. Append a new { version, up } entry — never reorder or modify existing ones.
-			//  2. `up` must be idempotent (use IF NOT EXISTS, column existence checks, etc.).
-			//  3. Only additive changes (new tables, new nullable columns) are safe here.
-			//     Destructive changes should fall through to the full reset below.
 			const PG_MIGRATIONS: Array<{
 				version: number;
 				label: string;
@@ -224,7 +278,6 @@ export class PostgresKnowledgeDB implements IKnowledgeDB {
 				},
 			];
 
-			// Apply incremental migrations
 			let migratedTo = currentVersion;
 			for (const migration of PG_MIGRATIONS) {
 				if (migratedTo >= migration.version) continue;
@@ -244,37 +297,30 @@ export class PostgresKnowledgeDB implements IKnowledgeDB {
 				);
 			}
 
-			// If migrations didn't bring us fully up to date, fall back to
-			// destructive drop+recreate (handles DBs too old for any migration
-			// or schema drift from partial startups).
+			// Safety net: if migrations still didn't reach SCHEMA_VERSION (e.g.
+			// a future migration requires destructive changes), fall back to
+			// drop+recreate. migratedTo > 0 is always true here (we already
+			// handled 0 above), so we always warn before the destructive reset.
 			if (migratedTo < SCHEMA_VERSION) {
-				if (migratedTo > 0) {
-					logger.warn(
-						`[pg-db] Schema still at v${migratedTo} after migrations, code expects v${SCHEMA_VERSION}. Dropping and recreating all tables.`,
-					);
-					await this.sql`DROP TABLE IF EXISTS knowledge_cluster_member CASCADE`;
-					await this.sql`DROP TABLE IF EXISTS knowledge_cluster CASCADE`;
-					await this.sql`DROP TABLE IF EXISTS knowledge_relation CASCADE`;
-					await this.sql`DROP TABLE IF EXISTS knowledge_entry CASCADE`;
-					await this.sql`DROP TABLE IF EXISTS consolidated_episode CASCADE`;
-					await this.sql`DROP TABLE IF EXISTS source_cursor CASCADE`;
-					await this.sql`DROP TABLE IF EXISTS consolidation_state CASCADE`;
-					await this.sql`DROP TABLE IF EXISTS embedding_metadata CASCADE`;
-					await this.sql`DROP TABLE IF EXISTS schema_version CASCADE`;
-				}
-
-				// Create all tables (idempotent on fresh DB; re-creates after reset)
+				logger.warn(
+					`[pg-db] Schema still at v${migratedTo} after migrations, code expects v${SCHEMA_VERSION}. Dropping and recreating all tables. All existing knowledge data has been cleared.`,
+				);
+				await this.sql`DROP TABLE IF EXISTS knowledge_cluster_member CASCADE`;
+				await this.sql`DROP TABLE IF EXISTS knowledge_cluster CASCADE`;
+				await this.sql`DROP TABLE IF EXISTS knowledge_relation CASCADE`;
+				await this.sql`DROP TABLE IF EXISTS knowledge_entry CASCADE`;
+				await this.sql`DROP TABLE IF EXISTS consolidated_episode CASCADE`;
+				await this.sql`DROP TABLE IF EXISTS source_cursor CASCADE`;
+				await this.sql`DROP TABLE IF EXISTS consolidation_state CASCADE`;
+				await this.sql`DROP TABLE IF EXISTS embedding_metadata CASCADE`;
+				await this.sql`DROP TABLE IF EXISTS schema_version CASCADE`;
 				await this.sql.unsafe(PG_CREATE_TABLES);
-
-				// Stamp version
 				await this.sql`
 					INSERT INTO schema_version (version, applied_at)
 					VALUES (${SCHEMA_VERSION}, ${Date.now()})
 				`;
 			}
 		}
-
-		this.initialized = true;
 	}
 
 	// ── Helpers ──
@@ -997,6 +1043,16 @@ export class PostgresKnowledgeDB implements IKnowledgeDB {
 
 	// ── Entry Merge ──
 
+	/**
+	 * Merge new content into an existing entry (reconsolidation).
+	 *
+	 * When `embedding` is omitted the entry's embedding is set to NULL and
+	 * ensureEmbeddings() will regenerate it at the end of the consolidation run.
+	 * This means a crash between mergeEntry and ensureEmbeddings leaves the
+	 * entry temporarily invisible to similarity queries — the same trade-off as
+	 * the SQLite backend. Callers that have already computed the new embedding
+	 * should pass it here to avoid the NULL window.
+	 */
 	async mergeEntry(
 		id: string,
 		updates: {
@@ -1071,10 +1127,7 @@ export class PostgresKnowledgeDB implements IKnowledgeDB {
 		};
 	}
 
-	async setEmbeddingMetadata(
-		model: string,
-		dimensions: number,
-	): Promise<void> {
+	async setEmbeddingMetadata(model: string, dimensions: number): Promise<void> {
 		await this.sql`
 			INSERT INTO embedding_metadata (id, model, dimensions, recorded_at)
 			VALUES (1, ${model}, ${dimensions}, ${Date.now()})
@@ -1147,12 +1200,17 @@ export class PostgresKnowledgeDB implements IKnowledgeDB {
 		const newClusterIds = new Set(clusters.map((c) => c.id));
 
 		await this.sql.begin(async (sql: TxSql) => {
-			// Remove stale clusters
-			const existingRows = await sql`SELECT id FROM knowledge_cluster`;
-			for (const row of existingRows) {
-				if (!newClusterIds.has(row.id as string)) {
-					await sql`DELETE FROM knowledge_cluster WHERE id = ${row.id}`;
-				}
+			// Remove stale clusters in a single DELETE rather than N round-trips.
+			// ON DELETE CASCADE on knowledge_cluster_member handles membership cleanup.
+			const keepIds = [...newClusterIds];
+			if (keepIds.length > 0) {
+				await sql`
+					DELETE FROM knowledge_cluster
+					WHERE id != ALL(${keepIds}::text[])
+				`;
+			} else {
+				// No clusters remain — wipe everything
+				await sql`DELETE FROM knowledge_cluster`;
 			}
 
 			for (const cluster of clusters) {

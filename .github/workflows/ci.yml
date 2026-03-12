@@ -11,6 +11,22 @@ jobs:
     name: Type-check & test
     runs-on: ubuntu-latest
 
+    services:
+      postgres:
+        # Ephemeral CI-only instance — credentials are not secret.
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ks
+          POSTGRES_PASSWORD: ks
+          POSTGRES_DB: knowledge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -26,3 +42,5 @@ jobs:
 
       - name: Test
         run: bun test
+        env:
+          PG_TEST_URI: postgres://ks:ks@localhost:5432/knowledge

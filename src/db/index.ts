@@ -33,8 +33,16 @@ export async function createKnowledgeDB(
 
 	if (pgUri) {
 		logger.log("[db] Using PostgreSQL backend.");
+		// Pool size is read from POSTGRES_POOL_MAX inside the constructor default.
 		const db = new PostgresKnowledgeDB(pgUri);
-		await db.initialize();
+		try {
+			await db.initialize();
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			throw new Error(
+				`[db] Failed to connect to PostgreSQL (POSTGRES_CONNECTION_URI). Check that the server is reachable and credentials are correct. Original error: ${msg}`,
+			);
+		}
 		return db;
 	}
 
