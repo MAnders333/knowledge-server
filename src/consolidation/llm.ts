@@ -247,7 +247,7 @@ Look at what you have been given and classify it:
 
 Ask yourself: "Did a human deliberately write this down so that others (or their future self) could look it up later?" If yes, it's high-density. If it's the natural by-product of a working session, it's low-density.
 
-Mixed content: if a single episode contains both conversational text and embedded reference artifacts (e.g. a pasted schema, table, data dictionary excerpt, or config block), treat each segment independently — the embedded artifact may be HIGH-DENSITY even if the surrounding session is LOW-DENSITY.
+Mixed content: if a single episode contains both conversational text and embedded reference artifacts (e.g. a pasted schema, table, or data dictionary excerpt), treat each segment independently — the embedded artifact may be HIGH-DENSITY even if the surrounding session is LOW-DENSITY. Apply the same authorial-intent test: would the author expect this artifact to serve as a reference for others later? If it was pasted only as a debugging aid or one-off example, treat it as LOW-DENSITY regardless of its structure.
 
 THE BAR (applied per entry after density assessment):
 Only encode something if a future version of yourself would genuinely benefit from remembering it across sessions. Ask yourself: "Would I be glad this was in my memory six months from now?" If not, skip it.
