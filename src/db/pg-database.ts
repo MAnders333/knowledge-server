@@ -1212,7 +1212,7 @@ export class PostgresKnowledgeDB implements IKnowledgeDB {
 		// TransactionSql scope does not expose .array(); only the top-level sql does.
 		const keepIdsParam =
 			newClusterIds.size > 0
-				? this.sql.array([...newClusterIds], "text")
+				? this.sql.array([...newClusterIds]) // postgres.js infers text (OID 25) for string[]
 				: null;
 
 		await this.sql.begin(async (sql: TxSql) => {
