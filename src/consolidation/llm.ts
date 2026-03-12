@@ -263,7 +263,7 @@ ENCODE if:
 - It's a decision with rationale that would be hard to reconstruct later
 - It's a non-obvious procedure or workflow that took effort to figure out
 - It's a principle or pattern confirmed across multiple observations
-- It's a historical data quality event: a period when tracking was broken, goals were misconfigured, forms failed, traffic was misattributed, or data was otherwise unreliable. These are always worth encoding even though they are past and resolved — they explain anomalies in historical data that analysts will encounter months or years later. Encode each distinct period as its own entry with the property/system affected, the date range, and what was wrong. Examples: "DS lead forms were broken 12–20 Apr 2022 — no leads received during this period", "EM UTM parameters not passed to Salesforce from ~15 Jun 2022 due to middleware bug".
+- It's a historical data quality event: a period when tracking was broken, goals were misconfigured, forms failed, traffic was misattributed, or data was otherwise unreliable. These are always worth encoding even though they are past and resolved — they explain anomalies in historical data that analysts will encounter months or years later. Encode each distinct period as its own entry (type: "fact") with the property/system affected, the date range, and what was wrong. Examples: "Property X lead forms were broken 1–10 Jan 2024 — no leads received during this period", "Channel Y UTM parameters not passed to CRM from ~Mar 2023 due to middleware bug".
 
 DO NOT ENCODE if:
 - The episode is just Q&A, debugging, exploration, or trial-and-error with no lasting conclusion
