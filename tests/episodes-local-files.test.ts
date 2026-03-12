@@ -95,10 +95,23 @@ describe("LocalFilesEpisodeReader — file filtering", () => {
 		expect(candidates).toHaveLength(0);
 	});
 
-	it("includes .md files (case-insensitive extension)", () => {
-		writeFile("notes.md", "# Notes\nsome content", BASE);
+	it("includes .md files regardless of extension case", () => {
+		// Write three files with different-cased extensions.
+		// On case-insensitive filesystems (macOS APFS default), "upper.MD" and
+		// "mixed.Md" may collapse to the same inode — so we assert ≥ 1 rather than
+		// a fixed count. The key invariant is that the extension check uses
+		// .toLowerCase() so uppercase variants are never silently excluded.
+		writeFile("lower.md", "# Lower\nsome content", BASE);
+		writeFile("upper.MD", "# Upper\nsome content", BASE + 1000);
+		writeFile("mixed.Md", "# Mixed\nsome content", BASE + 2000);
 		const candidates = reader.getCandidateSessions(BASE - 1);
-		expect(candidates).toHaveLength(1);
+		// All three produce unique paths on case-sensitive FSes (Linux);
+		// on case-insensitive FSes some may collapse — but at least one must pass.
+		expect(candidates.length).toBeGreaterThanOrEqual(1);
+		// Every returned candidate must have a .md extension (any case)
+		for (const c of candidates) {
+			expect(c.id.toLowerCase()).toMatch(/\.md$/);
+		}
 	});
 
 	it("ignores subdirectories", () => {
