@@ -16,7 +16,7 @@ import {
 } from "../activation/format.js";
 import { config } from "../config.js";
 import type { ConsolidationEngine } from "../consolidation/consolidate.js";
-import type { KnowledgeDB } from "../db/database.js";
+import type { IKnowledgeDB } from "../db/index.js";
 import { logger } from "../logger.js";
 import { activateInputSchema } from "../mcp/index.js";
 import type {
@@ -60,7 +60,7 @@ const REVIEW_STALE_STRENGTH_THRESHOLD = 0.3;
  * deployments, always set KNOWLEDGE_ADMIN_TOKEN so remote MCP clients must authenticate.
  */
 export function createApp(
-	db: KnowledgeDB,
+	db: IKnowledgeDB,
 	activation: ActivationEngine,
 	consolidation: ConsolidationEngine,
 	adminToken: string,
@@ -303,7 +303,7 @@ export function createApp(
 				);
 			}
 
-			db.reinitialize();
+			await db.reinitialize();
 
 			logger.log("[reinitialize] Knowledge DB wiped and cursor reset.");
 			return c.json({
@@ -319,9 +319,9 @@ export function createApp(
 
 	// -- Review --
 
-	app.get("/review", (c) => {
-		const conflicted = db.getEntriesByStatus("conflicted");
-		const active = db.getActiveEntries();
+	app.get("/review", async (c) => {
+		const conflicted = await db.getEntriesByStatus("conflicted");
+		const active = await db.getActiveEntries();
 
 		// Find stale entries (active but low strength)
 		const stale = active
@@ -347,21 +347,21 @@ export function createApp(
 
 	// -- Status --
 
-	app.get("/status", (c) => {
-		const stats = db.getStats();
-		const consolidationState = db.getConsolidationState();
+	app.get("/status", async (c) => {
+		const stats = await db.getStats();
+		const consolidationState = await db.getConsolidationState();
 
 		// Per-source cursor info — surfaced so operators can see each source's
 		// last-consolidated timestamp and high-water mark without tailing logs.
-		const sourceCursors = ["opencode", "claude-code"].map((source) => {
-			const cursor = db.getSourceCursor(source);
+		const sourceCursors = await Promise.all(["opencode", "claude-code"].map(async (source) => {
+			const cursor = await db.getSourceCursor(source);
 			return {
 				source,
 				lastConsolidatedAt: cursor.lastConsolidatedAt
 					? new Date(cursor.lastConsolidatedAt).toISOString()
 					: null,
 			};
-		});
+		}));
 
 		// Config block (model names, port) is gated behind the admin token.
 		// Unauthenticated callers (e.g. healthcheck scripts) still get version +
@@ -370,7 +370,7 @@ export function createApp(
 		// with partial data; the config block is simply omitted.
 		const isAdmin = requireAdminToken(c);
 
-		const embeddingMeta = db.getEmbeddingMetadata();
+		const embeddingMeta = await db.getEmbeddingMetadata();
 
 		return c.json({
 			status: "ok",
@@ -405,13 +405,13 @@ export function createApp(
 
 	// -- Entries CRUD --
 
-	app.get("/entries", (c) => {
+	app.get("/entries", async (c) => {
 		const status = c.req.query("status") || undefined;
 		const type = c.req.query("type") || undefined;
 		const scope = c.req.query("scope") || undefined;
 
 		// Filtering is pushed to SQL — no full-table load + JS filter
-		const entries = db.getEntries({ status, type, scope });
+		const entries = await db.getEntries({ status, type, scope });
 
 		return c.json({
 			entries: entries.map(stripEmbedding),
@@ -419,13 +419,13 @@ export function createApp(
 		});
 	});
 
-	app.get("/entries/:id", (c) => {
-		const entry = db.getEntry(c.req.param("id"));
+	app.get("/entries/:id", async (c) => {
+		const entry = await db.getEntry(c.req.param("id"));
 		if (!entry) {
 			return c.json({ error: "Entry not found" }, 404);
 		}
 
-		const relations = db.getRelationsFor(entry.id);
+		const relations = await db.getRelationsFor(entry.id);
 		return c.json({
 			entry: stripEmbedding(entry),
 			relations,
@@ -442,7 +442,7 @@ export function createApp(
 			return c.json({ error: "Unauthorized" }, 401);
 		}
 
-		const entry = db.getEntry(c.req.param("id"));
+		const entry = await db.getEntry(c.req.param("id"));
 		if (!entry) {
 			return c.json({ error: "Entry not found" }, 404);
 		}
@@ -544,8 +544,8 @@ export function createApp(
 			}
 		}
 
-		db.updateEntry(entry.id, updates);
-		const updated = db.getEntry(entry.id);
+		await db.updateEntry(entry.id, updates);
+		const updated = await db.getEntry(entry.id);
 		return c.json({ entry: updated ? stripEmbedding(updated) : null });
 	});
 
@@ -562,7 +562,7 @@ export function createApp(
 			return c.json({ error: "Unauthorized" }, 401);
 		}
 
-		const entry = db.getEntry(c.req.param("id"));
+		const entry = await db.getEntry(c.req.param("id"));
 		if (!entry) {
 			return c.json({ error: "Entry not found" }, 404);
 		}
@@ -598,7 +598,7 @@ export function createApp(
 
 		// All resolutions need the counterpart. For 'delete', we also restore the counterpart
 		// to 'active' before deleting — otherwise it stays 'conflicted' forever with no partner.
-		const relations = db.getRelationsFor(entry.id);
+		const relations = await db.getRelationsFor(entry.id);
 		const conflictRelation = relations.find((r) => r.type === "contradicts");
 		const counterpartId = conflictRelation
 			? conflictRelation.sourceId === entry.id
@@ -609,9 +609,9 @@ export function createApp(
 		if (resolution === "delete") {
 			// Restore the counterpart to active (deleteEntry cascades and removes the relation)
 			if (counterpartId) {
-				db.updateEntry(counterpartId, { status: "active" });
+				await db.updateEntry(counterpartId, { status: "active" });
 			}
-			db.deleteEntry(entry.id);
+			await db.deleteEntry(entry.id);
 			return c.json({
 				ok: true,
 				deleted: entry.id,
@@ -643,7 +643,7 @@ export function createApp(
 			}
 			// In applyContradictionResolution: "merge" means newEntryId content gets mergedData,
 			// existingEntryId is superseded. We treat :id as the winner (newEntryId).
-			db.applyContradictionResolution("merge", entry.id, counterpartId, {
+			await db.applyContradictionResolution("merge", entry.id, counterpartId, {
 				content: mergedContent,
 				type: entry.type,
 				topics: entry.topics,
@@ -661,7 +661,7 @@ export function createApp(
 			// :id loses — counterpart wins
 			// applyContradictionResolution("supersede_new", newEntryId=:id, existingEntryId=counterpart)
 			// means existingEntryId (counterpart) wins, newEntryId (:id) is superseded
-			db.applyContradictionResolution("supersede_new", entry.id, counterpartId);
+			await db.applyContradictionResolution("supersede_new", entry.id, counterpartId);
 			return c.json({
 				ok: true,
 				resolution: "supersede_this",
@@ -673,7 +673,7 @@ export function createApp(
 		// supersede_other — :id wins, counterpart loses
 		// applyContradictionResolution("supersede_old", newEntryId=:id, existingEntryId=counterpart)
 		// means newEntryId (:id) wins, existingEntryId (counterpart) is superseded
-		db.applyContradictionResolution("supersede_old", entry.id, counterpartId);
+		await db.applyContradictionResolution("supersede_old", entry.id, counterpartId);
 		return c.json({
 			ok: true,
 			resolution: "supersede_other",
@@ -760,12 +760,12 @@ export function createApp(
 	// DELETE /entries/:id — hard-delete an entry and all its relations.
 	// Use for noise, junk extractions, or entries you simply don't want in the store.
 	// Irreversible. For soft removal prefer PATCH with status='superseded'.
-	app.delete("/entries/:id", (c) => {
+	app.delete("/entries/:id", async (c) => {
 		if (!requireAdminToken(c)) {
 			return c.json({ error: "Unauthorized" }, 401);
 		}
 
-		const entry = db.getEntry(c.req.param("id"));
+		const entry = await db.getEntry(c.req.param("id"));
 		if (!entry) {
 			return c.json({ error: "Entry not found" }, 404);
 		}
@@ -775,18 +775,18 @@ export function createApp(
 		// leave the counterpart stuck in 'conflicted' status with no resolvable partner.
 		let restoredCounterpart: string | null = null;
 		if (entry.status === "conflicted") {
-			const relations = db.getRelationsFor(entry.id);
+			const relations = await db.getRelationsFor(entry.id);
 			const conflictRel = relations.find((r) => r.type === "contradicts");
 			if (conflictRel) {
 				restoredCounterpart =
 					conflictRel.sourceId === entry.id
 						? conflictRel.targetId
 						: conflictRel.sourceId;
-				db.updateEntry(restoredCounterpart, { status: "active" });
+				await db.updateEntry(restoredCounterpart, { status: "active" });
 			}
 		}
 
-		db.deleteEntry(entry.id);
+		await db.deleteEntry(entry.id);
 		return c.json({ ok: true, deleted: entry.id, restoredCounterpart });
 	});
 

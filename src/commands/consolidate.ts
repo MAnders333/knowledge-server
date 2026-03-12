@@ -1,7 +1,7 @@
 import { ActivationEngine } from "../activation/activate.js";
 import { ConsolidationEngine } from "../consolidation/consolidate.js";
 import { createEpisodeReaders } from "../consolidation/readers/index.js";
-import { KnowledgeDB } from "../db/database.js";
+import { createKnowledgeDB } from "../db/index.js";
 import { logger } from "../logger.js";
 
 /**
@@ -13,7 +13,7 @@ import { logger } from "../logger.js";
 export async function runConsolidate(): Promise<void> {
 	logger.init(""); // disable file logging — output goes to stdout only
 
-	const db = new KnowledgeDB();
+	const db = await createKnowledgeDB();
 	const activation = new ActivationEngine(db);
 	const readers = createEpisodeReaders();
 	const consolidation = new ConsolidationEngine(db, activation, readers);
@@ -30,7 +30,7 @@ export async function runConsolidate(): Promise<void> {
 			);
 		}
 
-		const { pendingSessions } = consolidation.checkPending();
+		const { pendingSessions } = await consolidation.checkPending();
 
 		if (pendingSessions > 0) {
 			console.log(
@@ -118,6 +118,6 @@ export async function runConsolidate(): Promise<void> {
 		console.log(`  Entries updated:    ${totalUpdated}`);
 	} finally {
 		consolidation.close();
-		db.close();
+		await db.close();
 	}
 }

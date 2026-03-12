@@ -3,7 +3,7 @@ import pkg from "../../package.json" with { type: "json" };
 import { ActivationEngine } from "../activation/activate.js";
 import { ConsolidationEngine } from "../consolidation/consolidate.js";
 import { createEpisodeReaders } from "../consolidation/readers/index.js";
-import { KnowledgeDB } from "../db/database.js";
+import { createKnowledgeDB } from "../db/index.js";
 
 /**
  * `knowledge-server status`
@@ -11,7 +11,7 @@ import { KnowledgeDB } from "../db/database.js";
  * Prints a human-readable summary of the knowledge store and whether the
  * HTTP server is currently running (detected via PID file).
  */
-export function runStatus(pidPath: string): void {
+export async function runStatus(pidPath: string): Promise<void> {
 	// Server running state — detected via PID file.
 	let serverLine: string;
 	if (!pidPath || !existsSync(pidPath)) {
@@ -36,15 +36,15 @@ export function runStatus(pidPath: string): void {
 		}
 	}
 
-	const db = new KnowledgeDB();
+	const db = await createKnowledgeDB();
 	try {
-		const stats = db.getStats();
-		const state = db.getConsolidationState();
+		const stats = await db.getStats();
+		const state = await db.getConsolidationState();
 
 		const activation = new ActivationEngine(db);
 		const readers = createEpisodeReaders();
 		const consolidation = new ConsolidationEngine(db, activation, readers);
-		const { pendingSessions } = consolidation.checkPending();
+		const { pendingSessions } = await consolidation.checkPending();
 		consolidation.close();
 
 		console.log("Knowledge Server Status");
@@ -66,6 +66,6 @@ export function runStatus(pidPath: string): void {
 			`  Total processed:    ${state.totalSessionsProcessed} sessions, ${state.totalEntriesCreated} created, ${state.totalEntriesUpdated} updated`,
 		);
 	} finally {
-		db.close();
+		await db.close();
 	}
 }

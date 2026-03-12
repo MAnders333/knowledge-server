@@ -1,4 +1,4 @@
-import { KnowledgeDB } from "../db/database.js";
+import { createKnowledgeDB } from "../db/index.js";
 
 /**
  * `knowledge-server reinitialize [--confirm]`
@@ -8,12 +8,12 @@ import { KnowledgeDB } from "../db/database.js";
  *
  * Requires --confirm to apply; prints a preview without it.
  */
-export function runReinitialize(args: string[]): void {
+export async function runReinitialize(args: string[]): Promise<void> {
 	const flag = args[0];
-	const db = new KnowledgeDB();
+	const db = await createKnowledgeDB();
 
 	try {
-		const stats = db.getStats();
+		const stats = await db.getStats();
 		const entryCount = stats.total ?? 0;
 
 		if (flag === "--dry-run") {
@@ -49,11 +49,11 @@ export function runReinitialize(args: string[]): void {
 			return;
 		}
 
-		db.reinitialize();
+		await db.reinitialize();
 		console.log(
 			`Knowledge DB reinitialized. ${entryCount} entries deleted, cursor reset.`,
 		);
 	} finally {
-		db.close();
+		await db.close();
 	}
 }

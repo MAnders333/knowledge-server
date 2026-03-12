@@ -2,7 +2,7 @@
 
 Persistent semantic memory for [OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview), [Cursor](https://cursor.com), [Codex CLI](https://github.com/openai/codex), and [VSCode](https://code.visualstudio.com) (GitHub Copilot) — fully local, no external service required.
 
-Reads your session history, extracts what's worth keeping into a local SQLite knowledge store, and injects relevant entries into new conversations automatically.
+Reads your session history, extracts what's worth keeping into a knowledge store (SQLite by default, or PostgreSQL for shared/hosted deployments), and injects relevant entries into new conversations automatically.
 
 ## Install
 
@@ -125,7 +125,8 @@ OpenCode    Claude Code    Cursor    Codex CLI    VSCode    Local Files
               [contradictionModel]   (0.4 ≤ sim < 0.82 → supersede/merge/flag)
                         │
                         ▼
-              KnowledgeDB (SQLite)   persistent graph with embeddings, strength, decay, relations
+              KnowledgeDB            persistent graph with embeddings, strength, decay, relations
+                                     (SQLite default · PostgreSQL when POSTGRES_CONNECTION_URI is set)
                         │
                         ▼
               Synthesis pass         KB-wide cluster synthesis → higher-order principles
@@ -326,7 +327,8 @@ Two options — set one or the other (or both; per-provider credentials take pre
 | `KNOWLEDGE_PORT` | `3179` | HTTP port. |
 | `KNOWLEDGE_HOST` | `127.0.0.1` | HTTP bind address. Must be a loopback address. |
 | `KNOWLEDGE_ADMIN_TOKEN` | *(random)* | Fixed admin token (≥16 chars) for scripted use. If unset, a random token is generated per process and printed at startup. |
-| `KNOWLEDGE_DB_PATH` | `~/.local/share/knowledge-server/knowledge.db` | Knowledge database path. |
+| `POSTGRES_CONNECTION_URI` | *(empty)* | PostgreSQL connection URI (e.g. `postgres://user:pass@host:5432/knowledge`). When set, PostgreSQL is used instead of SQLite. |
+| `KNOWLEDGE_DB_PATH` | `~/.local/share/knowledge-server/knowledge.db` | SQLite database path. Ignored when `POSTGRES_CONNECTION_URI` is set. |
 | `KNOWLEDGE_LOG_PATH` | `~/.local/share/knowledge-server/server.log` | Log file path. Set to `""` to disable file logging. |
 | `KNOWLEDGE_PID_PATH` | `~/.local/share/knowledge-server/server.pid` | PID file path. Used by `knowledge-server stop`. Set to `""` to disable. |
 | `KNOWLEDGE_CONFIG_HOME` | *(see .env search order above)* | Explicit override for the directory containing `.env`. |

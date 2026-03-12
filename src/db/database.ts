@@ -14,6 +14,7 @@ import type {
 	ProcessedRange,
 	SourceCursor,
 } from "../types.js";
+import type { IKnowledgeDB } from "./interface.js";
 import {
 	CREATE_TABLES,
 	EXPECTED_TABLE_COLUMNS,
@@ -21,13 +22,16 @@ import {
 } from "./schema.js";
 
 /**
- * Database layer for the knowledge graph.
+ * SQLite database layer for the knowledge graph.
  *
  * Uses bun:sqlite (Bun's native SQLite binding) for all operations:
  * CRUD for entries/relations, embedding storage/retrieval,
  * and consolidation state management.
+ *
+ * Implements IKnowledgeDB so it can be swapped with PostgresKnowledgeDB
+ * when POSTGRES_CONNECTION_URI is set.
  */
-export class KnowledgeDB {
+export class KnowledgeDB implements IKnowledgeDB {
 	private db: Database;
 
 	/**
@@ -231,9 +235,9 @@ export class KnowledgeDB {
 
 	// ── Entry CRUD ──
 
-	insertEntry(
+	async insertEntry(
 		entry: Omit<KnowledgeEntry, "embedding"> & { embedding?: number[] },
-	): void {
+	): Promise<void> {
 		const embeddingBlob = entry.embedding
 			? new Uint8Array(new Float32Array(entry.embedding).buffer)
 			: null;
@@ -268,7 +272,7 @@ export class KnowledgeDB {
 			);
 	}
 
-	updateEntry(id: string, updates: Partial<KnowledgeEntry>): void {
+	async updateEntry(id: string, updates: Partial<KnowledgeEntry>): Promise<void> {
 		const fields: string[] = [];
 		const values: SQLQueryBindings[] = [];
 
@@ -320,7 +324,7 @@ export class KnowledgeDB {
 			.run(...values);
 	}
 
-	getEntry(id: string): KnowledgeEntry | null {
+	async getEntry(id: string): Promise<KnowledgeEntry | null> {
 		const row = this.db
 			.prepare("SELECT * FROM knowledge_entry WHERE id = ?")
 			.get(id) as RawEntryRow | null;
@@ -328,7 +332,7 @@ export class KnowledgeDB {
 		return row ? this.rowToEntry(row) : null;
 	}
 
-	getActiveEntries(): KnowledgeEntry[] {
+	async getActiveEntries(): Promise<KnowledgeEntry[]> {
 		const rows = this.db
 			.prepare(
 				"SELECT * FROM knowledge_entry WHERE status = 'active' ORDER BY strength DESC",
@@ -343,9 +347,9 @@ export class KnowledgeDB {
 	 * Conflicted entries are included so they can be surfaced to the agent with a caveat
 	 * annotation, and so the contradiction scan can attempt to re-resolve them.
 	 */
-	getActiveEntriesWithEmbeddings(): Array<
+	async getActiveEntriesWithEmbeddings(): Promise<Array<
 		KnowledgeEntry & { embedding: number[] }
-	> {
+	>> {
 		const rows = this.db
 			.prepare(
 				"SELECT * FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL ORDER BY strength DESC",
@@ -363,7 +367,7 @@ export class KnowledgeDB {
 	 * Get a single active or conflicted entry that has an embedding.
 	 * Used to probe embedding dimensions without loading all entries into memory.
 	 */
-	getOneEntryWithEmbedding(): (KnowledgeEntry & { embedding: number[] }) | null {
+	async getOneEntryWithEmbedding(): Promise<(KnowledgeEntry & { embedding: number[] }) | null> {
 		const row = this.db
 			.prepare(
 				"SELECT * FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL LIMIT 1",
@@ -383,7 +387,7 @@ export class KnowledgeDB {
 	 * Used by applyDecay — avoids the TOCTOU window of two separate queries
 	 * (an entry transitioning between statuses between calls could be processed twice).
 	 */
-	getActiveAndConflictedEntries(): KnowledgeEntry[] {
+	async getActiveAndConflictedEntries(): Promise<KnowledgeEntry[]> {
 		const rows = this.db
 			.prepare(
 				"SELECT * FROM knowledge_entry WHERE status IN ('active', 'conflicted') ORDER BY updated_at DESC",
@@ -395,7 +399,7 @@ export class KnowledgeDB {
 	/**
 	 * Get entries missing an embedding — used by ensureEmbeddings.
 	 */
-	getEntriesMissingEmbeddings(): KnowledgeEntry[] {
+	async getEntriesMissingEmbeddings(): Promise<KnowledgeEntry[]> {
 		const rows = this.db
 			.prepare(
 				"SELECT * FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NULL ORDER BY updated_at DESC",
@@ -408,7 +412,7 @@ export class KnowledgeDB {
 	/**
 	 * Get entries by status (for review, decay processing, etc.)
 	 */
-	getEntriesByStatus(status: KnowledgeStatus): KnowledgeEntry[] {
+	async getEntriesByStatus(status: KnowledgeStatus): Promise<KnowledgeEntry[]> {
 		const rows = this.db
 			.prepare(
 				"SELECT * FROM knowledge_entry WHERE status = ? ORDER BY updated_at DESC",
@@ -422,11 +426,11 @@ export class KnowledgeDB {
 	 * Get entries with optional server-side filtering — pushes status/type/scope
 	 * filters to SQL so we don't load the full table into memory just to slice it.
 	 */
-	getEntries(filters: {
+	async getEntries(filters: {
 		status?: string;
 		type?: string;
 		scope?: string;
-	}): KnowledgeEntry[] {
+	}): Promise<KnowledgeEntry[]> {
 		const conditions: string[] = [];
 		const values: string[] = [];
 
@@ -458,7 +462,7 @@ export class KnowledgeDB {
 	 * Record an access (bump access_count and last_accessed_at).
 	 * Retrieval-only signal — never called during consolidation.
 	 */
-	recordAccess(id: string): void {
+	async recordAccess(id: string): Promise<void> {
 		this.db
 			.prepare(
 				`UPDATE knowledge_entry 
@@ -474,7 +478,7 @@ export class KnowledgeDB {
 	 * confirms the same knowledge appeared in a new episode.
 	 * Never called during activation/retrieval.
 	 */
-	reinforceObservation(id: string): void {
+	async reinforceObservation(id: string): Promise<void> {
 		this.db
 			.prepare(
 				`UPDATE knowledge_entry
@@ -487,7 +491,7 @@ export class KnowledgeDB {
 	/**
 	 * Batch update strength scores (used during decay).
 	 */
-	updateStrength(id: string, strength: number): void {
+	async updateStrength(id: string, strength: number): Promise<void> {
 		this.db
 			.prepare(
 				"UPDATE knowledge_entry SET strength = ?, updated_at = ? WHERE id = ?",
@@ -498,7 +502,7 @@ export class KnowledgeDB {
 	/**
 	 * Count entries by status.
 	 */
-	getStats(): Record<string, number> {
+	async getStats(): Promise<Record<string, number>> {
 		const rows = this.db
 			.prepare(
 				"SELECT status, COUNT(*) as count FROM knowledge_entry GROUP BY status",
@@ -531,10 +535,10 @@ export class KnowledgeDB {
 	 * Excludes a set of IDs already handled (e.g. the new entry itself, entries
 	 * already processed by decideMerge in this chunk).
 	 */
-	getEntriesWithOverlappingTopics(
+	async getEntriesWithOverlappingTopics(
 		topics: string[],
 		excludeIds: string[],
-	): Array<KnowledgeEntry & { embedding: number[] }> {
+	): Promise<Array<KnowledgeEntry & { embedding: number[] }>> {
 		if (topics.length === 0) return [];
 
 		const rows = this.db
@@ -571,7 +575,7 @@ export class KnowledgeDB {
 	 * and its status is restored to 'active'. This enables automatic re-resolution when
 	 * a new entry clearly settles a previously unresolvable conflict.
 	 */
-	applyContradictionResolution(
+	async applyContradictionResolution(
 		resolution: "supersede_old" | "supersede_new" | "merge" | "irresolvable",
 		newEntryId: string,
 		existingEntryId: string,
@@ -581,7 +585,7 @@ export class KnowledgeDB {
 			topics: string[];
 			confidence: number;
 		},
-	): void {
+	): Promise<void> {
 		const now = Date.now();
 
 		this.db.transaction(() => {
@@ -829,7 +833,7 @@ export class KnowledgeDB {
 	 * Intended for human review cleanup (junk/noise entries, irresolvable conflicts
 	 * that aren't worth keeping). Returns true if an entry was deleted, false if not found.
 	 */
-	deleteEntry(id: string): boolean {
+	async deleteEntry(id: string): Promise<boolean> {
 		let deleted = false;
 		this.db.transaction(() => {
 			this.db
@@ -847,7 +851,7 @@ export class KnowledgeDB {
 
 	// ── Relations ──
 
-	insertRelation(relation: KnowledgeRelation): void {
+	async insertRelation(relation: KnowledgeRelation): Promise<void> {
 		this.db
 			.prepare(
 				"INSERT INTO knowledge_relation (id, source_id, target_id, type, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -861,7 +865,7 @@ export class KnowledgeDB {
 			);
 	}
 
-	getRelationsFor(entryId: string): KnowledgeRelation[] {
+	async getRelationsFor(entryId: string): Promise<KnowledgeRelation[]> {
 		const rows = this.db
 			.prepare(
 				"SELECT * FROM knowledge_relation WHERE source_id = ? OR target_id = ?",
@@ -897,9 +901,9 @@ export class KnowledgeDB {
 	 * principle activates, its source entries are surfaced alongside it so the agent
 	 * can see both the abstraction and the evidence that produced it.
 	 */
-	getSupportSourcesForIds(
+	async getSupportSourcesForIds(
 		synthesizedIds: string[],
-	): Map<string, KnowledgeEntry[]> {
+	): Promise<Map<string, KnowledgeEntry[]>> {
 		if (synthesizedIds.length === 0) return new Map();
 
 		// `supports` relations: source_id = synthesized entry, target_id = source entry
@@ -934,7 +938,7 @@ export class KnowledgeDB {
 	 * Used by the activation engine to annotate conflicted entries without N+1 queries.
 	 * Entries with no contradicts relation are absent from the returned map.
 	 */
-	getContradictPairsForIds(entryIds: string[]): Map<string, string> {
+	async getContradictPairsForIds(entryIds: string[]): Promise<Map<string, string>> {
 		if (entryIds.length === 0) return new Map();
 
 		const rows = this.db
@@ -967,14 +971,14 @@ export class KnowledgeDB {
 	 *
 	 * @param source  Reader source name (e.g. "opencode", "claude-code").
 	 */
-	recordEpisode(
+	async recordEpisode(
 		source: string,
 		sessionId: string,
 		startMessageId: string,
 		endMessageId: string,
 		contentType: "compaction_summary" | "messages" | "document",
 		entriesCreated: number,
-	): void {
+	): Promise<void> {
 		this.db
 			.prepare(
 				`INSERT OR IGNORE INTO consolidated_episode
@@ -1007,10 +1011,10 @@ export class KnowledgeDB {
 	 * @param source      Reader source name (e.g. "opencode", "claude-code").
 	 * @param sessionIds  Session IDs to look up.
 	 */
-	getProcessedEpisodeRanges(
+	async getProcessedEpisodeRanges(
 		source: string,
 		sessionIds: string[],
-	): Map<string, ProcessedRange[]> {
+	): Promise<Map<string, ProcessedRange[]>> {
 		if (sessionIds.length === 0) return new Map();
 
 		const rows = this.db
@@ -1052,7 +1056,7 @@ export class KnowledgeDB {
 	 * Get the high-water mark cursor for a specific source.
 	 * Returns a zero-state cursor if no row exists for this source yet.
 	 */
-	getSourceCursor(source: string): SourceCursor {
+	async getSourceCursor(source: string): Promise<SourceCursor> {
 		const row = this.db
 			.prepare(
 				"SELECT last_message_time_created, last_consolidated_at FROM source_cursor WHERE source = ?",
@@ -1077,12 +1081,12 @@ export class KnowledgeDB {
 	 * Upsert the high-water mark cursor for a specific source.
 	 * Uses INSERT OR REPLACE so the first call creates the row automatically.
 	 */
-	updateSourceCursor(
+	async updateSourceCursor(
 		source: string,
 		cursor: Partial<Omit<SourceCursor, "source">>,
-	): void {
+	): Promise<void> {
 		// Read current values so we only update what's provided
-		const current = this.getSourceCursor(source);
+		const current = await this.getSourceCursor(source);
 
 		const newLastMessageTime =
 			cursor.lastMessageTimeCreated ?? current.lastMessageTimeCreated;
@@ -1099,7 +1103,7 @@ export class KnowledgeDB {
 
 	// ── Consolidation State ──
 
-	getConsolidationState(): ConsolidationState {
+	async getConsolidationState(): Promise<ConsolidationState> {
 		const row = this.db
 			.prepare("SELECT * FROM consolidation_state WHERE id = 1")
 			.get() as {
@@ -1132,7 +1136,7 @@ export class KnowledgeDB {
 		};
 	}
 
-	updateConsolidationState(state: Partial<ConsolidationState>): void {
+	async updateConsolidationState(state: Partial<ConsolidationState>): Promise<void> {
 		const fields: string[] = [];
 		const values: SQLQueryBindings[] = [];
 
@@ -1208,7 +1212,7 @@ export class KnowledgeDB {
 	 *   entry never passes through a NULL-embedding state. If omitted, embedding
 	 *   is set to NULL and ensureEmbeddings will regenerate it at end of run.
 	 */
-	mergeEntry(
+	async mergeEntry(
 		id: string,
 		updates: {
 			content: string;
@@ -1218,8 +1222,8 @@ export class KnowledgeDB {
 			additionalSources: string[]; // session IDs from the new episode
 		},
 		embedding?: number[],
-	): void {
-		const existing = this.getEntry(id);
+	): Promise<void> {
+		const existing = await this.getEntry(id);
 		if (!existing) return;
 
 		const mergedSources = [
@@ -1259,7 +1263,7 @@ export class KnowledgeDB {
 	 * Wipe all knowledge entries, relations, episode records, and reset all cursors.
 	 * Used during development/iteration to start fresh with improved extraction.
 	 */
-	reinitialize(): void {
+	async reinitialize(): Promise<void> {
 		// All operations must succeed atomically — a crash mid-wipe would leave
 		// entries deleted but cursors not reset (or vice versa).
 		this.db.transaction(() => {
@@ -1287,11 +1291,11 @@ export class KnowledgeDB {
 	 * Get the stored embedding model metadata.
 	 * Returns null if no metadata has been recorded yet (first run, or pre-v8 DB).
 	 */
-	getEmbeddingMetadata(): {
+	async getEmbeddingMetadata(): Promise<{
 		model: string;
 		dimensions: number;
 		recordedAt: number;
-	} | null {
+	} | null> {
 		const row = this.db
 			.prepare(
 				"SELECT model, dimensions, recorded_at FROM embedding_metadata WHERE id = 1",
@@ -1315,7 +1319,7 @@ export class KnowledgeDB {
 	 * Record the embedding model and dimensions currently in use.
 	 * Uses INSERT OR REPLACE so the first call creates the singleton row.
 	 */
-	setEmbeddingMetadata(model: string, dimensions: number): void {
+	async setEmbeddingMetadata(model: string, dimensions: number): Promise<void> {
 		this.db
 			.prepare(
 				"INSERT OR REPLACE INTO embedding_metadata (id, model, dimensions, recorded_at) VALUES (1, ?, ?, ?)",
@@ -1328,7 +1332,7 @@ export class KnowledgeDB {
 	/**
 	 * Load all persisted clusters with their current member entry IDs.
 	 */
-	getClustersWithMembers(): Array<{
+	async getClustersWithMembers(): Promise<Array<{
 		id: string;
 		centroid: number[];
 		memberCount: number;
@@ -1336,7 +1340,7 @@ export class KnowledgeDB {
 		lastMembershipChangedAt: number;
 		createdAt: number;
 		memberIds: string[];
-	}> {
+	}>> {
 		const clusterRows = this.db
 			.prepare("SELECT * FROM knowledge_cluster ORDER BY created_at ASC")
 			.all() as Array<{
@@ -1388,7 +1392,7 @@ export class KnowledgeDB {
 	 *
 	 * @param clusters  New cluster state from the clustering pass.
 	 */
-	persistClusters(
+	async persistClusters(
 		clusters: Array<{
 			id: string;
 			centroid: number[];
@@ -1396,7 +1400,7 @@ export class KnowledgeDB {
 			isNew: boolean;
 			membershipChanged: boolean;
 		}>,
-	): void {
+	): Promise<void> {
 		const now = Date.now();
 		const newClusterIds = new Set(clusters.map((c) => c.id));
 
@@ -1480,7 +1484,7 @@ export class KnowledgeDB {
 	 * Stamp a cluster as synthesized at the current time.
 	 * Called after a successful synthesis pass for that cluster.
 	 */
-	markClusterSynthesized(clusterId: string): void {
+	async markClusterSynthesized(clusterId: string): Promise<void> {
 		this.db
 			.prepare(
 				"UPDATE knowledge_cluster SET last_synthesized_at = ? WHERE id = ?",
@@ -1499,7 +1503,7 @@ export class KnowledgeDB {
 	 *
 	 * Returns the number of entries whose embeddings were cleared.
 	 */
-	clearAllEmbeddings(): number {
+	async clearAllEmbeddings(): Promise<number> {
 		const result = this.db
 			.prepare(
 				"UPDATE knowledge_entry SET embedding = NULL WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL",
@@ -1508,7 +1512,7 @@ export class KnowledgeDB {
 		return result.changes;
 	}
 
-	close(): void {
+	async close(): Promise<void> {
 		this.db.close();
 	}
 
