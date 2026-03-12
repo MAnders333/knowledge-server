@@ -1,6 +1,6 @@
 import { cosineSimilarity } from "../activation/embeddings.js";
 import { config } from "../config.js";
-import type { KnowledgeDB } from "../db/database.js";
+import type { IKnowledgeDB } from "../db/index.js";
 import { logger } from "../logger.js";
 import type { KnowledgeEntry } from "../types.js";
 import type { ConsolidationLLM } from "./llm.js";
@@ -26,10 +26,10 @@ const CONTRADICTION_BATCH_SIZE = 10;
  * - Track which candidates were already resolved this pass to avoid double-processing.
  */
 export class ContradictionScanner {
-	private db: KnowledgeDB;
+	private db: IKnowledgeDB;
 	private llm: ConsolidationLLM;
 
-	constructor(db: KnowledgeDB, llm: ConsolidationLLM) {
+	constructor(db: IKnowledgeDB, llm: ConsolidationLLM) {
 		this.db = db;
 		this.llm = llm;
 	}
@@ -143,7 +143,7 @@ export class ContradictionScanner {
 							}
 						: undefined;
 
-				this.db.applyContradictionResolution(
+				await this.db.applyContradictionResolution(
 					result.resolution,
 					entry.id,
 					result.candidateId,
@@ -225,7 +225,7 @@ export class ContradictionScanner {
 			// Pass 1: Find topic-overlapping pre-existing entries from DB.
 			// Exclude all changedIds — they were either handled by decideMerge (sim ≥ threshold)
 			// or will be covered in pass 2 (intra-chunk pairs, below).
-			const candidates = this.db.getEntriesWithOverlappingTopics(
+			const candidates = await this.db.getEntriesWithOverlappingTopics(
 				entry.topics,
 				[...changedIds], // only exclude chunk-changed entries, not all of entriesMap
 			);

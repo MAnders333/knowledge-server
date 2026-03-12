@@ -54,8 +54,8 @@ describe("HTTP API", () => {
 		app = createApp(db, activation, consolidation, TEST_ADMIN_TOKEN);
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
@@ -96,7 +96,7 @@ describe("HTTP API", () => {
 
 	it("GET /entries should list inserted entries", async () => {
 		const now = Date.now();
-		db.insertEntry({
+		await db.insertEntry({
 			id: "api-test-1",
 			type: "fact",
 			content: "Test fact",
@@ -145,8 +145,8 @@ describe("HTTP API", () => {
 			derivedFrom: [],
 		});
 
-		db.insertEntry(makeEntry("f1", "active"));
-		db.insertEntry(makeEntry("f2", "archived"));
+		await db.insertEntry(makeEntry("f1", "active"));
+		await db.insertEntry(makeEntry("f2", "archived"));
 
 		const activeRes = await app.request("/entries?status=active");
 		const activeData = await activeRes.json();
@@ -156,7 +156,7 @@ describe("HTTP API", () => {
 
 	it("GET /entries/:id should return a specific entry", async () => {
 		const now = Date.now();
-		db.insertEntry({
+		await db.insertEntry({
 			id: "specific-1",
 			type: "principle",
 			content: "Specific principle",
@@ -273,7 +273,7 @@ describe("HTTP API", () => {
 			});
 			expect(res.status).toBe(409);
 		} finally {
-			busyDb.close();
+			await busyDb.close();
 		}
 	});
 
@@ -326,7 +326,7 @@ describe("HTTP API", () => {
 	});
 
 	it("PATCH /entries/:id should update allowed fields", async () => {
-		db.insertEntry({
+		await db.insertEntry({
 			id: "patch-test",
 			type: "fact",
 			content: "Original content",
@@ -357,13 +357,13 @@ describe("HTTP API", () => {
 		const data = await res.json();
 		expect(data.entry.content).toBe("Updated content");
 		expect(data.entry.confidence).toBe(0.95);
-		expect(db.getEntry("patch-test")?.embedding?.[0]).toBeCloseTo(0.11);
-		expect(db.getEntry("patch-test")?.embedding?.[1]).toBeCloseTo(0.22);
-		expect(db.getEntry("patch-test")?.embedding?.[2]).toBeCloseTo(0.33);
+		expect((await db.getEntry("patch-test"))?.embedding?.[0]).toBeCloseTo(0.11);
+		expect((await db.getEntry("patch-test"))?.embedding?.[1]).toBeCloseTo(0.22);
+		expect((await db.getEntry("patch-test"))?.embedding?.[2]).toBeCloseTo(0.33);
 	});
 
 	it("PATCH /entries/:id should re-embed when only topics change", async () => {
-		db.insertEntry({
+		await db.insertEntry({
 			id: "patch-topics",
 			type: "fact",
 			content: "Original content",
@@ -399,11 +399,11 @@ describe("HTTP API", () => {
 		});
 		expect(res.status).toBe(200);
 		expect(embedSpy).toHaveBeenCalled();
-		expect(db.getEntry("patch-topics")?.embedding?.[0]).toBeCloseTo(0.44);
+		expect((await db.getEntry("patch-topics"))?.embedding?.[0]).toBeCloseTo(0.44);
 	});
 
 	it("PATCH /entries/:id should return 400 with no valid fields", async () => {
-		db.insertEntry({
+		await db.insertEntry({
 			id: "patch-noop",
 			type: "fact",
 			content: "Content",
@@ -449,7 +449,7 @@ describe("HTTP API", () => {
 	});
 
 	it("DELETE /entries/:id should hard-delete entry and relations", async () => {
-		db.insertEntry({
+		await db.insertEntry({
 			id: "delete-test",
 			type: "fact",
 			content: "To be deleted",
@@ -506,7 +506,7 @@ describe("HTTP API", () => {
 	});
 
 	it("POST /entries/:id/resolve should return 400 for non-conflicted entry", async () => {
-		db.insertEntry({
+		await db.insertEntry({
 			id: "not-conflicted",
 			type: "fact",
 			content: "Active entry",
@@ -537,7 +537,7 @@ describe("HTTP API", () => {
 	});
 
 	it("POST /entries/:id/resolve with delete should hard-delete a conflicted entry", async () => {
-		db.insertEntry({
+		await db.insertEntry({
 			id: "conflicted-del",
 			type: "fact",
 			content: "Conflicted junk",
@@ -571,7 +571,7 @@ describe("HTTP API", () => {
 	});
 
 	it("POST /entries/:id/resolve with invalid resolution should return 400", async () => {
-		db.insertEntry({
+		await db.insertEntry({
 			id: "conflicted-bad",
 			type: "fact",
 			content: "Conflicted",

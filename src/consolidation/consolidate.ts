@@ -1,6 +1,6 @@
 import type { ActivationEngine } from "../activation/activate.js";
 import { config } from "../config.js";
-import type { KnowledgeDB } from "../db/database.js";
+import type { IKnowledgeDB } from "../db/index.js";
 import { logger } from "../logger.js";
 import type { IEpisodeReader, KnowledgeEntry } from "../types.js";
 import type { ConsolidationResult } from "../types.js";
@@ -42,7 +42,7 @@ const MAX_CHUNK_TOKENS = 150_000;
  * 7. After all sources: apply decay and generate embeddings
  */
 export class ConsolidationEngine {
-	private db: KnowledgeDB;
+	private db: IKnowledgeDB;
 	private activation: ActivationEngine;
 	private readers: IEpisodeReader[];
 	private llm: ConsolidationLLM;
@@ -89,7 +89,7 @@ export class ConsolidationEngine {
 	 *                   without real source DBs on disk.
 	 */
 	constructor(
-		db: KnowledgeDB,
+		db: IKnowledgeDB,
 		activation: ActivationEngine,
 		readers: IEpisodeReader[] = [],
 	) {
@@ -110,12 +110,12 @@ export class ConsolidationEngine {
 	 * Used at startup to decide whether to kick off a background consolidation.
 	 * Aggregates across all active readers.
 	 */
-	checkPending(): { pendingSessions: number; lastConsolidatedAt: number } {
-		const state = this.db.getConsolidationState();
+	async checkPending(): Promise<{ pendingSessions: number; lastConsolidatedAt: number }> {
+		const state = await this.db.getConsolidationState();
 		let pendingSessions = 0;
 
 		for (const reader of this.readers) {
-			const cursor = this.db.getSourceCursor(reader.source);
+			const cursor = await this.db.getSourceCursor(reader.source);
 			pendingSessions += reader.countNewSessions(cursor.lastMessageTimeCreated);
 		}
 
@@ -140,7 +140,7 @@ export class ConsolidationEngine {
 	 */
 	async consolidate(): Promise<ConsolidationResult> {
 		const startTime = Date.now();
-		const state = this.db.getConsolidationState();
+		const state = await this.db.getConsolidationState();
 
 		logger.log(
 			`[consolidation] Starting. Last run: ${state.lastConsolidatedAt ? new Date(state.lastConsolidatedAt).toISOString() : "never"}`,
@@ -169,7 +169,7 @@ export class ConsolidationEngine {
 		}
 
 		// Apply decay to ALL active entries (once, after all sources are processed).
-		const archived = this.applyDecay();
+		const archived = await this.applyDecay();
 
 		// Generate embeddings for new entries (once, shared across all sources).
 		const embeddedCount = await this.activation.ensureEmbeddings();
@@ -182,10 +182,10 @@ export class ConsolidationEngine {
 		// Only seeds when metadata is absent — the model-change path is handled
 		// exclusively by checkAndReEmbed() at startup to avoid overwriting metadata
 		// with a stale model name while old-model vectors are still in the DB.
-		if (embeddedCount > 0 && !this.db.getEmbeddingMetadata()) {
-			const sample = this.db.getOneEntryWithEmbedding();
+		if (embeddedCount > 0 && !(await this.db.getEmbeddingMetadata())) {
+			const sample = await this.db.getOneEntryWithEmbedding();
 			if (sample) {
-				this.db.setEmbeddingMetadata(
+				await this.db.setEmbeddingMetadata(
 					config.embedding.model,
 					sample.embedding.length,
 				);
@@ -195,7 +195,7 @@ export class ConsolidationEngine {
 			}
 		}
 
-		this.db.updateConsolidationState({
+		await this.db.updateConsolidationState({
 			lastConsolidatedAt: Date.now(),
 			totalSessionsProcessed:
 				state.totalSessionsProcessed + totalSessionsProcessed,
@@ -233,7 +233,7 @@ export class ConsolidationEngine {
 		conflictsDetected: number;
 		conflictsResolved: number;
 	}> {
-		const cursor = this.db.getSourceCursor(reader.source);
+		const cursor = await this.db.getSourceCursor(reader.source);
 
 		// 1. Fetch candidate sessions: those with messages newer than this source's cursor.
 		//    Returns session IDs plus the max message timestamp per session,
@@ -257,7 +257,7 @@ export class ConsolidationEngine {
 		const candidateIds = candidateSessions.map((s) => s.id);
 
 		// 2. Load already-processed episode ranges for this source's batch of sessions.
-		const processedRanges = this.db.getProcessedEpisodeRanges(
+		const processedRanges = await this.db.getProcessedEpisodeRanges(
 			reader.source,
 			candidateIds,
 		);
@@ -366,7 +366,7 @@ export class ConsolidationEngine {
 		// Safety floor: never move the cursor backwards.
 		newCursor = Math.max(newCursor, cursor.lastMessageTimeCreated);
 
-		this.db.updateSourceCursor(reader.source, {
+		await this.db.updateSourceCursor(reader.source, {
 			lastMessageTimeCreated: newCursor,
 			lastConsolidatedAt: Date.now(),
 		});
@@ -448,7 +448,7 @@ export class ConsolidationEngine {
 		// Load entries for reconsolidation. Existing knowledge is no longer passed to
 		// the extraction LLM — deduplication is handled by the reconsolidation step
 		// (embedding similarity + decideMerge).
-		const allEntriesForChunk = this.db.getActiveEntriesWithEmbeddings();
+		const allEntriesForChunk = await this.db.getActiveEntriesWithEmbeddings();
 
 		// Extract knowledge via LLM (episodes only — no existing knowledge context).
 		const extractStart = Date.now();
@@ -564,7 +564,7 @@ export class ConsolidationEngine {
 			(chunkCreated + chunkUpdated) / chunk.length,
 		);
 		for (const ep of chunk) {
-			this.db.recordEpisode(
+			await this.db.recordEpisode(
 				source,
 				ep.sessionId,
 				ep.startMessageId,
@@ -586,19 +586,19 @@ export class ConsolidationEngine {
 	 * Apply decay to all active entries.
 	 * Returns the number of entries that were archived.
 	 */
-	private applyDecay(): number {
+	private async applyDecay(): Promise<number> {
 		// Include conflicted entries — their strength must continue aging.
 		// A conflicted entry whose strength falls to zero is effectively forgotten
 		// regardless of the conflict, and should still be archived.
 		// Single query avoids the TOCTOU window of two separate status queries.
-		const entries = this.db.getActiveAndConflictedEntries();
+		const entries = await this.db.getActiveAndConflictedEntries();
 		let archived = 0;
 
 		for (const entry of entries) {
 			const newStrength = computeStrength(entry);
 
 			if (newStrength < config.decay.archiveThreshold) {
-				this.db.updateEntry(entry.id, {
+				await this.db.updateEntry(entry.id, {
 					status: "archived",
 					strength: newStrength,
 				});
@@ -608,18 +608,18 @@ export class ConsolidationEngine {
 				);
 			} else if (Math.abs(newStrength - entry.strength) > 0.01) {
 				// Only update if strength changed meaningfully
-				this.db.updateStrength(entry.id, newStrength);
+				await this.db.updateStrength(entry.id, newStrength);
 			}
 		}
 
 		// Tombstone long-archived entries
-		const archivedEntries = this.db.getEntriesByStatus("archived");
+		const archivedEntries = await this.db.getEntriesByStatus("archived");
 		const tombstoneThreshold =
 			Date.now() - config.decay.tombstoneAfterDays * 24 * 60 * 60 * 1000;
 
 		for (const entry of archivedEntries) {
 			if (entry.updatedAt < tombstoneThreshold) {
-				this.db.updateEntry(entry.id, { status: "tombstoned" });
+				await this.db.updateEntry(entry.id, { status: "tombstoned" });
 				logger.log(
 					`[decay] Tombstoned: ${JSON.stringify(entry.content)} (archived for ${config.decay.tombstoneAfterDays}+ days)`,
 				);

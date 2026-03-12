@@ -75,6 +75,9 @@ export const config = {
 	adminToken: process.env.KNOWLEDGE_ADMIN_TOKEN || null,
 
 	// Database
+	// When POSTGRES_CONNECTION_URI is set, PostgreSQL is used instead of SQLite.
+	// Example: postgres://user:pass@host:5432/knowledge
+	postgresConnectionUri: process.env.POSTGRES_CONNECTION_URI || "",
 	dbPath:
 		process.env.KNOWLEDGE_DB_PATH ||
 		join(homedir(), ".local", "share", "knowledge-server", "knowledge.db"),

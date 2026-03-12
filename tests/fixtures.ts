@@ -26,6 +26,7 @@ export function makeEntry(
 		lastAccessedAt: now,
 		accessCount: 0,
 		observationCount: 1,
+		isSynthesized: false,
 		supersededBy: null,
 		derivedFrom: [],
 		...overrides,

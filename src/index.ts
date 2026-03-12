@@ -13,7 +13,8 @@ import { runStatus } from "./commands/status.js";
 import { config, validateConfig } from "./config.js";
 import { ConsolidationEngine } from "./consolidation/consolidate.js";
 import { createEpisodeReaders } from "./consolidation/readers/index.js";
-import { KnowledgeDB } from "./db/database.js";
+import { createKnowledgeDB } from "./db/index.js";
+import type { IKnowledgeDB } from "./db/index.js";
 import { logger } from "./logger.js";
 import { main as mcpMain } from "./mcp/index.js";
 import { runSetupTool } from "./setup-tool.js";
@@ -77,7 +78,7 @@ async function main() {
 
 	// `knowledge-server status`
 	if (subcommand === "status") {
-		runStatus(config.pidPath);
+		await runStatus(config.pidPath);
 		process.exit(0);
 	}
 
@@ -116,7 +117,7 @@ async function main() {
 
 	// `knowledge-server reinitialize [--confirm|--dry-run]`
 	if (subcommand === "reinitialize") {
-		runReinitialize(subcommandArgs);
+		await runReinitialize(subcommandArgs);
 		process.exit(0);
 	}
 
@@ -170,14 +171,14 @@ Options:
 	}
 
 	// Initialize components
-	const db = new KnowledgeDB();
+	const db = await createKnowledgeDB();
 	const activation = new ActivationEngine(db);
 	const readers = createEpisodeReaders();
 	const consolidation = new ConsolidationEngine(db, activation, readers);
 
 	// Check if this is a first run (no knowledge yet, but episodes exist)
-	const stats = db.getStats();
-	const consolidationState = db.getConsolidationState();
+	const stats = await db.getStats();
+	const consolidationState = await db.getConsolidationState();
 
 	logger.log(
 		`Knowledge graph: ${stats.total || 0} entries (${stats.active || 0} active)`,
@@ -211,7 +212,7 @@ Options:
 	}
 
 	// Check for pending sessions
-	const pending = consolidation.checkPending();
+	const pending = await consolidation.checkPending();
 	if (pending.pendingSessions > 0) {
 		logger.log(
 			`⚡ ${pending.pendingSessions} sessions pending consolidation` +
@@ -423,7 +424,7 @@ Options:
 				while (!shutdownRequested) {
 					await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
 					if (shutdownRequested) break;
-					const { pendingSessions } = consolidation.checkPending();
+					const { pendingSessions } = await consolidation.checkPending();
 					if (pendingSessions > 0) {
 						logger.log(
 							`[poll] ${pendingSessions} pending sessions — starting consolidation.`,
@@ -464,7 +465,7 @@ Options:
 			);
 		}
 		consolidation.close();
-		db.close();
+		await db.close();
 		// Clean up PID file on graceful shutdown — only if it still points to us.
 		// Guards against a race where a second instance already overwrote the file.
 		if (config.pidPath && existsSync(config.pidPath)) {

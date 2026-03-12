@@ -5,7 +5,7 @@ import {
   formatEmbeddingText,
 } from "../activation/embeddings.js";
 import { config } from "../config.js";
-import type { KnowledgeDB } from "../db/database.js";
+import type { IKnowledgeDB } from "../db/index.js";
 import { logger } from "../logger.js";
 import { clampKnowledgeType } from "../types.js";
 import type { KnowledgeEntry } from "../types.js";
@@ -49,12 +49,12 @@ const CLUSTER_MIN_MEMBERS = config.consolidation.clusterMinMembers;
  * - If below threshold: insert directly as a novel entry
  */
 export class Reconsolidator {
-  private db: KnowledgeDB;
+  private db: IKnowledgeDB;
   private embeddings: EmbeddingClient;
   private llm: ConsolidationLLM;
 
   constructor(
-    db: KnowledgeDB,
+    db: IKnowledgeDB,
     embeddings: EmbeddingClient,
     llm: ConsolidationLLM,
   ) {
@@ -91,12 +91,12 @@ export class Reconsolidator {
      */
     entriesMap: Map<string, KnowledgeEntry & { embedding: number[] }>,
     callbacks: {
-      onInsert: (inserted: KnowledgeEntry & { embedding?: number[] }) => void;
+      onInsert: (inserted: KnowledgeEntry & { embedding?: number[] }) => void | Promise<void>;
       onUpdate: (
         id: string,
         updated: Partial<KnowledgeEntry>,
         freshEmbedding: number[],
-      ) => void;
+      ) => void | Promise<void>;
       onKeep: () => void;
     },
     /**
@@ -152,13 +152,13 @@ export class Reconsolidator {
       !nearestEntry ||
       nearestSimilarity < config.consolidation.reconsolidationThreshold
     ) {
-      const inserted = this.insertNewEntry(
+      const inserted = await this.insertNewEntry(
         entry,
         sessionIds,
         entryEmbedding,
         sessionTimestamp,
       );
-      callbacks.onInsert(inserted);
+      await callbacks.onInsert(inserted);
       logger.log(
         `[${logPrefix}] Insert (novel, sim=${nearestSimilarity.toFixed(3)}): ${JSON.stringify(entry.content)}`,
       );
@@ -196,7 +196,7 @@ export class Reconsolidator {
         // and resets last_accessed_at so decay restarts from now.
         // We use reinforceObservation rather than recordAccess — this is not a retrieval
         // event; it's confirmation that the knowledge is still true.
-        this.db.reinforceObservation(nearestEntry.id);
+        await this.db.reinforceObservation(nearestEntry.id);
         logger.log(
           `[${logPrefix}] Keep existing (reinforced): ${JSON.stringify(nearestEntry.content)}`,
         );
@@ -226,16 +226,16 @@ export class Reconsolidator {
             decision.topics ?? [],
           ),
         );
-        this.db.mergeEntry(nearestEntry.id, mergeUpdates, freshEmbedding);
+        await this.db.mergeEntry(nearestEntry.id, mergeUpdates, freshEmbedding);
         logger.log(
           `[${logPrefix}] ${decision.action === "update" ? "Updated" : "Replaced"}: ${JSON.stringify(nearestEntry.content)} → ${JSON.stringify(decision.content)}`,
         );
-        callbacks.onUpdate(nearestEntry.id, mergeUpdates, freshEmbedding);
+        await callbacks.onUpdate(nearestEntry.id, mergeUpdates, freshEmbedding);
         break;
       }
 
       case "insert": {
-        const inserted = this.insertNewEntry(
+        const inserted = await this.insertNewEntry(
           entry,
           sessionIds,
           entryEmbedding,
@@ -244,7 +244,7 @@ export class Reconsolidator {
         logger.log(
           `[${logPrefix}] Insert (distinct despite similarity): ${JSON.stringify(entry.content)}`,
         );
-        callbacks.onInsert(inserted);
+        await callbacks.onInsert(inserted);
         break;
       }
     }
@@ -283,7 +283,7 @@ export class Reconsolidator {
    */
   async runKBSynthesis(): Promise<number> {
     // Load all active entries with embeddings (ensureEmbeddings just ran).
-    const allEntries = this.db.getActiveEntriesWithEmbeddings();
+    const allEntries = await this.db.getActiveEntriesWithEmbeddings();
     if (allEntries.length < CLUSTER_MIN_MEMBERS) return 0;
 
     // ── Step 1: Greedy clustering ──────────────────────────────────────────────
@@ -338,7 +338,7 @@ export class Reconsolidator {
 
     // ── Step 2: Identity reconciliation ───────────────────────────────────────
 
-    const persistedClusters = this.db.getClustersWithMembers();
+    const persistedClusters = await this.db.getClustersWithMembers();
 
     // Build a lookup: persisted cluster ID → matched in-memory cluster index
     const persistedToInMemory = new Map<string, number>();
@@ -414,7 +414,7 @@ export class Reconsolidator {
     });
 
     // Persist new cluster state (upsert clusters, delete stale ones)
-    this.db.persistClusters(
+    await this.db.persistClusters(
       resolvedClusters.map((c) => ({
         id: c.id,
         centroid: c.centroid,
@@ -471,7 +471,7 @@ export class Reconsolidator {
           `[synthesis] synthesizePrinciple failed for cluster ${cluster.id}: ${err instanceof Error ? err.message : String(err)}`,
         );
         // Mark as synthesized anyway to avoid hammering on a bad cluster next run.
-        this.db.markClusterSynthesized(cluster.id);
+        await this.db.markClusterSynthesized(cluster.id);
         continue;
       }
 
@@ -480,7 +480,7 @@ export class Reconsolidator {
       );
 
       // Mark cluster as synthesized regardless of results (bar was applied, nothing met it)
-      this.db.markClusterSynthesized(cluster.id);
+      await this.db.markClusterSynthesized(cluster.id);
 
       if (results.length === 0) {
         logger.log(
@@ -537,7 +537,7 @@ export class Reconsolidator {
             [], // no session IDs — KB-derived provenance
             entriesMap,
             {
-              onInsert: (inserted) => {
+              onInsert: async (inserted) => {
                 if (!inserted.embedding) {
                   throw new Error(
                     `[synthesis] Synthesized entry ${inserted.id} has no embedding — this is a bug.`,
@@ -549,7 +549,7 @@ export class Reconsolidator {
                 );
                 // Write supports relations from synthesized entry → source entries
                 for (const sourceId of validatedSourceIds) {
-                  this.db.insertRelation({
+                  await this.db.insertRelation({
                     id: randomUUID(),
                     sourceId: inserted.id,
                     targetId: sourceId,
@@ -563,10 +563,10 @@ export class Reconsolidator {
                   `[synthesis] Inserted synthesized entry ${inserted.id} with ${validatedSourceIds.length} supports relations.`,
                 );
               },
-              onUpdate: (id, _updated, freshEmbedding) => {
+              onUpdate: async (id, _updated, freshEmbedding) => {
                 // Mark the updated entry as synthesized — mergeEntry does not set
                 // this flag, so we patch it here on the synthesis-specific path.
-                this.db.updateEntry(id, { isSynthesized: true });
+                await this.db.updateEntry(id, { isSynthesized: true });
                 const existing = entriesMap.get(id);
                 if (existing) {
                   entriesMap.set(id, {
@@ -633,12 +633,12 @@ export class Reconsolidator {
    * old sessions start with the correct decay already applied — an entry from a
    * session 30 days ago will have 30 days of decay, not 0.
    */
-  private insertNewEntry(
+  private async insertNewEntry(
     entry: ExtractedKnowledge,
     sessionIds: string[],
     embedding?: number[],
     sessionTimestamp?: number,
-  ): KnowledgeEntry & { embedding?: number[] } {
+  ): Promise<KnowledgeEntry & { embedding?: number[] }> {
     const now = Date.now();
     // Cap at now — sessions cannot be from the future, and a clock skew or
     // corrupt timestamp should not produce a future lastAccessedAt.
@@ -685,7 +685,7 @@ export class Reconsolidator {
     // Pass `now` as the reference time for age computation so daysSinceAccess reflects
     // real elapsed time from the session date to the current moment.
     newEntry.strength = computeStrength(newEntry, now);
-    this.db.insertEntry(newEntry);
+    await this.db.insertEntry(newEntry);
     return newEntry;
   }
 }

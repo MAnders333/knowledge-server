@@ -1,6 +1,6 @@
 import { config } from "../config.js";
 import { computeStrength } from "../consolidation/decay.js";
-import type { KnowledgeDB } from "../db/database.js";
+import type { IKnowledgeDB } from "../db/index.js";
 import { logger } from "../logger.js";
 import type {
 	ActivationResult,
@@ -52,10 +52,10 @@ export function splitIntoCues(prompt: string): string[] {
  * - The same mechanism serves both passive (plugin-triggered) and active (agent-triggered) retrieval
  */
 export class ActivationEngine {
-	private db: KnowledgeDB;
+	private db: IKnowledgeDB;
 	readonly embeddings: EmbeddingClient;
 
-	constructor(db: KnowledgeDB) {
+	constructor(db: IKnowledgeDB) {
 		this.db = db;
 		this.embeddings = new EmbeddingClient();
 	}
@@ -102,7 +102,7 @@ export class ActivationEngine {
 		const similarityThreshold =
 			options?.threshold ?? config.activation.similarityThreshold;
 
-		const entries = this.db.getActiveEntriesWithEmbeddings();
+		const entries = await this.db.getActiveEntriesWithEmbeddings();
 
 		if (entries.length === 0) {
 			return { entries: [], query: primaryQuery, totalActive: 0 };
@@ -174,7 +174,7 @@ export class ActivationEngine {
 
 		// Record access for activated entries (reinforces their strength)
 		for (const { entry } of scored) {
-			this.db.recordAccess(entry.id);
+			await this.db.recordAccess(entry.id);
 		}
 
 		// ── Relation-aware activation: pull in supports sources ───────────────────
@@ -196,7 +196,7 @@ export class ActivationEngine {
 		const scoredIdSet = new Set(scored.map(({ entry }) => entry.id));
 
 		if (synthesizedIds.length > 0) {
-			const sourcesMap = this.db.getSupportSourcesForIds(synthesizedIds);
+			const sourcesMap = await this.db.getSupportSourcesForIds(synthesizedIds);
 
 			// Snapshot the array before iterating — we push source entries into `scored`
 			// during the loop and don't want to visit newly-added entries (which could
@@ -232,7 +232,7 @@ export class ActivationEngine {
 						},
 					});
 					scoredIdSet.add(source.id);
-					this.db.recordAccess(source.id);
+					await this.db.recordAccess(source.id);
 				}
 
 				// Respect maxResults cap for the outer loop too.
@@ -253,7 +253,7 @@ export class ActivationEngine {
 			.filter(({ entry }) => entry.status === "conflicted")
 			.map(({ entry }) => entry.id);
 
-		const contradictPairs = this.db.getContradictPairsForIds(conflictedIds);
+		const contradictPairs = await this.db.getContradictPairsForIds(conflictedIds);
 
 		// Build contradiction annotations for conflicted entries whose counterpart
 		// also activated in this query (both sides relevant — only then is the caveat useful).
@@ -307,7 +307,7 @@ export class ActivationEngine {
 	 * status queries to avoid any risk of duplicate entries in the result set.
 	 */
 	async ensureEmbeddings(): Promise<number> {
-		const needsEmbedding = this.db.getEntriesMissingEmbeddings();
+		const needsEmbedding = await this.db.getEntriesMissingEmbeddings();
 
 		if (needsEmbedding.length === 0) return 0;
 
@@ -320,7 +320,7 @@ export class ActivationEngine {
 		const embeddings = await this.embeddings.embedBatch(texts);
 
 		for (let i = 0; i < needsEmbedding.length; i++) {
-			this.db.updateEntry(needsEmbedding[i].id, {
+			await this.db.updateEntry(needsEmbedding[i].id, {
 				embedding: embeddings[i],
 			});
 		}
@@ -351,18 +351,18 @@ export class ActivationEngine {
 	 */
 	async checkAndReEmbed(): Promise<boolean> {
 		const configuredModel = config.embedding.model;
-		const stored = this.db.getEmbeddingMetadata();
+		const stored = await this.db.getEmbeddingMetadata();
 
 		if (!stored) {
 			// First run or upgrade from pre-v8 schema — seed metadata.
 			// Probe dimensions from an existing entry if available.
-			const existing = this.db.getActiveEntriesWithEmbeddings();
+			const existing = await this.db.getActiveEntriesWithEmbeddings();
 			if (existing.length > 0) {
 				const dims = existing[0].embedding.length;
 				logger.log(
 					`[embedding] No embedding metadata found. Recording current model: ${configuredModel} (${dims} dimensions, from ${existing.length} existing entries).`,
 				);
-				this.db.setEmbeddingMetadata(configuredModel, dims);
+				await this.db.setEmbeddingMetadata(configuredModel, dims);
 			} else {
 				// No entries yet — probe the API for dimensions.
 				logger.log(
@@ -370,7 +370,7 @@ export class ActivationEngine {
 				);
 				try {
 					const probe = await this.embeddings.embed("dimension probe");
-					this.db.setEmbeddingMetadata(configuredModel, probe.length);
+					await this.db.setEmbeddingMetadata(configuredModel, probe.length);
 					logger.log(
 						`[embedding] Recorded embedding model: ${configuredModel} (${probe.length} dimensions).`,
 					);
@@ -392,7 +392,7 @@ export class ActivationEngine {
 
 		// ── Model has changed — re-embed all entries in-place ──
 
-		const entriesWithEmbeddings = this.db.getActiveEntriesWithEmbeddings();
+		const entriesWithEmbeddings = await this.db.getActiveEntriesWithEmbeddings();
 		const totalEntries = entriesWithEmbeddings.length;
 
 		logger.log(
@@ -406,7 +406,7 @@ export class ActivationEngine {
 			);
 			try {
 				const probe = await this.embeddings.embed("dimension probe");
-				this.db.setEmbeddingMetadata(configuredModel, probe.length);
+				await this.db.setEmbeddingMetadata(configuredModel, probe.length);
 				logger.log(
 					`[embedding] Recorded new embedding model: ${configuredModel} (${probe.length} dimensions).`,
 				);
@@ -450,10 +450,10 @@ export class ActivationEngine {
 		// Write metadata BEFORE the loop. See failure-modes comment above for
 		// the crash-recovery trade-offs. embedBatch throwing above means we never
 		// reach this line, so the old-model metadata remains and next startup retries.
-		this.db.setEmbeddingMetadata(configuredModel, newDimensions);
+		await this.db.setEmbeddingMetadata(configuredModel, newDimensions);
 
 		for (let i = 0; i < entriesWithEmbeddings.length; i++) {
-			this.db.updateEntry(entriesWithEmbeddings[i].id, {
+			await this.db.updateEntry(entriesWithEmbeddings[i].id, {
 				embedding: newEmbeddings[i],
 			});
 		}

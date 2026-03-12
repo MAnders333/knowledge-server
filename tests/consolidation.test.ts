@@ -49,11 +49,11 @@ beforeEach(() => {
 	engine = new ConsolidationEngine(db, activation, [reader]);
 });
 
-afterEach(() => {
+afterEach(async () => {
 	// Restore all spies so prototype mutations don't leak into other test files
 	// (e.g. ConsolidationLLM.prototype.extractKnowledge mocks must not affect llm.test.ts).
 	mock.restore();
-	db.close();
+	await db.close();
 	rmSync(tempDir, { recursive: true, force: true });
 });
 
@@ -70,7 +70,7 @@ describe("ConsolidationEngine.applyDecay (via consolidate early-return path)", (
 			createdAt: Date.now() - 365 * 24 * 60 * 60 * 1000,
 			updatedAt: Date.now() - 365 * 24 * 60 * 60 * 1000,
 		});
-		db.insertEntry(weakEntry);
+		await db.insertEntry(weakEntry);
 
 		// Mock getCandidateSessions so consolidate() hits the early-return path
 		// without opening the real OpenCode DB (which may have sessions in CI).
@@ -111,17 +111,17 @@ describe("ConsolidationEngine — concurrency guard", () => {
 });
 
 describe("KnowledgeDB — getEntriesWithOverlappingTopics", () => {
-	it("returns active entries sharing a topic, excluding specified IDs", () => {
+	it("returns active entries sharing a topic, excluding specified IDs", async () => {
 		const emb = fakeEmbedding("test");
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({ id: "a1", topics: ["typescript", "bun"], embedding: emb }),
 		);
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({ id: "a2", topics: ["typescript", "sqlite"], embedding: emb }),
 		);
-		db.insertEntry(makeEntry({ id: "a3", topics: ["python"], embedding: emb }));
+		await db.insertEntry(makeEntry({ id: "a3", topics: ["python"], embedding: emb }));
 
-		const results = db.getEntriesWithOverlappingTopics(
+		const results = await db.getEntriesWithOverlappingTopics(
 			["typescript", "bun"],
 			["a1"], // exclude a1
 		);
@@ -132,16 +132,16 @@ describe("KnowledgeDB — getEntriesWithOverlappingTopics", () => {
 		expect(ids).not.toContain("a3"); // no topic overlap
 	});
 
-	it("returns empty array when topics list is empty", () => {
+	it("returns empty array when topics list is empty", async () => {
 		const emb = fakeEmbedding("test");
-		db.insertEntry(makeEntry({ id: "b1", topics: ["test"], embedding: emb }));
-		const results = db.getEntriesWithOverlappingTopics([], []);
+		await db.insertEntry(makeEntry({ id: "b1", topics: ["test"], embedding: emb }));
+		const results = await db.getEntriesWithOverlappingTopics([], []);
 		expect(results).toEqual([]);
 	});
 
-	it("does not return archived or superseded entries", () => {
+	it("does not return archived or superseded entries", async () => {
 		const emb = fakeEmbedding("test");
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "c1",
 				topics: ["shared"],
@@ -149,7 +149,7 @@ describe("KnowledgeDB — getEntriesWithOverlappingTopics", () => {
 				embedding: emb,
 			}),
 		);
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "c2",
 				topics: ["shared"],
@@ -157,7 +157,7 @@ describe("KnowledgeDB — getEntriesWithOverlappingTopics", () => {
 				embedding: emb,
 			}),
 		);
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "c3",
 				topics: ["shared"],
@@ -166,7 +166,7 @@ describe("KnowledgeDB — getEntriesWithOverlappingTopics", () => {
 			}),
 		);
 
-		const results = db.getEntriesWithOverlappingTopics(["shared"], []);
+		const results = await db.getEntriesWithOverlappingTopics(["shared"], []);
 		const ids = results.map((r) => r.id);
 		expect(ids).toContain("c3");
 		expect(ids).not.toContain("c1");
@@ -175,138 +175,136 @@ describe("KnowledgeDB — getEntriesWithOverlappingTopics", () => {
 });
 
 describe("KnowledgeDB — applyContradictionResolution", () => {
-	it("supersede_old: marks existing entry as superseded, inserts supersedes relation", () => {
-		db.insertEntry(makeEntry({ id: "new-1", topics: ["test"] }));
-		db.insertEntry(makeEntry({ id: "old-1", topics: ["test"] }));
+	it("supersede_old: marks existing entry as superseded, inserts supersedes relation", async () => {
+		await db.insertEntry(makeEntry({ id: "new-1", topics: ["test"] }));
+		await db.insertEntry(makeEntry({ id: "old-1", topics: ["test"] }));
 
-		db.applyContradictionResolution("supersede_old", "new-1", "old-1");
+		await db.applyContradictionResolution("supersede_old", "new-1", "old-1");
 
-		const old = db.getEntry("old-1");
+		const old = await db.getEntry("old-1");
 		expect(old?.status).toBe("superseded");
 		expect(old?.supersededBy).toBe("new-1");
 
-		const relations = db.getRelationsFor("new-1");
+		const relations = await db.getRelationsFor("new-1");
 		expect(
 			relations.some((r) => r.type === "supersedes" && r.targetId === "old-1"),
 		).toBe(true);
 	});
 
-	it("supersede_new: marks new entry as superseded, inserts supersedes relation", () => {
-		db.insertEntry(makeEntry({ id: "new-2", topics: ["test"] }));
-		db.insertEntry(makeEntry({ id: "old-2", topics: ["test"] }));
+	it("supersede_new: marks new entry as superseded, inserts supersedes relation", async () => {
+		await db.insertEntry(makeEntry({ id: "new-2", topics: ["test"] }));
+		await db.insertEntry(makeEntry({ id: "old-2", topics: ["test"] }));
 
-		db.applyContradictionResolution("supersede_new", "new-2", "old-2");
+		await db.applyContradictionResolution("supersede_new", "new-2", "old-2");
 
-		const newEntry = db.getEntry("new-2");
+		const newEntry = await db.getEntry("new-2");
 		expect(newEntry?.status).toBe("superseded");
 		expect(newEntry?.supersededBy).toBe("old-2");
 	});
 
-	it("irresolvable: marks BOTH entries as conflicted, inserts contradicts relation", () => {
-		db.insertEntry(makeEntry({ id: "new-3", topics: ["test"] }));
-		db.insertEntry(makeEntry({ id: "old-3", topics: ["test"] }));
+	it("irresolvable: marks BOTH entries as conflicted, inserts contradicts relation", async () => {
+		await db.insertEntry(makeEntry({ id: "new-3", topics: ["test"] }));
+		await db.insertEntry(makeEntry({ id: "old-3", topics: ["test"] }));
 
-		db.applyContradictionResolution("irresolvable", "new-3", "old-3");
+		await db.applyContradictionResolution("irresolvable", "new-3", "old-3");
 
 		// Both halves of the conflict must be visible in the /review queue
-		const newEntry = db.getEntry("new-3");
+		const newEntry = await db.getEntry("new-3");
 		expect(newEntry?.status).toBe("conflicted");
 
-		const old = db.getEntry("old-3");
+		const old = await db.getEntry("old-3");
 		expect(old?.status).toBe("conflicted");
 
-		const relations = db.getRelationsFor("new-3");
+		const relations = await db.getRelationsFor("new-3");
 		expect(relations.some((r) => r.type === "contradicts")).toBe(true);
 	});
 
-	it("merge: updates new entry content, marks existing as superseded", () => {
-		db.insertEntry(
+	it("merge: updates new entry content, marks existing as superseded", async () => {
+		await db.insertEntry(
 			makeEntry({ id: "new-4", content: "Original content", topics: ["test"] }),
 		);
-		db.insertEntry(makeEntry({ id: "old-4", topics: ["test"] }));
+		await db.insertEntry(makeEntry({ id: "old-4", topics: ["test"] }));
 
-		db.applyContradictionResolution("merge", "new-4", "old-4", {
+		await db.applyContradictionResolution("merge", "new-4", "old-4", {
 			content: "Merged unified content",
 			type: "principle",
 			topics: ["test", "merged"],
 			confidence: 0.9,
 		});
 
-		const newEntry = db.getEntry("new-4");
+		const newEntry = await db.getEntry("new-4");
 		expect(newEntry?.content).toBe("Merged unified content");
 		expect(newEntry?.type).toBe("principle");
 		expect(newEntry?.status).toBe("active"); // new entry stays active
 
-		const old = db.getEntry("old-4");
+		const old = await db.getEntry("old-4");
 		expect(old?.status).toBe("superseded");
 	});
 
-	it("merge: clamps invalid LLM type to 'fact' rather than crashing", () => {
-		db.insertEntry(
+	it("merge: clamps invalid LLM type to 'fact' rather than crashing", async () => {
+		await db.insertEntry(
 			makeEntry({ id: "new-5", content: "Original", topics: ["test"] }),
 		);
-		db.insertEntry(makeEntry({ id: "old-5", topics: ["test"] }));
+		await db.insertEntry(makeEntry({ id: "old-5", topics: ["test"] }));
 
 		// LLM occasionally returns values like "fact/principle" that violate the CHECK constraint
-		expect(() => {
-			db.applyContradictionResolution("merge", "new-5", "old-5", {
-				content: "Merged content",
-				type: "fact/principle", // invalid — would previously throw SQLITE_CONSTRAINT_CHECK
-				topics: ["test"],
-				confidence: 0.8,
-			});
-		}).not.toThrow();
+		await db.applyContradictionResolution("merge", "new-5", "old-5", {
+			content: "Merged content",
+			type: "fact/principle", // invalid — would previously throw SQLITE_CONSTRAINT_CHECK
+			topics: ["test"],
+			confidence: 0.8,
+		});
 
-		const newEntry = db.getEntry("new-5");
+		const newEntry = await db.getEntry("new-5");
 		expect(newEntry?.type).toBe("fact"); // clamped to valid fallback
 		expect(newEntry?.content).toBe("Merged content");
 
-		const oldEntry = db.getEntry("old-5");
+		const oldEntry = await db.getEntry("old-5");
 		expect(oldEntry?.status).toBe("superseded");
 	});
 });
 
 describe("KnowledgeDB — getEntries with filters", () => {
-	it("filters by status", () => {
-		db.insertEntry(makeEntry({ id: "s1", status: "active" }));
-		db.insertEntry(makeEntry({ id: "s2", status: "archived" }));
+	it("filters by status", async () => {
+		await db.insertEntry(makeEntry({ id: "s1", status: "active" }));
+		await db.insertEntry(makeEntry({ id: "s2", status: "archived" }));
 
-		const active = db.getEntries({ status: "active" });
+		const active = await db.getEntries({ status: "active" });
 		expect(active.map((e) => e.id)).toContain("s1");
 		expect(active.map((e) => e.id)).not.toContain("s2");
 	});
 
-	it("filters by type", () => {
-		db.insertEntry(makeEntry({ id: "t1", type: "fact" }));
-		db.insertEntry(makeEntry({ id: "t2", type: "principle" }));
+	it("filters by type", async () => {
+		await db.insertEntry(makeEntry({ id: "t1", type: "fact" }));
+		await db.insertEntry(makeEntry({ id: "t2", type: "principle" }));
 
-		const facts = db.getEntries({ type: "fact" });
+		const facts = await db.getEntries({ type: "fact" });
 		expect(facts.map((e) => e.id)).toContain("t1");
 		expect(facts.map((e) => e.id)).not.toContain("t2");
 	});
 
-	it("filters by scope", () => {
-		db.insertEntry(makeEntry({ id: "sc1", scope: "personal" }));
-		db.insertEntry(makeEntry({ id: "sc2", scope: "team" }));
+	it("filters by scope", async () => {
+		await db.insertEntry(makeEntry({ id: "sc1", scope: "personal" }));
+		await db.insertEntry(makeEntry({ id: "sc2", scope: "team" }));
 
-		const team = db.getEntries({ scope: "team" });
+		const team = await db.getEntries({ scope: "team" });
 		expect(team.map((e) => e.id)).toContain("sc2");
 		expect(team.map((e) => e.id)).not.toContain("sc1");
 	});
 
-	it("returns all entries when no filters given", () => {
-		db.insertEntry(makeEntry({ id: "all1" }));
-		db.insertEntry(makeEntry({ id: "all2", status: "archived" }));
+	it("returns all entries when no filters given", async () => {
+		await db.insertEntry(makeEntry({ id: "all1" }));
+		await db.insertEntry(makeEntry({ id: "all2", status: "archived" }));
 
-		const all = db.getEntries({});
+		const all = await db.getEntries({});
 		expect(all.length).toBe(2);
 	});
 
-	it("combines multiple filters", () => {
-		db.insertEntry(
+	it("combines multiple filters", async () => {
+		await db.insertEntry(
 			makeEntry({ id: "m1", type: "fact", scope: "team", status: "active" }),
 		);
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "m2",
 				type: "fact",
@@ -314,7 +312,7 @@ describe("KnowledgeDB — getEntries with filters", () => {
 				status: "active",
 			}),
 		);
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "m3",
 				type: "principle",
@@ -323,15 +321,15 @@ describe("KnowledgeDB — getEntries with filters", () => {
 			}),
 		);
 
-		const results = db.getEntries({ type: "fact", scope: "team" });
+		const results = await db.getEntries({ type: "fact", scope: "team" });
 		expect(results.map((e) => e.id)).toEqual(["m1"]);
 	});
 });
 
 describe("KnowledgeDB — conflicted entries included in similarity queries", () => {
-	it("getEntriesWithOverlappingTopics returns conflicted entries alongside active ones", () => {
+	it("getEntriesWithOverlappingTopics returns conflicted entries alongside active ones", async () => {
 		const emb = fakeEmbedding("abc");
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "ot-active",
 				topics: ["shared"],
@@ -339,7 +337,7 @@ describe("KnowledgeDB — conflicted entries included in similarity queries", ()
 				embedding: emb,
 			}),
 		);
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "ot-conflicted",
 				topics: ["shared"],
@@ -347,7 +345,7 @@ describe("KnowledgeDB — conflicted entries included in similarity queries", ()
 				embedding: emb,
 			}),
 		);
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "ot-archived",
 				topics: ["shared"],
@@ -355,7 +353,7 @@ describe("KnowledgeDB — conflicted entries included in similarity queries", ()
 				embedding: emb,
 			}),
 		);
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "ot-superseded",
 				topics: ["shared"],
@@ -364,7 +362,7 @@ describe("KnowledgeDB — conflicted entries included in similarity queries", ()
 			}),
 		);
 
-		const results = db.getEntriesWithOverlappingTopics(["shared"], []);
+		const results = await db.getEntriesWithOverlappingTopics(["shared"], []);
 		const ids = results.map((r) => r.id);
 		expect(ids).toContain("ot-active");
 		expect(ids).toContain("ot-conflicted");
@@ -372,19 +370,19 @@ describe("KnowledgeDB — conflicted entries included in similarity queries", ()
 		expect(ids).not.toContain("ot-superseded");
 	});
 
-	it("getActiveEntriesWithEmbeddings returns conflicted entries alongside active ones", () => {
+	it("getActiveEntriesWithEmbeddings returns conflicted entries alongside active ones", async () => {
 		const emb = fakeEmbedding("abc");
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({ id: "ae-active", status: "active", embedding: emb }),
 		);
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({ id: "ae-conflicted", status: "conflicted", embedding: emb }),
 		);
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({ id: "ae-archived", status: "archived", embedding: emb }),
 		);
 
-		const results = db.getActiveEntriesWithEmbeddings();
+		const results = await db.getActiveEntriesWithEmbeddings();
 		const ids = results.map((r) => r.id);
 		expect(ids).toContain("ae-active");
 		expect(ids).toContain("ae-conflicted");
@@ -393,128 +391,128 @@ describe("KnowledgeDB — conflicted entries included in similarity queries", ()
 });
 
 describe("KnowledgeDB — applyContradictionResolution clears conflicted status on winner", () => {
-	it("supersede_old: orphaned conflict counterpart of the loser is restored to active", () => {
+	it("supersede_old: orphaned conflict counterpart of the loser is restored to active", async () => {
 		// "loser" and "winner" are an irresolvable pair
-		db.insertEntry(makeEntry({ id: "winner", topics: ["x"] }));
-		db.insertEntry(makeEntry({ id: "loser", topics: ["x"] }));
-		db.applyContradictionResolution("irresolvable", "loser", "winner");
+		await db.insertEntry(makeEntry({ id: "winner", topics: ["x"] }));
+		await db.insertEntry(makeEntry({ id: "loser", topics: ["x"] }));
+		await db.applyContradictionResolution("irresolvable", "loser", "winner");
 
-		expect(db.getEntry("winner")?.status).toBe("conflicted");
-		expect(db.getEntry("loser")?.status).toBe("conflicted");
+		expect((await db.getEntry("winner"))?.status).toBe("conflicted");
+		expect((await db.getEntry("loser"))?.status).toBe("conflicted");
 
 		// New entry decisively supersedes the loser
-		db.insertEntry(makeEntry({ id: "new-decisive", topics: ["x"] }));
-		db.applyContradictionResolution("supersede_old", "new-decisive", "loser");
+		await db.insertEntry(makeEntry({ id: "new-decisive", topics: ["x"] }));
+		await db.applyContradictionResolution("supersede_old", "new-decisive", "loser");
 
 		// loser is superseded
-		expect(db.getEntry("loser")?.status).toBe("superseded");
+		expect((await db.getEntry("loser"))?.status).toBe("superseded");
 		// winner (the orphaned counterpart) must be restored to active
-		expect(db.getEntry("winner")?.status).toBe("active");
+		expect((await db.getEntry("winner"))?.status).toBe("active");
 		// winner's contradicts relation should be gone
 		expect(
-			db.getRelationsFor("winner").some((r) => r.type === "contradicts"),
+			(await db.getRelationsFor("winner")).some((r) => r.type === "contradicts"),
 		).toBe(false);
 	});
 
-	it("supersede_old: winner that was conflicted is restored to active, its counterpart too", () => {
+	it("supersede_old: winner that was conflicted is restored to active, its counterpart too", async () => {
 		// conf-a and conf-b are an irresolvable pair; new-entry arrives and wins over conf-b
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({ id: "conf-a", status: "active", topics: ["topic"] }),
 		);
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({ id: "conf-b", status: "active", topics: ["topic"] }),
 		);
-		db.applyContradictionResolution("irresolvable", "conf-a", "conf-b");
+		await db.applyContradictionResolution("irresolvable", "conf-a", "conf-b");
 
-		expect(db.getEntry("conf-a")?.status).toBe("conflicted");
-		expect(db.getEntry("conf-b")?.status).toBe("conflicted");
+		expect((await db.getEntry("conf-a"))?.status).toBe("conflicted");
+		expect((await db.getEntry("conf-b"))?.status).toBe("conflicted");
 
 		// conf-a (new entry in this call) was conflicted with conf-b but now decisively wins
 		// over a third entry "old-z". Winning should settle conf-a's prior conflict:
 		// conf-a restored to active, conf-b (its orphaned counterpart) also restored.
-		db.insertEntry(makeEntry({ id: "old-z", topics: ["topic"] }));
-		db.applyContradictionResolution("supersede_old", "conf-a", "old-z");
+		await db.insertEntry(makeEntry({ id: "old-z", topics: ["topic"] }));
+		await db.applyContradictionResolution("supersede_old", "conf-a", "old-z");
 
 		// old-z is superseded (the loser)
-		expect(db.getEntry("old-z")?.status).toBe("superseded");
+		expect((await db.getEntry("old-z"))?.status).toBe("superseded");
 		// conf-a (the winner) was conflicted — should now be active
-		expect(db.getEntry("conf-a")?.status).toBe("active");
+		expect((await db.getEntry("conf-a"))?.status).toBe("active");
 		// conf-b (conf-a's orphaned counterpart) should also be restored to active
-		expect(db.getEntry("conf-b")?.status).toBe("active");
+		expect((await db.getEntry("conf-b"))?.status).toBe("active");
 		// conf-a's contradicts relation should be gone
 		expect(
-			db.getRelationsFor("conf-a").some((r) => r.type === "contradicts"),
+			(await db.getRelationsFor("conf-a")).some((r) => r.type === "contradicts"),
 		).toBe(false);
 	});
 
-	it("supersede_new: winner that was conflicted is restored to active, its counterpart too", () => {
+	it("supersede_new: winner that was conflicted is restored to active, its counterpart too", async () => {
 		// conf-a and conf-b are an irresolvable pair; new-entry arrives and loses to conf-b
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({ id: "conf-a", status: "active", topics: ["topic"] }),
 		);
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({ id: "conf-b", status: "active", topics: ["topic"] }),
 		);
-		db.applyContradictionResolution("irresolvable", "conf-a", "conf-b");
+		await db.applyContradictionResolution("irresolvable", "conf-a", "conf-b");
 
-		expect(db.getEntry("conf-a")?.status).toBe("conflicted");
-		expect(db.getEntry("conf-b")?.status).toBe("conflicted");
+		expect((await db.getEntry("conf-a"))?.status).toBe("conflicted");
+		expect((await db.getEntry("conf-b"))?.status).toBe("conflicted");
 
 		// new-entry (loser) has no prior conflict; conf-b (winner) was conflicted with conf-a.
 		// Winning this battle decisively settles conf-b's conflict — both conf-b and conf-a
 		// should be restored to active.
-		db.insertEntry(makeEntry({ id: "new-entry", topics: ["topic"] }));
-		db.applyContradictionResolution("supersede_new", "new-entry", "conf-b");
+		await db.insertEntry(makeEntry({ id: "new-entry", topics: ["topic"] }));
+		await db.applyContradictionResolution("supersede_new", "new-entry", "conf-b");
 
-		expect(db.getEntry("new-entry")?.status).toBe("superseded");
+		expect((await db.getEntry("new-entry"))?.status).toBe("superseded");
 		// conf-b won — should be restored to active
-		expect(db.getEntry("conf-b")?.status).toBe("active");
+		expect((await db.getEntry("conf-b"))?.status).toBe("active");
 		// conf-a (conf-b's orphaned counterpart) should also be restored
-		expect(db.getEntry("conf-a")?.status).toBe("active");
+		expect((await db.getEntry("conf-a"))?.status).toBe("active");
 		expect(
-			db.getRelationsFor("conf-b").some((r) => r.type === "contradicts"),
+			(await db.getRelationsFor("conf-b")).some((r) => r.type === "contradicts"),
 		).toBe(false);
 	});
 
-	it("supersede_new: restores the loser's conflict counterpart when loser was conflicted", () => {
+	it("supersede_new: restores the loser's conflict counterpart when loser was conflicted", async () => {
 		// conf-p and conf-q are an irresolvable pair
-		db.insertEntry(makeEntry({ id: "conf-p", topics: ["topic"] }));
-		db.insertEntry(makeEntry({ id: "conf-q", topics: ["topic"] }));
-		db.applyContradictionResolution("irresolvable", "conf-p", "conf-q");
+		await db.insertEntry(makeEntry({ id: "conf-p", topics: ["topic"] }));
+		await db.insertEntry(makeEntry({ id: "conf-q", topics: ["topic"] }));
+		await db.applyContradictionResolution("irresolvable", "conf-p", "conf-q");
 
 		// decisive-new arrives and supersede_new means conf-q wins (existing) — conf-p is superseded
 		// conf-p was conf-q's conflict partner — conf-q should be restored to active
-		db.insertEntry(makeEntry({ id: "decisive-new", topics: ["topic"] }));
-		db.applyContradictionResolution("supersede_new", "conf-p", "decisive-new");
+		await db.insertEntry(makeEntry({ id: "decisive-new", topics: ["topic"] }));
+		await db.applyContradictionResolution("supersede_new", "conf-p", "decisive-new");
 
 		// conf-p (the loser/new entry in this call) is superseded
-		expect(db.getEntry("conf-p")?.status).toBe("superseded");
+		expect((await db.getEntry("conf-p"))?.status).toBe("superseded");
 		// decisive-new (the winner) was never conflicted, stays active
-		expect(db.getEntry("decisive-new")?.status).toBe("active");
+		expect((await db.getEntry("decisive-new"))?.status).toBe("active");
 		// conf-q (conf-p's orphaned counterpart) must be restored to active
-		expect(db.getEntry("conf-q")?.status).toBe("active");
+		expect((await db.getEntry("conf-q"))?.status).toBe("active");
 		expect(
-			db.getRelationsFor("conf-q").some((r) => r.type === "contradicts"),
+			(await db.getRelationsFor("conf-q")).some((r) => r.type === "contradicts"),
 		).toBe(false);
 	});
 
-	it("merge: when the new (winning) entry was conflicted, it is restored to active after merge", () => {
+	it("merge: when the new (winning) entry was conflicted, it is restored to active after merge", async () => {
 		// conf-x and conf-y are in irresolvable conflict
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({ id: "conf-x", status: "active", topics: ["topic"] }),
 		);
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({ id: "conf-y", status: "active", topics: ["topic"] }),
 		);
-		db.applyContradictionResolution("irresolvable", "conf-x", "conf-y");
+		await db.applyContradictionResolution("irresolvable", "conf-x", "conf-y");
 
-		expect(db.getEntry("conf-x")?.status).toBe("conflicted");
+		expect((await db.getEntry("conf-x"))?.status).toBe("conflicted");
 
 		// conf-x (the "new" entry in this call) wins via merge over a third entry "old-z"
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({ id: "old-z", status: "active", topics: ["topic"] }),
 		);
-		db.applyContradictionResolution("merge", "conf-x", "old-z", {
+		await db.applyContradictionResolution("merge", "conf-x", "old-z", {
 			content: "Merged decisive content",
 			type: "fact",
 			topics: ["topic"],
@@ -522,12 +520,12 @@ describe("KnowledgeDB — applyContradictionResolution clears conflicted status 
 		});
 
 		// conf-x was conflicted — it's the winning entry in this merge, should now be active
-		expect(db.getEntry("conf-x")?.status).toBe("active");
+		expect((await db.getEntry("conf-x"))?.status).toBe("active");
 		// Its contradicts relations should be gone
-		const relX = db.getRelationsFor("conf-x");
+		const relX = await db.getRelationsFor("conf-x");
 		expect(relX.some((r) => r.type === "contradicts")).toBe(false);
 		// old-z is superseded
-		expect(db.getEntry("old-z")?.status).toBe("superseded");
+		expect((await db.getEntry("old-z"))?.status).toBe("superseded");
 	});
 });
 
@@ -600,7 +598,7 @@ describe("ConsolidationEngine.reconsolidate() — novel entry (below threshold)"
 		expect(result.entriesCreated).toBe(1);
 		expect(result.entriesUpdated).toBe(0);
 
-		const entries = db.getEntries({ type: "fact" });
+		const entries = await db.getEntries({ type: "fact" });
 		expect(entries.length).toBe(1);
 		expect(entries[0].content).toBe("TypeScript is statically typed.");
 		expect(entries[0].status).toBe("active");
@@ -609,7 +607,7 @@ describe("ConsolidationEngine.reconsolidate() — novel entry (below threshold)"
 	it("inserts a new entry when nearest neighbour is below RECONSOLIDATION_SIMILARITY_THRESHOLD", async () => {
 		// Pre-populate one entry with an orthogonal embedding (similarity = 0)
 		const existingEmb = [1, 0, 0, 0, 0, 0, 0, 0];
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "existing",
 				content: "Unrelated fact.",
@@ -650,7 +648,7 @@ describe("ConsolidationEngine.reconsolidate() — novel entry (below threshold)"
 		expect(result.entriesCreated).toBe(1);
 		expect(decideMergeSpy).not.toHaveBeenCalled();
 
-		const allEntries = db.getEntries({});
+		const allEntries = await db.getEntries({});
 		expect(allEntries.length).toBe(2);
 	});
 });
@@ -659,7 +657,7 @@ describe("ConsolidationEngine.reconsolidate() — 'keep' decision (above thresho
 	it("reinforces the existing entry and does not create a new one", async () => {
 		// Existing entry with a known embedding
 		const existingEmb = fakeEmbedding("TypeScript static");
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "existing-ts",
 				content: "TypeScript is statically typed.",
@@ -702,10 +700,10 @@ describe("ConsolidationEngine.reconsolidate() — 'keep' decision (above thresho
 		expect(result.entriesUpdated).toBe(0);
 
 		// observationCount should have been incremented by reinforceObservation
-		const entry = db.getEntry("existing-ts");
+		const entry = await db.getEntry("existing-ts");
 		expect(entry?.observationCount).toBe(2);
 
-		const allEntries = db.getEntries({});
+		const allEntries = await db.getEntries({});
 		expect(allEntries.length).toBe(1);
 	});
 });
@@ -732,10 +730,10 @@ describe("ConsolidationEngine — cluster-based synthesis (runKBSynthesis)", () 
 		// Insert 4 entries — not enough to form a ripe cluster (min=5)
 		const emb1 = fakeEmbedding("TypeScript static");
 		const emb2 = fakeEmbedding("TypeScript types");
-		db.insertEntry(makeEntry({ id: "e1", content: "TypeScript is statically typed.", topics: ["typescript"], embedding: emb1 }));
-		db.insertEntry(makeEntry({ id: "e2", content: "TypeScript has structural types.", topics: ["typescript"], embedding: emb2 }));
-		db.insertEntry(makeEntry({ id: "e3", content: "TypeScript checks types at compile time.", topics: ["typescript"], embedding: emb1 }));
-		db.insertEntry(makeEntry({ id: "e4", content: "TypeScript interfaces define contracts.", topics: ["typescript"], embedding: emb2 }));
+		await db.insertEntry(makeEntry({ id: "e1", content: "TypeScript is statically typed.", topics: ["typescript"], embedding: emb1 }));
+		await db.insertEntry(makeEntry({ id: "e2", content: "TypeScript has structural types.", topics: ["typescript"], embedding: emb2 }));
+		await db.insertEntry(makeEntry({ id: "e3", content: "TypeScript checks types at compile time.", topics: ["typescript"], embedding: emb1 }));
+		await db.insertEntry(makeEntry({ id: "e4", content: "TypeScript interfaces define contracts.", topics: ["typescript"], embedding: emb2 }));
 
 		spyOn(OpenCodeEpisodeReader.prototype, "getCandidateSessions").mockReturnValue([
 			{ id: "session-1", maxMessageTime: Date.now() },
@@ -756,11 +754,11 @@ describe("ConsolidationEngine — cluster-based synthesis (runKBSynthesis)", () 
 	it("calls synthesizePrinciple when a new cluster with ≥ 5 members forms", async () => {
 		// Insert 5 semantically similar entries — they should cluster together
 		const emb = fakeEmbedding("TypeScript static");
-		db.insertEntry(makeEntry({ id: "e1", content: "TypeScript is statically typed.", topics: ["typescript"], embedding: emb }));
-		db.insertEntry(makeEntry({ id: "e2", content: "TypeScript has structural types.", topics: ["typescript"], embedding: emb }));
-		db.insertEntry(makeEntry({ id: "e3", content: "TypeScript checks types at compile time.", topics: ["typescript"], embedding: emb }));
-		db.insertEntry(makeEntry({ id: "e4", content: "TypeScript interfaces define contracts.", topics: ["typescript"], embedding: emb }));
-		db.insertEntry(makeEntry({ id: "e5", content: "TypeScript generics enable type-safe reuse.", topics: ["typescript"], embedding: emb }));
+		await db.insertEntry(makeEntry({ id: "e1", content: "TypeScript is statically typed.", topics: ["typescript"], embedding: emb }));
+		await db.insertEntry(makeEntry({ id: "e2", content: "TypeScript has structural types.", topics: ["typescript"], embedding: emb }));
+		await db.insertEntry(makeEntry({ id: "e3", content: "TypeScript checks types at compile time.", topics: ["typescript"], embedding: emb }));
+		await db.insertEntry(makeEntry({ id: "e4", content: "TypeScript interfaces define contracts.", topics: ["typescript"], embedding: emb }));
+		await db.insertEntry(makeEntry({ id: "e5", content: "TypeScript generics enable type-safe reuse.", topics: ["typescript"], embedding: emb }));
 
 		spyOn(OpenCodeEpisodeReader.prototype, "getCandidateSessions").mockReturnValue([
 			{ id: "session-1", maxMessageTime: Date.now() },
@@ -782,11 +780,11 @@ describe("ConsolidationEngine — cluster-based synthesis (runKBSynthesis)", () 
 		const emb = fakeEmbedding("TypeScript static");
 		const synthEmb = [0, 0, 0, 0, 0, 0, 0, 1]; // orthogonal to all fakeEmbedding() outputs
 
-		db.insertEntry(makeEntry({ id: "e1", content: "TypeScript is statically typed.", topics: ["typescript"], embedding: emb }));
-		db.insertEntry(makeEntry({ id: "e2", content: "TypeScript has structural types.", topics: ["typescript"], embedding: emb }));
-		db.insertEntry(makeEntry({ id: "e3", content: "TypeScript checks types at compile time.", topics: ["typescript"], embedding: emb }));
-		db.insertEntry(makeEntry({ id: "e4", content: "TypeScript interfaces define contracts.", topics: ["typescript"], embedding: emb }));
-		db.insertEntry(makeEntry({ id: "e5", content: "TypeScript generics enable type-safe reuse.", topics: ["typescript"], embedding: emb }));
+		await db.insertEntry(makeEntry({ id: "e1", content: "TypeScript is statically typed.", topics: ["typescript"], embedding: emb }));
+		await db.insertEntry(makeEntry({ id: "e2", content: "TypeScript has structural types.", topics: ["typescript"], embedding: emb }));
+		await db.insertEntry(makeEntry({ id: "e3", content: "TypeScript checks types at compile time.", topics: ["typescript"], embedding: emb }));
+		await db.insertEntry(makeEntry({ id: "e4", content: "TypeScript interfaces define contracts.", topics: ["typescript"], embedding: emb }));
+		await db.insertEntry(makeEntry({ id: "e5", content: "TypeScript generics enable type-safe reuse.", topics: ["typescript"], embedding: emb }));
 
 		spyOn(OpenCodeEpisodeReader.prototype, "getCandidateSessions").mockReturnValue([
 			{ id: "session-1", maxMessageTime: Date.now() },
@@ -809,7 +807,7 @@ describe("ConsolidationEngine — cluster-based synthesis (runKBSynthesis)", () 
 		await engine.consolidate();
 		await engine.runSynthesis();
 
-		const allEntries = db.getEntries({});
+		const allEntries = await db.getEntries({});
 		const synthesized = allEntries.find((e) => e.content === "Static typing produces more reliable code.");
 		expect(synthesized).toBeDefined();
 		expect(synthesized?.type).toBe("principle");
@@ -820,7 +818,7 @@ describe("ConsolidationEngine — cluster-based synthesis (runKBSynthesis)", () 
 describe("ConsolidationEngine.reconsolidate() — 'update' decision (above threshold)", () => {
 	it("merges the new observation into the existing entry in place", async () => {
 		const existingEmb = fakeEmbedding("TypeScript static");
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "existing-ts",
 				content: "TypeScript is statically typed.",
@@ -865,7 +863,7 @@ describe("ConsolidationEngine.reconsolidate() — 'update' decision (above thres
 		expect(result.entriesCreated).toBe(0);
 		expect(result.entriesUpdated).toBe(1);
 
-		const entry = db.getEntry("existing-ts");
+		const entry = await db.getEntry("existing-ts");
 		expect(entry?.content).toBe(
 			"TypeScript is statically typed and supports type inference.",
 		);
@@ -879,7 +877,7 @@ describe("ConsolidationEngine.reconsolidate() — 'update' decision (above thres
 describe("ConsolidationEngine.reconsolidate() — 'insert' decision (above threshold but distinct)", () => {
 	it("inserts a new entry even when similarity exceeds the threshold", async () => {
 		const existingEmb = fakeEmbedding("TypeScript static");
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "existing-ts",
 				content: "TypeScript is statically typed.",
@@ -920,7 +918,7 @@ describe("ConsolidationEngine.reconsolidate() — 'insert' decision (above thres
 		expect(result.entriesCreated).toBe(1);
 		expect(result.entriesUpdated).toBe(0);
 
-		const allEntries = db.getEntries({});
+		const allEntries = await db.getEntries({});
 		expect(allEntries.length).toBe(2);
 	});
 });
@@ -930,7 +928,7 @@ describe("ConsolidationEngine.reconsolidate() — 'insert' decision (above thres
 describe("ConsolidationEngine.runContradictionScan() — hallucinated candidateId guard", () => {
 	it("ignores a candidateId the LLM invented that was not in the candidate list", async () => {
 		const existingEmb = fakeEmbedding("server port");
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "candidate-real",
 				content: "The server runs on port 8080.",
@@ -987,7 +985,7 @@ describe("ConsolidationEngine.runContradictionScan() — hallucinated candidateI
 
 		// The hallucinated ID should be ignored — both entries remain active
 		expect(result.conflictsResolved).toBe(0);
-		const candidate = db.getEntry("candidate-real");
+		const candidate = await db.getEntry("candidate-real");
 		expect(candidate?.status).toBe("active"); // not superseded
 	});
 });
@@ -1002,7 +1000,7 @@ describe("ConsolidationEngine.runContradictionScan() — supersede_new stops fur
 		const candidateEmb = [1, 0, 0, 0, 0, 0, 0, 0];
 		const newEmb = [0.6, 0.8, 0, 0, 0, 0, 0, 0]; // already unit (0.36+0.64=1)
 
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "candidate-a",
 				content: "Port is 8080.",
@@ -1010,7 +1008,7 @@ describe("ConsolidationEngine.runContradictionScan() — supersede_new stops fur
 				embedding: candidateEmb,
 			}),
 		);
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "candidate-b",
 				content: "Port is 3000.",
@@ -1065,12 +1063,12 @@ describe("ConsolidationEngine.runContradictionScan() — supersede_new stops fur
 
 		// The new entry was superseded (supersede_new counts as resolved)
 		expect(result.conflictsResolved).toBe(1);
-		const newEntries = db.getEntries({ type: "fact" });
+		const newEntries = await db.getEntries({ type: "fact" });
 		const insertedNew = newEntries.find((e) => e.content.includes("9090"));
 		expect(insertedNew?.status).toBe("superseded");
 
 		// candidate-b must not have been superseded — the scan stopped after supersede_new
-		expect(db.getEntry("candidate-b")?.status).toBe("active");
+		expect((await db.getEntry("candidate-b"))?.status).toBe("active");
 	});
 });
 
@@ -1089,7 +1087,7 @@ describe("ConsolidationEngine.runContradictionScan() — superseded_in_scan trac
 		const newEmb2 = [0.6, 0, 0.8, 0, 0, 0, 0, 0]; // unit: 0.36+0.64=1
 		// cos(newEmb1, newEmb2) = 0.6*0.6 + 0.8*0 + 0*0.8 = 0.36 < reconsolidationThreshold (0.82)
 
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "candidate-x",
 				content: "Port is 8080.",
@@ -1166,7 +1164,7 @@ describe("ConsolidationEngine.runContradictionScan() — superseded_in_scan trac
 		await engine.consolidate();
 
 		// candidate-x must be superseded exactly once (by new-entry-1)
-		expect(db.getEntry("candidate-x")?.status).toBe("superseded");
+		expect((await db.getEntry("candidate-x"))?.status).toBe("superseded");
 		// candidate-x must not have been passed to the second scan iteration
 		expect(candidateXAppearedInScan2).toBe(false);
 		// at most one scan call per new entry
@@ -1194,11 +1192,11 @@ describe("ConsolidationEngine.consolidate() — cursor advancement", () => {
 		);
 		spyOn(activation, "ensureEmbeddings").mockResolvedValue(0);
 
-		const initialCursor = db.getSourceCursor("opencode");
+		const initialCursor = await db.getSourceCursor("opencode");
 
 		await engine.consolidate();
 
-		const cursor = db.getSourceCursor("opencode");
+		const cursor = await db.getSourceCursor("opencode");
 		// Batch was NOT full (returned 2, limit is much higher) → cursor must advance to t2
 		expect(cursor.lastMessageTimeCreated).toBe(t2);
 		expect(cursor.lastMessageTimeCreated).toBeGreaterThan(
@@ -1242,7 +1240,7 @@ describe("ConsolidationEngine.consolidate() — cursor advancement", () => {
 
 		await engine.consolidate();
 
-		const cursor = db.getSourceCursor("opencode");
+		const cursor = await db.getSourceCursor("opencode");
 		// Batch was full → cursor must be capped to lastSession.maxMessageTime - 1
 		expect(cursor.lastMessageTimeCreated).toBe(lastSession.maxMessageTime - 1);
 	});
@@ -1250,7 +1248,7 @@ describe("ConsolidationEngine.consolidate() — cursor advancement", () => {
 	it("never moves cursor backwards", async () => {
 		// Set the opencode source cursor to a future timestamp
 		const futureCursor = Date.now() + 100_000;
-		db.updateSourceCursor("opencode", { lastMessageTimeCreated: futureCursor });
+		await db.updateSourceCursor("opencode", { lastMessageTimeCreated: futureCursor });
 
 		spyOn(
 			OpenCodeEpisodeReader.prototype,
@@ -1260,7 +1258,7 @@ describe("ConsolidationEngine.consolidate() — cursor advancement", () => {
 
 		await engine.consolidate();
 
-		const cursor = db.getSourceCursor("opencode");
+		const cursor = await db.getSourceCursor("opencode");
 		// Cursor must not go backwards
 		expect(cursor.lastMessageTimeCreated).toBeGreaterThanOrEqual(futureCursor);
 	});
@@ -1276,7 +1274,7 @@ describe("ConsolidationEngine.consolidate() — full pipeline with mocked LLM + 
 		// 0.6 is in [contradictionMinSimilarity=0.4, reconsolidationThreshold=0.82) → mid-band.
 		// cos = 0.6 < 0.82 → reconsolidate inserts (below reconsolidationThreshold).
 		const existingEmb = [1, 0, 0, 0, 0, 0, 0, 0];
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "existing-port",
 				content: "The server runs on port 8080.",
@@ -1331,14 +1329,13 @@ describe("ConsolidationEngine.consolidate() — full pipeline with mocked LLM + 
 		expect(result.conflictsResolved).toBe(0); // irresolvable doesn't count as resolved
 
 		// The new entry must be in the DB as conflicted
-		const newEntry = db
-			.getEntries({ type: "fact" })
+		const newEntry = (await db.getEntries({ type: "fact" }))
 			.find((e) => e.content.includes("9090"));
 		expect(newEntry).toBeDefined();
 		expect(newEntry?.status).toBe("conflicted"); // irresolvable marks both as conflicted
 
 		// existing-port also marked conflicted
-		expect(db.getEntry("existing-port")?.status).toBe("conflicted");
+		expect((await db.getEntry("existing-port"))?.status).toBe("conflicted");
 	});
 
 	it("records episodes so they are not reprocessed on the next run", async () => {
@@ -1365,7 +1362,7 @@ describe("ConsolidationEngine.consolidate() — full pipeline with mocked LLM + 
 		await engine.consolidate();
 
 		// The episode range must now be recorded in the DB under the "opencode" source
-		const ranges = db.getProcessedEpisodeRanges("opencode", ["session-1"]);
+		const ranges = await db.getProcessedEpisodeRanges("opencode", ["session-1"]);
 		const sessionRanges = ranges.get("session-1") ?? [];
 		const recorded = sessionRanges.find(
 			(r) =>
@@ -1380,7 +1377,7 @@ describe("ActivationEngine — contradiction annotation on activated conflicted 
 		// Both entries share the same embedding prefix — they will both score above
 		// the similarity threshold for any query with that prefix.
 		const emb = fakeEmbedding("abc");
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "side-a",
 				content: "abc approach A",
@@ -1388,7 +1385,7 @@ describe("ActivationEngine — contradiction annotation on activated conflicted 
 				embedding: emb,
 			}),
 		);
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "side-b",
 				content: "abc approach B",
@@ -1396,7 +1393,7 @@ describe("ActivationEngine — contradiction annotation on activated conflicted 
 				embedding: emb,
 			}),
 		);
-		db.applyContradictionResolution("irresolvable", "side-a", "side-b");
+		await db.applyContradictionResolution("irresolvable", "side-a", "side-b");
 
 		// Both are now conflicted — mock embedBatch so activate() uses deterministic vectors.
 		// activate() always calls embedBatch (even for a single string query).
@@ -1431,7 +1428,7 @@ describe("ActivationEngine — contradiction annotation on activated conflicted 
 		// [1,0,0,...] and [0,1,0,...] are perpendicular, so their dot product is 0.
 		const embC = [1, 0, 0, 0, 0, 0, 0, 0];
 		const embD = [0, 1, 0, 0, 0, 0, 0, 0];
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "side-c",
 				content: "abc thing",
@@ -1439,7 +1436,7 @@ describe("ActivationEngine — contradiction annotation on activated conflicted 
 				embedding: embC,
 			}),
 		);
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "side-d",
 				content: "xyz thing",
@@ -1447,7 +1444,7 @@ describe("ActivationEngine — contradiction annotation on activated conflicted 
 				embedding: embD,
 			}),
 		);
-		db.applyContradictionResolution("irresolvable", "side-c", "side-d");
+		await db.applyContradictionResolution("irresolvable", "side-c", "side-d");
 
 		// Query embedding == side-c's embedding (similarity 1.0 with side-c, 0.0 with side-d)
 		const embedSpy = spyOn(
@@ -1472,7 +1469,7 @@ describe("ActivationEngine — contradiction annotation on activated conflicted 
 
 	it("active entries are never annotated even if they have no contradicting partner", async () => {
 		const emb = fakeEmbedding("abc");
-		db.insertEntry(
+		await db.insertEntry(
 			makeEntry({
 				id: "plain",
 				content: "abc plain entry",

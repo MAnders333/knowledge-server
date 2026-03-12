@@ -15,19 +15,19 @@ describe("KnowledgeDB", () => {
 		db = new KnowledgeDB(join(tempDir, "test.db"));
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	it("should create tables on initialization", () => {
-		const stats = db.getStats();
+	it("should create tables on initialization", async () => {
+		const stats = await db.getStats();
 		expect(stats.total).toBe(0);
 	});
 
-	it("should insert and retrieve an entry", () => {
+	it("should insert and retrieve an entry", async () => {
 		const now = Date.now();
-		db.insertEntry({
+		await db.insertEntry({
 			id: "test-1",
 			type: "fact",
 			content: "Churn rate is 4.2%",
@@ -46,7 +46,7 @@ describe("KnowledgeDB", () => {
 			derivedFrom: ["session-123"],
 		});
 
-		const entry = db.getEntry("test-1");
+		const entry = await db.getEntry("test-1");
 		expect(entry).not.toBeNull();
 		expect(entry?.content).toBe("Churn rate is 4.2%");
 		expect(entry?.topics).toEqual(["churn", "metrics"]);
@@ -54,9 +54,9 @@ describe("KnowledgeDB", () => {
 		expect(entry?.derivedFrom).toEqual(["session-123"]);
 	});
 
-	it("should update entry fields", () => {
+	it("should update entry fields", async () => {
 		const now = Date.now();
-		db.insertEntry({
+		await db.insertEntry({
 			id: "test-2",
 			type: "fact",
 			content: "Old content",
@@ -75,23 +75,23 @@ describe("KnowledgeDB", () => {
 			derivedFrom: [],
 		});
 
-		db.updateEntry("test-2", {
+		await db.updateEntry("test-2", {
 			content: "New content",
 			confidence: 0.8,
 			status: "superseded",
 			supersededBy: "test-3",
 		});
 
-		const entry = db.getEntry("test-2");
+		const entry = await db.getEntry("test-2");
 		expect(entry?.content).toBe("New content");
 		expect(entry?.confidence).toBe(0.8);
 		expect(entry?.status).toBe("superseded");
 		expect(entry?.supersededBy).toBe("test-3");
 	});
 
-	it("should record access and increment count", () => {
+	it("should record access and increment count", async () => {
 		const now = Date.now();
-		db.insertEntry({
+		await db.insertEntry({
 			id: "test-3",
 			type: "principle",
 			content: "Test principle",
@@ -110,16 +110,16 @@ describe("KnowledgeDB", () => {
 			derivedFrom: [],
 		});
 
-		db.recordAccess("test-3");
-		db.recordAccess("test-3");
-		db.recordAccess("test-3");
+		await db.recordAccess("test-3");
+		await db.recordAccess("test-3");
+		await db.recordAccess("test-3");
 
-		const entry = db.getEntry("test-3");
+		const entry = await db.getEntry("test-3");
 		expect(entry?.accessCount).toBe(3);
 		expect(entry?.lastAccessedAt).toBeGreaterThanOrEqual(now);
 	});
 
-	it("should filter entries by status", () => {
+	it("should filter entries by status", async () => {
 		const now = Date.now();
 		const makeEntry = (id: string, status: string) => ({
 			id,
@@ -140,22 +140,22 @@ describe("KnowledgeDB", () => {
 			derivedFrom: [],
 		});
 
-		db.insertEntry(makeEntry("a1", "active"));
-		db.insertEntry(makeEntry("a2", "active"));
-		db.insertEntry(makeEntry("a3", "archived"));
+		await db.insertEntry(makeEntry("a1", "active"));
+		await db.insertEntry(makeEntry("a2", "active"));
+		await db.insertEntry(makeEntry("a3", "archived"));
 
-		const active = db.getActiveEntries();
+		const active = await db.getActiveEntries();
 		expect(active.length).toBe(2);
 
-		const archived = db.getEntriesByStatus("archived");
+		const archived = await db.getEntriesByStatus("archived");
 		expect(archived.length).toBe(1);
 	});
 
-	it("should store and retrieve embeddings", () => {
+	it("should store and retrieve embeddings", async () => {
 		const now = Date.now();
 		const embedding = [0.1, 0.2, 0.3, 0.4, 0.5];
 
-		db.insertEntry({
+		await db.insertEntry({
 			id: "test-emb",
 			type: "fact",
 			content: "Entry with embedding",
@@ -175,7 +175,7 @@ describe("KnowledgeDB", () => {
 			embedding,
 		});
 
-		const entry = db.getEntry("test-emb");
+		const entry = await db.getEntry("test-emb");
 		expect(entry?.embedding).toBeDefined();
 		expect(entry?.embedding?.length).toBe(5);
 		// Float32 precision — check approximate equality
@@ -186,46 +186,46 @@ describe("KnowledgeDB", () => {
 		}
 	});
 
-	it("should manage consolidation state", () => {
-		const state = db.getConsolidationState();
+	it("should manage consolidation state", async () => {
+		const state = await db.getConsolidationState();
 		expect(state.lastConsolidatedAt).toBe(0);
 		expect(state.totalSessionsProcessed).toBe(0);
 
-		db.updateConsolidationState({
+		await db.updateConsolidationState({
 			lastConsolidatedAt: 1000000,
 			totalSessionsProcessed: 50,
 			totalEntriesCreated: 25,
 		});
 
-		const updated = db.getConsolidationState();
+		const updated = await db.getConsolidationState();
 		expect(updated.lastConsolidatedAt).toBe(1000000);
 		expect(updated.totalSessionsProcessed).toBe(50);
 		expect(updated.totalEntriesCreated).toBe(25);
 	});
 
-	it("should manage source cursors", () => {
+	it("should manage source cursors", async () => {
 		// Default zero state for unknown source
-		const initial = db.getSourceCursor("opencode");
+		const initial = await db.getSourceCursor("opencode");
 		expect(initial.source).toBe("opencode");
 		expect(initial.lastMessageTimeCreated).toBe(0);
 		expect(initial.lastConsolidatedAt).toBe(0);
 
 		// Update and re-read
-		db.updateSourceCursor("opencode", {
+		await db.updateSourceCursor("opencode", {
 			lastMessageTimeCreated: 999999,
 			lastConsolidatedAt: 1000000,
 		});
-		const updated = db.getSourceCursor("opencode");
+		const updated = await db.getSourceCursor("opencode");
 		expect(updated.lastMessageTimeCreated).toBe(999999);
 		expect(updated.lastConsolidatedAt).toBe(1000000);
 
 		// Different source is independent
-		const other = db.getSourceCursor("claude-code");
+		const other = await db.getSourceCursor("claude-code");
 		expect(other.lastMessageTimeCreated).toBe(0);
 	});
 
-	it("should record and retrieve episode ranges", () => {
-		db.recordEpisode(
+	it("should record and retrieve episode ranges", async () => {
+		await db.recordEpisode(
 			"opencode",
 			"session-1",
 			"msg-start-1",
@@ -233,7 +233,7 @@ describe("KnowledgeDB", () => {
 			"messages",
 			3,
 		);
-		db.recordEpisode(
+		await db.recordEpisode(
 			"opencode",
 			"session-1",
 			"msg-start-2",
@@ -241,7 +241,7 @@ describe("KnowledgeDB", () => {
 			"compaction_summary",
 			1,
 		);
-		db.recordEpisode(
+		await db.recordEpisode(
 			"opencode",
 			"session-2",
 			"msg-start-3",
@@ -250,7 +250,7 @@ describe("KnowledgeDB", () => {
 			0,
 		);
 
-		const ranges = db.getProcessedEpisodeRanges("opencode", [
+		const ranges = await db.getProcessedEpisodeRanges("opencode", [
 			"session-1",
 			"session-2",
 		]);
@@ -279,9 +279,9 @@ describe("KnowledgeDB", () => {
 		expect((s2 ?? [{}])[0].endMessageId).toBe("msg-end-3");
 	});
 
-	it("episodes from different sources are isolated", () => {
-		db.recordEpisode("opencode", "session-1", "msg-a", "msg-b", "messages", 2);
-		db.recordEpisode(
+	it("episodes from different sources are isolated", async () => {
+		await db.recordEpisode("opencode", "session-1", "msg-a", "msg-b", "messages", 2);
+		await db.recordEpisode(
 			"claude-code",
 			"session-1",
 			"msg-a",
@@ -291,28 +291,28 @@ describe("KnowledgeDB", () => {
 		);
 
 		// Each source only sees its own episodes
-		const oc = db.getProcessedEpisodeRanges("opencode", ["session-1"]);
-		const cc = db.getProcessedEpisodeRanges("claude-code", ["session-1"]);
+		const oc = await db.getProcessedEpisodeRanges("opencode", ["session-1"]);
+		const cc = await db.getProcessedEpisodeRanges("claude-code", ["session-1"]);
 		expect(oc.get("session-1")).toHaveLength(1);
 		expect(cc.get("session-1")).toHaveLength(1);
 	});
 
-	it("recordEpisode is idempotent — duplicate inserts are ignored", () => {
-		db.recordEpisode("opencode", "session-1", "msg-a", "msg-b", "messages", 2);
-		db.recordEpisode("opencode", "session-1", "msg-a", "msg-b", "messages", 2);
+	it("recordEpisode is idempotent — duplicate inserts are ignored", async () => {
+		await db.recordEpisode("opencode", "session-1", "msg-a", "msg-b", "messages", 2);
+		await db.recordEpisode("opencode", "session-1", "msg-a", "msg-b", "messages", 2);
 
-		const ranges = db.getProcessedEpisodeRanges("opencode", ["session-1"]);
+		const ranges = await db.getProcessedEpisodeRanges("opencode", ["session-1"]);
 		expect(ranges.get("session-1")).toHaveLength(1);
 	});
 
-	it("getProcessedEpisodeRanges returns empty map for unknown session", () => {
-		const ranges = db.getProcessedEpisodeRanges("opencode", [
+	it("getProcessedEpisodeRanges returns empty map for unknown session", async () => {
+		const ranges = await db.getProcessedEpisodeRanges("opencode", [
 			"no-such-session",
 		]);
 		expect(ranges.size).toBe(0);
 	});
 
-	it("should handle relations between entries", () => {
+	it("should handle relations between entries", async () => {
 		const now = Date.now();
 		const makeEntry = (id: string) => ({
 			id,
@@ -333,10 +333,10 @@ describe("KnowledgeDB", () => {
 			derivedFrom: [],
 		});
 
-		db.insertEntry(makeEntry("e1"));
-		db.insertEntry(makeEntry("e2"));
+		await db.insertEntry(makeEntry("e1"));
+		await db.insertEntry(makeEntry("e2"));
 
-		db.insertRelation({
+		await db.insertRelation({
 			id: "rel-1",
 			sourceId: "e1",
 			targetId: "e2",
@@ -344,7 +344,7 @@ describe("KnowledgeDB", () => {
 			createdAt: now,
 		});
 
-		const relations = db.getRelationsFor("e1");
+		const relations = await db.getRelationsFor("e1");
 		expect(relations.length).toBe(1);
 		expect(relations[0].type).toBe("supports");
 		expect(relations[0].targetId).toBe("e2");
@@ -352,34 +352,34 @@ describe("KnowledgeDB", () => {
 
 	// ── Embedding Metadata ──
 
-	it("getEmbeddingMetadata returns null when no metadata exists", () => {
-		const meta = db.getEmbeddingMetadata();
+	it("getEmbeddingMetadata returns null when no metadata exists", async () => {
+		const meta = await db.getEmbeddingMetadata();
 		expect(meta).toBeNull();
 	});
 
-	it("setEmbeddingMetadata creates singleton row and getEmbeddingMetadata reads it", () => {
-		db.setEmbeddingMetadata("text-embedding-3-small", 1536);
-		const meta = db.getEmbeddingMetadata();
+	it("setEmbeddingMetadata creates singleton row and getEmbeddingMetadata reads it", async () => {
+		await db.setEmbeddingMetadata("text-embedding-3-small", 1536);
+		const meta = await db.getEmbeddingMetadata();
 		expect(meta).not.toBeNull();
 		expect(meta?.model).toBe("text-embedding-3-small");
 		expect(meta?.dimensions).toBe(1536);
 		expect(meta?.recordedAt).toBeGreaterThan(0);
 	});
 
-	it("setEmbeddingMetadata overwrites previous metadata (upsert)", () => {
-		db.setEmbeddingMetadata("text-embedding-3-small", 1536);
-		db.setEmbeddingMetadata("text-embedding-3-large", 3072);
-		const meta = db.getEmbeddingMetadata();
+	it("setEmbeddingMetadata overwrites previous metadata (upsert)", async () => {
+		await db.setEmbeddingMetadata("text-embedding-3-small", 1536);
+		await db.setEmbeddingMetadata("text-embedding-3-large", 3072);
+		const meta = await db.getEmbeddingMetadata();
 		expect(meta?.model).toBe("text-embedding-3-large");
 		expect(meta?.dimensions).toBe(3072);
 	});
 
 	// ── clearAllEmbeddings ──
 
-	it("clearAllEmbeddings NULLs embeddings on active and conflicted entries", () => {
+	it("clearAllEmbeddings NULLs embeddings on active and conflicted entries", async () => {
 		const now = Date.now();
 		const emb = [0.1, 0.2, 0.3];
-		db.insertEntry({
+		await db.insertEntry({
 			id: "e1",
 			type: "fact",
 			content: "Active entry",
@@ -398,7 +398,7 @@ describe("KnowledgeDB", () => {
 			derivedFrom: [],
 			embedding: emb,
 		});
-		db.insertEntry({
+		await db.insertEntry({
 			id: "e2",
 			type: "fact",
 			content: "Conflicted entry",
@@ -417,7 +417,7 @@ describe("KnowledgeDB", () => {
 			derivedFrom: [],
 			embedding: emb,
 		});
-		db.insertEntry({
+		await db.insertEntry({
 			id: "e3",
 			type: "fact",
 			content: "Superseded entry",
@@ -437,26 +437,26 @@ describe("KnowledgeDB", () => {
 			embedding: emb,
 		});
 
-		const cleared = db.clearAllEmbeddings();
+		const cleared = await db.clearAllEmbeddings();
 		expect(cleared).toBe(2); // only active + conflicted
 
-		expect(db.getEntry("e1")?.embedding).toBeUndefined();
-		expect(db.getEntry("e2")?.embedding).toBeUndefined();
+		expect((await db.getEntry("e1"))?.embedding).toBeUndefined();
+		expect((await db.getEntry("e2"))?.embedding).toBeUndefined();
 		// Superseded entry should retain its embedding
-		expect(db.getEntry("e3")?.embedding).toBeDefined();
+		expect((await db.getEntry("e3"))?.embedding).toBeDefined();
 	});
 
-	it("clearAllEmbeddings returns 0 when no embeddings exist", () => {
-		const cleared = db.clearAllEmbeddings();
+	it("clearAllEmbeddings returns 0 when no embeddings exist", async () => {
+		const cleared = await db.clearAllEmbeddings();
 		expect(cleared).toBe(0);
 	});
 
 	// ── getEntriesMissingEmbeddings ──
 
-	it("getEntriesMissingEmbeddings returns only active/conflicted entries without embeddings", () => {
+	it("getEntriesMissingEmbeddings returns only active/conflicted entries without embeddings", async () => {
 		const now = Date.now();
 		// Active with embedding — should NOT be returned
-		db.insertEntry({
+		await db.insertEntry({
 			id: "has-emb",
 			type: "fact",
 			content: "Has embedding",
@@ -476,7 +476,7 @@ describe("KnowledgeDB", () => {
 			embedding: [0.1, 0.2],
 		});
 		// Active without embedding — should be returned
-		db.insertEntry({
+		await db.insertEntry({
 			id: "no-emb",
 			type: "fact",
 			content: "No embedding",
@@ -495,7 +495,7 @@ describe("KnowledgeDB", () => {
 			derivedFrom: [],
 		});
 		// Superseded without embedding — should NOT be returned
-		db.insertEntry({
+		await db.insertEntry({
 			id: "superseded-no-emb",
 			type: "fact",
 			content: "Superseded",
@@ -514,23 +514,23 @@ describe("KnowledgeDB", () => {
 			derivedFrom: [],
 		});
 
-		const missing = db.getEntriesMissingEmbeddings();
+		const missing = await db.getEntriesMissingEmbeddings();
 		expect(missing.length).toBe(1);
 		expect(missing[0].id).toBe("no-emb");
 	});
 
 	// ── reinitialize clears embedding_metadata ──
 
-	it("reinitialize clears embedding_metadata", () => {
-		db.setEmbeddingMetadata("test-model", 128);
-		expect(db.getEmbeddingMetadata()).not.toBeNull();
+	it("reinitialize clears embedding_metadata", async () => {
+		await db.setEmbeddingMetadata("test-model", 128);
+		expect(await db.getEmbeddingMetadata()).not.toBeNull();
 
-		db.reinitialize();
+		await db.reinitialize();
 
-		expect(db.getEmbeddingMetadata()).toBeNull();
+		expect(await db.getEmbeddingMetadata()).toBeNull();
 	});
 
-	it("should return correct stats", () => {
+	it("should return correct stats", async () => {
 		const now = Date.now();
 		const makeEntry = (id: string, status: string) => ({
 			id,
@@ -551,13 +551,13 @@ describe("KnowledgeDB", () => {
 			derivedFrom: [],
 		});
 
-		db.insertEntry(makeEntry("s1", "active"));
-		db.insertEntry(makeEntry("s2", "active"));
-		db.insertEntry(makeEntry("s3", "active"));
-		db.insertEntry(makeEntry("s4", "archived"));
-		db.insertEntry(makeEntry("s5", "superseded"));
+		await db.insertEntry(makeEntry("s1", "active"));
+		await db.insertEntry(makeEntry("s2", "active"));
+		await db.insertEntry(makeEntry("s3", "active"));
+		await db.insertEntry(makeEntry("s4", "archived"));
+		await db.insertEntry(makeEntry("s5", "superseded"));
 
-		const stats = db.getStats();
+		const stats = await db.getStats();
 		expect(stats.total).toBe(5);
 		expect(stats.active).toBe(3);
 		expect(stats.archived).toBe(1);
@@ -574,14 +574,14 @@ describe("KnowledgeDB — cluster CRUD", () => {
 		db = new KnowledgeDB(join(tempDir, "test.db"));
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	function insertEntry(id: string, embedding: number[]) {
+	async function insertEntry(id: string, embedding: number[]) {
 		const now = Date.now();
-		db.insertEntry({
+		await db.insertEntry({
 			id,
 			type: "fact",
 			content: `Entry ${id}`,
@@ -602,16 +602,16 @@ describe("KnowledgeDB — cluster CRUD", () => {
 		});
 	}
 
-	it("getClustersWithMembers returns empty array when no clusters exist", () => {
-		expect(db.getClustersWithMembers()).toEqual([]);
+	it("getClustersWithMembers returns empty array when no clusters exist", async () => {
+		expect(await db.getClustersWithMembers()).toEqual([]);
 	});
 
-	it("persistClusters inserts a new cluster with members", () => {
+	it("persistClusters inserts a new cluster with members", async () => {
 		const centroid = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-		insertEntry("e1", centroid);
-		insertEntry("e2", centroid);
+		await insertEntry("e1", centroid);
+		await insertEntry("e2", centroid);
 
-		db.persistClusters([
+		await db.persistClusters([
 			{
 				id: "cluster-1",
 				centroid,
@@ -621,7 +621,7 @@ describe("KnowledgeDB — cluster CRUD", () => {
 			},
 		]);
 
-		const clusters = db.getClustersWithMembers();
+		const clusters = await db.getClustersWithMembers();
 		expect(clusters).toHaveLength(1);
 		expect(clusters[0].id).toBe("cluster-1");
 		expect(clusters[0].memberIds.sort()).toEqual(["e1", "e2"]);
@@ -631,80 +631,80 @@ describe("KnowledgeDB — cluster CRUD", () => {
 		expect(clusters[0].centroid[0]).toBeCloseTo(1.0);
 	});
 
-	it("persistClusters updates centroid and member count on re-run, does not bump last_membership_changed_at when membership is stable", () => {
+	it("persistClusters updates centroid and member count on re-run, does not bump last_membership_changed_at when membership is stable", async () => {
 		const centroid = [0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-		insertEntry("e1", centroid);
-		insertEntry("e2", centroid);
+		await insertEntry("e1", centroid);
+		await insertEntry("e2", centroid);
 
 		// First persist — new cluster
-		db.persistClusters([
+		await db.persistClusters([
 			{ id: "cluster-1", centroid, memberIds: ["e1", "e2"], isNew: true, membershipChanged: true },
 		]);
-		const before = db.getClustersWithMembers()[0].lastMembershipChangedAt;
+		const before = (await db.getClustersWithMembers())[0].lastMembershipChangedAt;
 
 		// Small delay to ensure timestamps differ if the code is wrong
 		const newCentroid = [0.6, 0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
 		// Re-persist same cluster, same members, membershipChanged=false
-		db.persistClusters([
+		await db.persistClusters([
 			{ id: "cluster-1", centroid: newCentroid, memberIds: ["e1", "e2"], isNew: false, membershipChanged: false },
 		]);
 
-		const after = db.getClustersWithMembers()[0];
+		const after = (await db.getClustersWithMembers())[0];
 		expect(after.lastMembershipChangedAt).toBe(before); // unchanged
 		expect(after.centroid[0]).toBeCloseTo(0.6); // centroid updated
 	});
 
-	it("persistClusters deletes stale clusters not in the new set", () => {
+	it("persistClusters deletes stale clusters not in the new set", async () => {
 		const centroid = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-		insertEntry("e1", centroid);
+		await insertEntry("e1", centroid);
 
-		db.persistClusters([
+		await db.persistClusters([
 			{ id: "cluster-old", centroid, memberIds: ["e1"], isNew: true, membershipChanged: true },
 		]);
-		expect(db.getClustersWithMembers()).toHaveLength(1);
+		expect(await db.getClustersWithMembers()).toHaveLength(1);
 
 		// New pass produces a different cluster (cluster-old disappears)
-		db.persistClusters([
+		await db.persistClusters([
 			{ id: "cluster-new", centroid, memberIds: ["e1"], isNew: true, membershipChanged: true },
 		]);
 
-		const clusters = db.getClustersWithMembers();
+		const clusters = await db.getClustersWithMembers();
 		expect(clusters).toHaveLength(1);
 		expect(clusters[0].id).toBe("cluster-new");
 	});
 
-	it("markClusterSynthesized stamps last_synthesized_at", () => {
+	it("markClusterSynthesized stamps last_synthesized_at", async () => {
 		const centroid = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-		insertEntry("e1", centroid);
+		await insertEntry("e1", centroid);
 
-		db.persistClusters([
+		await db.persistClusters([
 			{ id: "cluster-1", centroid, memberIds: ["e1"], isNew: true, membershipChanged: true },
 		]);
 
-		expect(db.getClustersWithMembers()[0].lastSynthesizedAt).toBeNull();
+		expect((await db.getClustersWithMembers())[0].lastSynthesizedAt).toBeNull();
 
 		const before = Date.now();
-		db.markClusterSynthesized("cluster-1");
+		await db.markClusterSynthesized("cluster-1");
 		const after = Date.now();
 
-		const stamped = db.getClustersWithMembers()[0].lastSynthesizedAt;
+		const stamped = (await db.getClustersWithMembers())[0].lastSynthesizedAt;
 		expect(stamped).not.toBeNull();
 		expect(stamped).toBeGreaterThanOrEqual(before);
 		expect(stamped).toBeLessThanOrEqual(after);
 	});
 
-	it("reinitialize clears cluster tables", () => {
+	it("reinitialize clears cluster tables", async () => {
 		const centroid = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-		insertEntry("e1", centroid);
-		db.persistClusters([
+		await insertEntry("e1", centroid);
+		await db.persistClusters([
 			{ id: "cluster-1", centroid, memberIds: ["e1"], isNew: true, membershipChanged: true },
 		]);
-		expect(db.getClustersWithMembers()).toHaveLength(1);
+		expect(await db.getClustersWithMembers()).toHaveLength(1);
 
-		db.reinitialize();
+		await db.reinitialize();
 
-		expect(db.getClustersWithMembers()).toHaveLength(0);
+		expect(await db.getClustersWithMembers()).toHaveLength(0);
 	});
 });
 

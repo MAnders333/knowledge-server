@@ -1,5 +1,5 @@
 import { ActivationEngine } from "../activation/activate.js";
-import { KnowledgeDB } from "../db/database.js";
+import { createKnowledgeDB } from "../db/index.js";
 
 /**
  * `knowledge-server activate <query>`
@@ -13,7 +13,7 @@ export async function runActivate(query: string): Promise<void> {
 		process.exit(1);
 	}
 
-	const db = new KnowledgeDB();
+	const db = await createKnowledgeDB();
 	const activation = new ActivationEngine(db);
 
 	try {
@@ -40,6 +40,6 @@ export async function runActivate(query: string): Promise<void> {
 			console.log("");
 		}
 	} finally {
-		db.close();
+		await db.close();
 	}
 }
