@@ -25,16 +25,6 @@ import { PostgresKnowledgeDB } from "../src/db/pg-database";
 
 const PG_URI = process.env.PG_TEST_URI;
 
-// Helper: truncate all tables between tests for isolation.
-async function truncateAll(uri: string) {
-	const sql = postgres(uri);
-	try {
-		await sql`TRUNCATE knowledge_cluster_member, knowledge_cluster, knowledge_relation, knowledge_entry, consolidated_episode, source_cursor, consolidation_state, embedding_metadata, schema_version CASCADE`;
-	} finally {
-		await sql.end();
-	}
-}
-
 // Helper: create a standard test entry object
 function makeEntry(id: string, overrides: Record<string, unknown> = {}) {
 	const now = Date.now();
@@ -63,15 +53,18 @@ function makeEntry(id: string, overrides: Record<string, unknown> = {}) {
 describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 	let db: IKnowledgeDB;
 	const uri = PG_URI as string;
+	// Shared truncation client — created once to avoid pool churn on every test.
+	let truncSql: ReturnType<typeof postgres>;
 
 	beforeAll(async () => {
+		truncSql = postgres(uri, { max: 1 });
 		db = new PostgresKnowledgeDB(uri);
 		await (db as PostgresKnowledgeDB).initialize();
 	});
 
 	beforeEach(async () => {
-		// Wipe data between tests for isolation
-		await truncateAll(uri);
+		// Wipe data between tests for isolation.
+		await truncSql`TRUNCATE knowledge_cluster_member, knowledge_cluster, knowledge_relation, knowledge_entry, consolidated_episode, source_cursor, consolidation_state, embedding_metadata, schema_version CASCADE`;
 		// Re-initialize to re-stamp schema_version (truncated above).
 		// Clear initPromise (private field) so initialize() re-runs on next call.
 		(db as unknown as { initPromise: null }).initPromise = null;
@@ -80,6 +73,7 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 
 	afterAll(async () => {
 		await db.close();
+		await truncSql.end();
 	});
 
 	// ── Schema & Init ──

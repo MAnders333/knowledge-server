@@ -171,11 +171,15 @@ export class PostgresKnowledgeDB implements IKnowledgeDB {
 			logger.log(
 				`[pg-db] Fresh database — creating schema at v${SCHEMA_VERSION}.`,
 			);
-			await this.sql.unsafe(PG_CREATE_TABLES);
-			await this.sql`
-				INSERT INTO schema_version (version, applied_at)
-				VALUES (${SCHEMA_VERSION}, ${Date.now()})
-			`;
+			// Wrap in a transaction so a crash between CREATE and INSERT leaves the
+			// DB fully empty (schema_version still 0) rather than half-created.
+			await this.sql.begin(async (sql) => {
+				await sql.unsafe(PG_CREATE_TABLES);
+				await sql`
+					INSERT INTO schema_version (version, applied_at)
+					VALUES (${SCHEMA_VERSION}, ${Date.now()})
+				`;
+			});
 			return;
 		}
 
@@ -305,20 +309,25 @@ export class PostgresKnowledgeDB implements IKnowledgeDB {
 				logger.warn(
 					`[pg-db] Schema still at v${migratedTo} after migrations, code expects v${SCHEMA_VERSION}. Dropping and recreating all tables. All existing knowledge data has been cleared.`,
 				);
-				await this.sql`DROP TABLE IF EXISTS knowledge_cluster_member CASCADE`;
-				await this.sql`DROP TABLE IF EXISTS knowledge_cluster CASCADE`;
-				await this.sql`DROP TABLE IF EXISTS knowledge_relation CASCADE`;
-				await this.sql`DROP TABLE IF EXISTS knowledge_entry CASCADE`;
-				await this.sql`DROP TABLE IF EXISTS consolidated_episode CASCADE`;
-				await this.sql`DROP TABLE IF EXISTS source_cursor CASCADE`;
-				await this.sql`DROP TABLE IF EXISTS consolidation_state CASCADE`;
-				await this.sql`DROP TABLE IF EXISTS embedding_metadata CASCADE`;
-				await this.sql`DROP TABLE IF EXISTS schema_version CASCADE`;
-				await this.sql.unsafe(PG_CREATE_TABLES);
-				await this.sql`
-					INSERT INTO schema_version (version, applied_at)
-					VALUES (${SCHEMA_VERSION}, ${Date.now()})
-				`;
+				// Wrap the entire drop+recreate in a transaction so a crash mid-way
+				// leaves the DB at the last committed migration version (re-runnable
+				// on restart) rather than with a partially-dropped schema.
+				await this.sql.begin(async (sql) => {
+					await sql`DROP TABLE IF EXISTS knowledge_cluster_member CASCADE`;
+					await sql`DROP TABLE IF EXISTS knowledge_cluster CASCADE`;
+					await sql`DROP TABLE IF EXISTS knowledge_relation CASCADE`;
+					await sql`DROP TABLE IF EXISTS knowledge_entry CASCADE`;
+					await sql`DROP TABLE IF EXISTS consolidated_episode CASCADE`;
+					await sql`DROP TABLE IF EXISTS source_cursor CASCADE`;
+					await sql`DROP TABLE IF EXISTS consolidation_state CASCADE`;
+					await sql`DROP TABLE IF EXISTS embedding_metadata CASCADE`;
+					await sql`DROP TABLE IF EXISTS schema_version CASCADE`;
+					await sql.unsafe(PG_CREATE_TABLES);
+					await sql`
+						INSERT INTO schema_version (version, applied_at)
+						VALUES (${SCHEMA_VERSION}, ${Date.now()})
+					`;
+				});
 			}
 		}
 	}
@@ -1206,7 +1215,7 @@ export class PostgresKnowledgeDB implements IKnowledgeDB {
 			if (keepIds.length > 0) {
 				await sql`
 					DELETE FROM knowledge_cluster
-					WHERE id != ALL(${keepIds}::text[])
+					WHERE id != ALL(${sql.array(keepIds, "text")})
 				`;
 			} else {
 				// No clusters remain — wipe everything
