@@ -43,12 +43,19 @@ const BASE = 1_700_000_000_000;
  * uppercase-extension test assertions are meaningful.
  */
 function isCaseSensitiveFS(): boolean {
-	const probe = mkdtempSync(join(tmpdir(), "ks-case-probe-"));
 	try {
-		writeFileSync(join(probe, "probe.md"), "");
-		return !existsSync(join(probe, "PROBE.MD"));
-	} finally {
-		rmSync(probe, { recursive: true, force: true });
+		const probe = mkdtempSync(join(tmpdir(), "ks-case-probe-"));
+		try {
+			writeFileSync(join(probe, "probe.md"), "");
+			return !existsSync(join(probe, "PROBE.MD"));
+		} finally {
+			rmSync(probe, { recursive: true, force: true });
+		}
+	} catch {
+		// Probe failed (e.g. tmpdir unwritable in a sandboxed CI environment).
+		// Fall back to false (treat as case-insensitive) — skips extended assertions
+		// rather than crashing the module.
+		return false;
 	}
 }
 
