@@ -315,9 +315,12 @@ export class ConsolidationEngine {
 		for (let i = 0; i < episodes.length; i += chunkSize) {
 			const chunk = episodes.slice(i, i + chunkSize);
 			const chunkLabel = `${Math.floor(i / chunkSize) + 1}/${Math.ceil(episodes.length / chunkSize)}`;
+			const episodeTitles = [...new Set(chunk.map((ep) => ep.sessionTitle))]
+				.map((t) => `"${t.length > 40 ? `${t.slice(0, 40)}…` : t}"`)
+				.join(", ");
 
 			logger.log(
-				`[consolidation/${reader.source}] Chunk ${chunkLabel} (${chunk.length} episodes)`,
+				`[consolidation/${reader.source}] Chunk ${chunkLabel} (${chunk.length} episodes): ${episodeTitles}`,
 			);
 
 			const counts = await this.processChunk(reader.source, chunk);
@@ -496,6 +499,9 @@ export class ConsolidationEngine {
 						onInsert: (inserted) => {
 							chunkCreated++;
 							changedIds.add(inserted.id);
+							logger.log(
+								`[consolidation/${source}] + insert [${inserted.type}] ${inserted.content.replace(/\r?\n/g, " ")}`,
+							);
 							// Add to cache so subsequent entries in this chunk can deduplicate against it.
 							// Embedding is available immediately since insertNewEntry stores it.
 							if (inserted.embedding) {
@@ -508,8 +514,13 @@ export class ConsolidationEngine {
 						onUpdate: (id, updated, freshEmbedding) => {
 							chunkUpdated++;
 							changedIds.add(id);
-							// Update the cache with the new content and fresh embedding.
 							const existing = entriesMap.get(id);
+							const contentForLog = updated.content ?? existing?.content ?? "";
+							const typeForLog = updated.type ?? existing?.type ?? "?";
+							logger.log(
+								`[consolidation/${source}] ~ update [${typeForLog}] ${contentForLog.replace(/\r?\n/g, " ")}`,
+							);
+							// Update the cache with the new content and fresh embedding.
 							if (existing) {
 								entriesMap.set(id, {
 									...existing,
@@ -522,10 +533,10 @@ export class ConsolidationEngine {
 								});
 							}
 						},
-					onKeep: () => {},
-				},
-				chunkSessionTimestamp,
-			);
+						onKeep: () => {},
+					},
+					chunkSessionTimestamp,
+				);
 			} catch (err) {
 				// Log and skip this extracted entry — do NOT rethrow.
 				// Rethrowing would skip recordEpisode for the whole chunk, causing all
