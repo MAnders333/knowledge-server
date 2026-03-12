@@ -56,7 +56,8 @@ function isCaseSensitiveFS(): boolean {
 		// Fall back to false (treat as case-insensitive) — skips extended assertions
 		// rather than crashing the module.
 		// Re-throw anything unexpected so real bugs surface.
-		const code = (e as NodeJS.ErrnoException).code;
+		// EPERM is the Windows equivalent of EACCES/EROFS.
+		const code = e instanceof Error ? (e as { code?: string }).code : undefined;
 		if (code === "EACCES" || code === "EROFS" || code === "EPERM") return false;
 		throw e;
 	}
