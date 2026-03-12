@@ -19,7 +19,7 @@
  *   - close() is a no-op and doesn't throw
  */
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalFilesEpisodeReader } from "../src/consolidation/readers/local-files";
@@ -34,6 +34,25 @@ let reader: LocalFilesEpisodeReader;
 
 /** Fixed base mtime for deterministic comparisons. */
 const BASE = 1_700_000_000_000;
+
+/**
+ * Probe whether the OS temp directory uses a case-sensitive filesystem.
+ * Writes a lowercase sentinel file and checks whether the uppercase name
+ * resolves to the same path. macOS APFS (default) is case-insensitive;
+ * Linux ext4/tmpfs is case-sensitive. The result determines whether
+ * uppercase-extension test assertions are meaningful.
+ */
+function isCaseSensitiveFS(): boolean {
+	const probe = mkdtempSync(join(tmpdir(), "ks-case-probe-"));
+	try {
+		writeFileSync(join(probe, "probe.md"), "");
+		return !existsSync(join(probe, "PROBE.MD"));
+	} finally {
+		rmSync(probe, { recursive: true, force: true });
+	}
+}
+
+const CASE_SENSITIVE_FS = isCaseSensitiveFS();
 
 /** Write a Markdown file with a specific mtime. */
 function writeFile(name: string, content: string, mtimeMs = BASE): string {
@@ -96,17 +115,28 @@ describe("LocalFilesEpisodeReader — file filtering", () => {
 	});
 
 	it("includes .md files (extension filter uses toLowerCase)", () => {
-		// Test that the extension check is `extname(…).toLowerCase() === ".md"`,
-		// not a case-sensitive equality. We test only lowercase here because macOS
-		// APFS (case-insensitive by default) collapses `upper.MD` and `mixed.Md`
-		// to the same inode as `lower.md`, making multi-case assertions
-		// non-deterministic across platforms. The `.toLowerCase()` call in the
-		// implementation (local-files.ts:165) is the invariant; the unit test for
-		// that line is better placed as a pure function test if needed.
-		writeFile("notes.md", "# Notes\nsome content", BASE);
-		const candidates = reader.getCandidateSessions(BASE - 1);
-		expect(candidates).toHaveLength(1);
-		expect(candidates[0].id).toContain("notes.md");
+		// Always include lowercase .md — should work on any filesystem.
+		writeFile("lower.md", "# Lower\nsome content", BASE);
+
+		if (CASE_SENSITIVE_FS) {
+			// On case-sensitive filesystems (Linux), uppercase extensions are
+			// distinct files — assert all three variants are included.
+			writeFile("upper.MD", "# Upper\nsome content", BASE + 1000);
+			writeFile("mixed.Md", "# Mixed\nsome content", BASE + 2000);
+			const candidates = reader.getCandidateSessions(BASE - 1);
+			expect(candidates).toHaveLength(3);
+			const ids = candidates.map((c) => c.id);
+			expect(ids).toContain(join(knowledgeDir, "lower.md"));
+			expect(ids).toContain(join(knowledgeDir, "upper.MD"));
+			expect(ids).toContain(join(knowledgeDir, "mixed.Md"));
+		} else {
+			// On case-insensitive filesystems (macOS APFS), "upper.MD" and
+			// "mixed.Md" collapse to the same inode — only the lowercase
+			// variant can be tested deterministically.
+			const candidates = reader.getCandidateSessions(BASE - 1);
+			expect(candidates).toHaveLength(1);
+			expect(candidates[0].id).toBe(join(knowledgeDir, "lower.md"));
+		}
 	});
 
 	it("ignores subdirectories", () => {
