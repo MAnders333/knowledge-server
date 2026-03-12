@@ -245,7 +245,7 @@ Ask yourself: "Did a human deliberately write this down so that others (or their
 
 - LOW-DENSITY source: a conversational session, Q&A exchange, debugging trace, exploratory discussion, or any artifact pasted as a throwaway illustration or debugging aid. Most of the content is transient context. Apply the high bar strictly — most low-density sessions should produce few or no entries.
 
-Mixed content: if an episode contains both conversational text and embedded structured artifacts, treat each segment independently — the embedded artifact may be HIGH-DENSITY even if the surrounding session is LOW-DENSITY.
+Mixed content: if an episode contains both conversational text and embedded structured artifacts, treat each segment independently — apply the authorial-intent question to each: was this artifact curated for future reference, or pasted as a one-off? If the latter, treat it as LOW-DENSITY regardless of its structure.
 
 THE BAR (applied per entry after density assessment):
 Only encode something if a future version of yourself would genuinely benefit from remembering it across sessions. Ask yourself: "Would I be glad this was in my memory six months from now?" If not, skip it.
