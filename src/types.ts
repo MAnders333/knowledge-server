@@ -155,7 +155,7 @@ export interface Episode {
 	timeCreated: number;
 	maxMessageTime: number; // max time_created of messages in this episode — used for cursor advance
 	content: string; // pre-formatted text (either compaction summary or formatted messages)
-	contentType: "compaction_summary" | "messages"; // what kind of content this is
+	contentType: "compaction_summary" | "messages" | "document"; // what kind of content this is
 	approxTokens: number; // rough token estimate for budget enforcement
 }
 

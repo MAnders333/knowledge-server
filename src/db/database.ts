@@ -972,7 +972,7 @@ export class KnowledgeDB {
 		sessionId: string,
 		startMessageId: string,
 		endMessageId: string,
-		contentType: "compaction_summary" | "messages",
+		contentType: "compaction_summary" | "messages" | "document",
 		entriesCreated: number,
 	): void {
 		this.db

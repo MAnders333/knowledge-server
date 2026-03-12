@@ -134,6 +134,14 @@ export const config = {
 	//   means "auto-detect" rather than "path was not found".
 	vscodeDataDir: process.env.VSCODE_DATA_DIR || "",
 
+	// localFilesDir: directory containing Markdown files to ingest as a knowledge source.
+	//   Default: ~/knowledge (user-visible, memorable location).
+	//   Override with LOCAL_FILES_DIR env var.
+	//   If the directory does not exist, the source is silently skipped (no warning,
+	//   no error) — the feature is opt-in by creating the directory.
+	localFilesDir:
+		process.env.LOCAL_FILES_DIR || join(homedir(), "knowledge"),
+
 	// Explicit source enable/disable.
 	// All default to true (auto-detect); set to "false" to hard-disable a source.
 	opencodeEnabled: process.env.OPENCODE_ENABLED !== "false",
@@ -141,6 +149,7 @@ export const config = {
 	cursorEnabled: process.env.CURSOR_ENABLED !== "false",
 	codexEnabled: process.env.CODEX_ENABLED !== "false",
 	vscodeEnabled: process.env.VSCODE_ENABLED !== "false",
+	localFilesEnabled: process.env.LOCAL_FILES_ENABLED !== "false",
 
 	// LLM credentials — three tiers, evaluated per-provider at call time:
 	//

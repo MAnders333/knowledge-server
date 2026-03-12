@@ -68,8 +68,11 @@ All setup steps are idempotent — re-running is safe.
 | **Cursor** | `~/.config/Cursor/User/globalStorage/state.vscdb` (SQLite) | Linux |
 | **VSCode** | `~/Library/Application Support/Code/User/workspaceStorage/*/chatSessions/*.json` (JSON) | macOS |
 | **VSCode** | `~/.config/Code/User/workspaceStorage/*/chatSessions/*.json` (JSON) | Linux |
+| **Local files** | `~/knowledge/*.md` (Markdown) | macOS, Linux |
 
-All sources are enabled by default and auto-detected on startup. Disable any with `OPENCODE_ENABLED=false`, `CLAUDE_ENABLED=false`, `CODEX_ENABLED=false`, `CURSOR_ENABLED=false`, or `VSCODE_ENABLED=false`. Override a path with `OPENCODE_DB_PATH`, `CLAUDE_DB_PATH`, `CODEX_SESSIONS_DIR`, `CURSOR_DB_PATH`, or `VSCODE_DATA_DIR`.
+All sources are enabled by default and auto-detected on startup. Disable any with `OPENCODE_ENABLED=false`, `CLAUDE_ENABLED=false`, `CODEX_ENABLED=false`, `CURSOR_ENABLED=false`, `VSCODE_ENABLED=false`, or `LOCAL_FILES_ENABLED=false`. Override a path with `OPENCODE_DB_PATH`, `CLAUDE_DB_PATH`, `CODEX_SESSIONS_DIR`, `CURSOR_DB_PATH`, `VSCODE_DATA_DIR`, or `LOCAL_FILES_DIR`.
+
+The local-files source is opt-in by directory presence: if `~/knowledge/` does not exist it is silently skipped. Create the directory and drop `.md` files in it to start ingesting them.
 
 ## How it works
 
@@ -102,10 +105,10 @@ The similarity thresholds (0.82 for reconsolidation, 0.4 for the contradiction s
 ## Architecture
 
 ```
-OpenCode    Claude Code    Cursor    Codex CLI    VSCode
-(SQLite)      (JSONL)    (SQLite)    (JSONL)     (JSON)
-    │             │          │          │           │
-    └─────────────┴──────────┴──────────┴───────────┘
+OpenCode    Claude Code    Cursor    Codex CLI    VSCode    Local Files
+(SQLite)      (JSONL)    (SQLite)    (JSONL)     (JSON)    (Markdown)
+    │             │          │          │           │           │
+    └─────────────┴──────────┴──────────┴───────────┴───────────┘
                             ▼
                    EpisodeReader          reads new sessions since cursor (per source)
                         │
@@ -342,6 +345,8 @@ Two options — set one or the other (or both; per-provider credentials take pre
 | `CURSOR_ENABLED` | `true` | Set to `false` to disable Cursor session reading. |
 | `VSCODE_DATA_DIR` | *(auto-detected)* | Path to VSCode's data directory. Auto-detected per platform (macOS: `~/Library/Application Support/Code`, Linux: `~/.config/Code`). |
 | `VSCODE_ENABLED` | `true` | Set to `false` to disable VSCode session reading. |
+| `LOCAL_FILES_DIR` | `~/knowledge` | Directory containing `.md` files to ingest. Source is silently skipped if the directory does not exist. |
+| `LOCAL_FILES_ENABLED` | `true` | Set to `false` to hard-disable local file ingestion. |
 
 ### Consolidation
 

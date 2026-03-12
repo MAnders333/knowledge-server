@@ -6,6 +6,7 @@ import type { IEpisodeReader } from "../../types.js";
 import { ClaudeCodeEpisodeReader } from "./claude-code.js";
 import { CodexEpisodeReader, resolveCodexSessionsDir } from "./codex.js";
 import { CursorEpisodeReader, resolveCursorDbPath } from "./cursor.js";
+import { LocalFilesEpisodeReader } from "./local-files.js";
 import { OpenCodeEpisodeReader } from "./opencode.js";
 import { VSCodeEpisodeReader, resolveVSCodeDataDir } from "./vscode.js";
 
@@ -14,6 +15,7 @@ export { ClaudeCodeEpisodeReader } from "./claude-code.js";
 export { CursorEpisodeReader } from "./cursor.js";
 export { CodexEpisodeReader } from "./codex.js";
 export { VSCodeEpisodeReader } from "./vscode.js";
+export { LocalFilesEpisodeReader } from "./local-files.js";
 
 /**
  * Probe list of candidate OpenCode DB paths to check when OPENCODE_DB_PATH is not set.
@@ -177,6 +179,21 @@ export function createEpisodeReaders(): IEpisodeReader[] {
 		}
 	} else {
 		logger.log("[sources] VSCode: disabled (VSCODE_ENABLED=false)");
+	}
+
+	// ── Local Files ──
+	if (config.localFilesEnabled) {
+		if (existsSync(config.localFilesDir)) {
+			readers.push(new LocalFilesEpisodeReader(config.localFilesDir));
+			logger.log(`[sources] Local files: ${config.localFilesDir}`);
+		} else {
+			// Not a warning — this is opt-in. The directory simply doesn't exist yet.
+			logger.log(
+				`[sources] Local files: directory not found at ${config.localFilesDir} — skipping. Create it or set LOCAL_FILES_DIR to enable.`,
+			);
+		}
+	} else {
+		logger.log("[sources] Local files: disabled (LOCAL_FILES_ENABLED=false)");
 	}
 
 	return readers;
