@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.10.0](https://github.com/MAnders333/knowledge-server/compare/v2.9.0...v2.10.0) (2026-03-12)
+
+
+### Features
+
+* **db:** add PostgreSQL backend as alternative to SQLite ([27cc669](https://github.com/MAnders333/knowledge-server/commit/27cc6698b703f85963879fe6eb2a45e311de24cd))
+* **db:** add PostgreSQL backend as alternative to SQLite ([27cc669](https://github.com/MAnders333/knowledge-server/commit/27cc6698b703f85963879fe6eb2a45e311de24cd))
+* **db:** add PostgreSQL backend as alternative to SQLite ([a767608](https://github.com/MAnders333/knowledge-server/commit/a7676084700be562785a3e6533732855e5ed48c0))
+
+
+### Bug Fixes
+
+* **db:** address review findings in PostgresKnowledgeDB ([38591a8](https://github.com/MAnders333/knowledge-server/commit/38591a85b952065920d6ed94b40048f82336cf78))
+* **db:** build array param outside transaction in persistClusters ([48dcd8c](https://github.com/MAnders333/knowledge-server/commit/48dcd8cbb4b8f3deb5be61c602a8cac710f98bf1))
+* **db:** drop string type arg from sql.array — expects OID number ([cde5f17](https://github.com/MAnders333/knowledge-server/commit/cde5f17b8fc121f596d1ce2e0e8e31a0a6fa6059))
+* **db:** harden PostgresKnowledgeDB and wire PG into CI ([b535c10](https://github.com/MAnders333/knowledge-server/commit/b535c10811d454db2dc01304e83b84d53e4ca502))
+* **test:** correct TRUNCATE comment — knowledge_relation cascades from knowledge_entry ([8fdfc55](https://github.com/MAnders333/knowledge-server/commit/8fdfc55c2f737eee817a65463992659833c02e08))
+* **test:** restore knowledge_cluster to TRUNCATE list in pg-integration ([47486d5](https://github.com/MAnders333/knowledge-server/commit/47486d57e780e3c87a9a53e8b70599470f4554c6))
+
 ## [2.9.0](https://github.com/MAnders333/knowledge-server/compare/v2.8.0...v2.9.0) (2026-03-12)
 
 
