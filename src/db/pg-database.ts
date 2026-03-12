@@ -1208,14 +1208,20 @@ export class PostgresKnowledgeDB implements IKnowledgeDB {
 		const now = Date.now();
 		const newClusterIds = new Set(clusters.map((c) => c.id));
 
+		// Build the array parameter outside the transaction — postgres.js's
+		// TransactionSql scope does not expose .array(); only the top-level sql does.
+		const keepIdsParam =
+			newClusterIds.size > 0
+				? this.sql.array([...newClusterIds], "text")
+				: null;
+
 		await this.sql.begin(async (sql: TxSql) => {
 			// Remove stale clusters in a single DELETE rather than N round-trips.
 			// ON DELETE CASCADE on knowledge_cluster_member handles membership cleanup.
-			const keepIds = [...newClusterIds];
-			if (keepIds.length > 0) {
+			if (keepIdsParam !== null) {
 				await sql`
 					DELETE FROM knowledge_cluster
-					WHERE id != ALL(${sql.array(keepIds, "text")})
+					WHERE id != ALL(${keepIdsParam})
 				`;
 			} else {
 				// No clusters remain — wipe everything
