@@ -500,6 +500,8 @@ export class ConsolidationEngine {
 							chunkCreated++;
 							changedIds.add(inserted.id);
 							logger.log(
+								// type is a validated KnowledgeType enum — bare interpolation is safe.
+								// content is LLM-sourced — JSON.stringify escapes injected newlines/tokens.
 								`[consolidation/${source}] + insert [${inserted.type}] ${JSON.stringify(inserted.content)}`,
 							);
 							// Add to cache so subsequent entries in this chunk can deduplicate against it.
