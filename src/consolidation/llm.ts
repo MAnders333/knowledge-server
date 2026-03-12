@@ -728,16 +728,23 @@ export interface ContradictionResult {
 
 /**
  * Format a batch of episodes into a text summary for the LLM.
- * Episodes can be either compaction summaries (already condensed)
- * or raw message sequences.
+ * Episodes can be compaction summaries (already condensed), raw message
+ * sequences, or standalone documents (local Markdown files).
  */
 export function formatEpisodes(episodes: Episode[]): string {
 	return episodes
 		.map((ep) => {
 			const typeLabel =
-				ep.contentType === "compaction_summary" ? " (compaction summary)" : "";
-			return `### Session: "${ep.sessionTitle}"${typeLabel} (${new Date(ep.timeCreated).toISOString().split("T")[0]}, project: ${ep.projectName})
-${ep.content}`;
+				ep.contentType === "compaction_summary"
+					? " (compaction summary)"
+					: ep.contentType === "document"
+						? " (document)"
+						: "";
+			const header =
+				ep.contentType === "document"
+					? `### Document: "${ep.sessionTitle}"${typeLabel} (${new Date(ep.timeCreated).toISOString().split("T")[0]})`
+					: `### Session: "${ep.sessionTitle}"${typeLabel} (${new Date(ep.timeCreated).toISOString().split("T")[0]}, project: ${ep.projectName})`;
+			return `${header}\n${ep.content}`;
 		})
 		.join("\n\n---\n\n");
 }

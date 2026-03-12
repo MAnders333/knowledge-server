@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { extname, join } from "node:path";
+import { basename, extname, join } from "node:path";
 import { config } from "../../config.js";
+import { logger } from "../../logger.js";
 import type { Episode, IEpisodeReader, ProcessedRange } from "../../types.js";
 import { MAX_TOKENS_PER_EPISODE, approxTokens } from "./shared.js";
 
@@ -113,10 +114,11 @@ export class LocalFilesEpisodeReader implements IEpisodeReader {
 			const tokens = approxTokens(content);
 
 			// Warn if over the per-episode soft limit — consolidate.ts chunk guard
-			// will handle it, but it's useful to surface in logs.
+			// will handle it, but surface it in logs so large files are visible.
 			if (tokens > MAX_TOKENS_PER_EPISODE) {
-				// Imported intentionally — no action needed here, just informational.
-				// The consolidation engine's MAX_CHUNK_TOKENS guard will split it.
+				logger.warn(
+					`[local-files] "${title}" is ~${tokens} tokens — exceeds soft limit (${MAX_TOKENS_PER_EPISODE}), will be processed in a single chunk.`,
+				);
 			}
 
 			episodes.push({
@@ -186,7 +188,7 @@ function deriveTitle(content: string, filePath: string): string {
 	if (headingMatch) return headingMatch[1].trim();
 
 	// Fallback: filename without extension, with hyphens/underscores replaced by spaces.
-	const base = filePath.split("/").pop() ?? filePath;
+	const base = basename(filePath);
 	return base.replace(/\.md$/i, "").replace(/[-_]/g, " ");
 }
 
