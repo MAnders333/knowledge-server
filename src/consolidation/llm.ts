@@ -238,7 +238,17 @@ export class ConsolidationLLM {
 
 You operate like the human brain during sleep consolidation — most experiences fade, only genuinely useful things are encoded into long-term memory.
 
-THE BAR IS HIGH. Most episodes should produce NO entries (return []). Only encode something if a future version of yourself would genuinely benefit from remembering it across sessions. Ask yourself: "Would I be glad this was in my memory six months from now?" If not, skip it.
+STEP 1 — ASSESS SOURCE DENSITY before extracting anything.
+Look at what you have been given and classify it:
+
+- HIGH-DENSITY source: a reference document, data dictionary, schema catalog, analytics annotation log, Confluence page, or any structured artifact where the author already curated the content for future reference. Every distinct fact in a high-density source is a candidate for extraction — apply the bar entry-by-entry, not to the document as a whole. Expect to produce many entries.
+
+- LOW-DENSITY source: a conversational session, Q&A exchange, debugging trace, or exploratory discussion. Most of the content is transient context. Apply the high bar strictly — most low-density sessions should produce few or no entries.
+
+Ask yourself: "Did a human deliberately write this down so that others (or their future self) could look it up later?" If yes, it's high-density. If it's the natural by-product of a working session, it's low-density.
+
+THE BAR (applied per entry after density assessment):
+Only encode something if a future version of yourself would genuinely benefit from remembering it across sessions. Ask yourself: "Would I be glad this was in my memory six months from now?" If not, skip it.
 
 Knowledge types:
 - "fact": A specific, stable piece of information (e.g., "The MI Jira Team field ID is customfield_11000 = '370a2d4c...'")
