@@ -133,6 +133,18 @@ async function main() {
 		process.exit(0);
 	}
 
+	// `knowledge-server help-advanced` — less-common commands not shown in main --help
+	if (subcommand === "help-advanced") {
+		console.log(`knowledge-server v${pkg.version} — advanced commands
+
+  migrate-config            Generate ~/.config/knowledge-server/config.jsonc from
+                            legacy environment variables (POSTGRES_CONNECTION_URI,
+                            KNOWLEDGE_DB_PATH). Run once after upgrading from a
+                            pre-config.jsonc release. Safe to re-run.
+`);
+		process.exit(0);
+	}
+
 	// `knowledge-server reinitialize [--confirm|--dry-run]`
 	if (subcommand === "reinitialize") {
 		await runReinitialize(subcommandArgs);
@@ -154,13 +166,14 @@ Commands:
   review [--filter <f>]     Interactively review entries (filter: conflicted|stale|all)
   calibrate                 Recommend similarity thresholds for the active embedding model
   reinitialize              Wipe all knowledge and reset consolidation cursor
-  migrate-config            Generate config.jsonc from legacy environment variables
   setup-tool <tool>         Set up integration (opencode|claude-code|cursor|codex|vscode)
   update [--version v1.2.3] Update to the latest (or specified) release
   mcp                       Start the MCP stdio proxy (used by tool integrations)
 
 Options:
   -h, --help                Show this help message
+
+Run \`knowledge-server help-advanced\` for additional commands (migrate-config, etc.)
 `);
 		process.exit(0);
 	}

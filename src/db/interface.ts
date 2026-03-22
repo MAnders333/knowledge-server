@@ -27,9 +27,15 @@ export interface IKnowledgeDB {
 	): Promise<void>;
 
 	/**
-	 * Low-level field update. Prefer `KnowledgeService.updateEntry` over calling
-	 * this directly — the service layer automatically re-embeds when content or
-	 * topics change, whereas this method writes whatever you pass as-is.
+	 * Low-level field update for non-semantic fields (status, strength, confidence,
+	 * scope, isSynthesized, embedding).
+	 *
+	 * **Never call this directly with `content` or `topics` changes.**
+	 * Use `KnowledgeService.updateEntry` instead — it automatically re-embeds
+	 * the entry when semantic fields change, keeping the stored vector in sync.
+	 * Calling this directly with content/topics changes will silently leave the
+	 * embedding stale, causing wrong similarity scores in activation and
+	 * reconsolidation.
 	 */
 	updateEntry(id: string, updates: Partial<KnowledgeEntry>): Promise<void>;
 
