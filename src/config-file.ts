@@ -250,29 +250,30 @@ function validateConfigFile(
 		);
 	}
 
-	// Exactly one writable store required
+	// At least one writable store required.
+	// Multiple writable stores are allowed — but require domain routing to be
+	// configured so the engine knows which store each entry belongs to.
 	const writableStores = stores.filter((s) => s.writable);
 	if (writableStores.length === 0) {
 		throw new Error(
-			`config.jsonc "stores" must have exactly one store with "writable": true`,
-		);
-	}
-	if (writableStores.length > 1) {
-		throw new Error(
-			`config.jsonc "stores" has ${writableStores.length} writable stores — exactly one is required. ` +
-				`Writable store ids: ${writableStores.map((s) => s.id).join(", ")}`,
+			`config.jsonc "stores" must have at least one store with "writable": true`,
 		);
 	}
 
-	// domains — optional, defaults to empty (single-store, no routing)
+	// domains — optional, defaults to empty (single-store mode)
 	const domains: DomainConfig[] = [];
 	if ("domains" in obj) {
 		if (!Array.isArray(obj.domains)) {
 			throw new Error(`config.jsonc "domains" must be an array`);
 		}
 		const storeIds = new Set(stores.map((s) => s.id));
+		const writableStoreIds = new Set(
+			stores.filter((s) => s.writable).map((s) => s.id),
+		);
 		for (let i = 0; i < obj.domains.length; i++) {
-			domains.push(validateDomain(obj.domains[i], i, storeIds));
+			domains.push(
+				validateDomain(obj.domains[i], i, storeIds, writableStoreIds),
+			);
 		}
 		// Validate no duplicate domain ids
 		const domainIds = domains.map((d) => d.id);
@@ -282,6 +283,30 @@ function validateConfigFile(
 		if (domainDupes.length > 0) {
 			throw new Error(
 				`config.jsonc "domains" contains duplicate ids: ${[...new Set(domainDupes)].join(", ")}`,
+			);
+		}
+	}
+
+	// If more than one writable store exists, domains must be configured.
+	// Without domains, the engine has no way to decide which writable store
+	// a given entry belongs to — consolidation routing would be ambiguous.
+	if (writableStores.length > 1 && domains.length === 0) {
+		throw new Error(
+			`config.jsonc has ${writableStores.length} writable stores but no "domains" configured. Domains are required when multiple writable stores exist so the engine knows where to route each entry. Writable store ids: ${writableStores.map((s) => s.id).join(", ")}`,
+		);
+	}
+
+	// Warn about writable stores not covered by any domain (likely a config mistake).
+	// Not a hard error — a writable store could intentionally be a fallback target.
+	if (domains.length > 0) {
+		const coveredStoreIds = new Set(domains.map((d) => d.store));
+		const uncoveredWritable = writableStores.filter(
+			(s) => !coveredStoreIds.has(s.id),
+		);
+		if (uncoveredWritable.length > 0) {
+			// Log at config parse time — logger may not be available here, so use console.warn.
+			console.warn(
+				`[config] Warning: writable store(s) not targeted by any domain: ${uncoveredWritable.map((s) => s.id).join(", ")}. These stores will only receive entries via the fallback domain path.`,
 			);
 		}
 	}
@@ -310,6 +335,7 @@ function validateDomain(
 	raw: unknown,
 	index: number,
 	storeIds: Set<string>,
+	writableStoreIds: Set<string>,
 ): DomainConfig {
 	const loc = `config.jsonc domains[${index}]`;
 	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
@@ -342,6 +368,12 @@ function validateDomain(
 	if (!storeIds.has(d.store)) {
 		throw new Error(
 			`${loc} references unknown store "${d.store}" — must be one of: ${[...storeIds].join(", ")}`,
+		);
+	}
+	if (!writableStoreIds.has(d.store)) {
+		throw new Error(
+			`${loc} references read-only store "${d.store}" — domains must target a writable store because consolidation writes go there. ` +
+				`Writable stores: ${[...writableStoreIds].join(", ")}`,
 		);
 	}
 

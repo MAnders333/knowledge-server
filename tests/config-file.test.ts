@@ -174,11 +174,31 @@ describe("loadConfigFile", () => {
 			}),
 		);
 		expect(() => loadConfigFile(configPath)).toThrow(
-			/exactly one store.*writable/,
+			/at least one store.*writable/,
 		);
 	});
 
-	it("throws when multiple writable stores", () => {
+	it("allows multiple writable stores when domains are configured", () => {
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				stores: [
+					{ id: "personal", kind: "sqlite", writable: true },
+					{ id: "work", kind: "sqlite", writable: true },
+				],
+				domains: [
+					{ id: "personal", description: "Personal", store: "personal" },
+					{ id: "work", description: "Work", store: "work" },
+				],
+			}),
+		);
+		// Should not throw — multiple writable stores are valid when domains are configured
+		const config = loadConfigFile(configPath);
+		expect(config.stores).toHaveLength(2);
+		expect(config.domains).toHaveLength(2);
+	});
+
+	it("throws when multiple writable stores and no domains", () => {
 		writeFileSync(
 			configPath,
 			JSON.stringify({
@@ -188,7 +208,9 @@ describe("loadConfigFile", () => {
 				],
 			}),
 		);
-		expect(() => loadConfigFile(configPath)).toThrow(/2 writable stores/);
+		expect(() => loadConfigFile(configPath)).toThrow(
+			/2 writable stores.*no "domains"/,
+		);
 	});
 
 	it("throws on invalid store id characters", () => {
@@ -306,20 +328,15 @@ describe("loadConfigFile — domain and project validation", () => {
 	});
 
 	it("parses domains and projects", () => {
+		// Both domains point to the same writable store — valid in single-store setups.
+		// The domain id is a logical category; the store id is the physical backend.
 		writeFileSync(
 			configPath,
 			JSON.stringify({
-				stores: [
-					{ id: "personal", kind: "sqlite", writable: true },
-					{ id: "work", kind: "sqlite", writable: false },
-				],
+				stores: [{ id: "main", kind: "sqlite", writable: true }],
 				domains: [
-					{
-						id: "personal",
-						description: "Personal workflows",
-						store: "personal",
-					},
-					{ id: "work", description: "Team knowledge", store: "work" },
+					{ id: "personal", description: "Personal workflows", store: "main" },
+					{ id: "work", description: "Team knowledge", store: "main" },
 				],
 				projects: [{ path: "~/work/project", default_domain: "work" }],
 			}),
@@ -327,7 +344,7 @@ describe("loadConfigFile — domain and project validation", () => {
 		const config = loadConfigFile(configPath);
 		expect(config.domains).toHaveLength(2);
 		expect(config.domains[0].id).toBe("personal");
-		expect(config.domains[1].store).toBe("work");
+		expect(config.domains[1].store).toBe("main");
 		expect(config.projects).toHaveLength(1);
 		expect(config.projects[0].default_domain).toBe("work");
 	});
@@ -356,6 +373,25 @@ describe("loadConfigFile — domain and project validation", () => {
 		const config = loadConfigFile(configPath);
 		expect(config.projects[0].path).not.toContain("~");
 		expect(config.projects[0].path).toContain(homedir());
+	});
+
+	it("throws when domain references a read-only store", () => {
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				stores: [
+					{ id: "primary", kind: "sqlite", writable: true },
+					{ id: "readonly", kind: "sqlite", writable: false },
+				],
+				domains: [
+					// This should fail — domains must target writable stores
+					{ id: "work", description: "Team knowledge", store: "readonly" },
+				],
+			}),
+		);
+		expect(() => loadConfigFile(configPath)).toThrow(
+			/read-only store "readonly"/,
+		);
 	});
 
 	it("throws when domain references unknown store", () => {

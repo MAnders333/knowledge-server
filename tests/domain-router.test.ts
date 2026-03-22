@@ -12,9 +12,10 @@ function makeConfig(
 	overrides: Partial<KnowledgeServerConfig> = {},
 ): KnowledgeServerConfig {
 	return {
+		// Both writable — domains are configured so multiple writable stores are valid
 		stores: [
 			{ id: "personal", kind: "sqlite", writable: true },
-			{ id: "work", kind: "sqlite", writable: false },
+			{ id: "work", kind: "sqlite", writable: true },
 		],
 		domains: [
 			{
@@ -32,6 +33,7 @@ function makeConfig(
 			{ path: `${homedir()}/work/project-a`, default_domain: "work" },
 			{ path: `${homedir()}/personal`, default_domain: "personal" },
 		],
+		userId: "default",
 		...overrides,
 	};
 }
