@@ -29,10 +29,49 @@ export interface StoreConfig {
 }
 
 /**
+ * Domain configuration — a semantic category of knowledge.
+ *
+ * Each domain maps to exactly one store (by store id) and has a description
+ * that the LLM uses to classify knowledge entries during consolidation.
+ */
+export interface DomainConfig {
+	/** Unique domain identifier — used in routing and as a tag on entries. */
+	id: string;
+	/**
+	 * Human-readable description of what belongs in this domain.
+	 * Injected into the LLM extraction prompt to guide classification.
+	 * Example: "Personal preferences, individual workflows, user-specific setups"
+	 */
+	description: string;
+	/** ID of the store that receives consolidation writes for this domain. */
+	store: string;
+}
+
+/**
+ * Project configuration — maps a local directory path to a default domain.
+ *
+ * When a session's working directory matches a project path prefix, that
+ * project's default_domain is used as the prior for LLM classification.
+ * This is a hint, not a hard constraint — the LLM may still classify an
+ * individual entry differently (e.g. a personal preference found in a work project).
+ */
+export interface ProjectConfig {
+	/**
+	 * Absolute path prefix (~ is expanded to the home directory).
+	 * Sessions whose working directory starts with this path match this project.
+	 */
+	path: string;
+	/** Domain id to use as the default for sessions in this project. */
+	default_domain: string;
+}
+
+/**
  * Parsed and validated config.jsonc file.
  */
 export interface KnowledgeServerConfig {
 	stores: StoreConfig[];
+	domains: DomainConfig[];
+	projects: ProjectConfig[];
 }
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
@@ -205,7 +244,111 @@ function validateConfigFile(
 		);
 	}
 
-	return { stores };
+	// domains — optional, defaults to empty (single-store, no routing)
+	const domains: DomainConfig[] = [];
+	if ("domains" in obj) {
+		if (!Array.isArray(obj.domains)) {
+			throw new Error(`config.jsonc "domains" must be an array`);
+		}
+		const storeIds = new Set(stores.map((s) => s.id));
+		for (let i = 0; i < obj.domains.length; i++) {
+			domains.push(validateDomain(obj.domains[i], i, storeIds));
+		}
+		// Validate no duplicate domain ids
+		const domainIds = domains.map((d) => d.id);
+		const domainDupes = domainIds.filter(
+			(id, i) => domainIds.indexOf(id) !== i,
+		);
+		if (domainDupes.length > 0) {
+			throw new Error(
+				`config.jsonc "domains" contains duplicate ids: ${[...new Set(domainDupes)].join(", ")}`,
+			);
+		}
+	}
+
+	// projects — optional, defaults to empty
+	const projects: ProjectConfig[] = [];
+	if ("projects" in obj) {
+		if (!Array.isArray(obj.projects)) {
+			throw new Error(`config.jsonc "projects" must be an array`);
+		}
+		const domainIds = new Set(domains.map((d) => d.id));
+		for (let i = 0; i < obj.projects.length; i++) {
+			projects.push(validateProject(obj.projects[i], i, domainIds));
+		}
+	}
+
+	return { stores, domains, projects };
+}
+
+function validateDomain(
+	raw: unknown,
+	index: number,
+	storeIds: Set<string>,
+): DomainConfig {
+	const loc = `config.jsonc domains[${index}]`;
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+		throw new Error(`${loc} must be an object`);
+	}
+	const d = raw as Record<string, unknown>;
+
+	if (typeof d.id !== "string" || !d.id.trim()) {
+		throw new Error(`${loc} must have a non-empty string "id"`);
+	}
+	if (!/^[a-z0-9_-]+$/.test(d.id)) {
+		throw new Error(
+			`${loc} id "${d.id}" is invalid — use only lowercase letters, digits, hyphens, and underscores`,
+		);
+	}
+	if (typeof d.description !== "string" || !d.description.trim()) {
+		throw new Error(`${loc} must have a non-empty string "description"`);
+	}
+	if (typeof d.store !== "string" || !d.store.trim()) {
+		throw new Error(`${loc} must have a non-empty string "store"`);
+	}
+	if (!storeIds.has(d.store)) {
+		throw new Error(
+			`${loc} references unknown store "${d.store}" — must be one of: ${[...storeIds].join(", ")}`,
+		);
+	}
+
+	return {
+		id: d.id as string,
+		description: d.description as string,
+		store: d.store as string,
+	};
+}
+
+function validateProject(
+	raw: unknown,
+	index: number,
+	domainIds: Set<string>,
+): ProjectConfig {
+	const loc = `config.jsonc projects[${index}]`;
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+		throw new Error(`${loc} must be an object`);
+	}
+	const p = raw as Record<string, unknown>;
+
+	if (typeof p.path !== "string" || !p.path.trim()) {
+		throw new Error(`${loc} must have a non-empty string "path"`);
+	}
+	if (typeof p.default_domain !== "string" || !p.default_domain.trim()) {
+		throw new Error(`${loc} must have a non-empty string "default_domain"`);
+	}
+	if (domainIds.size > 0 && !domainIds.has(p.default_domain)) {
+		throw new Error(
+			`${loc} references unknown domain "${p.default_domain}" — must be one of: ${[...domainIds].join(", ")}`,
+		);
+	}
+
+	// Expand ~ to home directory
+	const expandedPath = (p.path as string).replace(/^~/, homedir());
+
+	return {
+		path: expandedPath,
+		default_domain: p.default_domain as string,
+	};
 }
 
 function validateStore(
@@ -310,4 +453,6 @@ export const DEFAULT_CONFIG: KnowledgeServerConfig = {
 			writable: true,
 		},
 	],
+	domains: [],
+	projects: [],
 };

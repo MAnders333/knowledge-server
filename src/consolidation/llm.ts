@@ -3,13 +3,10 @@ import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateText } from "ai";
 import { config } from "../config.js";
+import type { DomainContext } from "../domain-router.js";
 import { logger } from "../logger.js";
 import { clampKnowledgeScope, clampKnowledgeType } from "../types.js";
-import type {
-	Episode,
-	KnowledgeScope,
-	KnowledgeType,
-} from "../types.js";
+import type { Episode, KnowledgeScope, KnowledgeType } from "../types.js";
 
 /**
  * LLM interface for consolidation.
@@ -49,25 +46,41 @@ function createModel(modelString: string) {
 			// Per-provider credentials take precedence over unified endpoint.
 			// baseURL: per-provider override → unified proxy path → undefined (SDK uses api.anthropic.com)
 			const apiKey = config.llm.anthropic.apiKey || config.llm.apiKey;
-			const baseURL = config.llm.anthropic.baseURL ||
-				(config.llm.baseEndpoint ? `${config.llm.baseEndpoint}/anthropic/v1` : undefined);
+			const baseURL =
+				config.llm.anthropic.baseURL ||
+				(config.llm.baseEndpoint
+					? `${config.llm.baseEndpoint}/anthropic/v1`
+					: undefined);
 			const provider = createAnthropic({ ...(baseURL && { baseURL }), apiKey });
 			return provider(modelId);
 		}
 		case "google": {
 			const apiKey = config.llm.google.apiKey || config.llm.apiKey;
-			const baseURL = config.llm.google.baseURL ||
-				(config.llm.baseEndpoint ? `${config.llm.baseEndpoint}/gemini/v1beta` : undefined);
-			const provider = createGoogleGenerativeAI({ ...(baseURL && { baseURL }), apiKey });
+			const baseURL =
+				config.llm.google.baseURL ||
+				(config.llm.baseEndpoint
+					? `${config.llm.baseEndpoint}/gemini/v1beta`
+					: undefined);
+			const provider = createGoogleGenerativeAI({
+				...(baseURL && { baseURL }),
+				apiKey,
+			});
 			return provider(modelId);
 		}
 		default: {
 			// openai/ prefix or any unknown provider — use OpenAI-compatible SDK.
 			const apiKey = config.llm.openai.apiKey || config.llm.apiKey;
 			// baseURL is required by createOpenAICompatible — fall back to public API.
-			const baseURL = config.llm.openai.baseURL ||
-				(config.llm.baseEndpoint ? `${config.llm.baseEndpoint}/openai/v1` : "https://api.openai.com/v1");
-			const provider = createOpenAICompatible({ name: providerName, baseURL, apiKey });
+			const baseURL =
+				config.llm.openai.baseURL ||
+				(config.llm.baseEndpoint
+					? `${config.llm.baseEndpoint}/openai/v1`
+					: "https://api.openai.com/v1");
+			const provider = createOpenAICompatible({
+				name: providerName,
+				baseURL,
+				apiKey,
+			});
 			return provider.chatModel(modelId);
 		}
 	}
@@ -230,9 +243,15 @@ export class ConsolidationLLM {
 	/**
 	 * Extract knowledge entries from a batch of episodes.
 	 * Uses the extraction model (highest quality — complex reasoning task).
+	 *
+	 * @param episodeSummaries Pre-formatted episode content.
+	 * @param domainContext    Optional domain routing context. When provided,
+	 *                         the LLM assigns each entry to a domain (for multi-store
+	 *                         routing). When absent, domain assignment is skipped.
 	 */
 	async extractKnowledge(
 		episodeSummaries: string,
+		domainContext?: DomainContext,
 	): Promise<ExtractedKnowledge[]> {
 		const systemPrompt = `You are a knowledge consolidation engine. Your job is to distill raw conversation episodes into structured, durable knowledge entries.
 
@@ -295,6 +314,23 @@ FORMAT:
 
 Respond ONLY with a JSON array. No markdown, no explanation. Return [] if nothing meets the bar.`;
 
+		// Domain routing context — injected when multi-store routing is configured.
+		// Tells the LLM which domains exist and which is the default for this session.
+		const domainSection = domainContext
+			? `\n## DOMAIN ASSIGNMENT
+This session belongs to the "${domainContext.defaultDomain}" domain by default.
+Assign each entry to exactly one of the following domains based on its content:
+
+${domainContext.domains.map((d) => `- "${d.id}": ${d.description}`).join("\n")}
+
+Assignment rules:
+- Use the default domain ("${domainContext.defaultDomain}") when the content clearly belongs there.
+- Override to a different domain when the content is a better fit — for example, a personal tool
+  preference found in a work session belongs in the personal domain, not the work domain.
+- The domain field must be exactly one of: ${domainContext.domains.map((d) => `"${d.id}"`).join(", ")}.
+`
+			: "";
+
 		// NOTE: episode content is wrapped in XML tags with explicit instructions to
 		// treat the inner text as inert data. This limits the blast radius of
 		// prompt-injection attempts embedded in conversation content.
@@ -303,7 +339,7 @@ The following block contains raw conversation content to extract knowledge from.
 <episode-content>
 ${episodeSummaries}
 </episode-content>
-
+${domainSection}
 Extract knowledge entries as a JSON array:
 [
   {
@@ -312,7 +348,7 @@ Extract knowledge entries as a JSON array:
     "topics": ["topic1", "topic2"],
     "confidence": 0.5-1.0,
     "scope": "personal|team",
-    "source": "Brief provenance (e.g., 'session: Churn Analysis, Feb 2026')"
+    "source": "Brief provenance (e.g., 'session: Churn Analysis, Feb 2026')"${domainContext ? `,\n    "domain": "${domainContext.domains.map((d) => d.id).join("|")}"` : ""}
   }
 ]
 
@@ -333,6 +369,10 @@ If there is nothing new worth extracting, return an empty array: []`;
 			return [];
 		}
 
+		const validDomainIds = domainContext
+			? new Set(domainContext.domains.map((d) => d.id))
+			: null;
+
 		return (
 			parsed
 				// type is intentionally not validated in the filter — clamped to KnowledgeType in the map below
@@ -350,6 +390,11 @@ If there is nothing new worth extracting, return an empty array: []`;
 					source:
 						entry.source ||
 						`extraction ${new Date().toISOString().split("T")[0]}`,
+					// Clamp domain to valid ids — hallucinated ids fall back to undefined
+					// and the caller defaults to the session's resolved domain.
+					...(validDomainIds && entry.domain && validDomainIds.has(entry.domain)
+						? { domain: entry.domain as string }
+						: {}),
 				}))
 		);
 	}
@@ -528,7 +573,9 @@ If no meaningful synthesis is possible, return: []`;
 			2048,
 		);
 
-		const parsed = parseJSON<Array<Partial<SynthesisResult> & { sourceIds?: string[] }>>(response, true);
+		const parsed = parseJSON<
+			Array<Partial<SynthesisResult> & { sourceIds?: string[] }>
+		>(response, true);
 
 		if (!parsed || !Array.isArray(parsed) || parsed.length === 0) {
 			return [];
@@ -692,6 +739,12 @@ export interface ExtractedKnowledge {
 	confidence: number;
 	scope: KnowledgeScope;
 	source: string;
+	/**
+	 * Domain id assigned by the LLM during extraction (multi-store routing).
+	 * Only present when domainContext was passed to extractKnowledge().
+	 * Used by ConsolidationEngine to route the entry to the correct store.
+	 */
+	domain?: string;
 	/** Set to true when this entry was produced by synthesis rather than LLM extraction from an episode. */
 	isSynthesized?: boolean;
 }

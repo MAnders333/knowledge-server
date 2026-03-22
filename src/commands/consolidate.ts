@@ -17,7 +17,12 @@ export async function runConsolidate(): Promise<void> {
 	const db = registry.writableStore();
 	const activation = new ActivationEngine(db, registry.readStores());
 	const readers = createEpisodeReaders();
-	const consolidation = new ConsolidationEngine(db, activation, readers);
+	const consolidation = new ConsolidationEngine(
+		db,
+		activation,
+		readers,
+		registry.domainRouter,
+	);
 
 	try {
 		// Check for embedding model change before consolidating — ensures all

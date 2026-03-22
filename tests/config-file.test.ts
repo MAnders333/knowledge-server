@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	DEFAULT_SQLITE_PATH,
@@ -289,5 +289,129 @@ describe("resolvePostgresUri", () => {
 		});
 		expect(result).toBe("postgres://hyphen/db");
 		delete process.env[hyphenEnvKey];
+	});
+});
+
+describe("loadConfigFile — domain and project validation", () => {
+	let tempDir: string;
+	let configPath: string;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(join(tmpdir(), "ks-domain-config-test-"));
+		configPath = join(tempDir, "config.jsonc");
+	});
+
+	afterEach(() => {
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("parses domains and projects", () => {
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				stores: [
+					{ id: "personal", kind: "sqlite", writable: true },
+					{ id: "work", kind: "sqlite", writable: false },
+				],
+				domains: [
+					{
+						id: "personal",
+						description: "Personal workflows",
+						store: "personal",
+					},
+					{ id: "work", description: "Team knowledge", store: "work" },
+				],
+				projects: [{ path: "~/work/project", default_domain: "work" }],
+			}),
+		);
+		const config = loadConfigFile(configPath);
+		expect(config.domains).toHaveLength(2);
+		expect(config.domains[0].id).toBe("personal");
+		expect(config.domains[1].store).toBe("work");
+		expect(config.projects).toHaveLength(1);
+		expect(config.projects[0].default_domain).toBe("work");
+	});
+
+	it("defaults to empty domains and projects when omitted", () => {
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				stores: [{ id: "main", kind: "sqlite", writable: true }],
+			}),
+		);
+		const config = loadConfigFile(configPath);
+		expect(config.domains).toHaveLength(0);
+		expect(config.projects).toHaveLength(0);
+	});
+
+	it("expands ~ in project paths", () => {
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				stores: [{ id: "main", kind: "sqlite", writable: true }],
+				domains: [{ id: "personal", description: "desc", store: "main" }],
+				projects: [{ path: "~/personal", default_domain: "personal" }],
+			}),
+		);
+		const config = loadConfigFile(configPath);
+		expect(config.projects[0].path).not.toContain("~");
+		expect(config.projects[0].path).toContain(homedir());
+	});
+
+	it("throws when domain references unknown store", () => {
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				stores: [{ id: "main", kind: "sqlite", writable: true }],
+				domains: [{ id: "work", description: "desc", store: "nonexistent" }],
+			}),
+		);
+		expect(() => loadConfigFile(configPath)).toThrow(
+			/unknown store "nonexistent"/,
+		);
+	});
+
+	it("throws on duplicate domain ids", () => {
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				stores: [{ id: "main", kind: "sqlite", writable: true }],
+				domains: [
+					{ id: "personal", description: "d1", store: "main" },
+					{ id: "personal", description: "d2", store: "main" },
+				],
+			}),
+		);
+		expect(() => loadConfigFile(configPath)).toThrow(
+			/duplicate ids:.*personal/,
+		);
+	});
+
+	it("throws when project references unknown domain", () => {
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				stores: [{ id: "main", kind: "sqlite", writable: true }],
+				domains: [{ id: "personal", description: "desc", store: "main" }],
+				projects: [{ path: "~/work", default_domain: "nonexistent" }],
+			}),
+		);
+		expect(() => loadConfigFile(configPath)).toThrow(
+			/unknown domain "nonexistent"/,
+		);
+	});
+
+	it("allows projects with no domains defined (domain validation skipped)", () => {
+		// Projects with no domains configured — default_domain validation is skipped
+		// since there are no domains to validate against.
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				stores: [{ id: "main", kind: "sqlite", writable: true }],
+				projects: [{ path: "~/work", default_domain: "anything" }],
+			}),
+		);
+		// Should not throw — no domains to validate against
+		expect(() => loadConfigFile(configPath)).not.toThrow();
 	});
 });

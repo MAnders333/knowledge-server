@@ -44,7 +44,12 @@ export async function runStatus(pidPath: string): Promise<void> {
 
 		const activation = new ActivationEngine(db, registry.readStores());
 		const readers = createEpisodeReaders();
-		const consolidation = new ConsolidationEngine(db, activation, readers);
+		const consolidation = new ConsolidationEngine(
+			db,
+			activation,
+			readers,
+			registry.domainRouter,
+		);
 		const { pendingSessions } = await consolidation.checkPending();
 		consolidation.close();
 

@@ -197,7 +197,12 @@ Options:
 	const db = registry.writableStore();
 	const activation = new ActivationEngine(db, registry.readStores());
 	const readers = createEpisodeReaders();
-	const consolidation = new ConsolidationEngine(db, activation, readers);
+	const consolidation = new ConsolidationEngine(
+		db,
+		activation,
+		readers,
+		registry.domainRouter,
+	);
 
 	// Check if this is a first run (no knowledge yet, but episodes exist)
 	const stats = await db.getStats();

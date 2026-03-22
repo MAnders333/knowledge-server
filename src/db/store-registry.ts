@@ -6,6 +6,7 @@ import {
 	resolveSqlitePath,
 } from "../config-file.js";
 import type { KnowledgeServerConfig, StoreConfig } from "../config-file.js";
+import { DomainRouter } from "../domain-router.js";
 import { logger } from "../logger.js";
 import { KnowledgeDB } from "./database.js";
 import type { IKnowledgeDB } from "./interface.js";
@@ -30,8 +31,14 @@ export class StoreRegistry {
 	private stores: Map<string, IKnowledgeDB>;
 	private writable: IKnowledgeDB;
 	private readable: IKnowledgeDB[];
+	/** Domain router for consolidation routing. Null when no domains are configured. */
+	readonly domainRouter: DomainRouter | null;
 
-	private constructor(stores: Map<string, IKnowledgeDB>, writableId: string) {
+	private constructor(
+		stores: Map<string, IKnowledgeDB>,
+		writableId: string,
+		config: KnowledgeServerConfig,
+	) {
 		this.stores = stores;
 		const writable = stores.get(writableId);
 		if (!writable) {
@@ -41,6 +48,10 @@ export class StoreRegistry {
 		}
 		this.writable = writable;
 		this.readable = Array.from(stores.values());
+		this.domainRouter =
+			config.domains.length > 0
+				? new DomainRouter(config, stores, writable)
+				: null;
 	}
 
 	/** The store that receives consolidation writes. */
@@ -108,7 +119,7 @@ export class StoreRegistry {
 			initialized.map(({ id, db }) => [id, db]),
 		);
 
-		return new StoreRegistry(stores, writableId);
+		return new StoreRegistry(stores, writableId, config);
 	}
 }
 

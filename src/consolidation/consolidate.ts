@@ -1,6 +1,7 @@
 import type { ActivationEngine } from "../activation/activate.js";
 import { config } from "../config.js";
 import type { IKnowledgeDB } from "../db/index.js";
+import type { DomainRouter } from "../domain-router.js";
 import { logger } from "../logger.js";
 import type { IEpisodeReader, KnowledgeEntry } from "../types.js";
 import type { ConsolidationResult } from "../types.js";
@@ -48,6 +49,7 @@ export class ConsolidationEngine {
 	private llm: ConsolidationLLM;
 	private reconsolidator: Reconsolidator;
 	private contradictionScanner: ContradictionScanner;
+	private domainRouter: DomainRouter | null;
 
 	/**
 	 * Concurrency guard — only one consolidation run at a time, regardless of
@@ -92,10 +94,12 @@ export class ConsolidationEngine {
 		db: IKnowledgeDB,
 		activation: ActivationEngine,
 		readers: IEpisodeReader[] = [],
+		domainRouter: DomainRouter | null = null,
 	) {
 		this.db = db;
 		this.activation = activation;
 		this.readers = readers;
+		this.domainRouter = domainRouter;
 		this.llm = new ConsolidationLLM();
 		this.reconsolidator = new Reconsolidator(
 			db,
@@ -110,7 +114,10 @@ export class ConsolidationEngine {
 	 * Used at startup to decide whether to kick off a background consolidation.
 	 * Aggregates across all active readers.
 	 */
-	async checkPending(): Promise<{ pendingSessions: number; lastConsolidatedAt: number }> {
+	async checkPending(): Promise<{
+		pendingSessions: number;
+		lastConsolidatedAt: number;
+	}> {
 		const state = await this.db.getConsolidationState();
 		let pendingSessions = 0;
 
@@ -445,14 +452,28 @@ export class ConsolidationEngine {
 		}
 
 		// Fits within budget (or is a single episode that can't be split further).
-		// Load entries for reconsolidation. Existing knowledge is no longer passed to
-		// the extraction LLM — deduplication is handled by the reconsolidation step
-		// (embedding similarity + decideMerge).
+		// Load entries for reconsolidation across ALL read stores — deduplication is
+		// cross-store so we don't re-insert knowledge that already exists in any domain.
+		// Load entries from the primary writable store for reconsolidation/dedup.
+		// Cross-store deduplication (against read-only domain stores) is not implemented
+		// in this release — entries in secondary stores may produce near-duplicates if
+		// the same knowledge surface appears in a different domain session. This is an
+		// accepted limitation of the initial domain routing design.
 		const allEntriesForChunk = await this.db.getActiveEntriesWithEmbeddings();
+
+		// Domain routing: resolve the domain for this chunk based on the episodes' directory.
+		// Use the first episode's directory as the representative — episodes within a chunk
+		// come from the same session source. The LLM may still classify individual entries
+		// into different domains (e.g. a personal preference found in a work project).
+		const chunkDirectory = chunk[0]?.directory ?? "";
+		const domainResolution = this.domainRouter?.resolve(chunkDirectory) ?? null;
 
 		// Extract knowledge via LLM (episodes only — no existing knowledge context).
 		const extractStart = Date.now();
-		const extracted = await this.llm.extractKnowledge(chunkSummary);
+		const extracted = await this.llm.extractKnowledge(
+			chunkSummary,
+			domainResolution?.domainContext ?? undefined,
+		);
 		logger.log(
 			`[consolidation/${source}] Extracted ${extracted.length} entries in ${((Date.now() - extractStart) / 1000).toFixed(1)}s.`,
 		);
@@ -491,6 +512,23 @@ export class ConsolidationEngine {
 
 		for (const entry of extracted) {
 			try {
+				// Resolve the target store for this entry:
+				// 1. If entry has an LLM-assigned domain, use that domain's store.
+				// 2. Otherwise fall back to the chunk's resolved domain store.
+				// 3. If no domain routing (domainResolution is null), pass undefined
+				//    so reconsolidate() uses this.db as its insertDb fallback.
+				//
+				// this.domainRouter is non-null whenever domainResolution is non-null:
+				// resolve() only returns non-null when domains are configured, and domains
+				// being configured is the precondition for domainRouter being non-null.
+				const domainRouter = this.domainRouter;
+				const entryTargetStore =
+					domainResolution && domainRouter
+						? (domainRouter.resolveStore(
+								entry.domain ?? domainResolution.domainId ?? undefined,
+							) ?? domainResolution.store)
+						: undefined;
+
 				await this.reconsolidator.reconsolidate(
 					entry,
 					sessionIds,
@@ -502,7 +540,7 @@ export class ConsolidationEngine {
 							logger.log(
 								// type is a validated KnowledgeType enum — bare interpolation is safe.
 								// content is LLM-sourced — JSON.stringify escapes injected newlines/tokens.
-								`[consolidation/${source}] + insert [${inserted.type}] ${JSON.stringify(inserted.content)}`,
+								`[consolidation/${source}] + insert [${inserted.type}] ${entry.domain ? `domain:${entry.domain} ` : ""}${JSON.stringify(inserted.content)}`,
 							);
 							// Add to cache so subsequent entries in this chunk can deduplicate against it.
 							// Embedding is available immediately since insertNewEntry stores it.
@@ -538,6 +576,9 @@ export class ConsolidationEngine {
 						onKeep: () => {},
 					},
 					chunkSessionTimestamp,
+					undefined, // precomputedEmbedding
+					"consolidation",
+					entryTargetStore,
 				);
 			} catch (err) {
 				// Log and skip this extracted entry — do NOT rethrow.
