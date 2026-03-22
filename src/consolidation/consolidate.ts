@@ -256,8 +256,25 @@ export class ConsolidationEngine {
 		// 0. Optional async preparation step (e.g. PendingEpisodesReader pre-loads
 		//    its candidate list from the pending_episodes table before the sync
 		//    getCandidateSessions / countNewSessions calls).
+		//    Wrapped in try/catch so a prepare() failure (e.g. DB unreachable)
+		//    skips this source rather than aborting the entire consolidation run.
 		if (reader.prepare) {
-			await reader.prepare(cursor.lastMessageTimeCreated);
+			try {
+				await reader.prepare(cursor.lastMessageTimeCreated);
+			} catch (err) {
+				logger.error(
+					`[consolidation/${reader.source}] prepare() failed — skipping source this run:`,
+					err,
+				);
+				return {
+					sessionsProcessed: 0,
+					segmentsProcessed: 0,
+					entriesCreated: 0,
+					entriesUpdated: 0,
+					conflictsDetected: 0,
+					conflictsResolved: 0,
+				};
+			}
 		}
 
 		// 1. Fetch candidate sessions: those with messages newer than this source's cursor.
