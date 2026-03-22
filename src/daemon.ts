@@ -24,7 +24,6 @@
  */
 
 import { config, validateConfig } from "./config.js";
-import { resolveUserId } from "./config-file.js";
 import { createEpisodeReaders } from "./consolidation/readers/index.js";
 import { KnowledgeDB } from "./db/database.js";
 import { StoreRegistry } from "./db/store-registry.js";
@@ -51,9 +50,6 @@ if (errors.length > 0) {
 	process.exit(1);
 }
 
-// Resolve user ID (KNOWLEDGE_USER_ID → config.jsonc → hostname → "default")
-const userId = resolveUserId(config.userId ?? undefined);
-
 // Local SQLite DB — always used for daemon cursor storage.
 // Uses the default SQLite path if not configured explicitly.
 const localDb = new KnowledgeDB();
@@ -63,6 +59,9 @@ const localDb = new KnowledgeDB();
 // In remote setups this is a Postgres instance the server also connects to.
 const registry = await StoreRegistry.create();
 const targetDb = registry.writableStore();
+
+// Resolve user ID from StoreRegistry (reads config.jsonc → KNOWLEDGE_USER_ID → hostname → "default")
+const userId = registry.userId;
 
 // Episode readers — same set as the consolidation engine uses locally.
 const readers = createEpisodeReaders();
