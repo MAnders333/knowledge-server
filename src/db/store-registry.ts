@@ -188,9 +188,7 @@ async function initStore(storeConfig: StoreConfig): Promise<IKnowledgeDB> {
  * Detection: a Postgres URI is considered "remote" if its host is not localhost
  * or 127.0.0.1 and is not a Unix socket path.
  */
-function warnIfMixedTopology(
-	config: import("../config-file.js").KnowledgeServerConfig,
-): void {
+function warnIfMixedTopology(config: KnowledgeServerConfig): void {
 	const hasSqliteWritable = config.stores.some(
 		(s) => s.kind === "sqlite" && s.writable,
 	);
@@ -198,15 +196,18 @@ function warnIfMixedTopology(
 
 	const hasRemotePostgres = config.stores.some((s) => {
 		if (s.kind !== "postgres") return false;
-		const uri =
-			process.env[`STORE_${s.id.toUpperCase().replace(/-/g, "_")}_URI`] ??
-			s.uri ??
-			"";
-		if (!uri) return false;
+		// Use resolvePostgresUri to match the actual URI used during initStore,
+		// avoiding silent divergence if the env-var naming convention changes.
+		let uri: string;
+		try {
+			uri = resolvePostgresUri(s);
+		} catch {
+			return false; // URI not configured — not remote
+		}
 		try {
 			const url = new URL(uri);
 			const host = url.hostname;
-			// Unix socket paths start with / or are empty
+			// Unix socket connections have an empty or path-like hostname.
 			if (!host || host.startsWith("/")) return false;
 			return host !== "localhost" && host !== "127.0.0.1" && host !== "::1";
 		} catch {
