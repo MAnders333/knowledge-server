@@ -126,7 +126,15 @@ export class StoreRegistry {
 			initialized.map(({ id, db }) => [id, db]),
 		);
 
-		return new StoreRegistry(stores, writableId, config);
+		const registry = new StoreRegistry(stores, writableId, config);
+
+		// Warn if writable SQLite stores coexist with remote Postgres stores.
+		// In this topology, a remote consolidation server cannot write to local SQLite —
+		// any entries the LLM classifies as belonging to the SQLite domain will be
+		// misrouted to the fallback store instead. This is a configuration smell.
+		warnIfMixedTopology(config);
+
+		return registry;
 	}
 }
 
@@ -166,6 +174,55 @@ async function initStore(storeConfig: StoreConfig): Promise<IKnowledgeDB> {
 
 	// TypeScript exhaustiveness — kind is validated in config-file.ts
 	throw new Error(`Unknown store kind: ${(storeConfig as StoreConfig).kind}`);
+}
+
+/**
+ * Warn if the config has writable SQLite stores alongside remote Postgres stores.
+ *
+ * This topology is problematic for remote consolidation: a knowledge server
+ * running on a different machine can connect to remote Postgres but cannot
+ * write to a local SQLite file. Entries classified as belonging to the SQLite
+ * domain would be misrouted to the fallback store rather than silently lost,
+ * but the operator should be aware of the limitation.
+ *
+ * Detection: a Postgres URI is considered "remote" if its host is not localhost
+ * or 127.0.0.1 and is not a Unix socket path.
+ */
+function warnIfMixedTopology(
+	config: import("../config-file.js").KnowledgeServerConfig,
+): void {
+	const hasSqliteWritable = config.stores.some(
+		(s) => s.kind === "sqlite" && s.writable,
+	);
+	if (!hasSqliteWritable) return;
+
+	const hasRemotePostgres = config.stores.some((s) => {
+		if (s.kind !== "postgres") return false;
+		const uri =
+			process.env[`STORE_${s.id.toUpperCase().replace(/-/g, "_")}_URI`] ??
+			s.uri ??
+			"";
+		if (!uri) return false;
+		try {
+			const url = new URL(uri);
+			const host = url.hostname;
+			// Unix socket paths start with / or are empty
+			if (!host || host.startsWith("/")) return false;
+			return host !== "localhost" && host !== "127.0.0.1" && host !== "::1";
+		} catch {
+			return false;
+		}
+	});
+
+	if (hasRemotePostgres) {
+		logger.warn(
+			"[config] Mixed topology detected: writable SQLite store(s) alongside remote Postgres store(s). " +
+				"If this knowledge server is accessed remotely (e.g. via the managed product or a team setup), " +
+				"entries classified as belonging to SQLite-backed domains cannot be written from the remote context " +
+				"and will fall back to the default store. " +
+				"Consider using Postgres for all writable stores in remote deployments.",
+		);
+	}
 }
 
 /** Redact password from a postgres URI for safe logging. */

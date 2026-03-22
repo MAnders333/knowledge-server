@@ -141,9 +141,55 @@ export class ConsolidationEngine {
 	}
 
 	/**
-	 * Run a consolidation cycle.
+	 * Public entry point. Acquires the DB-level advisory lock, delegates to
+	 * _consolidate(), and releases the lock in a finally block.
 	 *
-	 * This is the main entry point — called by HTTP API or CLI.
+	 * **Two-layer locking contract:**
+	 *
+	 * Layer 1 — Engine-level in-process lock (`tryLock` / `unlock`):
+	 *   Owned by callers (index.ts drain loop, API server, CLI).
+	 *   Prevents consolidate() and runSynthesis() from running concurrently
+	 *   within the same process. Must be acquired *before* calling consolidate().
+	 *
+	 * Layer 2 — DB-level advisory lock (`tryAcquireConsolidationLock`):
+	 *   Owned by consolidate() itself. Prevents concurrent consolidation across
+	 *   *different processes* that share the same Postgres DB (team members each
+	 *   running a local knowledge server against a shared remote DB).
+	 *   Returns an empty result immediately if another process holds it — never waits.
+	 *
+	 * `runSynthesis` is intentionally not wrapped in the DB advisory lock:
+	 *   Synthesis uses reconsolidate() which deduplicates via embedding similarity,
+	 *   making concurrent synthesis runs safe (they produce near-duplicate entries
+	 *   that the next synthesis pass will cluster and merge). The in-process lock
+	 *   (Layer 1) ensures synthesis and consolidation never overlap on the same instance.
+	 */
+	async consolidate(): Promise<ConsolidationResult> {
+		const lockAcquired = await this.db.tryAcquireConsolidationLock();
+		if (!lockAcquired) {
+			logger.log(
+				"[consolidation] Skipping — consolidation lock is already held (another process or concurrent call).",
+			);
+			return {
+				sessionsProcessed: 0,
+				segmentsProcessed: 0,
+				entriesCreated: 0,
+				entriesUpdated: 0,
+				entriesArchived: 0,
+				conflictsDetected: 0,
+				conflictsResolved: 0,
+				duration: 0,
+			};
+		}
+
+		try {
+			return await this._consolidate();
+		} finally {
+			await this.db.releaseConsolidationLock();
+		}
+	}
+
+	/**
+	 * Core consolidation logic. Called only from consolidate() after lock is held.
 	 *
 	 * Per-source per-run steps:
 	 * 1. Fetch candidate sessions since the source cursor
@@ -156,7 +202,7 @@ export class ConsolidationEngine {
 	 * 6. Apply decay to all active entries
 	 * 7. Generate embeddings for new/updated entries
 	 */
-	async consolidate(): Promise<ConsolidationResult> {
+	private async _consolidate(): Promise<ConsolidationResult> {
 		const startTime = Date.now();
 		const state = await this.db.getConsolidationState();
 

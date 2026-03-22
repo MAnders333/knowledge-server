@@ -91,6 +91,13 @@ function toNum(val: number | string): number {
 export class PostgresKnowledgeDB implements IKnowledgeDB {
 	private sql: postgres.Sql;
 	/**
+	 * Reserved connection held for the duration of the advisory lock.
+	 * Advisory locks in Postgres are session-scoped — acquire and release must
+	 * use the exact same backend connection. Storing a reserved connection here
+	 * ensures the pool doesn't route the unlock call to a different session.
+	 */
+	private _lockConnection: postgres.ReservedSql | null = null;
+	/**
 	 * Promise-based init lock: null = not started, pending Promise = in-flight,
 	 * resolved Promise = complete. All callers await the same Promise so
 	 * concurrent initialize() calls are safe.
@@ -1416,6 +1423,71 @@ export class PostgresKnowledgeDB implements IKnowledgeDB {
 			WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL
 		`;
 		return result.count;
+	}
+
+	// ── Consolidation lock ────────────────────────────────────────────────────
+
+	/**
+	 * Advisory lock key — the default port number, stable and application-specific.
+	 * Postgres advisory locks are DB-scoped: two processes connecting to the same
+	 * Postgres DB will contend on this key, serialising consolidation runs.
+	 * Using a plain number (fits in int4 range) — pg_try_advisory_lock accepts int8
+	 * but a plain JS number works fine for values this small.
+	 */
+	private static readonly ADVISORY_LOCK_KEY = 3179;
+
+	async tryAcquireConsolidationLock(): Promise<boolean> {
+		// Re-entrancy guard: pg_try_advisory_lock is re-entrant at the session level —
+		// calling it twice on the same session increments a counter, meaning one
+		// releaseConsolidationLock() call would not fully release it.
+		if (this._lockConnection) return false;
+
+		// Reserve a dedicated connection for the lock lifetime.
+		// Advisory locks are session-scoped in Postgres — acquire and release MUST
+		// use the same backend connection, otherwise pg_advisory_unlock is a no-op
+		// on the wrong session and the original lock leaks until the connection closes.
+		//
+		// Use a let/try/catch pattern so the connection is released if *either*
+		// sql.reserve() or the advisory-lock query throws — avoids pool exhaustion.
+		let reserved: postgres.ReservedSql | undefined;
+		try {
+			reserved = await this.sql.reserve();
+			const rows = await reserved<[{ acquired: boolean }]>`
+				SELECT pg_try_advisory_lock(${PostgresKnowledgeDB.ADVISORY_LOCK_KEY}) AS acquired
+			`;
+			const acquired = rows[0]?.acquired === true;
+			if (acquired) {
+				// Keep the reserved connection — releaseConsolidationLock() will use it.
+				this._lockConnection = reserved;
+			} else {
+				// Lock not acquired — release the reserved connection back to the pool.
+				reserved.release();
+			}
+			return acquired;
+		} catch (err) {
+			// reserve() or query failed — return the connection if one was reserved.
+			reserved?.release();
+			throw err;
+		}
+	}
+
+	async releaseConsolidationLock(): Promise<void> {
+		if (!this._lockConnection) return;
+		const conn = this._lockConnection;
+		this._lockConnection = null;
+		try {
+			const rows = await conn<[{ released: boolean }]>`
+				SELECT pg_advisory_unlock(${PostgresKnowledgeDB.ADVISORY_LOCK_KEY}) AS released
+			`;
+			if (rows[0]?.released === false) {
+				logger.warn(
+					"[consolidation] pg_advisory_unlock returned false — lock was not held by this connection. " +
+						"This should not happen with the reserved-connection pattern.",
+				);
+			}
+		} finally {
+			conn.release();
+		}
 	}
 
 	// ── Pending Episodes ─────────────────────────────────────────────────────

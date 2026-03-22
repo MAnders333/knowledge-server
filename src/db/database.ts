@@ -1661,6 +1661,26 @@ export class KnowledgeDB implements IKnowledgeDB {
 		return result.changes;
 	}
 
+	// ── Consolidation lock ────────────────────────────────────────────────────
+
+	/**
+	 * In-process flag. Prevents re-entrant consolidation on the same SQLite instance
+	 * (e.g. HTTP trigger fires while the polling loop is already running).
+	 * Does NOT prevent two separate processes sharing the same SQLite file from
+	 * consolidating simultaneously — that scenario is out of scope for SQLite.
+	 */
+	private _consolidationLockHeld = false;
+
+	async tryAcquireConsolidationLock(): Promise<boolean> {
+		if (this._consolidationLockHeld) return false;
+		this._consolidationLockHeld = true;
+		return true;
+	}
+
+	async releaseConsolidationLock(): Promise<void> {
+		this._consolidationLockHeld = false;
+	}
+
 	// ── Pending Episodes ─────────────────────────────────────────────────────
 
 	async insertPendingEpisode(episode: PendingEpisode): Promise<void> {

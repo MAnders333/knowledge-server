@@ -267,6 +267,32 @@ export interface IKnowledgeDB {
 	 */
 	clearAllEmbeddings(): Promise<number>;
 
+	// ── Consolidation lock ────────────────────────────────────────────────────
+
+	/**
+	 * Try to acquire an exclusive consolidation lock.
+	 *
+	 * Returns true if the lock was acquired (caller may proceed with consolidation).
+	 * Returns false if another process/instance already holds the lock (caller
+	 * should skip this consolidation run rather than waiting).
+	 *
+	 * SQLite: in-process boolean flag — prevents re-entrant consolidation on the
+	 * same DB instance. Multiple processes sharing the same SQLite file are rare
+	 * and not the primary use case (SQLite is single-machine).
+	 *
+	 * Postgres: pg_try_advisory_lock(3179) — session-scoped, prevents concurrent
+	 * consolidation across multiple processes sharing the same Postgres DB.
+	 * The lock key 3179 is the default knowledge-server port — stable, memorable,
+	 * and unique enough for this application.
+	 */
+	tryAcquireConsolidationLock(): Promise<boolean>;
+
+	/**
+	 * Release the consolidation lock acquired by tryAcquireConsolidationLock().
+	 * No-op if the lock is not currently held by this instance.
+	 */
+	releaseConsolidationLock(): Promise<void>;
+
 	// ── Pending Episodes (daemon ↔ server staging table) ──────────────────────
 
 	/**
