@@ -60,7 +60,7 @@ const localDb = new KnowledgeDB();
 const registry = await StoreRegistry.create();
 const targetDb = registry.writableStore();
 
-// Resolve user ID from StoreRegistry (reads config.jsonc → KNOWLEDGE_USER_ID → hostname → "default")
+// Resolve user ID from StoreRegistry (KNOWLEDGE_USER_ID → config.jsonc → hostname → "default")
 const userId = registry.userId;
 
 // Episode readers — same set as the consolidation engine uses locally.
