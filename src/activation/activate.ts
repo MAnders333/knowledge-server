@@ -470,19 +470,20 @@ export class ActivationEngine {
 		);
 
 		// Re-embed in-place: compute all new embeddings via a single batch call,
-		// then overwrite each entry's vector individually.
+		// then overwrite each entry's vector individually, then stamp the metadata.
 		//
 		// Failure modes:
-		// - embedBatch throws (network error, rate limit): setEmbeddingMetadata is
-		//   never reached → metadata still points to the old model → next startup
-		//   detects mismatch and retries in full. Safe.
+		// - embedBatch throws (network error, rate limit): nothing is written →
+		//   metadata still points to the old model → next startup detects mismatch
+		//   and retries in full. Safe.
 		// - Process crashes mid-loop: entries updated so far have new-model
 		//   embeddings; remaining entries still carry old-model embeddings (non-NULL).
-		//   Because metadata is written BEFORE the loop, next startup sees
-		//   stored.model === configuredModel and skips the re-embed. ensureEmbeddings
-		//   also skips them (not NULL). Mixed-dimension state persists silently until
-		//   a manual model toggle or clearAllEmbeddings(). Accepted trade-off: full
-		//   atomicity would require buffering all new embeddings before any DB write.
+		//   Because metadata is written AFTER the loop, next startup sees
+		//   stored.model !== configuredModel and re-runs the full re-embed. The
+		//   already-updated entries will be re-embedded redundantly but correctly.
+		//   This is preferable to the previous behaviour (metadata before loop) where
+		//   a mid-loop crash left mixed-dimension state that ensureEmbeddings could
+		//   not detect (entries had non-NULL embeddings of the wrong dimension).
 		const reEmbedStart = Date.now();
 
 		const texts = entriesWithEmbeddings.map((e) =>
@@ -490,21 +491,18 @@ export class ActivationEngine {
 		);
 		const newEmbeddings = await this.embeddings.embedBatch(texts);
 
-		// Probe dimensions before writing any entries so the metadata is consistent
-		// with what we're about to write (not what was there before).
 		const newDimensions =
 			newEmbeddings.length > 0 ? newEmbeddings[0].length : 0;
-
-		// Write metadata BEFORE the loop. See failure-modes comment above for
-		// the crash-recovery trade-offs. embedBatch throwing above means we never
-		// reach this line, so the old-model metadata remains and next startup retries.
-		await this.db.setEmbeddingMetadata(configuredModel, newDimensions);
 
 		for (let i = 0; i < entriesWithEmbeddings.length; i++) {
 			await this.db.updateEntry(entriesWithEmbeddings[i].id, {
 				embedding: newEmbeddings[i],
 			});
 		}
+
+		// Write metadata AFTER the loop so a mid-loop crash does not leave the DB
+		// with mixed-dimension embeddings that look consistent to the next startup.
+		await this.db.setEmbeddingMetadata(configuredModel, newDimensions);
 
 		const durationSec = ((Date.now() - reEmbedStart) / 1000).toFixed(1);
 

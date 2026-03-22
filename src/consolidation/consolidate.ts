@@ -3,8 +3,12 @@ import { config } from "../config.js";
 import type { IKnowledgeDB } from "../db/index.js";
 import type { DomainRouter } from "../domain-router.js";
 import { logger } from "../logger.js";
-import type { IEpisodeReader, KnowledgeEntry } from "../types.js";
-import type { ConsolidationResult } from "../types.js";
+import type {
+	ConsolidationResult,
+	Episode,
+	IEpisodeReader,
+	KnowledgeEntry,
+} from "../types.js";
 import { ContradictionScanner } from "./contradiction.js";
 import { computeStrength } from "./decay.js";
 import { ConsolidationLLM, formatEpisodes } from "./llm.js";
@@ -327,9 +331,28 @@ export class ConsolidationEngine {
 
 		const chunkSize = config.consolidation.chunkSize;
 
-		for (let i = 0; i < episodes.length; i += chunkSize) {
-			const chunk = episodes.slice(i, i + chunkSize);
-			const chunkLabel = `${Math.floor(i / chunkSize) + 1}/${Math.ceil(episodes.length / chunkSize)}`;
+		// Group episodes by domain when domain routing is configured so all
+		// episodes in a chunk share the same domain context. Without grouping,
+		// a chunk spanning multiple project directories would use chunk[0].directory
+		// as the domain hint for all entries — likely misrouting entries from the
+		// other directories. When no domain router is configured, episodes are
+		// processed in their original order (single-store mode).
+		const episodeGroups: (typeof episodes)[] = this.domainRouter
+			? groupByDomain(episodes, this.domainRouter)
+			: [episodes];
+
+		// Flatten groups into a single ordered sequence of chunks, preserving
+		// within-group ordering while ensuring cross-domain episodes don't mix.
+		const chunks: (typeof episodes)[] = [];
+		for (const group of episodeGroups) {
+			for (let i = 0; i < group.length; i += chunkSize) {
+				chunks.push(group.slice(i, i + chunkSize));
+			}
+		}
+
+		for (let ci = 0; ci < chunks.length; ci++) {
+			const chunk = chunks[ci];
+			const chunkLabel = `${ci + 1}/${chunks.length}`;
 			const episodeTitles = [...new Set(chunk.map((ep) => ep.sessionTitle))]
 				.map((t) => `"${t.length > 40 ? `${t.slice(0, 40)}…` : t}"`)
 				.join(", ");
@@ -699,4 +722,38 @@ export class ConsolidationEngine {
 			reader.close();
 		}
 	}
+}
+
+// ── Module helpers ────────────────────────────────────────────────────────────
+
+/**
+ * Group episodes by their resolved domain so episodes with different project
+ * directories don't end up in the same chunk.
+ *
+ * Within each group, original episode order is preserved. Groups are ordered
+ * by first-occurrence of their domain in the episode list.
+ *
+ * This ensures the DomainRouter receives a consistent directory for all episodes
+ * in a given chunk, so the domain context injected into the LLM extraction prompt
+ * accurately reflects the project the episodes actually came from.
+ */
+function groupByDomain(episodes: Episode[], router: DomainRouter): Episode[][] {
+	const groups = new Map<string, Episode[]>();
+	const order: string[] = [];
+
+	for (const ep of episodes) {
+		const resolution = router.resolve(ep.directory);
+		// Use domainId as the grouping key; undefined (no-domain mode) falls
+		// back to a single "__default__" group so behaviour degrades gracefully.
+		const key = resolution.domainId ?? "__default__";
+		let group = groups.get(key);
+		if (!group) {
+			group = [];
+			groups.set(key, group);
+			order.push(key);
+		}
+		group.push(ep);
+	}
+
+	return order.map((k) => groups.get(k) ?? []);
 }
