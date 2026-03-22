@@ -8,9 +8,19 @@ import { KnowledgeDB } from "../src/db/database";
 
 describe("resolveUserId", () => {
 	const envKey = "KNOWLEDGE_USER_ID";
+	let originalValue: string | undefined;
+
+	beforeEach(() => {
+		originalValue = process.env[envKey];
+		delete process.env[envKey];
+	});
 
 	afterEach(() => {
-		delete process.env[envKey];
+		if (originalValue !== undefined) {
+			process.env[envKey] = originalValue;
+		} else {
+			delete process.env[envKey];
+		}
 	});
 
 	it("returns KNOWLEDGE_USER_ID env var when set", () => {

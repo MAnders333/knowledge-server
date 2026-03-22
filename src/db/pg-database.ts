@@ -308,9 +308,20 @@ export class PostgresKnowledgeDB implements IKnowledgeDB {
 								  AND table_name = 'source_cursor'
 								  AND constraint_type = 'PRIMARY KEY'
 							`;
-							if (cursorPkRows.length > 0) {
-								const pkName = cursorPkRows[0].constraint_name as string;
-								await sql`ALTER TABLE source_cursor DROP CONSTRAINT ${sql(pkName)}`;
+							const cursorPkName =
+								cursorPkRows.length > 0
+									? String(cursorPkRows[0].constraint_name ?? "").trim()
+									: "";
+							if (cursorPkName) {
+								await sql`ALTER TABLE source_cursor DROP CONSTRAINT ${sql(cursorPkName)}`;
+							} else {
+								// No PK found via information_schema — log a warning so operators
+								// can investigate, then attempt ADD PRIMARY KEY anyway. If a PK
+								// actually exists under an unexpected name, the ADD will fail with
+								// a clear Postgres error rather than silently corrupting state.
+								logger.warn(
+									"[pg-db] v11 migration: could not find source_cursor primary key via information_schema. Proceeding with ADD PRIMARY KEY — will fail if an unnamed PK already exists.",
+								);
 							}
 							await sql`ALTER TABLE source_cursor ADD PRIMARY KEY (source, user_id)`;
 						}
@@ -333,9 +344,16 @@ export class PostgresKnowledgeDB implements IKnowledgeDB {
 								  AND table_name = 'consolidated_episode'
 								  AND constraint_type = 'PRIMARY KEY'
 							`;
-							if (episodePkRows.length > 0) {
-								const pkName = episodePkRows[0].constraint_name as string;
-								await sql`ALTER TABLE consolidated_episode DROP CONSTRAINT ${sql(pkName)}`;
+							const episodePkName =
+								episodePkRows.length > 0
+									? String(episodePkRows[0].constraint_name ?? "").trim()
+									: "";
+							if (episodePkName) {
+								await sql`ALTER TABLE consolidated_episode DROP CONSTRAINT ${sql(episodePkName)}`;
+							} else {
+								logger.warn(
+									"[pg-db] v11 migration: could not find consolidated_episode primary key via information_schema. Proceeding with ADD PRIMARY KEY — will fail if an unnamed PK already exists.",
+								);
 							}
 							await sql`
 								ALTER TABLE consolidated_episode

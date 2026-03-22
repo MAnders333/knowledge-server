@@ -178,10 +178,10 @@ export class KnowledgeDB implements IKnowledgeDB {
 						}>
 					).map((c) => c.name);
 					if (cursorCols.length > 0 && !cursorCols.includes("user_id")) {
-						// Each statement in a separate exec() call — multi-statement strings
-						// in db.exec() may auto-commit DDL individually in some SQLite binding
-						// versions, breaking the enclosing transaction. Individual calls ensure
-						// all DDL runs atomically within this.db.transaction().
+						// Each DDL statement in a separate exec() call for clarity and safety.
+						// In better-sqlite3, exec() participates in the enclosing transaction()
+						// wrapper regardless of statement count — splitting here avoids any
+						// ambiguity about multi-statement string handling across binding versions.
 						db.exec(
 							"ALTER TABLE source_cursor ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default'",
 						);

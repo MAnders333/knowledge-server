@@ -377,6 +377,9 @@ export function createApp(
 			version: pkg.version,
 			knowledge: stats,
 			consolidation: {
+				// userId gated behind admin — it's not a secret, but it identifies the
+				// running user in multi-user setups and shouldn't be publicly visible.
+				...(isAdmin && { userId }),
 				lastRun: consolidationState.lastConsolidatedAt
 					? new Date(consolidationState.lastConsolidatedAt).toISOString()
 					: null,

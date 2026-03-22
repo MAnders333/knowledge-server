@@ -36,7 +36,7 @@ export class StoreRegistry {
 	/**
 	 * Stable user identifier for multi-user shared DB setups.
 	 * Scopes the consolidation cursor and episode log per user.
-	 * Resolved from USER_ID env var → config.jsonc userId → hostname → "default".
+	 * Resolved from KNOWLEDGE_USER_ID env var → config.jsonc userId → hostname → "default".
 	 */
 	readonly userId: string;
 
