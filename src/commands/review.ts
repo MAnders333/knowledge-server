@@ -2,7 +2,7 @@ import * as readline from "node:readline";
 import { EmbeddingClient } from "../activation/embeddings.js";
 import { REVIEW_STALE_STRENGTH_THRESHOLD } from "../config.js";
 import { StoreRegistry } from "../db/store-registry.js";
-import { KnowledgeService } from "../knowledge-service.js";
+import { KnowledgeService } from "../services/knowledge-service.js";
 import type { KnowledgeEntry } from "../types.js";
 
 const CONTENT_DISPLAY_MAX = 200;

@@ -3,7 +3,7 @@ import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateText } from "ai";
 import { config } from "../config.js";
-import type { DomainContext } from "../domain-router.js";
+import type { DomainContext } from "./domain-router.js";
 import { logger } from "../logger.js";
 import { clampKnowledgeScope, clampKnowledgeType } from "../types.js";
 import type { Episode, KnowledgeScope, KnowledgeType } from "../types.js";

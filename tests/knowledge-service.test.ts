@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EmbeddingClient } from "../src/activation/embeddings";
 import { KnowledgeDB } from "../src/db/database";
-import { KnowledgeService } from "../src/knowledge-service";
+import { KnowledgeService } from "../src/services/knowledge-service";
 import { makeEntry } from "./fixtures";
 
 describe("KnowledgeService.updateEntry", () => {

@@ -18,9 +18,9 @@ import { createEpisodeReaders } from "./consolidation/readers/index.js";
 import { StoreRegistry } from "./db/store-registry.js";
 import { logger } from "./logger.js";
 import { main as mcpMain } from "./mcp/index.js";
-import { runSetupTool } from "./setup-tool.js";
-import { runStop } from "./stop.js";
-import { runUpdate } from "./update.js";
+import { runSetupTool } from "./commands/setup-tool.js";
+import { runStop } from "./commands/stop.js";
+import { runUpdate } from "./commands/update.js";
 
 // Bun normalises process.argv the same way for both compiled binaries and `bun run`:
 //   argv[0] = "bun"

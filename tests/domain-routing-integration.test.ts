@@ -29,7 +29,7 @@ import { ConsolidationEngine } from "../src/consolidation/consolidate";
 import { ConsolidationLLM } from "../src/consolidation/llm";
 import { OpenCodeEpisodeReader } from "../src/consolidation/readers/opencode";
 import { KnowledgeDB } from "../src/db/database";
-import { DomainRouter } from "../src/domain-router";
+import { DomainRouter } from "../src/consolidation/domain-router";
 import { fakeEmbedding } from "./fixtures";
 
 // ── helpers ───────────────────────────────────────────────────────────────────

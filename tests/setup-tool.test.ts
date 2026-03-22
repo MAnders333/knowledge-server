@@ -18,7 +18,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { setupCodex, setupCursor, stripJsoncComments } from "../src/setup-tool";
+import { setupCodex, setupCursor, stripJsoncComments } from "../src/commands/setup-tool";
 
 describe("stripJsoncComments", () => {
 	// ── Basic comment stripping ───────────────────────────────────────────────

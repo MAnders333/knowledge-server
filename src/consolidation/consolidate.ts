@@ -1,7 +1,7 @@
 import type { ActivationEngine } from "../activation/activate.js";
 import { config } from "../config.js";
 import type { IKnowledgeDB } from "../db/index.js";
-import type { DomainRouter } from "../domain-router.js";
+import type { DomainRouter } from "./domain-router.js";
 import { logger } from "../logger.js";
 import type {
 	ConsolidationResult,

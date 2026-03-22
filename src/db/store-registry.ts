@@ -6,7 +6,7 @@ import {
 	resolveSqlitePath,
 } from "../config-file.js";
 import type { KnowledgeServerConfig, StoreConfig } from "../config-file.js";
-import { DomainRouter } from "../domain-router.js";
+import { DomainRouter } from "../consolidation/domain-router.js";
 import { logger } from "../logger.js";
 import { KnowledgeDB } from "./database.js";
 import type { IKnowledgeDB } from "./interface.js";

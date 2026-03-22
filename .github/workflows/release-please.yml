@@ -65,7 +65,7 @@ jobs:
       - name: Build binaries
         run: |
           bun build --compile --minify src/index.ts --outfile dist/knowledge-server-${{ matrix.suffix }}
-          bun build --compile --minify src/daemon.ts --outfile dist/knowledge-daemon-${{ matrix.suffix }}
+          bun build --compile --minify src/daemon/index.ts --outfile dist/knowledge-daemon-${{ matrix.suffix }}
 
       - name: Generate checksums and compress
         run: |

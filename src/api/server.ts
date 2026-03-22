@@ -16,7 +16,7 @@ import {
 import { config, REVIEW_STALE_STRENGTH_THRESHOLD } from "../config.js";
 import type { ConsolidationEngine } from "../consolidation/consolidate.js";
 import type { IKnowledgeDB } from "../db/index.js";
-import { KnowledgeService } from "../knowledge-service.js";
+import { KnowledgeService } from "../services/knowledge-service.js";
 import { logger } from "../logger.js";
 import { activateInputSchema } from "../mcp/index.js";
 import type {
