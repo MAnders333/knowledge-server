@@ -27,15 +27,15 @@ export interface IKnowledgeDB {
 	): Promise<void>;
 
 	/**
-	 * Low-level field update for non-semantic fields (status, strength, confidence,
-	 * scope, isSynthesized, embedding).
+	 * Low-level field update for non-semantic fields: status, strength, confidence,
+	 * scope, isSynthesized — and `embedding` **only when supplying a freshly computed
+	 * vector for the current content/topics** (e.g. in ensureEmbeddings / checkAndReEmbed).
 	 *
-	 * **Never call this directly with `content` or `topics` changes.**
-	 * Use `KnowledgeService.updateEntry` instead — it automatically re-embeds
-	 * the entry when semantic fields change, keeping the stored vector in sync.
-	 * Calling this directly with content/topics changes will silently leave the
-	 * embedding stale, causing wrong similarity scores in activation and
-	 * reconsolidation.
+	 * **Never call this with `content` or `topics` changes.**
+	 * Use `KnowledgeService.updateEntry` instead — it automatically re-embeds when
+	 * semantic fields change, keeping the stored vector in sync.
+	 * Bypassing the service will silently leave the embedding stale, causing wrong
+	 * similarity scores in activation and reconsolidation.
 	 */
 	updateEntry(id: string, updates: Partial<KnowledgeEntry>): Promise<void>;
 

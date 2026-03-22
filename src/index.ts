@@ -133,18 +133,6 @@ async function main() {
 		process.exit(0);
 	}
 
-	// `knowledge-server help-advanced` — less-common commands not shown in main --help
-	if (subcommand === "help-advanced") {
-		console.log(`knowledge-server v${pkg.version} — advanced commands
-
-  migrate-config            Generate ~/.config/knowledge-server/config.jsonc from
-                            legacy environment variables (POSTGRES_CONNECTION_URI,
-                            KNOWLEDGE_DB_PATH). Run once after upgrading from a
-                            pre-config.jsonc release. Safe to re-run.
-`);
-		process.exit(0);
-	}
-
 	// `knowledge-server reinitialize [--confirm|--dry-run]`
 	if (subcommand === "reinitialize") {
 		await runReinitialize(subcommandArgs);
@@ -173,7 +161,18 @@ Commands:
 Options:
   -h, --help                Show this help message
 
-Run \`knowledge-server help-advanced\` for additional commands (migrate-config, etc.)
+Run \`knowledge-server help-advanced\` for additional commands.
+`);
+		process.exit(0);
+	}
+
+	// `knowledge-server help-advanced` — less-common commands, co-located with --help
+	if (subcommand === "help-advanced") {
+		console.log(`knowledge-server v${pkg.version} — advanced commands
+
+  migrate-config            Idempotent. Generates ~/.config/knowledge-server/config.jsonc
+                            from legacy env vars (POSTGRES_CONNECTION_URI, KNOWLEDGE_DB_PATH).
+                            Run once after upgrading from a pre-config.jsonc release.
 `);
 		process.exit(0);
 	}
