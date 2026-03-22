@@ -116,8 +116,8 @@ export async function runReview(args: string[]): Promise<void> {
 
 					case "d":
 					case "delete": {
-						const confirm = await prompt("  Delete this entry? (y/N) ");
-						if (confirm.trim().toLowerCase() === "y") {
+						const deleteConfirm = await prompt("  Delete this entry? (y/N) ");
+						if (deleteConfirm.trim().toLowerCase() === "y") {
 							await db.deleteEntry(entry.id);
 							console.log("  Deleted.\n");
 							deleted++;
@@ -131,9 +131,8 @@ export async function runReview(args: string[]): Promise<void> {
 
 					case "a":
 					case "archive":
-						// status is a non-semantic field — db.updateEntry is correct here,
-						// no re-embedding needed.
-						await db.updateEntry(entry.id, { status: "archived" });
+						// status is non-semantic — service passes it through without re-embedding.
+						await service.updateEntry(entry.id, { status: "archived" });
 						console.log("  Archived.\n");
 						archived++;
 						handled = true;

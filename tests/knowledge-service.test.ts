@@ -62,6 +62,45 @@ describe("KnowledgeService.updateEntry", () => {
 		expect(entry?.embedding?.[0]).toBeCloseTo(0.1);
 	});
 
+	it("re-embeds using new values when both content and topics change simultaneously", async () => {
+		await db.insertEntry(
+			makeEntry({
+				id: "e4",
+				content: "old content",
+				topics: ["old-topic"],
+				embedding: [0.9, 0.9, 0.9],
+			}),
+		);
+
+		await service.updateEntry("e4", {
+			content: "new content",
+			topics: ["new-topic"],
+		});
+
+		expect(embedSpy).toHaveBeenCalledTimes(1);
+		const entry = await db.getEntry("e4");
+		expect(entry?.content).toBe("new content");
+		expect(entry?.topics).toEqual(["new-topic"]);
+		expect(entry?.embedding?.[0]).toBeCloseTo(0.1);
+	});
+
+	it("propagates embed errors without writing to DB", async () => {
+		await db.insertEntry(
+			makeEntry({ id: "e5", content: "original", embedding: [0.9, 0.9, 0.9] }),
+		);
+
+		embedSpy.mockRejectedValueOnce(new Error("API quota exceeded"));
+
+		await expect(
+			service.updateEntry("e5", { content: "updated" }),
+		).rejects.toThrow("API quota exceeded");
+
+		// DB should be unchanged — no partial write
+		const entry = await db.getEntry("e5");
+		expect(entry?.content).toBe("original");
+		expect(entry?.embedding?.[0]).toBeCloseTo(0.9);
+	});
+
 	it("throws when entry does not exist", async () => {
 		await expect(
 			service.updateEntry("nonexistent", { content: "x" }),

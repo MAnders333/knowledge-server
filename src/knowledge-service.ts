@@ -17,8 +17,8 @@ import type { KnowledgeEntry } from "./types.js";
  *     re-computes and stores the embedding — no caller needs to remember to do
  *     this manually.
  *
- * All other IKnowledgeDB methods are delegated through unchanged. This keeps
- * the service surface minimal and avoids re-implementing the full DB interface.
+ * The service is intentionally narrow — only `updateEntry` and `close` are
+ * exposed. All other DB operations go directly through `IKnowledgeDB`.
  *
  * Backward compatibility: no schema changes, no migrations. Users who update
  * the binary automatically get the safer update path.

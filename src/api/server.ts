@@ -62,7 +62,7 @@ export function createApp(
 	adminTokenIsStable = false,
 ): Hono {
 	const app = new Hono();
-	// Share ActivationEngine's EmbeddingClient so tests can spy on a single instance.
+	// Reuse ActivationEngine's EmbeddingClient to avoid a second model connection.
 	const service = new KnowledgeService(db, activation.embeddings);
 
 	// -- /mcp streamable-http transport --
