@@ -373,8 +373,8 @@ If there is nothing new worth extracting, return an empty array: []`;
 			? new Set(domainContext.domains.map((d) => d.id))
 			: null;
 
-		// Log hallucinated domains outside the map pipeline — cleaner than an IIFE.
-		if (validDomainIds && parsed) {
+		// Log hallucinated domains before the map pipeline (parsed is non-null here).
+		if (validDomainIds) {
 			for (const entry of parsed) {
 				if (entry.domain && !validDomainIds.has(entry.domain)) {
 					logger.warn(
