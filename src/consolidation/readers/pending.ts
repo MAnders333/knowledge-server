@@ -76,13 +76,13 @@ export class PendingEpisodesReader implements IEpisodeReader {
 	 * Called by ConsolidationEngine before getCandidateSessions (optional hook).
 	 */
 	async prepare(afterMessageTimeCreated: number): Promise<void> {
-		// Reset cache state each time prepare() is called so stale candidates
-		// from a previous consolidation run don't persist into the next one.
-		// This also resets _prepared so countNewSessions' conservative default
-		// doesn't short-circuit when the cache holds expired data.
+		// Reset cache state before the async fetch so stale data from the previous
+		// run doesn't persist. _prepared stays false until the fetch completes so
+		// a DB error doesn't leave the reader in a "prepared but empty" state that
+		// would suppress the conservative return-1 in countNewSessions.
 		this._cachedRows = [];
 		this._cachedCandidates = [];
-		this._prepared = true;
+		this._prepared = false;
 		const rows = await this.db.getPendingEpisodes(
 			this.originalSource,
 			this.userId,
@@ -101,6 +101,8 @@ export class PendingEpisodesReader implements IEpisodeReader {
 		this._cachedCandidates = Array.from(sessionMap.entries()).map(
 			([id, maxMessageTime]) => ({ id, maxMessageTime }),
 		);
+		// Set _prepared only after successful cache population.
+		this._prepared = true;
 	}
 
 	getNewEpisodes(
