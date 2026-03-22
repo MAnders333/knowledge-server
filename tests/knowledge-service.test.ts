@@ -107,6 +107,6 @@ describe("KnowledgeService.updateEntry", () => {
 	it("throws when entry does not exist", async () => {
 		await expect(
 			service.updateEntry("nonexistent", { content: "x" }),
-		).rejects.toThrow("entry not found: nonexistent");
+		).rejects.toThrow("KnowledgeService.updateEntry: entry not found: nonexistent");
 	});
 });
