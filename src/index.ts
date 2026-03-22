@@ -9,6 +9,7 @@ import { runActivate } from "./commands/activate.js";
 import { runCalibrate } from "./commands/calibrate.js";
 import { runConsolidate } from "./commands/consolidate.js";
 import { runReinitialize } from "./commands/reinitialize.js";
+import { runReview } from "./commands/review.js";
 import { runStatus } from "./commands/status.js";
 import { config, validateConfig } from "./config.js";
 import { ConsolidationEngine } from "./consolidation/consolidate.js";
@@ -115,6 +116,17 @@ async function main() {
 		process.exit(0);
 	}
 
+	// `knowledge-server review [--filter <conflicted|stale|all>]`
+	if (subcommand === "review") {
+		const errors = validateConfig();
+		if (errors.length > 0) {
+			for (const err of errors) console.error(`  ✗ ${err}`);
+			process.exit(1);
+		}
+		await runReview(subcommandArgs);
+		process.exit(0);
+	}
+
 	// `knowledge-server reinitialize [--confirm|--dry-run]`
 	if (subcommand === "reinitialize") {
 		await runReinitialize(subcommandArgs);
@@ -133,6 +145,7 @@ Commands:
   status                    Show server state and knowledge graph stats
   consolidate               Run a manual consolidation cycle
   activate <query>          Test knowledge activation for a query
+  review [--filter <f>]     Interactively review entries (filter: conflicted|stale|all)
   calibrate                 Recommend similarity thresholds for the active embedding model
   reinitialize              Wipe all knowledge and reset consolidation cursor
   setup-tool <tool>         Set up integration (opencode|claude-code|cursor|codex|vscode)

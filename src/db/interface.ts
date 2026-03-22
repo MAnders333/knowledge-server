@@ -26,6 +26,11 @@ export interface IKnowledgeDB {
 		entry: Omit<KnowledgeEntry, "embedding"> & { embedding?: number[] },
 	): Promise<void>;
 
+	/**
+	 * Low-level field update. Prefer `KnowledgeService.updateEntry` over calling
+	 * this directly — the service layer automatically re-embeds when content or
+	 * topics change, whereas this method writes whatever you pass as-is.
+	 */
 	updateEntry(id: string, updates: Partial<KnowledgeEntry>): Promise<void>;
 
 	getEntry(id: string): Promise<KnowledgeEntry | null>;

@@ -8,15 +8,15 @@ import { bodyLimit } from "hono/body-limit";
 import pkg from "../../package.json" with { type: "json" };
 import type { ActivationEngine } from "../activation/activate.js";
 import { splitIntoCues } from "../activation/activate.js";
-import { formatEmbeddingText } from "../activation/embeddings.js";
 import {
 	contradictionTagBlock,
 	contradictionTagInline,
 	staleTag,
 } from "../activation/format.js";
-import { config } from "../config.js";
+import { config, REVIEW_STALE_STRENGTH_THRESHOLD } from "../config.js";
 import type { ConsolidationEngine } from "../consolidation/consolidate.js";
 import type { IKnowledgeDB } from "../db/index.js";
+import { KnowledgeService } from "../knowledge-service.js";
 import { logger } from "../logger.js";
 import { activateInputSchema } from "../mcp/index.js";
 import type {
@@ -24,12 +24,6 @@ import type {
 	KnowledgeEntry,
 	KnowledgeStatus,
 } from "../types.js";
-
-/**
- * Strength below which an active entry is considered stale and surfaced in /review.
- * Distinct from DECAY_ARCHIVE_THRESHOLD (0.15) — entries here are active but fading.
- */
-const REVIEW_STALE_STRENGTH_THRESHOLD = 0.3;
 
 /**
  * HTTP API for the knowledge server.
@@ -68,6 +62,8 @@ export function createApp(
 	adminTokenIsStable = false,
 ): Hono {
 	const app = new Hono();
+	// Share ActivationEngine's EmbeddingClient so tests can spy on a single instance.
+	const service = new KnowledgeService(db, activation.embeddings);
 
 	// -- /mcp streamable-http transport --
 	//
@@ -353,15 +349,17 @@ export function createApp(
 
 		// Per-source cursor info — surfaced so operators can see each source's
 		// last-consolidated timestamp and high-water mark without tailing logs.
-		const sourceCursors = await Promise.all(["opencode", "claude-code"].map(async (source) => {
-			const cursor = await db.getSourceCursor(source);
-			return {
-				source,
-				lastConsolidatedAt: cursor.lastConsolidatedAt
-					? new Date(cursor.lastConsolidatedAt).toISOString()
-					: null,
-			};
-		}));
+		const sourceCursors = await Promise.all(
+			["opencode", "claude-code"].map(async (source) => {
+				const cursor = await db.getSourceCursor(source);
+				return {
+					source,
+					lastConsolidatedAt: cursor.lastConsolidatedAt
+						? new Date(cursor.lastConsolidatedAt).toISOString()
+						: null,
+				};
+			}),
+		);
 
 		// Config block (model names, port) is gated behind the admin token.
 		// Unauthenticated callers (e.g. healthcheck scripts) still get version +
@@ -531,22 +529,17 @@ export function createApp(
 			}
 		}
 
-		if (updates.content !== undefined || updates.topics !== undefined) {
-			try {
-				const nextContent = updates.content ?? entry.content;
-				const nextTopics = updates.topics ?? entry.topics;
-				updates.embedding = await activation.embeddings.embed(
-					formatEmbeddingText(entry.type, nextContent, nextTopics),
-				);
-			} catch (e) {
-				logger.error("[entries/patch] Failed to re-embed updated entry:", e);
-				return c.json({ error: "Failed to re-embed updated entry" }, 500);
+		try {
+			await service.updateEntry(entry.id, updates);
+			const updated = await db.getEntry(entry.id);
+			if (!updated) {
+				return c.json({ error: "Entry not found after update" }, 500);
 			}
+			return c.json({ entry: stripEmbedding(updated) });
+		} catch (e) {
+			logger.error("[entries/patch] Failed to update entry:", e);
+			return c.json({ error: "Failed to update entry" }, 500);
 		}
-
-		await db.updateEntry(entry.id, updates);
-		const updated = await db.getEntry(entry.id);
-		return c.json({ entry: updated ? stripEmbedding(updated) : null });
 	});
 
 	// POST /entries/:id/resolve — resolve a conflicted entry pair via one of three outcomes:
@@ -661,7 +654,11 @@ export function createApp(
 			// :id loses — counterpart wins
 			// applyContradictionResolution("supersede_new", newEntryId=:id, existingEntryId=counterpart)
 			// means existingEntryId (counterpart) wins, newEntryId (:id) is superseded
-			await db.applyContradictionResolution("supersede_new", entry.id, counterpartId);
+			await db.applyContradictionResolution(
+				"supersede_new",
+				entry.id,
+				counterpartId,
+			);
 			return c.json({
 				ok: true,
 				resolution: "supersede_this",
@@ -673,7 +670,11 @@ export function createApp(
 		// supersede_other — :id wins, counterpart loses
 		// applyContradictionResolution("supersede_old", newEntryId=:id, existingEntryId=counterpart)
 		// means newEntryId (:id) wins, existingEntryId (counterpart) is superseded
-		await db.applyContradictionResolution("supersede_old", entry.id, counterpartId);
+		await db.applyContradictionResolution(
+			"supersede_old",
+			entry.id,
+			counterpartId,
+		);
 		return c.json({
 			ok: true,
 			resolution: "supersede_other",

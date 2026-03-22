@@ -44,6 +44,14 @@ function parseFloatEnv(
 //   ACTIVATION_SIMILARITY_THRESHOLD, CLUSTER_ASSIGNMENT_THRESHOLD,
 //   CLUSTER_MIN_MEMBERS.
 
+/**
+ * Strength below which an active entry is considered stale and surfaced in
+ * `GET /review` and `knowledge-server review`.
+ * Distinct from DECAY_ARCHIVE_THRESHOLD (0.15) — entries here are active but
+ * fading and warrant human attention before they decay further.
+ */
+export const REVIEW_STALE_STRENGTH_THRESHOLD = 0.3;
+
 /** Near-duplicate merge cutoff (upper bound of contradiction scan band). */
 export const DEFAULT_RECONSOLIDATION_THRESHOLD = 0.78;
 /** Lower bound of the contradiction scan band. */
@@ -142,8 +150,7 @@ export const config = {
 	//   Override with LOCAL_FILES_DIR env var.
 	//   If the directory does not exist, the source is silently skipped (no warning,
 	//   no error) — the feature is opt-in by creating the directory.
-	localFilesDir:
-		process.env.LOCAL_FILES_DIR || join(homedir(), "knowledge"),
+	localFilesDir: process.env.LOCAL_FILES_DIR || join(homedir(), "knowledge"),
 
 	// Explicit source enable/disable.
 	// All default to true (auto-detect); set to "false" to hard-disable a source.
@@ -412,13 +419,16 @@ export function validateConfig(): string[] {
 	// unified endpoint (LLM_BASE_ENDPOINT + LLM_API_KEY). Having any one of them
 	// configured is sufficient — the runtime routing will use whichever applies.
 	const hasAnthropic = !!(
-		config.llm.anthropic.apiKey?.trim() && config.llm.anthropic.apiKey.trim() !== PLACEHOLDER_API_KEY
+		config.llm.anthropic.apiKey?.trim() &&
+		config.llm.anthropic.apiKey.trim() !== PLACEHOLDER_API_KEY
 	);
 	const hasOpenAI = !!(
-		config.llm.openai.apiKey?.trim() && config.llm.openai.apiKey.trim() !== PLACEHOLDER_API_KEY
+		config.llm.openai.apiKey?.trim() &&
+		config.llm.openai.apiKey.trim() !== PLACEHOLDER_API_KEY
 	);
 	const hasGoogle = !!(
-		config.llm.google.apiKey?.trim() && config.llm.google.apiKey.trim() !== PLACEHOLDER_API_KEY
+		config.llm.google.apiKey?.trim() &&
+		config.llm.google.apiKey.trim() !== PLACEHOLDER_API_KEY
 	);
 	const unifiedApiKey = config.llm.apiKey?.trim() ?? "";
 	const unifiedEndpoint = config.llm.baseEndpoint?.trim() ?? "";
