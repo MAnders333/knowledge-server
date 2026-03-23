@@ -99,7 +99,7 @@ export class Reconsolidator {
 				updated: Partial<KnowledgeEntry>,
 				freshEmbedding: number[],
 			) => void | Promise<void>;
-			onKeep: () => void;
+			onKeep: () => void | Promise<void>;
 		},
 		/**
 		 * Timestamp of the source session (unix ms, capped at Date.now()).
@@ -225,7 +225,7 @@ export class Reconsolidator {
 				logger.log(
 					`[${logPrefix}] Keep existing (reinforced): ${JSON.stringify(nearestEntry.content)}`,
 				);
-				callbacks.onKeep();
+				await callbacks.onKeep();
 				break;
 			}
 

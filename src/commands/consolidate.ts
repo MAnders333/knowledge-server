@@ -78,24 +78,28 @@ export async function runConsolidate(): Promise<void> {
 					waited += LOCK_POLL_MS;
 				}
 			}
-			let result: Awaited<ReturnType<typeof consolidation.consolidate>>;
 			try {
-				result = await consolidation.consolidate();
+				const result = await consolidation.consolidate();
+
+				if (result.sessionsProcessed === 0) break;
+
+				totalSessions += result.sessionsProcessed;
+				totalCreated += result.entriesCreated;
+				totalUpdated += result.entriesUpdated;
+
+				console.log(
+					`  Batch ${batch}: ${result.sessionsProcessed} sessions → ` +
+						`${result.entriesCreated} created, ${result.entriesUpdated} updated`,
+				);
+				batch++;
+			} catch (err) {
+				console.error(
+					`Batch ${batch} failed: ${err instanceof Error ? err.message : String(err)}`,
+				);
+				break;
 			} finally {
 				consolidation.unlock();
 			}
-
-			if (result.sessionsProcessed === 0) break;
-
-			totalSessions += result.sessionsProcessed;
-			totalCreated += result.entriesCreated;
-			totalUpdated += result.entriesUpdated;
-
-			console.log(
-				`  Batch ${batch}: ${result.sessionsProcessed} sessions → ` +
-					`${result.entriesCreated} created, ${result.entriesUpdated} updated`,
-			);
-			batch++;
 		}
 
 		// Run KB synthesis once after all batches, same as the server-side drain.
@@ -103,7 +107,7 @@ export async function runConsolidate(): Promise<void> {
 		// new sessions were processed (e.g. after a re-embedding pass).
 		// Wrapped in its own try/catch so a synthesis failure doesn't suppress the
 		// completion summary.
-		if (pendingSessions > 0) console.log("\nRunning KB synthesis pass...");
+		console.log("\nRunning KB synthesis pass...");
 		try {
 			if (consolidation.tryLock()) {
 				try {

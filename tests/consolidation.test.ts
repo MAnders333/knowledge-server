@@ -76,8 +76,8 @@ afterEach(async () => {
 	// Restore all spies so prototype mutations don't leak into other test files
 	// (e.g. ConsolidationLLM.prototype.extractKnowledge mocks must not affect llm.test.ts).
 	mock.restore();
-	await db.close();
-	await serverStateDb.close();
+	await db?.close();
+	await serverStateDb?.close();
 	rmSync(tempDir, { recursive: true, force: true });
 });
 

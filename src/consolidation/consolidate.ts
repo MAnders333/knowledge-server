@@ -61,7 +61,8 @@ export class ConsolidationEngine {
 	 * Stores that received inserts or content-changing updates during the most
 	 * recent consolidation run. Accumulated across all batches in a drain loop.
 	 * Reset at the start of each new consolidation run (_consolidate resets it).
-	 * Used by runSynthesis() to limit synthesis to stores that had new knowledge.
+	 * Reserved for the follow-up refactor that will scope runSynthesis() to only
+	 * touched stores — currently runSynthesis() always operates on this.db.
 	 *
 	 * Invariant: if _consolidate() throws mid-run, this set is partial (only stores
 	 * from completed readers). The exception propagates to the caller who must not
@@ -807,31 +808,20 @@ export class ConsolidationEngine {
 	 * batches first and then synthesize once — rather than synthesizing after every
 	 * batch, which re-clusters and re-synthesizes an ever-growing KB on each pass.
 	 *
-	 * When `touchedStores` is provided, synthesis runs only on stores that received
-	 * inserts or content-changing updates this run. Pass the set returned by consolidate()
-	 * to avoid running synthesis on stores that had no new knowledge. Falls back to
-	 * this.db (single-store mode) when the set is empty or not provided.
-	 *
 	 * Must be called after ensureEmbeddings() has run (i.e. after consolidate()) so
 	 * all entries have embeddings. Returns the total number of principles synthesized.
+	 *
+	 * NOTE: the `touchedStores` parameter and `_lastTouchedStores` accumulation are
+	 * scaffolding for a follow-up refactor. Synthesis currently always runs on this.db
+	 * only — running on domain stores is unsafe until reconsolidate() is parameterized
+	 * for a mergeDb target (the inner mergeEntry call is hardcoded to this.db, so
+	 * operating on a domain store would silently corrupt or no-op this.db entries).
+	 * TODO: once reconsolidate() supports a mergeDb parameter, iterate over
+	 * touchedStores (falling back to [this.db]) here instead of always using this.db.
 	 */
-	async runSynthesis(touchedStores?: Set<IKnowledgeStore>): Promise<number> {
-		// Use the explicitly provided set, or fall back to what was accumulated during
-		// the most recent consolidate() call. If neither has stores (e.g. no new entries
-		// this run), synthesis still runs on this.db so existing clusters are re-evaluated.
-		const resolved = touchedStores ?? this._lastTouchedStores;
-		const stores = resolved.size > 0 ? [...resolved] : [this.db];
-
-		// NOTE: synthesis currently runs on this.db only. Running on domain stores
-		// (db !== this.db) is unsafe until reconsolidate() is parameterized for merge
-		// operations — the inner mergeEntry call is hardcoded to this.db, so merge
-		// decisions on domain-store entries would silently no-op or corrupt this.db.
-		// The touchedStores tracking and per-store loop are in place for when that
-		// follow-up refactor lands. For now, always synthesise this.db.
-		// TODO: remove this guard once reconsolidate() supports a mergeDb parameter.
-		let total = 0;
-		total += await this.reconsolidator.runKBSynthesis(this.db);
-		return total;
+	async runSynthesis(_touchedStores?: Set<IKnowledgeStore>): Promise<number> {
+		// TODO: replace with per-store iteration once mergeDb refactor lands.
+		return this.reconsolidator.runKBSynthesis(this.db);
 	}
 
 	close(): void {
