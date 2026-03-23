@@ -1499,6 +1499,15 @@ export class KnowledgeDB implements IKnowledgeDB {
 		}));
 	}
 
+	async countPendingSessions(): Promise<number> {
+		// In new-architecture setups this table lives in server.db — returns 0 here.
+		// In legacy single-file setups the table may exist.
+		const row = this.db
+			.prepare("SELECT COUNT(DISTINCT session_id) as n FROM pending_episodes")
+			.get() as { n: number } | null;
+		return row?.n ?? 0;
+	}
+
 	async deletePendingEpisodes(ids: string[]): Promise<void> {
 		if (ids.length === 0) return;
 		this.db

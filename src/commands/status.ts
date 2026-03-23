@@ -44,13 +44,7 @@ export async function runStatus(pidPath: string): Promise<void> {
 		// a full ConsolidationEngine (which costs LLM/embedding client setup)
 		// and avoids the stale-1 bug from PendingEpisodesReader.countNewSessions()
 		// when prepare() has not been called.
-		// No limit — we want a true count even for large backlogs.
-		const pendingRows = await serverLocalDb.getPendingEpisodes(
-			0,
-			Number.MAX_SAFE_INTEGER,
-		);
-		const pendingSessionIds = new Set(pendingRows.map((r) => r.sessionId));
-		const pendingSessions = pendingSessionIds.size;
+		const pendingSessions = await serverLocalDb.countPendingSessions();
 
 		console.log("Knowledge Server Status");
 		console.log("───────────────────────────────────────");

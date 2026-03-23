@@ -46,6 +46,12 @@ export interface IServerLocalDB {
 	 */
 	deletePendingEpisodes(ids: string[]): Promise<void>;
 
+	/**
+	 * Count distinct pending session IDs without loading episode content.
+	 * Efficient O(1)-memory alternative to fetching all rows for counting.
+	 */
+	countPendingSessions(): Promise<number>;
+
 	// ── Episode Tracking (idempotency) ────────────────────────────────────────
 
 	/**

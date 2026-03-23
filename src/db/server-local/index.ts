@@ -182,6 +182,13 @@ export class ServerLocalDB implements IServerLocalDB {
 		}));
 	}
 
+	async countPendingSessions(): Promise<number> {
+		const row = this.db
+			.prepare("SELECT COUNT(DISTINCT session_id) as n FROM pending_episodes")
+			.get() as { n: number };
+		return row?.n ?? 0;
+	}
+
 	async deletePendingEpisodes(ids: string[]): Promise<void> {
 		if (ids.length === 0) return;
 		this.db
