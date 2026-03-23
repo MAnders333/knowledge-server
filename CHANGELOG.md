@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.0.4](https://github.com/MAnders333/knowledge-server/compare/v3.0.3...v3.0.4) (2026-03-23)
+
+
+### Bug Fixes
+
+* **llm:** remove hardcoded domain names from extraction prompt example ([93f739f](https://github.com/MAnders333/knowledge-server/commit/93f739f0ff535119eab845c13e9ae35f0f8d2c78))
+
 ## [3.0.3](https://github.com/MAnders333/knowledge-server/compare/v3.0.2...v3.0.3) (2026-03-23)
 
 
