@@ -1014,11 +1014,20 @@ function setupDaemon(): void {
 	const platform = process.platform;
 	const home = homedir();
 
-	const autoSpawnNote =
+	// Shown on successful service registration — tells the user to disable auto-spawn.
+	const autoSpawnNoteSuccess =
 		"  Note: knowledge-server auto-spawns the daemon by default.\n" +
-		"  After registering it as a system service, set DAEMON_AUTO_SPAWN=false\n" +
-		'  in your .env or add "daemonAutoSpawn": false to config.jsonc,\n' +
-		"  otherwise two daemon instances will run simultaneously.";
+		"  Now that it runs as a system service, disable auto-spawn to avoid\n" +
+		"  running two daemon instances:\n" +
+		"    Set DAEMON_AUTO_SPAWN=false in your .env\n" +
+		'    or add "daemonAutoSpawn": false to config.jsonc';
+
+	// Shown on failed registration — service file is on disk but not yet running,
+	// so the user should NOT disable auto-spawn until they fix registration.
+	const autoSpawnNoteFailure =
+		"  Note: the service file is on disk but the daemon is not running yet.\n" +
+		"  Keep the server running so auto-spawn stays active until you fix\n" +
+		"  the registration error above.";
 
 	// Resolve daemon binary path
 	let daemonBin: string;
@@ -1085,17 +1094,17 @@ ${programArgs}
 			console.warn(
 				`  ⚠ launchctl load returned ${load.status}. The daemon plist was written but may not be running. Try: launchctl load ${plistPath}`,
 			);
+			console.log("");
+			console.log(autoSpawnNoteFailure);
 		} else {
 			console.log("  ✓ Daemon registered as macOS launchd service");
 			console.log(`    Plist: ${plistPath}`);
 			console.log(
 				`    Log:   ${join(home, ".local", "share", "knowledge-server", "daemon.log")}`,
 			);
+			console.log("");
+			console.log(autoSpawnNoteSuccess);
 		}
-		// Print regardless of load success — plist is on disk and will activate
-		// on the next reboot or manual retry, so the warning is always relevant.
-		console.log("");
-		console.log(autoSpawnNote);
 	} else if (platform === "linux") {
 		// Linux systemd user service
 		const serviceDir = join(home, ".config", "systemd", "user");
@@ -1130,17 +1139,17 @@ WantedBy=default.target
 			console.warn(
 				`  ⚠ systemctl enable returned ${enable.status}. The service file was written but may not be running. Try: systemctl --user enable --now knowledge-daemon`,
 			);
+			console.log("");
+			console.log(autoSpawnNoteFailure);
 		} else {
 			console.log("  ✓ Daemon registered as systemd user service");
 			console.log(`    Service: ${servicePath}`);
 			console.log(
 				`    Log:     ${join(home, ".local", "share", "knowledge-server", "daemon.log")}`,
 			);
+			console.log("");
+			console.log(autoSpawnNoteSuccess);
 		}
-		// Print regardless of enable success — service file is on disk and will
-		// activate on retry or reboot, so the warning is always relevant.
-		console.log("");
-		console.log(autoSpawnNote);
 	} else {
 		console.error(
 			`  ✗ Unsupported platform: ${platform}. Automatic service registration is only supported on macOS and Linux.`,
