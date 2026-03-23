@@ -464,21 +464,25 @@ Run \`knowledge-server help-advanced\` for additional commands.
 				// TextDecoder is stateful: using { stream: true } preserves carry-over
 				// state so multi-byte UTF-8 sequences split across chunk boundaries
 				// are decoded correctly rather than replaced with \uFFFD.
+				// Forward daemon output to the server log without double-stamping.
+				// Daemon lines are already structured (have their own timestamp + level).
 				const forwardStream = async (
 					stream: ReadableStream<Uint8Array> | null,
 				) => {
 					if (!stream) return;
 					const decoder = new TextDecoder();
-					for await (const chunk of stream) {
-						const text = decoder.decode(chunk, { stream: true });
+					const emit = (text: string) => {
 						for (const line of text.split("\n")) {
 							const trimmed = line.trimEnd();
-							if (!trimmed) continue;
-							// Daemon output is already structured (has its own timestamp +
-							// level prefix). Use passthrough to avoid double-stamping.
-							logger.passthrough(trimmed);
+							if (trimmed) logger.passthrough(trimmed);
 						}
+					};
+					for await (const chunk of stream) {
+						emit(decoder.decode(chunk, { stream: true }));
 					}
+					// Flush decoder carry-over buffer so multi-byte sequences at the
+					// end of a chunk boundary are not silently dropped on stream close.
+					emit(decoder.decode());
 				};
 				forwardStream(
 					daemonChild.stdout as ReadableStream<Uint8Array> | null,
