@@ -198,3 +198,8 @@ export function createEpisodeReaders(): IEpisodeReader[] {
 
 	return readers;
 }
+
+// Note: PendingEpisodesReader is intentionally NOT here.
+// It belongs to the consolidation layer (src/consolidation/readers/pending.ts)
+// because it reads from the pending_episodes DB table — not from local disk files.
+// The daemon writes to pending_episodes; the server reads from it via PendingEpisodesReader.

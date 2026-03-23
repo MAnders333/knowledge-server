@@ -24,7 +24,7 @@
  */
 
 import { config, validateConfig } from "../config.js";
-import { createEpisodeReaders } from "../daemon/readers/index.js";
+import { createEpisodeReaders } from "./readers/index.js";
 import { KnowledgeDB } from "../db/database.js";
 import { StoreRegistry } from "../db/store-registry.js";
 import { EpisodeUploader } from "./uploader.js";
