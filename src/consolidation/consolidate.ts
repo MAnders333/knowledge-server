@@ -821,10 +821,16 @@ export class ConsolidationEngine {
 		// this run), synthesis still runs on this.db so existing clusters are re-evaluated.
 		const resolved = touchedStores ?? this._lastTouchedStores;
 		const stores = resolved.size > 0 ? [...resolved] : [this.db];
+
+		// NOTE: synthesis currently runs on this.db only. Running on domain stores
+		// (db !== this.db) is unsafe until reconsolidate() is parameterized for merge
+		// operations — the inner mergeEntry call is hardcoded to this.db, so merge
+		// decisions on domain-store entries would silently no-op or corrupt this.db.
+		// The touchedStores tracking and per-store loop are in place for when that
+		// follow-up refactor lands. For now, always synthesise this.db.
+		// TODO: remove this guard once reconsolidate() supports a mergeDb parameter.
 		let total = 0;
-		for (const store of stores) {
-			total += await this.reconsolidator.runKBSynthesis(store);
-		}
+		total += await this.reconsolidator.runKBSynthesis(this.db);
 		return total;
 	}
 
