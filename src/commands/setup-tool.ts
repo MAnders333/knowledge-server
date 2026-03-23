@@ -1014,15 +1014,11 @@ function setupDaemon(): void {
 	const platform = process.platform;
 	const home = homedir();
 
-	// Warn: the server auto-spawns the daemon by default, so registering it as
-	// a system service without disabling auto-spawn will result in two daemons.
-	console.log(
+	const autoSpawnNote =
 		"  Note: knowledge-server auto-spawns the daemon by default.\n" +
-			"  After registering it as a system service, add to your config.jsonc:\n" +
-			'    "daemonAutoSpawn": false\n' +
-			"  or set DAEMON_AUTO_SPAWN=false in your .env to avoid running two daemons.",
-	);
-	console.log("");
+		"  After registering it as a system service, set DAEMON_AUTO_SPAWN=false\n" +
+		'  in your .env or add "daemonAutoSpawn": false to config.jsonc,\n' +
+		"  otherwise two daemon instances will run simultaneously.";
 
 	// Resolve daemon binary path
 	let daemonBin: string;
@@ -1032,12 +1028,9 @@ function setupDaemon(): void {
 		daemonBin = `${bunBin} run ${join(projectDir, "src", "daemon", "index.ts")}`;
 	} else {
 		// Binary install — daemon is a sibling binary in the same directory.
-		// Use process.execPath (the real on-disk path) not Bun.main (virtual bundle
-		// path like /$bunfs/root/src/index.ts in compiled binaries).
 		const binDir = dirname(process.execPath);
 		daemonBin = join(binDir, "knowledge-daemon");
 		if (!existsSync(daemonBin)) {
-			// Fallback: knowledge-daemon may be on PATH
 			daemonBin = "knowledge-daemon";
 		}
 	}
@@ -1098,6 +1091,8 @@ ${programArgs}
 			console.log(
 				`    Log:   ${join(home, ".local", "share", "knowledge-server", "daemon.log")}`,
 			);
+			console.log("");
+			console.log(autoSpawnNote);
 		}
 	} else if (platform === "linux") {
 		// Linux systemd user service
@@ -1139,6 +1134,8 @@ WantedBy=default.target
 			console.log(
 				`    Log:     ${join(home, ".local", "share", "knowledge-server", "daemon.log")}`,
 			);
+			console.log("");
+			console.log(autoSpawnNote);
 		}
 	} else {
 		console.error(
