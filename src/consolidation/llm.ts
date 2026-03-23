@@ -325,8 +325,7 @@ ${domainContext.domains.map((d) => `- "${d.id}": ${d.description}`).join("\n")}
 
 Assignment rules:
 - Use the default domain ("${domainContext.defaultDomain}") when the content clearly belongs there.
-- Override to a different domain when the content is a better fit — for example, a personal tool
-  preference found in a work session belongs in the personal domain, not the work domain.
+- Override to a different domain when the entry's content is a better fit regardless of where the session came from.
 - The domain field must be exactly one of: ${domainContext.domains.map((d) => `"${d.id}"`).join(", ")}.
 `
 			: "";
