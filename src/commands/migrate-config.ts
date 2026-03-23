@@ -88,7 +88,10 @@ export function runMigrateConfig(): void {
 		port !== null
 			? `\n  // HTTP port (from KNOWLEDGE_PORT). You can remove that env var now.\n  "port": ${validPort ? port : 3179},`
 			: `\n  // "port": 3179,  // HTTP port (default)`;
-	if (port !== null) {
+	// Only add to envVarsToRemove when the value was successfully migrated.
+	// If the port was invalid, the var still contains the bad value — don't tell
+	// the user to remove it.
+	if (validPort) {
 		envVarsToRemove = [...envVarsToRemove, "KNOWLEDGE_PORT"];
 	}
 

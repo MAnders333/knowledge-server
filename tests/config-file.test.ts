@@ -544,10 +544,18 @@ describe("loadConfigFile — domain and project validation", () => {
 			expect(cfg.host).toBe("127.0.0.1");
 			expect(cfg.daemonAutoSpawn).toBe(true);
 		} finally {
-			// Restore original env state
-			process.env.KNOWLEDGE_PORT = savedPort;
-			process.env.KNOWLEDGE_HOST = savedHost;
-			process.env.DAEMON_AUTO_SPAWN = savedDaemon;
+			// Restore original env state. Must use Reflect.deleteProperty (not
+			// `= undefined`) when the var wasn't originally set — assigning
+			// undefined coerces to the string "undefined" in process.env.
+			if (savedPort === undefined)
+				Reflect.deleteProperty(process.env, "KNOWLEDGE_PORT");
+			else process.env.KNOWLEDGE_PORT = savedPort;
+			if (savedHost === undefined)
+				Reflect.deleteProperty(process.env, "KNOWLEDGE_HOST");
+			else process.env.KNOWLEDGE_HOST = savedHost;
+			if (savedDaemon === undefined)
+				Reflect.deleteProperty(process.env, "DAEMON_AUTO_SPAWN");
+			else process.env.DAEMON_AUTO_SPAWN = savedDaemon;
 		}
 	});
 });
