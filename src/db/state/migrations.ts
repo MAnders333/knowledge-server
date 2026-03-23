@@ -216,8 +216,8 @@ function dropKnowledgeDbStagingTables(db: Database): void {
 	)
 		return;
 
+	const rw = new Database(LEGACY_KNOWLEDGE_DB_PATH);
 	try {
-		const rw = new Database(LEGACY_KNOWLEDGE_DB_PATH);
 		rw.transaction(() => {
 			rw.exec("DROP TABLE IF EXISTS pending_episodes");
 			rw.exec("DROP TABLE IF EXISTS consolidated_episode");
@@ -225,7 +225,6 @@ function dropKnowledgeDbStagingTables(db: Database): void {
 			rw.exec("DROP TABLE IF EXISTS daemon_cursor");
 			rw.exec("DROP TABLE IF EXISTS source_cursor");
 		})();
-		rw.close();
 		db.prepare(
 			"INSERT OR IGNORE INTO applied_migrations (name, applied_at) VALUES (?, ?)",
 		).run(dropKey, Date.now());
@@ -236,5 +235,7 @@ function dropKnowledgeDbStagingTables(db: Database): void {
 		logger.warn(
 			`[migration] Could not drop orphaned tables from knowledge.db: ${err instanceof Error ? err.message : String(err)}`,
 		);
+	} finally {
+		rw.close();
 	}
 }

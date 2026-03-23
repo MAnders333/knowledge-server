@@ -228,10 +228,10 @@ export const MIGRATIONS: Array<{
 
 			// NOTE: After v13, consolidated_episode belongs in state.db (ServerStateDB),
 			// not in knowledge.db. This migration preserves the existing table to allow
-			// ServerStateDB.migrateFromKnowledgeDb() to copy the rows on first startup.
+			// ServerStateDB (runStateMigrations) to copy the rows on first startup.
 			// After migration, the table in knowledge.db becomes orphaned (never read or
 			// written again) but is intentionally NOT dropped here — dropping before
-			// migrateFromKnowledgeDb() copies rows would silently destroy the idempotency
+			// runStateMigrations() copies rows would silently destroy the idempotency
 			// history, causing all previously-consolidated episodes to be re-processed.
 
 			// Rebuild consolidated_episode without user_id.
@@ -278,7 +278,7 @@ export const MIGRATIONS: Array<{
 		up: (_db) => {
 			// SQLite knowledge.db: staging tables (consolidated_episode, consolidation_state,
 			// pending_episodes) were already handled in v13 and remain as orphaned legacy
-			// tables until migrateFromKnowledgeDb() copies them to state.db.
+			// tables until runStateMigrations() copies them to state.db.
 			// No DDL changes needed for SQLite knowledge stores.
 		},
 	},

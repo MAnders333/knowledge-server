@@ -283,7 +283,7 @@ export const PG_MIGRATIONS: Array<{
 			// These tables may not exist on fresh installs — DROP IF EXISTS is safe.
 			//
 			// IMPORTANT: any data in consolidated_episode here should have already been
-			// migrated to state.db by ServerStateDB.migrateFromKnowledgeDb() on startup.
+			// migrated to state.db by ServerStateDB (runStateMigrations) on startup.
 			// The idempotency history from these rows is preserved in state.db.
 			await sql`DROP TABLE IF EXISTS pending_episodes CASCADE`;
 			await sql`DROP TABLE IF EXISTS consolidated_episode CASCADE`;
