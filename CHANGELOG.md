@@ -1,5 +1,14 @@
 # Changelog
 
+## [3.0.1](https://github.com/MAnders333/knowledge-server/compare/v3.0.0...v3.0.1) (2026-03-23)
+
+
+### Bug Fixes
+
+* log download start path and version, clarify silent comment ([ade27ec](https://github.com/MAnders333/knowledge-server/commit/ade27ecbbe2129ba3303c383d73a9bb782d2e299))
+* suppress progress output in downloadBinary when called silently ([81a351f](https://github.com/MAnders333/knowledge-server/commit/81a351fd725ca6d8bead6df7f831dd641266d534))
+* v prefix on version, merge import, fix cleanup ownership in downloadAndInstallDaemon ([cd9c731](https://github.com/MAnders333/knowledge-server/commit/cd9c731f14c7c3032a9ba8352281404b9a65916c))
+
 ## [3.0.0](https://github.com/MAnders333/knowledge-server/compare/v2.10.0...v3.0.0) (2026-03-23)
 
 
