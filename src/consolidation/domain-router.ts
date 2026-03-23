@@ -64,6 +64,8 @@ export class DomainRouter {
 	private stores: Map<string, IKnowledgeDB>;
 	private fallbackStore: IKnowledgeDB;
 	private unavailableStoreIds: ReadonlySet<string>;
+	/** ID of the fallback (primary writable) store — used for unavailability checks. */
+	private fallbackStoreId: string;
 
 	constructor(
 		config: KnowledgeServerConfig,
@@ -82,6 +84,10 @@ export class DomainRouter {
 		this.stores = stores;
 		this.fallbackStore = fallbackStore;
 		this.unavailableStoreIds = unavailableStoreIds;
+		// Derive fallback store ID from the stores map — safer than hardcoding "default"
+		// since the user can name their store anything in config.jsonc.
+		this.fallbackStoreId =
+			[...stores.entries()].find(([, db]) => db === fallbackStore)?.[0] ?? "";
 	}
 
 	/**
@@ -96,7 +102,7 @@ export class DomainRouter {
 			return {
 				domainId: undefined,
 				store: this.fallbackStore,
-				storeUnavailable: this.unavailableStoreIds.has("default"),
+				storeUnavailable: this.unavailableStoreIds.has(this.fallbackStoreId),
 				domainContext: null,
 			};
 		}
