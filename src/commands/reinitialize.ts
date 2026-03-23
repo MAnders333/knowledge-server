@@ -110,9 +110,9 @@ export async function runReinitialize(args: string[]): Promise<void> {
 			// without knowing the source→store mapping. Run without --store for a
 			// full reset including staging tables.
 			console.log(
-				"  Note: consolidation history (consolidated_episode) was not cleared — " +
-					"episodes already processed for this store will not be re-processed. " +
-					"Run without --store to do a full reset.",
+				"  Note: server.db staging tables (consolidated_episode, pending_episodes,\n" +
+					"  daemon_cursor, consolidation_state) were not cleared — they are shared\n" +
+					"  across all stores. Run without --store for a full reset including staging.",
 			);
 		}
 

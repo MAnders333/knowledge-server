@@ -21,49 +21,10 @@
 
 export const SERVER_LOCAL_SCHEMA_VERSION = 1;
 
-// Note: column manifest removed — schema is always additive (CREATE TABLE IF NOT EXISTS),
-// so drift detection by column comparison is no longer needed for server.db.
-// The KnowledgeDB (knowledge.db) equivalent (EXPECTED_TABLE_COLUMNS) is kept there
-// because the knowledge schema has a more complex migration history.
-
-// Kept for reference only — not imported anywhere. Remove if drifts from DDL.
-const _SERVER_LOCAL_TABLE_COLUMNS: Readonly<Record<string, readonly string[]>> =
-	{
-		pending_episodes: [
-			"id",
-			"user_id",
-			"source",
-			"session_id",
-			"start_message_id",
-			"end_message_id",
-			"session_title",
-			"project_name",
-			"directory",
-			"content",
-			"content_type",
-			"session_timestamp",
-			"max_message_time",
-			"approx_tokens",
-			"uploaded_at",
-		],
-		consolidated_episode: [
-			"source",
-			"session_id",
-			"start_message_id",
-			"end_message_id",
-			"content_type",
-			"processed_at",
-			"entries_created",
-		],
-		consolidation_state: [
-			"id",
-			"last_consolidated_at",
-			"total_sessions_processed",
-			"total_entries_created",
-			"total_entries_updated",
-		],
-		daemon_cursor: ["source", "last_message_time_created", "last_uploaded_at"],
-	};
+// Schema is always additive (CREATE TABLE IF NOT EXISTS), so column-manifest
+// drift detection is not used for server.db. See KnowledgeDB (knowledge.db)
+// for the EXPECTED_TABLE_COLUMNS pattern used when the schema has a more
+// complex migration history requiring column-presence assertions.
 
 export const SERVER_LOCAL_CREATE_TABLES = `
   CREATE TABLE IF NOT EXISTS schema_version (
