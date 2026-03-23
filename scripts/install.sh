@@ -246,8 +246,8 @@ else
 # Source paths (auto-detected by default — only set if your tool is in a non-standard location):
 # OPENCODE_DB_PATH=$HOME/.local/share/opencode/opencode.db
 
-# Store config (SQLite by default) — for Postgres or custom paths use config.jsonc instead:
-# knowledge-server migrate-config   ← run this once if upgrading from v2
+# Store config (SQLite by default).
+# For Postgres or multi-store setups, edit ~/.config/knowledge-server/config.jsonc instead.
 EOF
   echo "  ✓ Created $ENV_FILE"
   echo "  ⚠ Edit it and set your API key (ANTHROPIC_API_KEY, OPENAI_API_KEY, or LLM_BASE_ENDPOINT+LLM_API_KEY)"
@@ -398,8 +398,11 @@ fi
 
 # ── Print summary ─────────────────────────────────────────────────────────────
 
+# Detect whether the user has set an actual API key.
+# Checks for an uncommented key line — the template has these as comments,
+# so an unedited file registers as unconfigured.
 ENV_CONFIGURED=true
-if grep -qE "your-api-key-here|your-llm-endpoint" "$DISPLAY_ENV_FILE" 2>/dev/null; then
+if ! grep -qE '^(ANTHROPIC|OPENAI|GOOGLE)_API_KEY=.+|^LLM_API_KEY=.+' "$DISPLAY_ENV_FILE" 2>/dev/null; then
   ENV_CONFIGURED=false
 fi
 
@@ -431,7 +434,7 @@ fi
 
 if [ "$ENV_CONFIGURED" = false ]; then
   echo "  $STEP. Edit $DISPLAY_ENV_FILE"
-  echo "     Fill in LLM_API_KEY and LLM_BASE_ENDPOINT"
+  echo "     Uncomment and set your API key, e.g.: ANTHROPIC_API_KEY=sk-ant-..."
   echo ""
   STEP=$((STEP + 1))
 fi
