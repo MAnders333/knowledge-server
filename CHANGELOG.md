@@ -1,5 +1,69 @@
 # Changelog
 
+## [3.0.0](https://github.com/MAnders333/knowledge-server/compare/v2.10.0...v3.0.0) (2026-03-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* daemon-only consolidation, remove source_cursor and per-user scoping
+* Configuration has moved from environment variables to ~/.config/knowledge-server/config.jsonc. Run 'knowledge-server migrate-config' after updating to generate the config file from your existing env vars.
+
+### Features
+
+* auto-spawn daemon, install both binaries, v3 migration notice ([3ba42b6](https://github.com/MAnders333/knowledge-server/commit/3ba42b63bd0a971e36dd82e5b748c5cc78833af7))
+* daemon-only consolidation, remove source_cursor and per-user scoping ([baafd24](https://github.com/MAnders333/knowledge-server/commit/baafd24eca8fa2021ed7a0920e307e6df218bf97))
+* **daemon:** episode uploader daemon — pending_episodes staging table + PendingEpisodesReader ([a0bce0e](https://github.com/MAnders333/knowledge-server/commit/a0bce0e5073ed3b5b885b24f67102cfb9c851bb7))
+* **service:** add KnowledgeService with auto-re-embed and review CLI command ([1a40189](https://github.com/MAnders333/knowledge-server/commit/1a40189746aafd2bba63f0048b70a57c3b3965c8))
+* **stores:** degraded-mode startup when stores are unreachable ([32f88b4](https://github.com/MAnders333/knowledge-server/commit/32f88b440f82d27966482f0902b0e4ba66841a4b))
+* v3.0.0 — N-store architecture, domain routing, daemon, multi-user ([1cc4fec](https://github.com/MAnders333/knowledge-server/commit/1cc4fec2550e03663bea5fc7c5360662ade850b8))
+
+
+### Bug Fixes
+
+* always print auto-spawn note after daemon service registration ([bf6144e](https://github.com/MAnders333/knowledge-server/commit/bf6144ef5bf07837d81edcbd452a4335da6db412))
+* checkAndReEmbed metadata after loop; domain-aware chunk grouping; new tests ([ec7de8b](https://github.com/MAnders333/knowledge-server/commit/ec7de8b4f2e0235b443ba79516ccb9d30ca3ffa3))
+* clean up stale comments after getPendingEpisodes source removal ([c26af6c](https://github.com/MAnders333/knowledge-server/commit/c26af6cf7155480d723c30123a03c5d442c03b0a))
+* co-locate help-advanced with --help; clarify embedding doc ([83887ec](https://github.com/MAnders333/knowledge-server/commit/83887ecbeec6a353266466be3b8a84200cc8c5c4))
+* **config:** allow multiple writable stores when domains are configured ([93fe487](https://github.com/MAnders333/knowledge-server/commit/93fe487260edaad27300ed4b6c989e1c1f3ac434))
+* **consolidation:** guard prepare() hook with try/catch so a failing reader skips rather than aborting the run ([4c6db18](https://github.com/MAnders333/knowledge-server/commit/4c6db18482815e8ed39c528e04dccfda2b9d4af1))
+* **daemon:** correct userId resolution order in comment ([5821fcc](https://github.com/MAnders333/knowledge-server/commit/5821fcc7d2be54b9b2ef21bbb8c9d777c33ca0c3))
+* **daemon:** process.on over once; reset cache state in prepare() ([e5535a3](https://github.com/MAnders333/knowledge-server/commit/e5535a3eff229f1a4581393deeba8bacc2e532c6))
+* **daemon:** resolve userId from registry instead of config.ts (no userId field there) ([a4bf717](https://github.com/MAnders333/knowledge-server/commit/a4bf7170efd2ad5926132928fc546f6c283d6e68))
+* **daemon:** set _prepared only after successful cache population in prepare() ([9a56662](https://github.com/MAnders333/knowledge-server/commit/9a566627f07c09ce2bc47135970b5a7454450679))
+* **domains:** address reviewer findings ([0aa3a61](https://github.com/MAnders333/knowledge-server/commit/0aa3a61b889599e8964b974e643b880af906df03))
+* **domains:** flatten IIFE anti-pattern; clarify targetDb comment in reconsolidate ([7fc887e](https://github.com/MAnders333/knowledge-server/commit/7fc887ecee940448f6c0d8e23c699f81b5d95835))
+* **domains:** remove redundant parsed null-check in hallucination warn loop ([2bad7f9](https://github.com/MAnders333/knowledge-server/commit/2bad7f9aab71e9777b3996d80a3662aa3c2317fd))
+* **domains:** revert JSON comment in LLM prompt; fix newline regex; blank line ([8fdafa9](https://github.com/MAnders333/knowledge-server/commit/8fdafa96729ceb7a1bd22a3404cb4738119abd29))
+* graceful shutdown blocked by idle polling loop sleep ([e6f168e](https://github.com/MAnders333/knowledge-server/commit/e6f168e4c3ef2e59ae313d60c8825e80f9470203))
+* host security check post-registry, shared parsePortEnvVar helper, test coverage ([4b8d3b0](https://github.com/MAnders333/knowledge-server/commit/4b8d3b0f0b6459a2d7a6565020c78c53ba5940df))
+* improve install.sh env detection and hints ([1d5f6a7](https://github.com/MAnders333/knowledge-server/commit/1d5f6a75ced0e460064d604143eaebc49faf0e3b))
+* **lock:** catch releaseConsolidationLock error in close() so sql.end() always runs ([43e5822](https://github.com/MAnders333/knowledge-server/commit/43e582259255ec078eadecbcfae89efade891095))
+* **lock:** close() releases lock connection; fix warnIfMixedTopology type+URI ([aa83e75](https://github.com/MAnders333/knowledge-server/commit/aa83e75e2d4368bfe23b7963774ffa90edf62ac5))
+* **lock:** handle sql.reserve() throw before try block to prevent pool leak ([fef105b](https://github.com/MAnders333/knowledge-server/commit/fef105b0ded6ee1a0a30e0a46be1b4515b6d2f9f))
+* **multi-user:** address reviewer findings ([132e40d](https://github.com/MAnders333/knowledge-server/commit/132e40dc6575e226478562f4550d5f0935ad3a8e))
+* **multi-user:** fail loudly on missing PK in PG migration; gate userId behind admin ([01472f4](https://github.com/MAnders333/knowledge-server/commit/01472f42f2eddf36ffddfb04a2f89d53fe037129))
+* **multi-user:** fix remaining stale USER_ID refs; clean up minor code style ([6dd3368](https://github.com/MAnders333/knowledge-server/commit/6dd336881c5c63beef9ae8e1f110a5474e862fe4))
+* **pg:** add user_id to PG_CREATE_TABLES for fresh DB bootstrap ([2754058](https://github.com/MAnders333/knowledge-server/commit/2754058c7be411cd9c527f709fc7d79bd2e8b942))
+* **pg:** specify explicit conflict target in recordEpisode ON CONFLICT clause ([cd9b2d2](https://github.com/MAnders333/knowledge-server/commit/cd9b2d2cebe3b9d04dd3b860d66d7c83f1641ba8))
+* properly delete env vars in test teardown using Reflect.deleteProperty ([90b490e](https://github.com/MAnders333/knowledge-server/commit/90b490ee4574b46840f3f2c8af24fdc679dcec93))
+* **refactor:** fix daemon path in setup-tool; use process.execPath for binary dir ([a121d22](https://github.com/MAnders333/knowledge-server/commit/a121d2262a4f544c7e1e4831d32101d4fc8a03a9))
+* **refactor:** fix self-referential import in daemon/index.ts; add PendingEpisodesReader note ([cb32bbb](https://github.com/MAnders333/knowledge-server/commit/cb32bbb7d7a35556fbed37c5b0a5062d08678093))
+* resolve all typecheck errors (bun build silently passed these) ([4726848](https://github.com/MAnders333/knowledge-server/commit/4726848a94a7e53a717b78fda955d958f421d0a5))
+* restore daemonBin declaration accidentally deleted in previous commit ([f6ed8d3](https://github.com/MAnders333/knowledge-server/commit/f6ed8d3e93292296b7de5e07c83f8864c92a455f))
+* **service:** address post-merge review warnings ([39300b1](https://github.com/MAnders333/knowledge-server/commit/39300b122dcfc9d0ba2c5b4f7baa51b7c7727671))
+* show correct auto-spawn note on service registration success vs failure ([112ee06](https://github.com/MAnders333/knowledge-server/commit/112ee064b3636a6524fe83db49300c0fb4c75430))
+* **stores:** address reviewer findings — database.ts fallback, migrate-config injection ([cfd526b](https://github.com/MAnders333/knowledge-server/commit/cfd526b7ea00e8825104018adc300b6279136a9c))
+* **stores:** address reviewer warnings ([7cc0fa7](https://github.com/MAnders333/knowledge-server/commit/7cc0fa791e23e0288d91d05012d306ca98582a7a))
+* **stores:** derive fallback store ID from map instead of hardcoding 'default' ([cef729b](https://github.com/MAnders333/knowledge-server/commit/cef729bc609ad3e56a524ae26e8f1e15fd4e3f93))
+* **stores:** tighten domain-router warn message for fallback store lookup ([3e33d7d](https://github.com/MAnders333/knowledge-server/commit/3e33d7d1128e3fa9e930fe83fc7e4b3037983ae0))
+* **stores:** tighten duplicate-id test assertion and clarify checkAndReEmbed JSDoc ([87cee74](https://github.com/MAnders333/knowledge-server/commit/87cee74749358ea34b5a7db2d29d37dd723f69cf))
+* **stores:** warn when fallbackStore not found in stores map ([2508a33](https://github.com/MAnders333/knowledge-server/commit/2508a3380d67b9cc6afe978690f39de7d1a04cee))
+* **tests:** add missing userId args in pg-integration reinitialize test ([a6a6c3a](https://github.com/MAnders333/knowledge-server/commit/a6a6c3adb4cfb668536a912687448e0ad960df1d))
+* **types:** resolve two tsc errors flagged by bun run typecheck ([82c6a05](https://github.com/MAnders333/knowledge-server/commit/82c6a053241009fa645e5818ebb2c04c81a5db2f))
+* **types:** update stale null-path comments after domainId null→undefined change ([bff9f00](https://github.com/MAnders333/knowledge-server/commit/bff9f00660e46fc7efe92169e2ccfa23df31ec89))
+* **types:** use undefined over null for DomainResolution.domainId ([12245e7](https://github.com/MAnders333/knowledge-server/commit/12245e7bb5bf7271299d154b5cc96d9bf97e1a38))
+* warn about DAEMON_AUTO_SPAWN when registering daemon as system service ([30fc103](https://github.com/MAnders333/knowledge-server/commit/30fc10312c7b4596d7f5a83708145b0c7493d19c))
+
 ## [2.10.0](https://github.com/MAnders333/knowledge-server/compare/v2.9.0...v2.10.0) (2026-03-12)
 
 
