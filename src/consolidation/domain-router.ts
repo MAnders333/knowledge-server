@@ -97,7 +97,7 @@ export class DomainRouter {
 		}
 		if (!fallbackStoreId) {
 			logger.warn(
-				"[domain-router] fallbackStore not found in stores map — unavailability check will be skipped for single-store mode.",
+				"[domain-router] fallbackStore not found in stores map — the no-domain fallback path will not report store unavailability. This should not happen in normal operation.",
 			);
 		}
 		this.fallbackStoreId = fallbackStoreId;
