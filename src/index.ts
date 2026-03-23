@@ -21,7 +21,7 @@ import { logger } from "./logger.js";
 import { main as mcpMain } from "./mcp/index.js";
 import { runSetupTool } from "./commands/setup-tool.js";
 import { runStop } from "./commands/stop.js";
-import { runUpdate } from "./commands/update.js";
+import { downloadAndInstallDaemon, runUpdate } from "./commands/update.js";
 
 // Bun normalises process.argv the same way for both compiled binaries and `bun run`:
 //   argv[0] = "bun"
@@ -418,6 +418,23 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		// resolveEnvFilePath() and setup-tool.ts for source-vs-compiled detection.
 		const isSourceRun = basename(process.execPath).startsWith("bun");
 		const daemonBinPath = join(dirname(process.execPath), "knowledge-daemon");
+
+		// For compiled installs where the daemon binary is missing (e.g. upgrading
+		// from v2 which only downloaded knowledge-server), try to install it
+		// automatically using the same version as the running server.
+		if (!isSourceRun && !existsSync(daemonBinPath)) {
+			logger.log(
+				"[daemon] knowledge-daemon not found — downloading it automatically...",
+			);
+			try {
+				await downloadAndInstallDaemon(`v${pkg.version}`, daemonBinPath);
+				logger.log("[daemon] knowledge-daemon installed successfully.");
+			} catch (err) {
+				logger.warn(
+					`[daemon] Auto-install failed: ${err instanceof Error ? err.message : String(err)}. Run \`knowledge-server update\` to install it manually, or set DAEMON_AUTO_SPAWN=false to suppress this.`,
+				);
+			}
+		}
 
 		const daemonCmd: string[] = isSourceRun
 			? process.argv[1]

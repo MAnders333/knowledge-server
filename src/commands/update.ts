@@ -195,6 +195,48 @@ async function installBinary(
 }
 
 /**
+ * Download and install the knowledge-daemon binary for the current platform
+ * at the given destination path.
+ *
+ * Used by the server startup path to self-heal a missing daemon binary —
+ * e.g. after upgrading from v2 where only knowledge-server was downloaded.
+ *
+ * @param version  The version to download (e.g. "v3.0.0"). Fetches the latest
+ *                 release from GitHub when omitted.
+ * @param destPath The full path where knowledge-daemon should be installed.
+ */
+export async function downloadAndInstallDaemon(
+	version: string | undefined,
+	destPath: string,
+): Promise<void> {
+	const platform = detectPlatform();
+	const targetVersion = version ?? (await fetchLatestVersion());
+	const checksums = await fetchChecksums(targetVersion, platform);
+
+	const asset = `knowledge-daemon-${platform}`;
+	const url = `${GITHUB_RELEASES}/${targetVersion}/${asset}.gz`;
+
+	const tmpPath = await downloadBinary(url, destPath, asset);
+	// Note: downloadBinary and installBinary each clean up tmpPath on their own
+	// failure paths. The only gap is a checksum mismatch after a successful
+	// download — handle that explicitly here.
+	const expectedHash = checksums.get(asset);
+	if (expectedHash) {
+		try {
+			await verifyChecksum(tmpPath, expectedHash, asset);
+		} catch (err) {
+			await unlink(tmpPath).catch(() => {});
+			throw err;
+		}
+	} else {
+		console.warn(
+			`  ⚠ No checksum found for ${asset} in release ${targetVersion} — installing without verification.`,
+		);
+	}
+	await installBinary(tmpPath, destPath);
+}
+
+/**
  * Main update routine.
  *
  * Usage: knowledge-server update [--version v1.2.3]
