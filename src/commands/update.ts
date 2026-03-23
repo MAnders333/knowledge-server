@@ -286,33 +286,52 @@ export async function runUpdate(
 		process.exit(1);
 	}
 
-	// Single binary: knowledge-server now serves both the HTTP server and the MCP
-	// stdio proxy (via `knowledge-server mcp`). There is no separate MCP binary.
-	const binaryAsset = `knowledge-server-${platform}`;
-	const binaryUrl = `${GITHUB_RELEASES}/${targetVersion}/${binaryAsset}.gz`;
+	// Download both binaries: knowledge-server (HTTP/MCP server) and knowledge-daemon
+	// (episode uploader, auto-spawned by the server in single-machine mode).
+	const libexecDir = dirname(execPath);
+	const daemonPath = join(libexecDir, "knowledge-daemon");
 
-	let mainTmpPath = "";
+	const binariesToUpdate: Array<{ asset: string; destPath: string }> = [
+		{ asset: `knowledge-server-${platform}`, destPath: execPath },
+		{ asset: `knowledge-daemon-${platform}`, destPath: daemonPath },
+	];
+
+	// Track temp paths so all can be cleaned up if any step fails.
+	// downloadBinary places temp files next to the target binary for atomic rename.
+	const tmpPaths: string[] = [];
 	try {
-		mainTmpPath = await downloadBinary(binaryUrl, execPath, binaryAsset);
-		const expectedHash = checksums.get(binaryAsset);
-		if (expectedHash) {
-			process.stdout.write("  Verifying checksum... ");
-			await verifyChecksum(mainTmpPath, expectedHash, binaryAsset);
-			console.log("ok");
-		} else {
-			console.warn(
-				`  ⚠ No checksum found for ${binaryAsset} — proceeding without verification`,
-			);
+		for (const { asset, destPath } of binariesToUpdate) {
+			const url = `${GITHUB_RELEASES}/${targetVersion}/${asset}.gz`;
+			// Push the path only after downloadBinary succeeds so the outer catch
+			// only tries to unlink files that actually exist.
+			const tmpPath = await downloadBinary(url, destPath, asset);
+			tmpPaths.push(tmpPath);
+			const expectedHash = checksums.get(asset);
+			if (expectedHash) {
+				process.stdout.write("  Verifying checksum... ");
+				await verifyChecksum(tmpPath, expectedHash, asset);
+				console.log("ok");
+			} else {
+				console.warn(
+					`  ⚠ No checksum found for ${asset} — proceeding without verification`,
+				);
+			}
 		}
 	} catch (err) {
-		await unlink(mainTmpPath).catch(() => {});
+		// Clean up temp files; outer catch is the single cleanup point.
+		await Promise.all(tmpPaths.map((p) => unlink(p).catch(() => {})));
 		console.error(`\n  ✗ ${err instanceof Error ? err.message : err}`);
 		process.exit(1);
 	}
 
-	process.stdout.write("  Installing binary... ");
+	// Pair each temp path with its target and install sequentially.
+	// Sequential (not parallel) avoids two concurrent overwrites of files in the
+	// same directory, one of which is the running executable.
+	process.stdout.write("  Installing binaries... ");
 	try {
-		await installBinary(mainTmpPath, execPath);
+		for (let i = 0; i < binariesToUpdate.length; i++) {
+			await installBinary(tmpPaths[i], binariesToUpdate[i].destPath);
+		}
 		console.log("done");
 	} catch (err) {
 		console.error(`\n  ✗ ${err instanceof Error ? err.message : err}`);
@@ -323,9 +342,6 @@ export async function runUpdate(
 	// the main binary. As of v1.7.0 the MCP stdio proxy is built into the main
 	// binary as `knowledge-server mcp`; the separate binary is no longer
 	// distributed or updated.
-	//
-	// Convention from install.sh: both binaries lived at <install-dir>/libexec/.
-	const libexecDir = dirname(execPath);
 	const mcpBinaryPath = join(libexecDir, "knowledge-server-mcp");
 	if (existsSync(mcpBinaryPath)) {
 		try {
@@ -394,16 +410,14 @@ export async function runUpdate(
 	console.log(`\n  Updated to ${targetVersion}.`);
 	console.log("  Restart the server to pick up the new binary.");
 
-	// The MCP command changed in v1.7.0 / v2.0.0: knowledge-server-mcp no longer exists.
-	// Only show the migration notice when the user was previously on a version that
-	// still had the separate binary (i.e. currentVersion < v1.7.0 / v2.0.0).
-	// Users already on v2.x have already re-run setup-tool and don't need the reminder.
 	const currentMatch = /^v(\d+)\.(\d+)/.exec(currentVersion);
 	if (!currentMatch)
 		throw new Error(`Unexpected currentVersion format: ${currentVersion}`);
-	const wasOnOldBinary =
-		Number(currentMatch[1]) === 1 && Number(currentMatch[2]) < 7;
-	if (wasOnOldBinary) {
+	const currentMajor = Number(currentMatch[1]);
+	const currentMinor = Number(currentMatch[2]);
+
+	// v1.x → v2.x: knowledge-server-mcp binary replaced by `knowledge-server mcp`.
+	if (currentMajor === 1 && currentMinor < 7) {
 		console.log(`
   ⚠ Breaking change: the separate knowledge-server-mcp binary has been
     replaced by \`knowledge-server mcp\`. Re-run setup-tool for each of your
@@ -412,5 +426,31 @@ export async function runUpdate(
       knowledge-server setup-tool claude-code
       knowledge-server setup-tool cursor
       knowledge-server setup-tool codex`);
+	}
+
+	// v2.x → v3.x: consolidation now requires knowledge-daemon.
+	// The server auto-spawns it automatically, so no manual action is needed
+	// for single-machine setups. For remote setups, install the daemon separately.
+	const targetMatch = /^v(\d+)/.exec(targetVersion);
+	if (!targetMatch)
+		throw new Error(`Unexpected targetVersion format: ${targetVersion}`);
+	const targetMajor = Number(targetMatch[1]);
+	if (currentMajor < 3 && targetMajor >= 3) {
+		console.log(`
+  ⚠ Breaking change (v3): consolidation now runs through knowledge-daemon.
+
+  Single-machine users: no action needed — the server auto-spawns the
+  daemon automatically (just installed alongside this binary).
+
+  Remote server setup (daemon on local machine, server elsewhere):
+    - Set DAEMON_AUTO_SPAWN=false on the remote server
+    - Run the daemon on each local machine:
+        knowledge-daemon --interval=300
+      or register it as a background service:
+        knowledge-server setup-tool daemon
+
+  If you had a custom POSTGRES_CONNECTION_URI or KNOWLEDGE_DB_PATH,
+  run once to migrate your config:
+    knowledge-server migrate-config`);
 	}
 }

@@ -97,6 +97,13 @@ export const config = {
 		process.env.KNOWLEDGE_PID_PATH ??
 		join(homedir(), ".local", "share", "knowledge-server", "server.pid"),
 
+	// Daemon auto-spawn — when the writable store is SQLite (single-machine mode),
+	// the server automatically starts knowledge-daemon as a child process so that
+	// users don't need to manage two separate services.
+	// Set DAEMON_AUTO_SPAWN=false to opt out (e.g. if you manage the daemon yourself
+	// via launchd / systemd through `knowledge-server setup-tool daemon`).
+	daemonAutoSpawn: process.env.DAEMON_AUTO_SPAWN !== "false",
+
 	// Episode sources
 	//
 	// opencodeDbPath: path to OpenCode's SQLite DB.

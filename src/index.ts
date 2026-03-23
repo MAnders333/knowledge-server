@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { serve } from "bun";
 // @ts-ignore — Bun supports JSON imports natively
 import pkg from "../package.json" with { type: "json" };
@@ -365,6 +366,110 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		logger.raw(`\n  Logs: ${config.logPath}`);
 	}
 
+	// ── Daemon auto-spawn ────────────────────────────────────────────────────
+	//
+	// Automatically start knowledge-daemon as a child process so users don't
+	// need to manage two separate services. The daemon reads local AI tool
+	// session files and uploads episodes to pending_episodes; the server
+	// consolidates from there.
+	//
+	// The server doesn't try to second-guess whether there are local session
+	// files — the daemon handles that itself (warns and polls quietly when
+	// nothing is found). The only question is whether the daemon binary exists.
+	//
+	// Disabled when:
+	//   - DAEMON_AUTO_SPAWN=false — user manages the daemon themselves
+	//     (e.g. via launchd/systemd through `knowledge-server setup-tool daemon`)
+	//   - Running in dev mode (bun run src/index.ts) — no compiled binary present
+	//   - The daemon binary can't be found next to the server binary
+	//
+	// The daemon child inherits the server's environment so it picks up the
+	// same KNOWLEDGE_* env vars. Its stdout/stderr are forwarded to the server log.
+	let daemonChild: ReturnType<typeof Bun.spawn> | null = null;
+
+	if (config.daemonAutoSpawn) {
+		// Resolve the daemon command to spawn.
+		//
+		// Compiled install:   process.execPath = .../libexec/knowledge-server
+		//                     basename starts with "knowledge-server"
+		//                     cmd = [".../libexec/knowledge-daemon", "--interval=300"]
+		//
+		// Source install:     process.execPath = .../bun (basename starts with "bun")
+		//                     process.argv[1]  = .../repo/src/index.ts
+		//                     cmd = [".../bun", "run", ".../repo/src/daemon/index.ts", "--interval=300"]
+		//
+		// Uses basename(process.execPath).startsWith("bun") — same convention as
+		// resolveEnvFilePath() and setup-tool.ts for source-vs-compiled detection.
+		const isSourceRun = basename(process.execPath).startsWith("bun");
+		const daemonBinPath = join(dirname(process.execPath), "knowledge-daemon");
+
+		const daemonCmd: string[] = isSourceRun
+			? process.argv[1]
+				? [
+						process.execPath,
+						"run",
+						join(dirname(process.argv[1]), "daemon", "index.ts"),
+						"--interval=300",
+					]
+				: [] // argv[1] missing — can't locate daemon entry point
+			: existsSync(daemonBinPath)
+				? [daemonBinPath, "--interval=300"]
+				: [];
+
+		if (daemonCmd.length === 0) {
+			logger.warn(
+				`[daemon] Auto-spawn skipped — daemon binary not found at ${daemonBinPath}. Run \`knowledge-server update\` to install it, or set DAEMON_AUTO_SPAWN=false to suppress this warning.`,
+			);
+		} else {
+			try {
+				daemonChild = Bun.spawn(daemonCmd, {
+					stdout: "pipe",
+					stderr: "pipe",
+					env: { ...process.env },
+				});
+				// Forward daemon output to the server log.
+				// TextDecoder is stateful: using { stream: true } preserves carry-over
+				// state so multi-byte UTF-8 sequences split across chunk boundaries
+				// are decoded correctly rather than replaced with \uFFFD.
+				const forwardStream = async (
+					stream: ReadableStream<Uint8Array> | null,
+				) => {
+					if (!stream) return;
+					const decoder = new TextDecoder();
+					for await (const chunk of stream) {
+						const text = decoder.decode(chunk, { stream: true });
+						for (const line of text.split("\n")) {
+							if (line.trimEnd()) logger.raw(line.trimEnd());
+						}
+					}
+				};
+				forwardStream(daemonChild.stdout).catch((e) =>
+					logger.warn("[daemon] stdout forward error:", e),
+				);
+				forwardStream(daemonChild.stderr).catch((e) =>
+					logger.warn("[daemon] stderr forward error:", e),
+				);
+				// Observe daemon exit so unexpected crashes are surfaced in the server log.
+				daemonChild.exited
+					.then((code) => {
+						if (code !== 0 && !shutdownRequested) {
+							logger.warn(
+								`[daemon] Exited unexpectedly with code ${code}. Restart the server or run knowledge-daemon manually.`,
+							);
+						}
+					})
+					.catch((e) => logger.warn("[daemon] exit watch error:", e));
+				logger.log(
+					`[daemon] Auto-spawned (PID ${daemonChild.pid}). Set DAEMON_AUTO_SPAWN=false to manage the daemon yourself.`,
+				);
+			} catch (err) {
+				logger.warn(
+					`[daemon] Auto-spawn failed: ${err instanceof Error ? err.message : String(err)}. Start knowledge-daemon manually or run \`knowledge-server setup-tool daemon\`.`,
+				);
+			}
+		}
+	}
+
 	// Background consolidation — runs after the server starts listening so the
 	// HTTP API is available immediately. Two modes:
 	//
@@ -513,6 +618,20 @@ Run \`knowledge-server help-advanced\` for additional commands.
 			logger.warn(
 				`[shutdown] ${SHUTDOWN_TIMEOUT_MS / 1000}s timeout reached — in-flight consolidation batch abandoned.`,
 			);
+		}
+		// Terminate auto-spawned daemon child if running and wait briefly for
+		// it to exit cleanly before closing the DB (avoids concurrent SQLite access).
+		if (daemonChild) {
+			try {
+				daemonChild.kill();
+				await Promise.race([
+					daemonChild.exited,
+					new Promise<void>((r) => setTimeout(r, 2000)),
+				]);
+				logger.log("[daemon] Auto-spawned daemon terminated.");
+			} catch {
+				// Non-fatal — process may have already exited.
+			}
 		}
 		consolidation.close();
 		await registry.close();

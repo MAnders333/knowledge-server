@@ -128,27 +128,34 @@ mkdir -p "$COMMAND_DIR"
 
 # ── Download binaries and verify checksums ────────────────────────────────────
 
-echo "Downloading binary..."
+echo "Downloading binaries..."
 
 TMPDIR_DL="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR_DL"' EXIT
 
-# Download the checksum file first (contains hash of the uncompressed binary)
+# Download the checksum file first (contains hashes of both uncompressed binaries)
 curl --fail --location --silent --show-error \
   "$BASE_URL/SHA256SUMS-$PLATFORM" \
   -o "$TMPDIR_DL/SHA256SUMS"
 
-# Download gzip-compressed binary and decompress on the fly.
+# Download gzip-compressed binaries and decompress on the fly.
 # Streaming decompress avoids storing both compressed and uncompressed copies.
 curl --fail --location --show-error --progress-bar \
   "$BASE_URL/knowledge-server-$PLATFORM.gz" \
   | gunzip > "$TMPDIR_DL/knowledge-server"
 
-echo "Verifying checksum..."
-# The SHA256SUMS file contains the hash of the uncompressed binary.
-# Tool selection: macOS ships `shasum` (BSD); prefer it on Darwin.
+curl --fail --location --show-error --progress-bar \
+  "$BASE_URL/knowledge-daemon-$PLATFORM.gz" \
+  | gunzip > "$TMPDIR_DL/knowledge-daemon"
+
+echo "Verifying checksums..."
+# The SHA256SUMS file contains the hashes of the uncompressed binaries.
+# Normalise names so sha*sum --check can find the local files.
 _verify_checksums() {
-  sed "s/knowledge-server-$PLATFORM/knowledge-server/" SHA256SUMS | "$@"
+  sed \
+    -e "s|knowledge-server-$PLATFORM|knowledge-server|" \
+    -e "s|knowledge-daemon-$PLATFORM|knowledge-daemon|" \
+    SHA256SUMS | "$@"
 }
 if [[ "$OS" == "Darwin" ]] && command -v shasum > /dev/null 2>&1; then
   (cd "$TMPDIR_DL" && _verify_checksums shasum -a 256 --check --status) || {
@@ -168,12 +175,16 @@ elif command -v shasum > /dev/null 2>&1; then
 else
   echo "  ⚠ No sha256sum or shasum found — skipping checksum verification"
 fi
-echo "  ✓ Checksum verified"
+echo "  ✓ Checksums verified"
 
-# Move verified binary into place
+# Move verified binaries into place
 mv "$TMPDIR_DL/knowledge-server" "$INSTALL_DIR/libexec/knowledge-server"
 chmod +x "$INSTALL_DIR/libexec/knowledge-server"
 echo "  ✓ knowledge-server"
+
+mv "$TMPDIR_DL/knowledge-daemon" "$INSTALL_DIR/libexec/knowledge-daemon"
+chmod +x "$INSTALL_DIR/libexec/knowledge-daemon"
+echo "  ✓ knowledge-daemon"
 
 # Record installed version — written after download succeeds so a failed
 # update doesn't leave the version file pointing at a partially-updated install
