@@ -318,6 +318,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		adminToken,
 		adminTokenIsStable,
 		registry.userId,
+		registry.unavailableStoreIds,
 	);
 
 	// Start server — PID file written after this succeeds so it only exists

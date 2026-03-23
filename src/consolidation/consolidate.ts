@@ -575,6 +575,21 @@ export class ConsolidationEngine {
 		const chunkDirectory = chunk[0]?.directory ?? "";
 		const domainResolution = this.domainRouter?.resolve(chunkDirectory) ?? null;
 
+		// If the target store for this chunk's domain is currently unavailable, skip
+		// the chunk entirely. The episodes remain in pending_episodes and will be
+		// retried on the next consolidation run when the store may be reachable again.
+		if (domainResolution?.storeUnavailable) {
+			logger.warn(
+				`[consolidation/${source}] Skipping chunk — target store for domain "${domainResolution.domainId}" is unavailable. Episodes will be retried on next run.`,
+			);
+			return {
+				created: 0,
+				updated: 0,
+				conflictsDetected: 0,
+				conflictsResolved: 0,
+			};
+		}
+
 		// Extract knowledge via LLM (episodes only — no existing knowledge context).
 		const extractStart = Date.now();
 		const extracted = await this.llm.extractKnowledge(

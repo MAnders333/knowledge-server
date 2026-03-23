@@ -17,6 +17,12 @@ export interface DomainResolution {
 	/** The store that should receive writes for this domain. */
 	store: IKnowledgeDB;
 	/**
+	 * Whether the resolved store is currently unavailable (failed to connect at startup).
+	 * When true, the consolidation engine should skip this episode group and leave
+	 * the rows in pending_episodes for retry on the next run.
+	 */
+	storeUnavailable: boolean;
+	/**
 	 * Domain context to inject into the LLM extraction prompt.
 	 * Null when no domains are configured (single-store mode).
 	 */
@@ -57,11 +63,13 @@ export class DomainRouter {
 	private projects: Array<ProjectConfig & { normalizedPath: string }>;
 	private stores: Map<string, IKnowledgeDB>;
 	private fallbackStore: IKnowledgeDB;
+	private unavailableStoreIds: ReadonlySet<string>;
 
 	constructor(
 		config: KnowledgeServerConfig,
 		stores: Map<string, IKnowledgeDB>,
 		fallbackStore: IKnowledgeDB,
+		unavailableStoreIds: ReadonlySet<string> = new Set(),
 	) {
 		this.domains = config.domains;
 		// Pre-normalize project paths once at construction so bestProjectMatch
@@ -73,6 +81,7 @@ export class DomainRouter {
 		}));
 		this.stores = stores;
 		this.fallbackStore = fallbackStore;
+		this.unavailableStoreIds = unavailableStoreIds;
 	}
 
 	/**
@@ -87,6 +96,7 @@ export class DomainRouter {
 			return {
 				domainId: undefined,
 				store: this.fallbackStore,
+				storeUnavailable: this.unavailableStoreIds.has("default"),
 				domainContext: null,
 			};
 		}
@@ -122,9 +132,12 @@ export class DomainRouter {
 			);
 		}
 
+		const storeUnavailable = this.unavailableStoreIds.has(resolvedDomain.store);
+
 		return {
 			domainId: resolvedDomain.id,
 			store,
+			storeUnavailable,
 			domainContext: {
 				domains: this.domains.map((d) => ({
 					id: d.id,

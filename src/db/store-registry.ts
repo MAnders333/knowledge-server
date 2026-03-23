@@ -34,6 +34,12 @@ export class StoreRegistry {
 	/** Domain router for consolidation routing. Null when no domains are configured. */
 	readonly domainRouter: DomainRouter | null;
 	/**
+	 * Store IDs that failed to connect at startup and are currently unavailable.
+	 * Consolidation skips episodes destined for these stores; they are retried
+	 * on the next consolidation run. Activation excludes them from fan-out.
+	 */
+	readonly unavailableStoreIds: ReadonlySet<string>;
+	/**
 	 * Stable user identifier for multi-user shared DB setups.
 	 * Scopes the consolidation cursor and episode log per user.
 	 * Resolved from KNOWLEDGE_USER_ID env var → config.jsonc userId → hostname → "default".
@@ -44,6 +50,7 @@ export class StoreRegistry {
 		stores: Map<string, IKnowledgeDB>,
 		writableId: string,
 		config: KnowledgeServerConfig,
+		unavailableIds: Set<string>,
 	) {
 		this.stores = stores;
 		const writable = stores.get(writableId);
@@ -54,9 +61,10 @@ export class StoreRegistry {
 		}
 		this.writable = writable;
 		this.readable = Array.from(stores.values());
+		this.unavailableStoreIds = unavailableIds;
 		this.domainRouter =
 			config.domains.length > 0
-				? new DomainRouter(config, stores, writable)
+				? new DomainRouter(config, stores, writable, unavailableIds)
 				: null;
 		this.userId = config.userId;
 	}
@@ -107,26 +115,59 @@ export class StoreRegistry {
 			logger.log("[db] No config.jsonc found — using default SQLite store.");
 		}
 
-		// Resolve writableId before any I/O — it comes from config, not from DB init.
-		const writableId = config.stores.find((s) => s.writable)?.id ?? null;
-		if (!writableId) {
-			// Validated in loadConfigFile — should never happen, but guard anyway
-			throw new Error("StoreRegistry: no writable store configured");
+		// Initialise all stores in parallel.
+		// Unreachable stores produce a warning and are excluded — not a hard error.
+		// This lets the server start in degraded mode (e.g. team Postgres is down
+		// but personal SQLite works). SQLite stores always succeed.
+		const results = await Promise.all(
+			config.stores.map((storeConfig) => tryInitStore(storeConfig)),
+		);
+
+		const unavailableIds = new Set(
+			results.filter((r) => !r.db).map((r) => r.id),
+		);
+
+		for (const r of results) {
+			if (!r.db) {
+				logger.warn(
+					`[db] Store "${r.id}" is unavailable — excluded from activation and consolidation. Episodes destined for it will be retried when it is reachable again. Reason: ${r.error}`,
+				);
+			}
 		}
 
-		// Initialise all stores in parallel — no ordering dependency between them.
-		const initialized = await Promise.all(
-			config.stores.map(async (storeConfig) => ({
-				id: storeConfig.id,
-				db: await initStore(storeConfig),
-			})),
-		);
-
 		const stores = new Map<string, IKnowledgeDB>(
-			initialized.map(({ id, db }) => [id, db]),
+			results
+				.filter(
+					(r): r is { id: string; db: IKnowledgeDB; error: undefined } =>
+						r.db !== null,
+				)
+				.map(({ id, db }) => [id, db]),
 		);
 
-		const registry = new StoreRegistry(stores, writableId, config);
+		// At least one writable store must still be reachable — without it the
+		// server cannot consolidate or serve useful knowledge.
+		const availableWritableIds = config.stores
+			.filter((s) => s.writable && !unavailableIds.has(s.id))
+			.map((s) => s.id);
+
+		if (availableWritableIds.length === 0) {
+			const allWritableIds = config.stores
+				.filter((s) => s.writable)
+				.map((s) => s.id);
+			throw new Error(
+				`No writable stores are reachable. All writable stores failed to connect: ${allWritableIds.join(", ")}. At least one writable store must be available to start the server.`,
+			);
+		}
+
+		// Use the first available writable store as the primary.
+		const writableId = availableWritableIds[0];
+
+		const registry = new StoreRegistry(
+			stores,
+			writableId,
+			config,
+			unavailableIds,
+		);
 
 		// Warn if writable SQLite stores coexist with remote Postgres stores.
 		// In this topology, a remote consolidation server cannot write to local SQLite —
@@ -139,6 +180,26 @@ export class StoreRegistry {
 }
 
 // ── Store initializer ────────────────────────────────────────────────────────
+
+/**
+ * Try to initialise a store, returning null on connection failure rather than
+ * throwing. SQLite always succeeds (creates file if missing). Postgres may fail
+ * if the server is unreachable.
+ */
+async function tryInitStore(
+	storeConfig: StoreConfig,
+): Promise<{ id: string; db: IKnowledgeDB | null; error?: string }> {
+	try {
+		const db = await initStore(storeConfig);
+		return { id: storeConfig.id, db };
+	} catch (e) {
+		return {
+			id: storeConfig.id,
+			db: null,
+			error: e instanceof Error ? e.message : String(e),
+		};
+	}
+}
 
 async function initStore(storeConfig: StoreConfig): Promise<IKnowledgeDB> {
 	if (storeConfig.kind === "sqlite") {

@@ -62,6 +62,8 @@ export function createApp(
 	adminTokenIsStable = false,
 	/** User identifier for cursor scoping in multi-user shared DB setups. */
 	userId = "default",
+	/** Store IDs that failed to connect at startup and are currently unavailable. */
+	unavailableStoreIds: ReadonlySet<string> = new Set(),
 ): Hono {
 	const app = new Hono();
 	// Reuse ActivationEngine's EmbeddingClient to avoid a second model connection.
@@ -394,6 +396,9 @@ export function createApp(
 						recordedAt: new Date(embeddingMeta.recordedAt).toISOString(),
 					}
 				: null,
+			...(unavailableStoreIds.size > 0 && {
+				unavailableStores: [...unavailableStoreIds],
+			}),
 			...(isAdmin && {
 				config: {
 					port: config.port,
