@@ -1,5 +1,15 @@
 # Changelog
 
+## [3.0.3](https://github.com/MAnders333/knowledge-server/compare/v3.0.2...v3.0.3) (2026-03-23)
+
+
+### Bug Fixes
+
+* drop staging tables in PG hard-reset path; update stale test labels ([542da87](https://github.com/MAnders333/knowledge-server/commit/542da8754e5dc96528d0157712a74d56a438cf68))
+* run migrateFromKnowledgeDb before store initialization ([cc054e0](https://github.com/MAnders333/knowledge-server/commit/cc054e09fac5717b7bd9e1c4c4bdfb50afe1a205))
+* rw handle leak in drop phase; update stale migrateFromKnowledgeDb comments ([642b67e](https://github.com/MAnders333/knowledge-server/commit/642b67e53e7e11df6458a4a312ddb0dad8b31b5b))
+* split migration into two independent idempotent steps; atomic transaction guard ([a841d1d](https://github.com/MAnders333/knowledge-server/commit/a841d1d84f7e01cd18ecef4af51ce2aee1b4fe9e))
+
 ## [3.0.2](https://github.com/MAnders333/knowledge-server/compare/v3.0.1...v3.0.2) (2026-03-23)
 
 
