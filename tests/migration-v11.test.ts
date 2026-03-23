@@ -97,7 +97,7 @@ describe("v11 SQLite migration (v10 → v11)", () => {
 	});
 
 	afterEach(async () => {
-		await db.close();
+		await db?.close();
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
@@ -167,7 +167,25 @@ describe("v11 SQLite migration (v10 → v11)", () => {
 		expect(row.v).toBe(13);
 	});
 
-	it("ServerLocalDB works independently for episode tracking", async () => {
+	it("migrateFromKnowledgeDb copies legacy consolidated_episode rows to server.db", async () => {
+		// Open KnowledgeDB to trigger the v10 → v13 migration chain.
+		db = new KnowledgeDB(dbPath);
+
+		// Simulate what StoreRegistry does: create ServerLocalDB then migrate from knowledge.db.
+		const serverLocalDb2 = new ServerLocalDB(join(tempDir, "server2.db"));
+		serverLocalDb2.migrateFromKnowledgeDb(dbPath);
+
+		// The consolidated_episode row seeded in the v10 fixture should now be in server.db.
+		const ranges = await serverLocalDb2.getProcessedEpisodeRanges([
+			"session-abc",
+		]);
+		expect(ranges.size).toBe(1);
+		expect(ranges.get("session-abc")?.[0].source).toBe("opencode");
+		expect(ranges.get("session-abc")?.[0].startMessageId).toBe("msg-start");
+		await serverLocalDb2.close();
+	});
+
+	it("episode writes and reads work via ServerLocalDB", async () => {
 		db = new KnowledgeDB(dbPath);
 		const serverLocalDb = new ServerLocalDB(join(tempDir, "server.db"));
 
