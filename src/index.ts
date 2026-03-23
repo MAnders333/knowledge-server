@@ -594,10 +594,23 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		logger.log(
 			`✓ Auto-consolidation polling enabled (every ${intervalLabel}). Set CONSOLIDATION_POLL_INTERVAL_MS=0 to disable.`,
 		);
+
+		// Interruptible sleep: checks shutdownRequested every second rather than
+		// sleeping for the full interval. This lets shutdown complete immediately
+		// instead of waiting up to pollIntervalMs (e.g. 8h) for the setTimeout.
+		const interruptibleSleep = async (ms: number) => {
+			const end = Date.now() + ms;
+			while (!shutdownRequested && Date.now() < end) {
+				await new Promise((resolve) =>
+					setTimeout(resolve, Math.min(1000, end - Date.now())),
+				);
+			}
+		};
+
 		activeLoops.push(
 			(async () => {
 				while (!shutdownRequested) {
-					await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+					await interruptibleSleep(pollIntervalMs);
 					if (shutdownRequested) break;
 					const { pendingSessions } = await consolidation.checkPending();
 					if (pendingSessions > 0) {
@@ -623,10 +636,10 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		logger.log(`[${signal}] Shutting down gracefully...`);
 		shutdownRequested = true;
 		const TIMED_OUT = Symbol("timed_out");
-		if (activeLoops.length > 0) {
-			logger.log(
-				`[shutdown] Waiting for ${activeLoops.length} active consolidation loop(s) to finish...`,
-			);
+		// Only log a waiting message when consolidation is actually running —
+		// the polling loop is always in activeLoops but is idle most of the time.
+		if (consolidation.isConsolidating) {
+			logger.log("[shutdown] Waiting for in-flight consolidation to finish...");
 		}
 		const result = await Promise.race([
 			Promise.all(activeLoops).then(() => null),

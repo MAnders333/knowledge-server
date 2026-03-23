@@ -75,8 +75,7 @@ export function runMigrateConfig(): void {
 		envVarsToRemove = [...envVarsToRemove, "KNOWLEDGE_USER_ID"];
 	}
 
-	// port block — write value whenever KNOWLEDGE_PORT was set (even if default),
-	// so the env var can be removed after migration.
+	// port block — write value whenever KNOWLEDGE_PORT was set.
 	const validPort =
 		port !== null && !Number.isNaN(port) && port >= 1 && port <= 65535;
 	if (port !== null && !validPort) {
@@ -84,9 +83,12 @@ export function runMigrateConfig(): void {
 			`Warning: KNOWLEDGE_PORT "${process.env.KNOWLEDGE_PORT}" is not a valid port (1–65535) — writing default 3179 to config.jsonc.`,
 		);
 	}
+	const portComment = validPort
+		? "// HTTP port (from KNOWLEDGE_PORT). You can remove that env var now."
+		: "// HTTP port (default — your KNOWLEDGE_PORT value was invalid; fix or remove it manually).";
 	const portBlock =
 		port !== null
-			? `\n  // HTTP port (from KNOWLEDGE_PORT). You can remove that env var now.\n  "port": ${validPort ? port : 3179},`
+			? `\n  ${portComment}\n  "port": ${validPort ? port : 3179},`
 			: `\n  // "port": 3179,  // HTTP port (default)`;
 	// Only add to envVarsToRemove when the value was successfully migrated.
 	// If the port was invalid, the var still contains the bad value — don't tell
