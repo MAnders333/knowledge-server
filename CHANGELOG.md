@@ -1,5 +1,21 @@
 # Changelog
 
+## [3.1.0](https://github.com/MAnders333/knowledge-server/compare/v3.0.4...v3.1.0) (2026-03-23)
+
+
+### Features
+
+* **synthesis:** scope runSynthesis to touched stores per consolidation run ([787e1fa](https://github.com/MAnders333/knowledge-server/commit/787e1fa796d3e5e216cd9c7b66bff0fd17e883c5))
+* **synthesis:** track touched stores per run; gate multi-store synthesis on follow-up ([9890375](https://github.com/MAnders333/knowledge-server/commit/98903752ae873910b0244a248e20c6dcc6901f6b))
+
+
+### Bug Fixes
+
+* **consolidation:** address holistic review findings ([e3f09e4](https://github.com/MAnders333/knowledge-server/commit/e3f09e42174ff599d122955df2a4b7f84662341c))
+* **contradiction:** route scanner to correct domain store per chunk ([6e52ed5](https://github.com/MAnders333/knowledge-server/commit/6e52ed5a138c51c3233a161d485372ebb3e87bc7))
+* **migration:** seed daemon_cursor from source_cursor on pre-v12 upgrade ([f5ff28b](https://github.com/MAnders333/knowledge-server/commit/f5ff28bb0767cda1b1b4e73c2c49a74b72c8f32c))
+* **synthesis:** add mergeDb param to reconsolidate(); enable per-store synthesis ([5c4942e](https://github.com/MAnders333/knowledge-server/commit/5c4942ec4598070f47e58da5a4ab7b706a7f9e9a))
+
 ## [3.0.4](https://github.com/MAnders333/knowledge-server/compare/v3.0.3...v3.0.4) (2026-03-23)
 
 
