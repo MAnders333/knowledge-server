@@ -58,6 +58,19 @@ export class ConsolidationEngine {
 	private domainRouter: DomainRouter | null;
 
 	/**
+	 * Stores that received inserts or content-changing updates during the most
+	 * recent consolidation run. Accumulated across all batches in a drain loop.
+	 * Reset at the start of each new consolidation run (_consolidate resets it).
+	 * Used by runSynthesis() to limit synthesis to stores that had new knowledge.
+	 *
+	 * Invariant: if _consolidate() throws mid-run, this set is partial (only stores
+	 * from completed readers). The exception propagates to the caller who must not
+	 * call runSynthesis() after a failed consolidate(). The set is reset on the
+	 * next run so partial state does not persist across runs.
+	 */
+	private _lastTouchedStores = new Set<IKnowledgeStore>();
+
+	/**
 	 * Concurrency guard — only one consolidation run at a time, regardless of
 	 * whether it was triggered by the startup background loop or an API call.
 	 * Lives here (not in the API closure) so both paths share the same flag.
@@ -209,6 +222,9 @@ export class ConsolidationEngine {
 			`[consolidation] Starting. Last run: ${state.lastConsolidatedAt ? new Date(state.lastConsolidatedAt).toISOString() : "never"}`,
 		);
 
+		// Reset touched stores for this run — accumulates across all source batches.
+		this._lastTouchedStores = new Set();
+
 		let totalSessionsProcessed = 0;
 		let totalSegmentsProcessed = 0;
 		let totalCreated = 0;
@@ -225,6 +241,8 @@ export class ConsolidationEngine {
 			totalUpdated += sourceTotals.entriesUpdated;
 			totalConflictsDetected += sourceTotals.conflictsDetected;
 			totalConflictsResolved += sourceTotals.conflictsResolved;
+			for (const s of sourceTotals.touchedStores)
+				this._lastTouchedStores.add(s);
 		}
 
 		if (totalSessionsProcessed === 0) {
@@ -295,6 +313,7 @@ export class ConsolidationEngine {
 		entriesUpdated: number;
 		conflictsDetected: number;
 		conflictsResolved: number;
+		touchedStores: Set<IKnowledgeStore>;
 	}> {
 		// pending_episodes is self-draining — pass 0 so all remaining rows are candidates.
 		const afterMessageTimeCreated = 0;
@@ -318,6 +337,7 @@ export class ConsolidationEngine {
 					entriesUpdated: 0,
 					conflictsDetected: 0,
 					conflictsResolved: 0,
+					touchedStores: new Set(),
 				};
 			}
 		}
@@ -338,6 +358,7 @@ export class ConsolidationEngine {
 				entriesUpdated: 0,
 				conflictsDetected: 0,
 				conflictsResolved: 0,
+				touchedStores: new Set(),
 			};
 		}
 
@@ -365,6 +386,7 @@ export class ConsolidationEngine {
 				entriesUpdated: 0,
 				conflictsDetected: 0,
 				conflictsResolved: 0,
+				touchedStores: new Set(),
 			};
 		}
 
@@ -394,6 +416,7 @@ export class ConsolidationEngine {
 		let totalUpdated = 0;
 		let totalConflictsDetected = 0;
 		let totalConflictsResolved = 0;
+		const sourceTouchedStores = new Set<IKnowledgeStore>();
 
 		const chunkSize = config.consolidation.chunkSize;
 
@@ -437,6 +460,7 @@ export class ConsolidationEngine {
 			totalUpdated += counts.updated;
 			totalConflictsDetected += counts.conflictsDetected;
 			totalConflictsResolved += counts.conflictsResolved;
+			for (const s of counts.touchedStores) sourceTouchedStores.add(s);
 		}
 
 		// 7. Post-consolidation hook — PendingEpisodesReader deletes processed rows from
@@ -454,6 +478,7 @@ export class ConsolidationEngine {
 			entriesUpdated: totalUpdated,
 			conflictsDetected: totalConflictsDetected,
 			conflictsResolved: totalConflictsResolved,
+			touchedStores: sourceTouchedStores,
 		};
 	}
 
@@ -480,6 +505,7 @@ export class ConsolidationEngine {
 		updated: number;
 		conflictsDetected: number;
 		conflictsResolved: number;
+		touchedStores: Set<IKnowledgeStore>;
 	}> {
 		if (chunk.length === 0) {
 			return {
@@ -487,6 +513,7 @@ export class ConsolidationEngine {
 				updated: 0,
 				conflictsDetected: 0,
 				conflictsResolved: 0,
+				touchedStores: new Set(),
 			};
 		}
 
@@ -507,6 +534,7 @@ export class ConsolidationEngine {
 				updated: left.updated + right.updated,
 				conflictsDetected: left.conflictsDetected + right.conflictsDetected,
 				conflictsResolved: left.conflictsResolved + right.conflictsResolved,
+				touchedStores: new Set([...left.touchedStores, ...right.touchedStores]),
 			};
 		}
 
@@ -546,6 +574,7 @@ export class ConsolidationEngine {
 				updated: 0,
 				conflictsDetected: 0,
 				conflictsResolved: 0,
+				touchedStores: new Set(),
 			};
 		}
 
@@ -591,6 +620,11 @@ export class ConsolidationEngine {
 		// checked in a previous consolidation run).
 		const changedIds = new Set<string>();
 
+		// Track which stores received inserts or content-changing updates this chunk.
+		// Used after all chunks complete to run synthesis only on touched stores.
+		// onKeep (reinforcement only) does not count — it doesn't affect cluster ripeness.
+		const touchedStores = new Set<IKnowledgeStore>();
+
 		for (const entry of extracted) {
 			try {
 				// Resolve the target store for this entry:
@@ -621,6 +655,7 @@ export class ConsolidationEngine {
 						onInsert: (inserted) => {
 							chunkCreated++;
 							changedIds.add(inserted.id);
+							touchedStores.add(entryTargetStore ?? this.db);
 							logger.log(
 								// type is a validated KnowledgeType enum — bare interpolation is safe.
 								// content is LLM-sourced — JSON.stringify escapes injected newlines/tokens.
@@ -638,6 +673,10 @@ export class ConsolidationEngine {
 						onUpdate: (id, updated, freshEmbedding) => {
 							chunkUpdated++;
 							changedIds.add(id);
+							// Updates always go to this.db — existing entries live in this.db
+							// regardless of the incoming entry's domain (entriesMap is loaded
+							// exclusively from this.db). Only onInsert uses entryTargetStore.
+							touchedStores.add(this.db);
 							const existing = entriesMap.get(id);
 							const contentForLog = updated.content ?? existing?.content ?? "";
 							const typeForLog = updated.type ?? existing?.type ?? "?";
@@ -709,6 +748,7 @@ export class ConsolidationEngine {
 			updated: chunkUpdated,
 			conflictsDetected: chunkContradictions.detected,
 			conflictsResolved: chunkContradictions.resolved,
+			touchedStores,
 		};
 	}
 
@@ -767,11 +807,25 @@ export class ConsolidationEngine {
 	 * batches first and then synthesize once — rather than synthesizing after every
 	 * batch, which re-clusters and re-synthesizes an ever-growing KB on each pass.
 	 *
+	 * When `touchedStores` is provided, synthesis runs only on stores that received
+	 * inserts or content-changing updates this run. Pass the set returned by consolidate()
+	 * to avoid running synthesis on stores that had no new knowledge. Falls back to
+	 * this.db (single-store mode) when the set is empty or not provided.
+	 *
 	 * Must be called after ensureEmbeddings() has run (i.e. after consolidate()) so
-	 * all entries have embeddings. Returns the number of principles synthesized.
+	 * all entries have embeddings. Returns the total number of principles synthesized.
 	 */
-	async runSynthesis(): Promise<number> {
-		return this.reconsolidator.runKBSynthesis();
+	async runSynthesis(touchedStores?: Set<IKnowledgeStore>): Promise<number> {
+		// Use the explicitly provided set, or fall back to what was accumulated during
+		// the most recent consolidate() call. If neither has stores (e.g. no new entries
+		// this run), synthesis still runs on this.db so existing clusters are re-evaluated.
+		const resolved = touchedStores ?? this._lastTouchedStores;
+		const stores = resolved.size > 0 ? [...resolved] : [this.db];
+		let total = 0;
+		for (const store of stores) {
+			total += await this.reconsolidator.runKBSynthesis(store);
+		}
+		return total;
 	}
 
 	close(): void {

@@ -308,14 +308,14 @@ export class Reconsolidator {
 	 *
 	 * Returns the number of synthesis calls that produced at least one principle.
 	 *
-	 * Domain routing note: synthesised principles always land in this.db (the primary
-	 * writable store), regardless of domain configuration. Synthesis aggregates across
-	 * the full knowledge base and produces cross-domain abstractions — routing them to
-	 * a specific domain store would be arbitrary. This is intentional.
+	 * Domain routing: when domains are configured each store's knowledge is
+	 * synthesised independently. Pass the target store explicitly — the caller
+	 * is responsible for iterating over each store that received writes this run.
+	 * Defaults to this.db for single-store / backwards-compatible callers.
 	 */
-	async runKBSynthesis(): Promise<number> {
+	async runKBSynthesis(db: IKnowledgeStore = this.db): Promise<number> {
 		// Load all active entries with embeddings (ensureEmbeddings just ran).
-		const allEntries = await this.db.getActiveEntriesWithEmbeddings();
+		const allEntries = await db.getActiveEntriesWithEmbeddings();
 		if (allEntries.length < CLUSTER_MIN_MEMBERS) return 0;
 
 		// ── Step 1: Greedy clustering ──────────────────────────────────────────────
@@ -370,7 +370,7 @@ export class Reconsolidator {
 
 		// ── Step 2: Identity reconciliation ───────────────────────────────────────
 
-		const persistedClusters = await this.db.getClustersWithMembers();
+		const persistedClusters = await db.getClustersWithMembers();
 
 		// Build a lookup: persisted cluster ID → matched in-memory cluster index
 		const persistedToInMemory = new Map<string, number>();
@@ -446,7 +446,7 @@ export class Reconsolidator {
 		});
 
 		// Persist new cluster state (upsert clusters, delete stale ones)
-		await this.db.persistClusters(
+		await db.persistClusters(
 			resolvedClusters.map((c) => ({
 				id: c.id,
 				centroid: c.centroid,
@@ -503,7 +503,7 @@ export class Reconsolidator {
 					`[synthesis] synthesizePrinciple failed for cluster ${cluster.id}: ${err instanceof Error ? err.message : String(err)}`,
 				);
 				// Mark as synthesized anyway to avoid hammering on a bad cluster next run.
-				await this.db.markClusterSynthesized(cluster.id);
+				await db.markClusterSynthesized(cluster.id);
 				continue;
 			}
 
@@ -512,7 +512,7 @@ export class Reconsolidator {
 			);
 
 			// Mark cluster as synthesized regardless of results (bar was applied, nothing met it)
-			await this.db.markClusterSynthesized(cluster.id);
+			await db.markClusterSynthesized(cluster.id);
 
 			if (results.length === 0) {
 				logger.log(
@@ -581,7 +581,7 @@ export class Reconsolidator {
 								);
 								// Write supports relations from synthesized entry → source entries
 								for (const sourceId of validatedSourceIds) {
-									await this.db.insertRelation({
+									await db.insertRelation({
 										id: randomUUID(),
 										sourceId: inserted.id,
 										targetId: sourceId,
@@ -598,7 +598,7 @@ export class Reconsolidator {
 							onUpdate: async (id, _updated, freshEmbedding) => {
 								// Mark the updated entry as synthesized — mergeEntry does not set
 								// this flag, so we patch it here on the synthesis-specific path.
-								await this.db.updateEntry(id, { isSynthesized: true });
+								await db.updateEntry(id, { isSynthesized: true });
 								const existing = entriesMap.get(id);
 								if (existing) {
 									entriesMap.set(id, {
@@ -629,6 +629,7 @@ export class Reconsolidator {
 						undefined, // no sessionTimestamp — synthesized entries stamped at now
 						synthEmbedding,
 						"synthesis", // logPrefix — keeps synthesis reconsolidation out of [consolidation] logs
+						db, // targetDb — synthesized entries land in the same store being synthesized
 					);
 				} catch (err) {
 					// Log and skip this result — do NOT rethrow.
