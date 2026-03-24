@@ -376,9 +376,13 @@ export class ServerStateDB implements IServerStateDB {
 			);
 	}
 
+	async resetDaemonCursors(): Promise<void> {
+		this.db.exec("DELETE FROM daemon_cursor");
+	}
+
 	/**
 	 * Wipe all staging data: pending_episodes, consolidated_episode, and reset
-	 * consolidation_state. Called when reinitializing the knowledge store.
+	 * consolidation_state counters. Called when reinitializing the knowledge store.
 	 */
 	async reinitialize(): Promise<void> {
 		this.db.transaction(() => {

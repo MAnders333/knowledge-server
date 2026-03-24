@@ -113,13 +113,27 @@ export interface IServerStateDB {
 	): Promise<void>;
 
 	/**
+	 * Reset the daemon upload cursors for all sources back to zero.
+	 *
+	 * This causes the daemon to re-upload all historical episodes on its next
+	 * tick. Use this when connecting a machine to a new or existing store for
+	 * the first time, or when retroactively rerouting knowledge under a new
+	 * domain configuration.
+	 *
+	 * Safe for shared stores: daemon_cursor is per-machine (local state.db).
+	 * Other users' episodes are not affected.
+	 */
+	resetDaemonCursors(): Promise<void>;
+
+	/**
 	 * Wipe staging data: pending_episodes, consolidated_episode, and reset
 	 * consolidation_state counters.
 	 *
-	 * daemon_cursor is intentionally NOT reset — resetting it would cause the
-	 * daemon to re-upload all past episodes, producing duplicates on next run.
+	 * daemon_cursor is intentionally NOT touched here — call resetDaemonCursors()
+	 * explicitly if re-upload is also needed.
 	 *
-	 * Always called alongside IKnowledgeStore.reinitialize() for a full reset.
+	 * Use for re-consolidation with updated domain routing context. On shared
+	 * stores this is safe because session_ids are per-user by nature.
 	 */
 	reinitialize(): Promise<void>;
 
