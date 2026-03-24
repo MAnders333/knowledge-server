@@ -34,9 +34,10 @@ const LEGACY_KNOWLEDGE_DB_PATH = join(
  * @param db The state.db Database handle (schema tables already created).
  */
 export function runStateMigrations(db: Database): void {
-	// Two independent steps — each has its own applied_migrations guard.
+	// Each step is independent with its own applied_migrations guard.
 	copyKnowledgeDbStagingTables(db);
 	dropKnowledgeDbStagingTables(db);
+	dropOrphanedDaemonCursorFromStateDb(db);
 }
 
 /**
@@ -235,4 +236,53 @@ function dropKnowledgeDbStagingTables(db: Database): void {
 	} finally {
 		rw.close();
 	}
+}
+
+/**
+ * v3.x migration: drop orphaned daemon_cursor table from state.db.
+ *
+ * When DaemonDB was introduced (src/db/daemon/index.ts), daemon_cursor was
+ * moved out of state.db into a separate daemon.db. Existing state.db files
+ * from prior v3.x installs still contain the daemon_cursor table — it is
+ * now inert (nothing reads or writes it from state.db) but takes space and
+ * is confusing. Drop it.
+ *
+ * This migration is safe to run on any state.db version:
+ * - Fresh installs: no daemon_cursor table → DROP IF EXISTS is a no-op.
+ * - Pre-DaemonDB v3.x installs: table present → dropped.
+ *
+ * Note: the cursor data is intentionally NOT migrated to daemon.db here.
+ * That would require DaemonDB to be open and writable during state.db
+ * migration, creating a cross-DB dependency. The cost of discarding the
+ * cursor is a one-time re-upload of historical episodes (safe — the server
+ * deduplicates via consolidated_episode).
+ */
+function dropOrphanedDaemonCursorFromStateDb(db: Database): void {
+	const key = "drop_daemon_cursor_from_state_db";
+	const already = db
+		.prepare("SELECT 1 FROM applied_migrations WHERE name = ?")
+		.get(key);
+	if (already) return;
+
+	// Check if the table exists before attempting the drop.
+	const tables = new Set(
+		(
+			db
+				.prepare(
+					"SELECT name FROM sqlite_master WHERE type='table' AND name='daemon_cursor'",
+				)
+				.all() as Array<{ name: string }>
+		).map((r) => r.name),
+	);
+
+	if (tables.has("daemon_cursor")) {
+		db.exec("DROP TABLE IF EXISTS daemon_cursor");
+		logger.log(
+			"[migration] Dropped orphaned daemon_cursor table from state.db — cursor now lives in daemon.db.",
+		);
+	}
+
+	db.prepare(
+		"INSERT OR IGNORE INTO applied_migrations (name, applied_at) VALUES (?, ?)",
+	).run(key, Date.now());
 }
