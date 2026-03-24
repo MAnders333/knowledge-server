@@ -258,31 +258,30 @@ function dropKnowledgeDbStagingTables(db: Database): void {
  * deduplicates via consolidated_episode).
  */
 function dropOrphanedDaemonCursorFromStateDb(db: Database): void {
-	const key = "drop_daemon_cursor_from_state_db";
+	const key = "v3_drop_daemon_cursor_from_state_db";
 	const already = db
-		.prepare("SELECT 1 FROM applied_migrations WHERE name = ?")
+		.prepare("SELECT 1 FROM applied_migrations WHERE name = ? LIMIT 1")
 		.get(key);
 	if (already) return;
 
-	// Check if the table exists before attempting the drop.
-	const tables = new Set(
-		(
-			db
-				.prepare(
-					"SELECT name FROM sqlite_master WHERE type='table' AND name='daemon_cursor'",
-				)
-				.all() as Array<{ name: string }>
-		).map((r) => r.name),
-	);
+	db.transaction(() => {
+		// Check if the table exists — a simple row lookup is enough since the
+		// query already filters by name (no need for a Set).
+		const exists = db
+			.prepare(
+				"SELECT 1 FROM sqlite_master WHERE type='table' AND name='daemon_cursor' LIMIT 1",
+			)
+			.get();
 
-	if (tables.has("daemon_cursor")) {
-		db.exec("DROP TABLE IF EXISTS daemon_cursor");
-		logger.log(
-			"[migration] Dropped orphaned daemon_cursor table from state.db — cursor now lives in daemon.db.",
-		);
-	}
+		if (exists) {
+			db.exec("DROP TABLE IF EXISTS daemon_cursor");
+			logger.log(
+				"[migration] Dropped orphaned daemon_cursor table from state.db — cursor now lives in daemon.db.",
+			);
+		}
 
-	db.prepare(
-		"INSERT OR IGNORE INTO applied_migrations (name, applied_at) VALUES (?, ?)",
-	).run(key, Date.now());
+		db.prepare(
+			"INSERT OR IGNORE INTO applied_migrations (name, applied_at) VALUES (?, ?)",
+		).run(key, Date.now());
+	})();
 }
