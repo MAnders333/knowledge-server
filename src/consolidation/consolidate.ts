@@ -644,17 +644,18 @@ export class ConsolidationEngine {
 		// the episode may be recorded while some of its entries land in a failed store.
 		// This is acceptable — reconsolidate() is idempotent, so re-extraction on retry
 		// deduplicates against what was already written.
-		const noStoreWork = storeGroups.size === 0;
+		//
+		// succeededStores uses reference equality on IKnowledgeStore object instances.
+		// This is safe because resolveEpisodeStore() and groupExtractedByStore() both
+		// look up stores from the same Map<string, IKnowledgeStore> in DomainRouter,
+		// guaranteeing the same object instance is returned for the same store ID.
+		const extractionProducedNoEntries = storeGroups.size === 0;
 		const entriesPerEp = Math.round(
 			(chunkCreated + chunkUpdated) / Math.max(chunk.length, 1),
 		);
 		for (const ep of chunk) {
-			const epStore = this.domainRouter
-				? (this.domainRouter.resolveStore(
-						this.domainRouter.resolve(ep.directory).domainId ?? "",
-					) ?? this.db)
-				: this.db;
-			if (noStoreWork || succeededStores.has(epStore)) {
+			const epStore = this.resolveEpisodeStore(ep.directory);
+			if (extractionProducedNoEntries || succeededStores.has(epStore)) {
 				await this.serverStateDb.recordEpisode(
 					ep.source,
 					ep.sessionId,
@@ -727,6 +728,25 @@ export class ConsolidationEngine {
 			`[consolidation/${source}] Extracted ${extracted.length} entries in ${((Date.now() - extractStart) / 1000).toFixed(1)}s.`,
 		);
 		return extracted;
+	}
+
+	/**
+	 * Resolve the target store for a single episode based on its directory.
+	 * Uses the same domain-routing logic as groupExtractedByStore so that
+	 * resolveEpisodeStore(ep.directory) and the store used for that episode's
+	 * entries always return the same IKnowledgeStore instance.
+	 */
+	private resolveEpisodeStore(directory: string): IKnowledgeStore {
+		if (!this.domainRouter) return this.db;
+		const resolution = this.domainRouter.resolve(directory);
+		const store = this.domainRouter.resolveStore(resolution.domainId ?? "");
+		if (!store) {
+			logger.warn(
+				`[consolidation] resolveEpisodeStore: no store for domain "${resolution.domainId}" (directory: "${directory}") — falling back to primary store. Check domain routing config.`,
+			);
+			return this.db;
+		}
+		return store;
 	}
 
 	/**
