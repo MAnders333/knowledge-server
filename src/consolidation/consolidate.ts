@@ -588,7 +588,13 @@ export class ConsolidationEngine {
 		// SQLite stores are already serialised by their per-connection mutex; Postgres
 		// uses a process-level advisory lock (held at consolidate() level) that prevents
 		// cross-process races, not cross-store within-process parallelism.
-		const storeResults = await Promise.all(
+		//
+		// Promise.allSettled (not Promise.all) so a failure in one store does not
+		// abort the others mid-flight. Each store's result is inspected independently:
+		// - Successful stores contribute their counts and are recorded.
+		// - Failed stores are logged; their episodes are NOT recorded as processed,
+		//   so they will be re-processed on the next consolidation run.
+		const settled = await Promise.allSettled(
 			[...storeGroups.entries()].map(([store, entriesForStore]) =>
 				this.consolidateExtractedToStore(
 					source,
@@ -605,31 +611,43 @@ export class ConsolidationEngine {
 		let chunkConflictsDetected = 0;
 		let chunkConflictsResolved = 0;
 		const touchedStores = new Set<IKnowledgeStore>();
+		let anyStoreFailed = false;
 
-		for (const { store, counts } of storeResults) {
-			chunkCreated += counts.created;
-			chunkUpdated += counts.updated;
-			chunkConflictsDetected += counts.conflictsDetected;
-			chunkConflictsResolved += counts.conflictsResolved;
-			if (counts.created > 0 || counts.updated > 0) touchedStores.add(store);
+		for (const result of settled) {
+			if (result.status === "fulfilled") {
+				const { store, counts } = result.value;
+				chunkCreated += counts.created;
+				chunkUpdated += counts.updated;
+				chunkConflictsDetected += counts.conflictsDetected;
+				chunkConflictsResolved += counts.conflictsResolved;
+				if (counts.created > 0 || counts.updated > 0) touchedStores.add(store);
+			} else {
+				anyStoreFailed = true;
+				logger.error(
+					`[consolidation/${source}] Store consolidation failed — episodes will be retried on next run:`,
+					result.reason,
+				);
+			}
 		}
 
-		// Record all episodes as processed after both passes succeed. This preserves
-		// idempotency: a crash in Pass 2 causes the chunk to be fully re-processed on
-		// the next run. reconsolidate() is idempotent via embedding-similarity dedup,
-		// so re-processing produces duplicates that dedup catches — no data corruption.
-		const entriesPerEp = Math.round(
-			(chunkCreated + chunkUpdated) / chunk.length,
-		);
-		for (const ep of chunk) {
-			await this.serverStateDb.recordEpisode(
-				ep.source,
-				ep.sessionId,
-				ep.startMessageId,
-				ep.endMessageId,
-				ep.contentType,
-				entriesPerEp,
+		// Record episodes as processed only when all stores succeeded.
+		// If any store failed, skip recording so the full chunk is retried on the
+		// next run. reconsolidate() is idempotent via embedding-similarity dedup,
+		// so re-processing the successful stores' entries is safe (no data corruption).
+		if (!anyStoreFailed) {
+			const entriesPerEp = Math.round(
+				(chunkCreated + chunkUpdated) / chunk.length,
 			);
+			for (const ep of chunk) {
+				await this.serverStateDb.recordEpisode(
+					ep.source,
+					ep.sessionId,
+					ep.startMessageId,
+					ep.endMessageId,
+					ep.contentType,
+					entriesPerEp,
+				);
+			}
 		}
 
 		return {
