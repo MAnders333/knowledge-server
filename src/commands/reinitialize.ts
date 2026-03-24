@@ -79,16 +79,19 @@ export async function runReinitialize(args: string[]): Promise<void> {
 	const pidPath = config.pidPath;
 	if (pidPath && existsSync(pidPath)) {
 		const pid = Number.parseInt(readFileSync(pidPath, "utf8").trim(), 10);
-		if (!Number.isNaN(pid)) {
+		if (!Number.isNaN(pid) && pid > 0) {
 			// Send signal 0 to probe liveness without killing the process.
-			// kill(pid, 0) throws ESRCH when the process doesn't exist (dead)
-			// and EPERM when it exists but we can't signal it (alive, different user).
-			// Any other result (no throw) means alive.
+			// kill(pid, 0) succeeds (no throw) when alive and we have permission.
+			// EPERM: process exists but we can't signal it — still alive (e.g. daemon).
+			// ESRCH: no such process — dead.
+			// Unknown codes are treated as dead (defensive — avoids blocking reinitialize
+			// on unexpected OS errors). Matches the pattern used in stop.ts.
 			let alive = true;
 			try {
 				process.kill(pid, 0);
 			} catch (e: unknown) {
-				alive = (e as NodeJS.ErrnoException).code !== "ESRCH";
+				const code = (e as NodeJS.ErrnoException).code;
+				alive = code === "EPERM"; // EPERM = exists, no permission; ESRCH = dead
 			}
 			if (alive) {
 				console.error(
@@ -159,9 +162,10 @@ export async function runReinitialize(args: string[]): Promise<void> {
 			const levelFlags = remaining
 				.filter((a) => a !== "--confirm" && a !== "--dry-run")
 				.join(" ");
-			const storeFlag = storeId ? `--store=${storeId} ` : "";
-			const base = levelFlags
-				? `knowledge-server reinitialize ${storeFlag}${levelFlags}`
+			const storeFlag = storeId ? `--store=${storeId}` : "";
+			const baseParts = [storeFlag, levelFlags].filter(Boolean).join(" ");
+			const base = baseParts
+				? `knowledge-server reinitialize ${baseParts}`
 				: "knowledge-server reinitialize";
 
 			console.log(`Run with --confirm to proceed:\n  ${base} --confirm`);
