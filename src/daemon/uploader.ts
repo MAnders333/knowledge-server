@@ -57,6 +57,11 @@ export class EpisodeUploader {
 		sessionsProcessed: number;
 		sources: Array<{ source: string; episodes: number; sessions: number }>;
 	}> {
+		// Sources are independent — upload all concurrently.
+		const settled = await Promise.allSettled(
+			this.readers.map((reader) => this.uploadSource(reader)),
+		);
+
 		let totalEpisodes = 0;
 		let totalSessions = 0;
 		const sources: Array<{
@@ -65,24 +70,23 @@ export class EpisodeUploader {
 			sessions: number;
 		}> = [];
 
-		for (const reader of this.readers) {
-			try {
-				const result = await this.uploadSource(reader);
-				totalEpisodes += result.episodes;
-				totalSessions += result.sessions;
-				if (result.episodes > 0 || result.sessions > 0) {
+		for (let i = 0; i < settled.length; i++) {
+			const result = settled[i];
+			const reader = this.readers[i];
+			if (result.status === "fulfilled") {
+				totalEpisodes += result.value.episodes;
+				totalSessions += result.value.sessions;
+				if (result.value.episodes > 0 || result.value.sessions > 0) {
 					sources.push({
 						source: reader.source,
-						episodes: result.episodes,
-						sessions: result.sessions,
+						episodes: result.value.episodes,
+						sessions: result.value.sessions,
 					});
 				}
-			} catch (err) {
-				// Per-source failure: log and continue with other sources.
-				// Same philosophy as the consolidation engine's per-source try/catch.
+			} else {
 				logger.error(
 					`[daemon/${reader.source}] Upload failed — skipping source this run:`,
-					err,
+					result.reason,
 				);
 			}
 		}
@@ -223,25 +227,41 @@ export class EpisodeUploader {
 			`[daemon] Starting. Upload interval: ${Math.round(intervalMs / 1000)}s. User: ${this.userId}`,
 		);
 
-		// Run immediately on start
-		await this.upload();
-
-		const interval = setInterval(async () => {
-			await this.upload().catch((err) => {
-				logger.error("[daemon] Upload cycle failed:", err);
-			});
-		}, intervalMs);
-
-		// Graceful shutdown: stop the interval, run caller cleanup, then exit.
-		// Uses process.on (not once) so both SIGTERM and SIGINT are always handled.
-		// The re-entrancy guard prevents double-cleanup if both signals fire in rapid
-		// succession before the async onShutdown resolves (process.once would leave
-		// the second signal unhandled, causing a hard exit mid-onShutdown).
+		let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
 		let shuttingDown = false;
+
+		const scheduleNext = (immediate: boolean) => {
+			if (shuttingDown) return;
+			timeoutHandle = setTimeout(
+				() => void runCycle(),
+				immediate ? 0 : intervalMs,
+			);
+		};
+
+		const runCycle = async () => {
+			if (shuttingDown) return;
+			try {
+				const result = await this.upload();
+				// A source is "caught up" when it returned fewer sessions than
+				// maxSessionsPerRun. If ANY source returned a full batch, there
+				// may be more history — run the next cycle immediately.
+				// Only sleep when ALL sources are caught up (or nothing uploaded).
+				const anySourceHasMore = result.sources.some(
+					(s) => s.sessions >= config.consolidation.maxSessionsPerRun,
+				);
+				scheduleNext(anySourceHasMore);
+			} catch (err) {
+				logger.error("[daemon] Upload cycle failed:", err);
+				scheduleNext(false);
+			}
+		};
+
+		// Register shutdown handlers before first run so a SIGTERM during
+		// the initial upload cycle is handled cleanly.
 		const cleanup = async () => {
 			if (shuttingDown) return;
 			shuttingDown = true;
-			clearInterval(interval);
+			if (timeoutHandle !== null) clearTimeout(timeoutHandle);
 			logger.log("[daemon] Stopping…");
 			if (onShutdown) {
 				await onShutdown().catch((err) => {
@@ -251,8 +271,10 @@ export class EpisodeUploader {
 			logger.log("[daemon] Stopped.");
 			process.exit(0);
 		};
-
 		process.on("SIGTERM", () => void cleanup());
 		process.on("SIGINT", () => void cleanup());
+
+		// Run immediately on start, then self-schedule via scheduleNext.
+		await runCycle();
 	}
 }
