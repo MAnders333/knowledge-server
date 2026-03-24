@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.5.1](https://github.com/MAnders333/knowledge-server/compare/v3.5.0...v3.5.1) (2026-03-24)
+
+
+### Bug Fixes
+
+* **activation:** raise default similarity threshold from 0.30 to 0.42 ([5554fd1](https://github.com/MAnders333/knowledge-server/commit/5554fd18ed4992389c049cf2b676d7fb5c533baf))
+
 ## [3.5.0](https://github.com/MAnders333/knowledge-server/compare/v3.4.2...v3.5.0) (2026-03-24)
 
 
