@@ -1,3 +1,5 @@
+import { existsSync, readFileSync } from "node:fs";
+import { config } from "../config.js";
 import { StoreRegistry } from "../db/store-registry.js";
 
 /**
@@ -36,7 +38,8 @@ import { StoreRegistry } from "../db/store-registry.js";
  */
 export async function runReinitialize(args: string[]): Promise<void> {
 	const storeArg = args.find((a) => a.startsWith("--store="));
-	const storeId = storeArg?.split("=")[1];
+	// Use slice to handle store IDs that contain '=' (e.g. connection string fragments)
+	const storeId = storeArg ? storeArg.slice("--store=".length) : undefined;
 	const remaining = args.filter((a) => !a.startsWith("--store="));
 
 	const resetStore = remaining.includes("--reset-store");
@@ -61,9 +64,39 @@ export async function runReinitialize(args: string[]): Promise<void> {
 
 	if (storeId && !resetStore) {
 		console.error(
-			"--store=<id> only applies with --reset-store. Daemon cursor and state resets are always global.",
+			"--store=<id> scopes which store's entries are deleted and is only meaningful with --reset-store.\n" +
+				"Without --reset-store, there is no store-scoped operation to perform.\n" +
+				"Daemon cursor and state resets are always global.",
 		);
 		process.exit(1);
+	}
+
+	// Guard: refuse to run destructive operations while the server is live.
+	// Concurrent writes from the server (recordEpisode, insertEntry) and this
+	// command's deletes are not coordinated — running both at once can corrupt
+	// in-flight consolidation state or leave knowledge entries in a mixed state.
+	// Run unconditionally so even the default cursor-reset is guarded.
+	const pidPath = config.pidPath;
+	if (pidPath && existsSync(pidPath)) {
+		const pid = Number.parseInt(readFileSync(pidPath, "utf8").trim(), 10);
+		if (!Number.isNaN(pid)) {
+			// Send signal 0 to probe liveness without killing the process.
+			// kill(pid, 0) throws ESRCH when the process doesn't exist (dead)
+			// and EPERM when it exists but we can't signal it (alive, different user).
+			// Any other result (no throw) means alive.
+			let alive = true;
+			try {
+				process.kill(pid, 0);
+			} catch (e: unknown) {
+				alive = (e as NodeJS.ErrnoException).code !== "ESRCH";
+			}
+			if (alive) {
+				console.error(
+					`Server is running (PID ${pid}). Stop it first:\n  knowledge-server stop`,
+				);
+				process.exit(1);
+			}
+		}
 	}
 
 	const registry = await StoreRegistry.create();
@@ -91,20 +124,11 @@ export async function runReinitialize(args: string[]): Promise<void> {
 			targetStores = writableStoreEntries;
 		}
 
-		// Collect entry counts for display
-		let totalEntries = 0;
-		if (resetStore) {
-			for (const { db } of targetStores) {
-				const stats = await db.getStats();
-				totalEntries += stats.total ?? 0;
-			}
-		}
-
 		const storeLabel = storeId
 			? `store "${storeId}"`
 			: `all ${targetStores.length} writable store(s)`;
 
-		// Describe what will happen
+		// Describe what will happen (entry count fetched lazily, only when confirming)
 		const actions: string[] = [
 			"Reset daemon cursor — daemon re-uploads all historical episodes on next tick",
 		];
@@ -114,9 +138,8 @@ export async function runReinitialize(args: string[]): Promise<void> {
 			);
 		}
 		if (resetStore) {
-			actions.push(
-				`Delete ${totalEntries} knowledge entries from ${storeLabel}`,
-			);
+			// Placeholder; replaced with actual count when --confirm is provided
+			actions.push(`Delete knowledge entries from ${storeLabel}`);
 		}
 
 		if (dryRun) {
@@ -131,11 +154,14 @@ export async function runReinitialize(args: string[]): Promise<void> {
 			for (const action of actions) console.log(`  • ${action}`);
 			console.log("");
 
-			const flagsForConfirm = args
+			// Build suggested confirm command from remaining (already stripped of --store=)
+			// then re-add --store=<id> at the front if present, for clarity.
+			const levelFlags = remaining
 				.filter((a) => a !== "--confirm" && a !== "--dry-run")
 				.join(" ");
-			const base = flagsForConfirm
-				? `knowledge-server reinitialize ${flagsForConfirm}`
+			const storeFlag = storeId ? `--store=${storeId} ` : "";
+			const base = levelFlags
+				? `knowledge-server reinitialize ${storeFlag}${levelFlags}`
 				: "knowledge-server reinitialize";
 
 			console.log(`Run with --confirm to proceed:\n  ${base} --confirm`);
@@ -151,38 +177,60 @@ export async function runReinitialize(args: string[]): Promise<void> {
 			return;
 		}
 
-		// Apply
-		await serverStateDb.resetDaemonCursors();
-		console.log("  ✓ Reset daemon cursor (all sources)");
-
-		if (resetState) {
-			await serverStateDb.reinitialize();
-			console.log(
-				"  ✓ Wiped consolidated_episode and reset consolidation state",
-			);
-		}
-
+		// Collect entry counts now (only needed for the confirm path + --reset-store)
+		let totalEntries = 0;
 		if (resetStore) {
-			for (const { id, db } of targetStores) {
-				await db.reinitialize();
-				console.log(`  ✓ Wiped store "${id}"`);
+			for (const { db } of targetStores) {
+				const stats = await db.getStats();
+				totalEntries += stats.total ?? 0;
 			}
 		}
 
+		// Apply — operations are not cross-store atomic. If one step fails,
+		// subsequent steps are skipped. Run the command again to retry.
+		try {
+			await serverStateDb.resetDaemonCursors();
+			console.log(
+				"  ✓ Reset daemon cursor (all sources) — daemon will re-upload all episodes on next tick",
+			);
+
+			if (resetState) {
+				await serverStateDb.reinitialize();
+				console.log(
+					"  ✓ Wiped consolidated_episode and reset consolidation state",
+				);
+			}
+
+			if (resetStore) {
+				for (const { id, db } of targetStores) {
+					await db.reinitialize();
+					console.log(`  ✓ Wiped store "${id}"`);
+				}
+			}
+		} catch (err) {
+			console.error(
+				"\nReinitialize failed partway through — state may be partially reset.\n" +
+					"Run the same command again to retry; already-completed steps are safe to repeat.",
+			);
+			throw err;
+		}
+
+		const level = resetStore ? "full" : resetState ? "state" : "cursor";
 		console.log("\nDone.");
-		if (!resetState) {
+		if (level === "cursor") {
 			console.log(
 				"  Daemon will re-upload all historical episodes on its next tick.\n" +
 					"  Trigger consolidation when ready: knowledge-server consolidate",
 			);
-		} else if (!resetStore) {
+		} else if (level === "state") {
 			console.log(
 				"  Episodes will be re-uploaded and re-consolidated on the next run.\n" +
 					"  Trigger consolidation when ready: knowledge-server consolidate",
 			);
 		} else {
 			console.log(
-				"  Store wiped, state reset, daemon will re-upload all episodes.\n" +
+				`  Deleted ${totalEntries} entries from ${storeLabel}.\n` +
+					"  Episodes will be re-uploaded and re-consolidated on the next run.\n" +
 					"  Trigger consolidation when ready: knowledge-server consolidate",
 			);
 		}

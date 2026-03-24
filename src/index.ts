@@ -154,7 +154,7 @@ Commands:
   activate <query>          Test knowledge activation for a query
   review [--filter <f>]     Interactively review entries (filter: conflicted|stale|all)
   calibrate                 Recommend similarity thresholds for the active embedding model
-  reinitialize              Wipe all knowledge and reset consolidation cursor
+  reinitialize              Reset daemon cursor, state, or store entries (see --reset-state, --reset-store)
   setup-tool <tool>         Set up integration (opencode|claude-code|cursor|codex|vscode)
   update [--version v1.2.3] Update to the latest (or specified) release
   mcp                       Start the MCP stdio proxy (used by tool integrations)
