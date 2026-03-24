@@ -1,5 +1,5 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft-07/schema#",
   "$id": "https://raw.githubusercontent.com/MAnders333/knowledge-server/main/config.schema.json",
   "title": "knowledge-server config.jsonc",
   "description": "Configuration file for knowledge-server (~/.config/knowledge-server/config.jsonc)",
@@ -64,8 +64,8 @@
       "properties": {
         "id": {
           "type": "string",
-          "description": "Unique store identifier. Referenced by domain config. Use alphanumeric and underscores only — hyphens are not allowed because the ID is used in env var names (STORE_<ID>_URI).",
-          "pattern": "^[a-zA-Z0-9_]+$"
+          "description": "Unique store identifier. Referenced by domain config. Lowercase alphanumeric, underscores, and hyphens. Note: hyphens are converted to underscores in the STORE_<ID>_URI env var name.",
+          "pattern": "^[a-z0-9_-]+$"
         },
         "kind": {
           "type": "string",
@@ -106,8 +106,8 @@
       "properties": {
         "id": {
           "type": "string",
-          "description": "Unique domain identifier. Used in routing and as a tag on knowledge entries.",
-          "pattern": "^[a-zA-Z0-9_]+$"
+          "description": "Unique domain identifier. Used in routing and as a tag on knowledge entries. Lowercase alphanumeric, underscores, and hyphens.",
+          "pattern": "^[a-z0-9_-]+$"
         },
         "description": {
           "type": "string",
