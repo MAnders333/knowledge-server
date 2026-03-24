@@ -611,7 +611,7 @@ export class ConsolidationEngine {
 		let chunkConflictsDetected = 0;
 		let chunkConflictsResolved = 0;
 		const touchedStores = new Set<IKnowledgeStore>();
-		let anyStoreFailed = false;
+		const succeededStores = new Set<IKnowledgeStore>();
 
 		for (const result of settled) {
 			if (result.status === "fulfilled") {
@@ -621,24 +621,40 @@ export class ConsolidationEngine {
 				chunkConflictsDetected += counts.conflictsDetected;
 				chunkConflictsResolved += counts.conflictsResolved;
 				if (counts.created > 0 || counts.updated > 0) touchedStores.add(store);
+				succeededStores.add(store);
 			} else {
-				anyStoreFailed = true;
 				logger.error(
-					`[consolidation/${source}] Store consolidation failed — episodes will be retried on next run:`,
+					`[consolidation/${source}] Store consolidation failed — episodes for that store will be retried on next run:`,
 					result.reason,
 				);
 			}
 		}
 
-		// Record episodes as processed only when all stores succeeded.
-		// If any store failed, skip recording so the full chunk is retried on the
-		// next run. reconsolidate() is idempotent via embedding-similarity dedup,
-		// so re-processing the successful stores' entries is safe (no data corruption).
-		if (!anyStoreFailed) {
-			const entriesPerEp = Math.round(
-				(chunkCreated + chunkUpdated) / chunk.length,
-			);
-			for (const ep of chunk) {
+		// Record each episode as processed only if its target store succeeded.
+		// Episodes whose store failed are left in pending_episodes for retry.
+		// This prevents successful stores from being re-processed on the next run
+		// just because a sibling store failed.
+		//
+		// When extraction produced no entries (empty storeGroups), all episodes
+		// are recorded unconditionally — there were no store writes to fail.
+		//
+		// An episode's store is determined by its directory (same logic as groupByDomain).
+		// LLM-rerouted entries (where individual entries went to a different store than
+		// the episode's default) are a known limitation: if entry-store != episode-store,
+		// the episode may be recorded while some of its entries land in a failed store.
+		// This is acceptable — reconsolidate() is idempotent, so re-extraction on retry
+		// deduplicates against what was already written.
+		const noStoreWork = storeGroups.size === 0;
+		const entriesPerEp = Math.round(
+			(chunkCreated + chunkUpdated) / Math.max(chunk.length, 1),
+		);
+		for (const ep of chunk) {
+			const epStore = this.domainRouter
+				? (this.domainRouter.resolveStore(
+						this.domainRouter.resolve(ep.directory).domainId ?? "",
+					) ?? this.db)
+				: this.db;
+			if (noStoreWork || succeededStores.has(epStore)) {
 				await this.serverStateDb.recordEpisode(
 					ep.source,
 					ep.sessionId,
@@ -744,11 +760,6 @@ export class ConsolidationEngine {
 				groups.set(targetStore, group);
 			}
 			group.push(entry);
-		}
-
-		// In single-store mode (no domain routing), all entries go to this.db.
-		if (groups.size === 0 && extracted.length > 0) {
-			groups.set(this.db, [...extracted]);
 		}
 
 		return groups;
