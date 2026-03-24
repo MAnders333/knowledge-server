@@ -121,11 +121,11 @@ export class EpisodeUploader {
 
 		const candidateIds = candidateSessions.map((s) => s.id);
 
-		// getProcessedEpisodeRanges returns both consolidated and pending (staged)
-		// episode ranges, so the reader's overlap check covers both cases.
-		// No separate pendingSet check needed.
+		// getUploadedEpisodeRanges returns both consolidated and pending (staged)
+		// episode ranges, so the reader's overlap check covers both cases and
+		// the daemon won't re-upload episodes already in flight.
 		const processedRanges =
-			await this.serverStateDb.getProcessedEpisodeRanges(candidateIds);
+			await this.serverStateDb.getUploadedEpisodeRanges(candidateIds);
 
 		let newEpisodes: Episode[];
 		try {

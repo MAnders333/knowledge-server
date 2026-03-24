@@ -228,8 +228,8 @@ describe("EpisodeUploader.upload", () => {
 		expect(cursor.lastMessageTimeCreated).toBeGreaterThan(0);
 	});
 
-	it("getProcessedEpisodeRanges includes pending_episodes so readers can skip already-staged ranges", async () => {
-		// Verifies that getProcessedEpisodeRanges returns ranges from pending_episodes,
+	it("getUploadedEpisodeRanges includes pending_episodes so daemon skips already-staged ranges", async () => {
+		// Verifies that getUploadedEpisodeRanges (daemon path) returns ranges from pending_episodes,
 		// not just consolidated_episode. This is the mechanism that replaced the old
 		// pendingSet check in uploader.ts — readers use processedRanges for overlap
 		// detection, so pending rows must appear there.
@@ -246,7 +246,7 @@ describe("EpisodeUploader.upload", () => {
 			}),
 		);
 
-		const ranges = await db.getProcessedEpisodeRanges(["session-dedup"]);
+		const ranges = await db.getUploadedEpisodeRanges(["session-dedup"]);
 		const sessionRanges = ranges.get("session-dedup");
 		expect(sessionRanges).toBeDefined();
 		expect(sessionRanges).toHaveLength(1);
@@ -263,9 +263,7 @@ describe("EpisodeUploader.upload", () => {
 			"messages",
 			1,
 		);
-		const ranges2 = await db.getProcessedEpisodeRanges([
-			"session-consolidated",
-		]);
+		const ranges2 = await db.getUploadedEpisodeRanges(["session-consolidated"]);
 		expect(ranges2.get("session-consolidated")).toHaveLength(1);
 	});
 

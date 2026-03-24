@@ -252,8 +252,19 @@ export class PostgresServerStateDB implements IServerStateDB {
 	): Promise<Map<string, ProcessedRange[]>> {
 		if (sessionIds.length === 0) return new Map();
 		await this.initialize();
-		// UNION with pending_episodes so the reader's range overlap check covers
-		// both already-consolidated and staged-but-not-yet-consolidated episodes.
+		const rows = await this.sql`
+			SELECT source, session_id, start_message_id, end_message_id
+			FROM consolidated_episode
+			WHERE session_id = ANY(${this.sql.array(sessionIds)})
+		`;
+		return this.pgRowsToRangeMap(rows);
+	}
+
+	async getUploadedEpisodeRanges(
+		sessionIds: string[],
+	): Promise<Map<string, ProcessedRange[]>> {
+		if (sessionIds.length === 0) return new Map();
+		await this.initialize();
 		const rows = await this.sql`
 			SELECT source, session_id, start_message_id, end_message_id
 			FROM consolidated_episode
@@ -263,6 +274,12 @@ export class PostgresServerStateDB implements IServerStateDB {
 			FROM pending_episodes
 			WHERE session_id = ANY(${this.sql.array(sessionIds)})
 		`;
+		return this.pgRowsToRangeMap(rows);
+	}
+
+	private pgRowsToRangeMap(
+		rows: postgres.RowList<postgres.Row[]>,
+	): Map<string, ProcessedRange[]> {
 		const map = new Map<string, ProcessedRange[]>();
 		for (const r of rows) {
 			const sid = r.session_id as string;

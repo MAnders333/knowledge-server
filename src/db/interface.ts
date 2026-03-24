@@ -72,11 +72,20 @@ export interface IServerStateDB {
 	): Promise<void>;
 
 	/**
-	 * Return already-processed episode ranges for the given session IDs across all sources.
-	 * Returns a Map keyed by sessionId. Each ProcessedRange includes the source so
-	 * idempotency is maintained per (source, session, start, end).
+	 * Return already-consolidated episode ranges for the given session IDs.
+	 * Queries consolidated_episode only. Used by the consolidation engine to
+	 * skip already-processed episodes.
 	 */
 	getProcessedEpisodeRanges(
+		sessionIds: string[],
+	): Promise<Map<string, ProcessedRange[]>>;
+
+	/**
+	 * Return episode ranges that have already been staged OR consolidated,
+	 * for the given session IDs. Unions consolidated_episode with pending_episodes.
+	 * Used by the daemon uploader to avoid re-uploading episodes already in flight.
+	 */
+	getUploadedEpisodeRanges(
 		sessionIds: string[],
 	): Promise<Map<string, ProcessedRange[]>>;
 
