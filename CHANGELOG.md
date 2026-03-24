@@ -1,5 +1,22 @@
 # Changelog
 
+## [3.3.0](https://github.com/MAnders333/knowledge-server/compare/v3.2.0...v3.3.0) (2026-03-24)
+
+
+### Features
+
+* **daemon-db:** split daemon_cursor into DaemonDB; add PostgresServerStateDB ([d630ab4](https://github.com/MAnders333/knowledge-server/commit/d630ab4f7e347ad0aaa93b5499defd48c59a5009))
+
+
+### Bug Fixes
+
+* **daemon-db:** address post-merge reviewer findings ([f655796](https://github.com/MAnders333/knowledge-server/commit/f65579657df6fc9c871c94980ca594b1418c5a38))
+* **migration:** add transaction, simplify table check, fix key prefix convention ([c6c9d18](https://github.com/MAnders333/knowledge-server/commit/c6c9d18d86f226a6201049e484ae959bf048b662))
+* **migration:** drop orphaned daemon_cursor from state.db on upgrade ([dc5a4c7](https://github.com/MAnders333/knowledge-server/commit/dc5a4c7e5956946870478f7d3051b87166022fc9))
+* **postgres:** remove unused content_type column from getProcessedEpisodeRanges query ([67139ab](https://github.com/MAnders333/knowledge-server/commit/67139abf8bb062439e94aa3287ff53dc3c8b9c0d))
+* **schema:** align id patterns with runtime validator; fix schema self-ref ([2e67388](https://github.com/MAnders333/knowledge-server/commit/2e673887265161ca03c8e8d47610b6bb26ece24a))
+* **types:** fix typecheck errors and address cleanliness audit findings ([f5e1f0a](https://github.com/MAnders333/knowledge-server/commit/f5e1f0adc1b896a1b49e8f8405ad0791f3e9e297))
+
 ## [3.2.0](https://github.com/MAnders333/knowledge-server/compare/v3.1.0...v3.2.0) (2026-03-24)
 
 
