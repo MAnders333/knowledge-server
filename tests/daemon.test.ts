@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EpisodeUploader } from "../src/daemon/uploader";
 import { KnowledgeDB } from "../src/db/sqlite/index";
+import { DaemonDB } from "../src/db/daemon/index";
 import { ServerStateDB } from "../src/db/state/index";
 import { PendingEpisodesReader } from "../src/consolidation/readers/pending";
 import type { IEpisodeReader, PendingEpisode } from "../src/types";
@@ -61,15 +62,18 @@ function makeMockReader(
 
 let tempDir: string;
 let db: ServerStateDB;
+let daemonDb: DaemonDB;
 
 beforeEach(() => {
 	tempDir = mkdtempSync(join(tmpdir(), "ks-daemon-test-"));
 	db = new ServerStateDB(join(tempDir, "state.db"));
+	daemonDb = new DaemonDB(join(tempDir, "daemon.db"));
 });
 
 afterEach(async () => {
 	mock.restore();
 	await db.close();
+	daemonDb.close();
 	rmSync(tempDir, { recursive: true, force: true });
 });
 
@@ -152,30 +156,32 @@ describe("pending_episodes DB operations", () => {
 
 describe("daemon_cursor operations", () => {
 	it("returns zero-state cursor for unknown source", async () => {
-		const cursor = await db.getDaemonCursor("opencode");
+		const cursor = await daemonDb.getDaemonCursor("opencode");
 		expect(cursor.source).toBe("opencode");
 		expect(cursor.lastMessageTimeCreated).toBe(0);
 		expect(cursor.lastUploadedAt).toBe(0);
 	});
 
 	it("updates and retrieves cursor", async () => {
-		await db.updateDaemonCursor("opencode", {
+		await daemonDb.updateDaemonCursor("opencode", {
 			lastMessageTimeCreated: 12345,
 			lastUploadedAt: 67890,
 		});
-		const cursor = await db.getDaemonCursor("opencode");
+		const cursor = await daemonDb.getDaemonCursor("opencode");
 		expect(cursor.lastMessageTimeCreated).toBe(12345);
 		expect(cursor.lastUploadedAt).toBe(67890);
 	});
 
 	it("cursors are independent per source", async () => {
-		await db.updateDaemonCursor("opencode", { lastMessageTimeCreated: 1000 });
-		await db.updateDaemonCursor("claude-code", {
+		await daemonDb.updateDaemonCursor("opencode", {
+			lastMessageTimeCreated: 1000,
+		});
+		await daemonDb.updateDaemonCursor("claude-code", {
 			lastMessageTimeCreated: 9999,
 		});
 
-		const oc = await db.getDaemonCursor("opencode");
-		const cc = await db.getDaemonCursor("claude-code");
+		const oc = await daemonDb.getDaemonCursor("opencode");
+		const cc = await daemonDb.getDaemonCursor("claude-code");
 		expect(oc.lastMessageTimeCreated).toBe(1000);
 		expect(cc.lastMessageTimeCreated).toBe(9999);
 	});
@@ -207,7 +213,7 @@ describe("EpisodeUploader.upload", () => {
 			],
 		);
 
-		const uploader = new EpisodeUploader([reader], db, "alice");
+		const uploader = new EpisodeUploader([reader], db, daemonDb, "alice");
 		const result = await uploader.upload();
 
 		expect(result.episodesUploaded).toBe(1);
@@ -218,7 +224,7 @@ describe("EpisodeUploader.upload", () => {
 		expect(pending[0].sessionId).toBe("session-1");
 		expect(pending[0].userId).toBe("alice");
 
-		const cursor = await db.getDaemonCursor("opencode");
+		const cursor = await daemonDb.getDaemonCursor("opencode");
 		expect(cursor.lastMessageTimeCreated).toBeGreaterThan(0);
 	});
 
@@ -258,7 +264,7 @@ describe("EpisodeUploader.upload", () => {
 			],
 		);
 
-		const uploader = new EpisodeUploader([reader], db, "alice");
+		const uploader = new EpisodeUploader([reader], db, daemonDb, "alice");
 		const result = await uploader.upload();
 
 		// Should not upload again — already in pending_episodes
@@ -303,6 +309,7 @@ describe("EpisodeUploader.upload", () => {
 		const uploader = new EpisodeUploader(
 			[failingReader, workingReader],
 			db,
+			daemonDb,
 			"alice",
 		);
 		const result = await uploader.upload();

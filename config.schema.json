@@ -1,139 +1,163 @@
 {
-  "$schema": "https://json-schema.org/draft-07/schema#",
-  "$id": "https://raw.githubusercontent.com/MAnders333/knowledge-server/main/config.schema.json",
-  "title": "knowledge-server config.jsonc",
-  "description": "Configuration file for knowledge-server (~/.config/knowledge-server/config.jsonc)",
-  "type": "object",
-  "required": ["stores"],
-  "additionalProperties": false,
-  "properties": {
-    "$schema": {
-      "type": "string",
-      "description": "JSON Schema reference for editor validation."
-    },
-    "stores": {
-      "type": "array",
-      "description": "One or more knowledge stores. At least one must be writable.",
-      "minItems": 1,
-      "items": {
-        "$ref": "#/definitions/StoreConfig"
-      }
-    },
-    "domains": {
-      "type": "array",
-      "description": "Semantic domains for routing knowledge to different stores. Required when more than one writable store is configured.",
-      "items": {
-        "$ref": "#/definitions/DomainConfig"
-      }
-    },
-    "projects": {
-      "type": "array",
-      "description": "Maps local directory path prefixes to a default domain. Used as a prior for LLM classification during consolidation.",
-      "items": {
-        "$ref": "#/definitions/ProjectConfig"
-      }
-    },
-    "userId": {
-      "type": "string",
-      "description": "Stable identifier for this user/machine in a shared DB setup. Defaults to the OS hostname."
-    },
-    "port": {
-      "type": "integer",
-      "description": "HTTP port the server listens on. Also overridable via KNOWLEDGE_PORT.",
-      "default": 3179,
-      "minimum": 1,
-      "maximum": 65535
-    },
-    "host": {
-      "type": "string",
-      "description": "Bind address for the HTTP server. Also overridable via KNOWLEDGE_HOST. Defaults to 127.0.0.1 (loopback only).",
-      "default": "127.0.0.1"
-    },
-    "daemonAutoSpawn": {
-      "type": "boolean",
-      "description": "Whether the server auto-spawns knowledge-daemon on startup. Set false if you manage the daemon separately.",
-      "default": true
-    }
-  },
-  "definitions": {
-    "StoreConfig": {
-      "type": "object",
-      "description": "A knowledge store — either a local SQLite file or a remote Postgres database.",
-      "required": ["id", "kind", "writable"],
-      "additionalProperties": false,
-      "properties": {
-        "id": {
-          "type": "string",
-          "description": "Unique store identifier. Referenced by domain config. Lowercase alphanumeric, underscores, and hyphens. Note: hyphens are converted to underscores in the STORE_<ID>_URI env var name.",
-          "pattern": "^[a-z0-9_-]+$"
-        },
-        "kind": {
-          "type": "string",
-          "description": "Storage backend.",
-          "enum": ["sqlite", "postgres"]
-        },
-        "writable": {
-          "type": "boolean",
-          "description": "Whether this store accepts consolidation writes. At least one store must be writable. Multiple writable stores require domain config."
-        },
-        "path": {
-          "type": "string",
-          "description": "SQLite only: path to the .db file. ~ is expanded to the home directory. Defaults to ~/.local/share/knowledge-server/knowledge.db."
-        },
-        "uri": {
-          "type": "string",
-          "description": "Postgres only: connection URI (postgres://user:pass@host:5432/dbname). Can also be set via STORE_<ID>_URI environment variable, which takes precedence."
-        }
-      },
-      "if": {
-        "properties": { "kind": { "const": "postgres" } },
-        "required": ["kind"]
-      },
-      "then": {
-        "description": "Postgres store: uri is required (or set via STORE_<ID>_URI env var). path is not allowed.",
-        "not": { "required": ["path"] }
-      },
-      "else": {
-        "description": "SQLite store: path is optional (defaults to ~/.local/share/knowledge-server/knowledge.db). uri is not allowed.",
-        "not": { "required": ["uri"] }
-      }
-    },
-    "DomainConfig": {
-      "type": "object",
-      "description": "A semantic domain — a named category of knowledge routed to a specific store.",
-      "required": ["id", "description", "store"],
-      "additionalProperties": false,
-      "properties": {
-        "id": {
-          "type": "string",
-          "description": "Unique domain identifier. Used in routing and as a tag on knowledge entries. Lowercase alphanumeric, underscores, and hyphens.",
-          "pattern": "^[a-z0-9_-]+$"
-        },
-        "description": {
-          "type": "string",
-          "description": "Human-readable description of what belongs in this domain. Injected into the LLM extraction prompt to guide classification. Example: \"Professional projects, team decisions, and technical choices.\""
-        },
-        "store": {
-          "type": "string",
-          "description": "ID of the writable store that receives consolidation writes for this domain."
-        }
-      }
-    },
-    "ProjectConfig": {
-      "type": "object",
-      "description": "Maps a local directory path prefix to a default domain for session routing.",
-      "required": ["path", "default_domain"],
-      "additionalProperties": false,
-      "properties": {
-        "path": {
-          "type": "string",
-          "description": "Absolute path prefix. ~ is expanded to the home directory. Sessions whose working directory starts with this path match this project. The longest matching prefix wins when paths overlap."
-        },
-        "default_domain": {
-          "type": "string",
-          "description": "Domain ID to use as the default for sessions in this project. The LLM may still classify individual entries to a different domain (e.g. a personal preference found while working in a work project)."
-        }
-      }
-    }
-  }
+	"$schema": "https://json-schema.org/draft-07/schema#",
+	"$id": "https://raw.githubusercontent.com/MAnders333/knowledge-server/main/config.schema.json",
+	"title": "knowledge-server config.jsonc",
+	"description": "Configuration file for knowledge-server (~/.config/knowledge-server/config.jsonc)",
+	"type": "object",
+	"required": ["stores"],
+	"additionalProperties": false,
+	"properties": {
+		"$schema": {
+			"type": "string",
+			"description": "JSON Schema reference for editor validation."
+		},
+		"stores": {
+			"type": "array",
+			"description": "One or more knowledge stores. At least one must be writable.",
+			"minItems": 1,
+			"items": {
+				"$ref": "#/definitions/StoreConfig"
+			}
+		},
+		"domains": {
+			"type": "array",
+			"description": "Semantic domains for routing knowledge to different stores. Required when more than one writable store is configured.",
+			"items": {
+				"$ref": "#/definitions/DomainConfig"
+			}
+		},
+		"projects": {
+			"type": "array",
+			"description": "Maps local directory path prefixes to a default domain. Used as a prior for LLM classification during consolidation.",
+			"items": {
+				"$ref": "#/definitions/ProjectConfig"
+			}
+		},
+		"userId": {
+			"type": "string",
+			"description": "Stable identifier for this user/machine in a shared DB setup. Defaults to the OS hostname."
+		},
+		"port": {
+			"type": "integer",
+			"description": "HTTP port the server listens on. Also overridable via KNOWLEDGE_PORT.",
+			"default": 3179,
+			"minimum": 1,
+			"maximum": 65535
+		},
+		"host": {
+			"type": "string",
+			"description": "Bind address for the HTTP server. Also overridable via KNOWLEDGE_HOST. Defaults to 127.0.0.1 (loopback only).",
+			"default": "127.0.0.1"
+		},
+		"daemonAutoSpawn": {
+			"type": "boolean",
+			"description": "Whether the server auto-spawns knowledge-daemon on startup. Set false if you manage the daemon separately.",
+			"default": true
+		},
+		"stateDb": {
+			"$ref": "#/definitions/StateDbConfig"
+		}
+	},
+	"definitions": {
+		"StateDbConfig": {
+			"type": "object",
+			"description": "Server state database configuration (pending_episodes, consolidated_episode, consolidation_state). Defaults to local SQLite. Set kind: 'postgres' to enable a fully remote consolidation server where the daemon writes episodes to shared Postgres and the server consolidates from there. daemon_cursor always stays in daemon.db (local SQLite) regardless of this setting.",
+			"required": ["kind"],
+			"additionalProperties": false,
+			"properties": {
+				"kind": {
+					"type": "string",
+					"enum": ["sqlite", "postgres"],
+					"description": "Storage backend for server state."
+				},
+				"path": {
+					"type": "string",
+					"description": "SQLite only: path to state.db. Defaults to ~/.local/share/knowledge-server/state.db."
+				},
+				"uri": {
+					"type": "string",
+					"description": "Postgres only: connection URI. Also settable via STATE_DB_URI env var, which takes precedence."
+				}
+			}
+		},
+		"StoreConfig": {
+			"type": "object",
+			"description": "A knowledge store — either a local SQLite file or a remote Postgres database.",
+			"required": ["id", "kind", "writable"],
+			"additionalProperties": false,
+			"properties": {
+				"id": {
+					"type": "string",
+					"description": "Unique store identifier. Referenced by domain config. Lowercase alphanumeric, underscores, and hyphens. Note: hyphens are converted to underscores in the STORE_<ID>_URI env var name.",
+					"pattern": "^[a-z0-9_-]+$"
+				},
+				"kind": {
+					"type": "string",
+					"description": "Storage backend.",
+					"enum": ["sqlite", "postgres"]
+				},
+				"writable": {
+					"type": "boolean",
+					"description": "Whether this store accepts consolidation writes. At least one store must be writable. Multiple writable stores require domain config."
+				},
+				"path": {
+					"type": "string",
+					"description": "SQLite only: path to the .db file. ~ is expanded to the home directory. Defaults to ~/.local/share/knowledge-server/knowledge.db."
+				},
+				"uri": {
+					"type": "string",
+					"description": "Postgres only: connection URI (postgres://user:pass@host:5432/dbname). Can also be set via STORE_<ID>_URI environment variable, which takes precedence."
+				}
+			},
+			"if": {
+				"properties": { "kind": { "const": "postgres" } },
+				"required": ["kind"]
+			},
+			"then": {
+				"description": "Postgres store: uri is required (or set via STORE_<ID>_URI env var). path is not allowed.",
+				"not": { "required": ["path"] }
+			},
+			"else": {
+				"description": "SQLite store: path is optional (defaults to ~/.local/share/knowledge-server/knowledge.db). uri is not allowed.",
+				"not": { "required": ["uri"] }
+			}
+		},
+		"DomainConfig": {
+			"type": "object",
+			"description": "A semantic domain — a named category of knowledge routed to a specific store.",
+			"required": ["id", "description", "store"],
+			"additionalProperties": false,
+			"properties": {
+				"id": {
+					"type": "string",
+					"description": "Unique domain identifier. Used in routing and as a tag on knowledge entries. Lowercase alphanumeric, underscores, and hyphens.",
+					"pattern": "^[a-z0-9_-]+$"
+				},
+				"description": {
+					"type": "string",
+					"description": "Human-readable description of what belongs in this domain. Injected into the LLM extraction prompt to guide classification. Example: \"Professional projects, team decisions, and technical choices.\""
+				},
+				"store": {
+					"type": "string",
+					"description": "ID of the writable store that receives consolidation writes for this domain."
+				}
+			}
+		},
+		"ProjectConfig": {
+			"type": "object",
+			"description": "Maps a local directory path prefix to a default domain for session routing.",
+			"required": ["path", "default_domain"],
+			"additionalProperties": false,
+			"properties": {
+				"path": {
+					"type": "string",
+					"description": "Absolute path prefix. ~ is expanded to the home directory. Sessions whose working directory starts with this path match this project. The longest matching prefix wins when paths overlap."
+				},
+				"default_domain": {
+					"type": "string",
+					"description": "Domain ID to use as the default for sessions in this project. The LLM may still classify individual entries to a different domain (e.g. a personal preference found while working in a work project)."
+				}
+			}
+		}
+	}
 }

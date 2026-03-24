@@ -11,6 +11,7 @@ import { logger } from "../logger.js";
 import { KnowledgeDB } from "./sqlite/index.js";
 import type { IKnowledgeStore, IServerStateDB } from "./interface.js";
 import { PostgresKnowledgeDB } from "./postgres/index.js";
+import { PostgresServerStateDB } from "./state/postgres.js";
 import { ServerStateDB } from "./state/index.js";
 
 /**
@@ -34,10 +35,10 @@ export class StoreRegistry {
 	private writableIds: string[];
 	private readable: IKnowledgeStore[];
 	/**
-	 * The server-local SQLite database (state.db).
-	 * Always local to the machine where knowledge-server runs.
-	 * Holds staging tables (pending_episodes, consolidated_episode, etc.)
-	 * independently of the configured knowledge stores.
+	 * The server state database — holds staging tables (pending_episodes,
+	 * consolidated_episode, consolidation_state). Backed by local SQLite
+	 * (state.db, default) or remote Postgres (when stateDb.kind = "postgres"
+	 * or STATE_DB_URI is set). Independent of the configured knowledge stores.
 	 */
 	readonly serverStateDb: IServerStateDB;
 	/** Domain router for consolidation routing. Null when no domains are configured. */
@@ -157,13 +158,27 @@ export class StoreRegistry {
 			logger.log("[db] No config.jsonc found — using default SQLite store.");
 		}
 
-		// Create ServerStateDB — runs schema init and any pending data migrations
-		// (e.g. one-time copy of staging tables from legacy knowledge.db).
+		// Create IServerStateDB — backed by local SQLite (default) or remote Postgres.
 		// Must run BEFORE knowledge stores initialize: schema v14 drops staging
 		// tables from Postgres, and the migration must copy them first.
-		let serverStateDb: ServerStateDB;
+		let serverStateDb: IServerStateDB;
 		try {
-			serverStateDb = new ServerStateDB();
+			if (config.stateDb.kind === "postgres") {
+				const uri = process.env.STATE_DB_URI ?? config.stateDb.uri;
+				if (!uri) {
+					throw new Error(
+						'config.jsonc "stateDb" has kind "postgres" but no "uri" and STATE_DB_URI env var is not set',
+					);
+				}
+				const pgStateDb = new PostgresServerStateDB(uri);
+				await pgStateDb.initialize();
+				serverStateDb = pgStateDb;
+				logger.log(
+					`[db] Server state DB: Postgres at ${uri.replace(/:\/\/[^@]*@/, "://<redacted>@")}`,
+				);
+			} else {
+				serverStateDb = new ServerStateDB(config.stateDb.path);
+			}
 		} catch (e) {
 			throw new Error(
 				`Failed to initialise server state database: ${e instanceof Error ? e.message : String(e)}`,

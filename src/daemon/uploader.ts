@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { config } from "../config.js";
+import type { DaemonDB } from "../db/daemon/index.js";
 import type { IServerStateDB } from "../db/interface.js";
 import { logger } from "../logger.js";
 import type { Episode, IEpisodeReader, PendingEpisode } from "../types.js";
@@ -8,38 +9,42 @@ import type { Episode, IEpisodeReader, PendingEpisode } from "../types.js";
  * EpisodeUploader — the daemon's core upload loop.
  *
  * For each configured episode reader (OpenCode, Claude Code, Cursor, etc.):
- *   1. Reads the daemon cursor to find the high-water mark for this source
+ *   1. Reads the daemon cursor (from DaemonDB, always local) to find the
+ *      high-water mark for this source
  *   2. Calls getCandidateSessions to find new sessions
  *   3. Calls getNewEpisodes to get unprocessed episode content
- *   4. Writes each episode to the pending_episodes staging table
+ *   4. Writes each episode to pending_episodes via IServerStateDB (local SQLite
+ *      or remote Postgres, depending on configuration)
  *   5. Advances the daemon cursor
  *
- * The daemon writes pending_episodes to the server-local DB (state.db), which
- * is always co-located with the knowledge-server. The consolidation engine reads
- * from there, extracts knowledge via LLM, and routes entries to the appropriate
- * knowledge store (local SQLite or remote Postgres) based on domain configuration.
- *
- * The daemon cursor (tracking what has been uploaded) is stored in the same
- * server-local DB alongside pending_episodes.
+ * The separation of DaemonDB (cursor, always local) from IServerStateDB
+ * (pending_episodes, configurable) enables a fully remote consolidation server:
+ * the daemon writes episodes to a shared Postgres staging DB while keeping
+ * its own cursor in a local SQLite file.
  */
 export class EpisodeUploader {
 	private readonly readers: IEpisodeReader[];
 	private readonly serverStateDb: IServerStateDB;
+	private readonly daemonDb: DaemonDB;
 	private readonly userId: string;
 
 	/**
 	 * @param readers       Episode readers — one per AI tool source.
-	 * @param serverStateDb The server-local DB — holds pending_episodes and daemon_cursor.
-	 *                      This is always the DB on the same machine as the server.
+	 * @param serverStateDb The staging DB — holds pending_episodes.
+	 *                      Can be local SQLite or remote Postgres.
+	 * @param daemonDb      The daemon-local DB — holds daemon_cursor.
+	 *                      Always local SQLite, never remote.
 	 * @param userId        Stable user identifier (KNOWLEDGE_USER_ID or hostname).
 	 */
 	constructor(
 		readers: IEpisodeReader[],
 		serverStateDb: IServerStateDB,
+		daemonDb: DaemonDB,
 		userId: string,
 	) {
 		this.readers = readers;
 		this.serverStateDb = serverStateDb;
+		this.daemonDb = daemonDb;
 		this.userId = userId;
 	}
 
@@ -98,8 +103,8 @@ export class EpisodeUploader {
 	private async uploadSource(
 		reader: IEpisodeReader,
 	): Promise<{ episodes: number; sessions: number }> {
-		// Daemon cursor and pending_episodes both live in the server-local DB.
-		const cursor = await this.serverStateDb.getDaemonCursor(reader.source);
+		// Daemon cursor lives in DaemonDB (always local SQLite).
+		const cursor = await this.daemonDb.getDaemonCursor(reader.source);
 
 		const candidateSessions = reader.getCandidateSessions(
 			cursor.lastMessageTimeCreated,
@@ -201,7 +206,7 @@ export class EpisodeUploader {
 
 		newCursor = Math.max(newCursor, cursor.lastMessageTimeCreated);
 
-		await this.serverStateDb.updateDaemonCursor(reader.source, {
+		await this.daemonDb.updateDaemonCursor(reader.source, {
 			lastMessageTimeCreated: newCursor,
 			lastUploadedAt: Date.now(),
 		});

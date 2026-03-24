@@ -12,7 +12,8 @@
  * This entry point imports ONLY what the daemon needs:
  *   - Episode readers (file parsers for OpenCode, Claude Code, etc.)
  *   - EpisodeUploader (the upload loop)
- *   - ServerStateDB (staging + cursor)
+ *   - DaemonDB (daemon cursor, always local SQLite)
+ *   - StoreRegistry (to get IServerStateDB for pending_episodes)
  *   - Config resolution
  *
  * Intentionally does NOT import:
@@ -29,7 +30,8 @@
 
 import { config, validateConfig } from "../config.js";
 import { createEpisodeReaders } from "./readers/index.js";
-import { ServerStateDB } from "../db/state/index.js";
+import { DaemonDB } from "../db/daemon/index.js";
+import { createServerStateDB } from "../db/state/factory.js";
 import { resolveUserId } from "../config-file.js";
 import { EpisodeUploader } from "./uploader.js";
 import { logger } from "../logger.js";
@@ -54,9 +56,14 @@ if (errors.length > 0) {
 	process.exit(1);
 }
 
-// Server-local DB — always the local SQLite file (state.db).
-// Holds pending_episodes and daemon_cursor.
-const serverStateDb = new ServerStateDB();
+// Server state DB — holds pending_episodes. Can be local SQLite or Postgres
+// depending on stateDb config. Daemon writes episodes here; server reads them.
+// Uses createServerStateDB (thin factory) rather than StoreRegistry to avoid
+// importing the full knowledge-store surface, keeping the daemon binary small.
+const serverStateDb = await createServerStateDB();
+
+// Daemon-local DB — holds daemon_cursor only. Always local SQLite.
+const daemonDb = new DaemonDB();
 
 const userId = resolveUserId();
 
@@ -70,7 +77,7 @@ if (readers.length === 0) {
 	);
 }
 
-const uploader = new EpisodeUploader(readers, serverStateDb, userId);
+const uploader = new EpisodeUploader(readers, serverStateDb, daemonDb, userId);
 
 if (onceFlag) {
 	// One-shot mode: upload once and exit. Useful for cron / launchd OnDemand.
@@ -83,6 +90,7 @@ if (onceFlag) {
 	} finally {
 		for (const reader of readers) reader.close();
 		await serverStateDb.close();
+		daemonDb.close();
 	}
 	process.exit(0);
 } else {
@@ -90,5 +98,6 @@ if (onceFlag) {
 	await uploader.runPolling(intervalMs, async () => {
 		for (const reader of readers) reader.close();
 		await serverStateDb.close();
+		daemonDb.close();
 	});
 }

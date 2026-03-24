@@ -1,6 +1,5 @@
 import type {
 	ConsolidationState,
-	DaemonCursor,
 	KnowledgeEntry,
 	KnowledgeRelation,
 	KnowledgeStatus,
@@ -9,16 +8,21 @@ import type {
 } from "../types.js";
 
 /**
- * Server-local database interface — staging and bookkeeping tables.
+ * Server state database interface — staging and bookkeeping tables.
  *
- * Always backed by a local SQLite file (state.db) on the machine where
- * knowledge-server runs. Never lives in a remote Postgres instance.
+ * Can be backed by local SQLite (state.db, default) or remote Postgres.
+ * Postgres backing enables a fully remote/cloud consolidation server: the
+ * daemon writes pending_episodes to the shared Postgres, and the server
+ * (running anywhere) drains it from there.
  *
  * Holds:
  *   - pending_episodes  — daemon writes here; server consolidation drains it
  *   - consolidated_episode — idempotency log for consolidation
  *   - consolidation_state — global counters and last-run timestamp
- *   - daemon_cursor — daemon upload progress (also written by the daemon)
+ *
+ * Does NOT hold daemon_cursor — that lives in DaemonDB (always local SQLite,
+ * per-machine). Separating cursor from staging allows the daemon to write
+ * episodes to a remote IServerStateDB while keeping its cursor local.
  *
  * The knowledge stores (IKnowledgeStore) are separate — they hold the actual
  * extracted knowledge and can live anywhere (local SQLite or remote Postgres).
@@ -95,35 +99,6 @@ export interface IServerStateDB {
 	 * Release the consolidation lock.
 	 */
 	releaseConsolidationLock(): Promise<void>;
-
-	// ── Daemon Cursor ─────────────────────────────────────────────────────────
-
-	/**
-	 * Get the daemon's upload cursor for a source.
-	 * Returns a zero-state cursor if none exists yet.
-	 */
-	getDaemonCursor(source: string): Promise<DaemonCursor>;
-
-	/**
-	 * Advance the daemon's upload cursor for a source.
-	 */
-	updateDaemonCursor(
-		source: string,
-		cursor: Partial<Omit<DaemonCursor, "source">>,
-	): Promise<void>;
-
-	/**
-	 * Reset the daemon upload cursors for all sources back to zero.
-	 *
-	 * This causes the daemon to re-upload all historical episodes on its next
-	 * tick. Use this when connecting a machine to a new or existing store for
-	 * the first time, or when retroactively rerouting knowledge under a new
-	 * domain configuration.
-	 *
-	 * Safe for shared stores: daemon_cursor is per-machine (local state.db).
-	 * Other users' episodes are not affected.
-	 */
-	resetDaemonCursors(): Promise<void>;
 
 	/**
 	 * Wipe staging data: pending_episodes, consolidated_episode, and reset

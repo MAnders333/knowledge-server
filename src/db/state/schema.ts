@@ -1,18 +1,16 @@
 /**
- * SQLite schema for state.db — the server-local staging and bookkeeping database.
+ * SQLite schema for state.db — the server staging and bookkeeping database.
  *
- * This file is ALWAYS a local SQLite on the machine where knowledge-server runs.
- * It holds the staging tables (pending_episodes) and server bookkeeping
- * (consolidated_episode, consolidation_state, daemon_cursor).
+ * Can be local SQLite (default) or remote Postgres (see PostgresServerStateDB).
+ * This file defines the SQLite schema only.
  *
- * The actual knowledge (knowledge_entry, relations, clusters, embeddings) lives
- * in the configured knowledge stores — which can be local SQLite or remote Postgres.
- *
- * v1: Initial schema — extracted from KnowledgeDB (SQLite) schema v13.
- *   - pending_episodes: staging table for daemon uploads
+ * Holds:
+ *   - pending_episodes: daemon writes, server drains
  *   - consolidated_episode: idempotency log for consolidation
  *   - consolidation_state: global server counters
- *   - daemon_cursor: daemon upload progress
+ *
+ * Does NOT hold daemon_cursor — that lives in daemon.db (DaemonDB), always
+ * local SQLite per-machine. See src/db/daemon/index.ts.
  *
  * Migration from knowledge.db:
  *   On first startup with state.db, if knowledge.db exists and state.db does not,
@@ -90,11 +88,4 @@ export const SERVER_LOCAL_CREATE_TABLES = `
   INSERT OR IGNORE INTO consolidation_state
     (id, last_consolidated_at, total_sessions_processed, total_entries_created, total_entries_updated)
   VALUES (1, 0, 0, 0, 0);
-
-  -- Daemon cursor — tracks what the daemon has uploaded per source.
-  CREATE TABLE IF NOT EXISTS daemon_cursor (
-    source                    TEXT    PRIMARY KEY,
-    last_message_time_created INTEGER NOT NULL DEFAULT 0,
-    last_uploaded_at          INTEGER NOT NULL DEFAULT 0
-  );
 `;

@@ -522,27 +522,30 @@ There are two distinct scenarios where you'd run knowledge-daemon separately fro
 
 Multiple developers share a single knowledge store. Each developer runs `knowledge-daemon` locally to upload their sessions. A single `knowledge-server` instance (on a dedicated server, CI machine, or any always-on host) does the consolidation.
 
-**Each developer's machine:**
-1. Install `knowledge-daemon` (or full `knowledge-server` install with `DAEMON_AUTO_SPAWN=false`)
+**Each machine:**
+1. Install `knowledge-server`
 2. Point `config.jsonc` at the shared Postgres:
    ```jsonc
    { "stores": [{ "id": "main", "kind": "postgres", "uri": "postgres://...", "writable": true }] }
    ```
-3. Run the daemon: `knowledge-daemon` or `knowledge-server setup-tool daemon`
+3. Start: `knowledge-server`
 
-**The server (dedicated host, not a developer machine):**
-1. Install `knowledge-server`
-2. Point `config.jsonc` at the same Postgres
-3. Set `DAEMON_AUTO_SPAWN=false` (the server doesn't collect local sessions — the developers' daemons do that)
-4. Start: `knowledge-server`
+Each machine runs its own server instance (with auto-spawned daemon). The daemon scans local session files and stages episodes locally, the co-located server consolidates them and writes knowledge entries to the shared Postgres. All machines draw from the same knowledge base for activation.
 
-All developers' episodes upload directly to Postgres. The server consolidates from there. The shared knowledge base accumulates everyone's sessions.
+**Want a dedicated consolidation server?** You can run `knowledge-server` on a remote host (cloud or team server) and have developer machines run daemon-only. Set `stateDb` to Postgres in `config.jsonc` on both the daemon machines and the consolidation server — the daemon will write `pending_episodes` to shared Postgres, and the remote server will consolidate from there:
+
+```jsonc
+{
+  "stores": [{ "id": "main", "kind": "postgres", "uri": "postgres://...", "writable": true }],
+  "stateDb": { "kind": "postgres", "uri": "postgres://..." }
+}
+```
+
+On developer machines, set `DAEMON_AUTO_SPAWN=false` (or install only `knowledge-daemon`) and run just the daemon. The remote server does the consolidation.
 
 ### Personal multi-machine setup
 
-You work across multiple machines (e.g. a work laptop and a personal machine) and want a single knowledge base that spans both. Each machine runs `knowledge-daemon` to upload its sessions. One machine (or a dedicated host) runs `knowledge-server` to consolidate.
-
-The setup is identical to the team case above — replace "each developer's machine" with "each of your machines".
+You work across multiple machines and want a single knowledge base that spans all of them. Run `knowledge-server` on each machine pointing at a shared Postgres — same as the team setup above, just a single user.
 
 ## Knowledge entry types
 

@@ -70,10 +70,35 @@ export interface ProjectConfig {
 /**
  * Parsed and validated config.jsonc file.
  */
+/**
+ * Configuration for the server state database (pending_episodes staging table,
+ * consolidated_episode idempotency log, consolidation_state counters).
+ *
+ * Default: local SQLite (state.db). Set kind: "postgres" to use a remote
+ * Postgres instance — this enables a fully remote/cloud consolidation server
+ * where the daemon on each developer machine writes episodes to shared Postgres
+ * and the server consolidates from there.
+ *
+ * Note: daemon_cursor always stays in daemon.db (local SQLite) regardless of
+ * this setting — it is per-machine and never shared.
+ */
+export interface StateDbConfig {
+	kind: "sqlite" | "postgres";
+	/** SQLite only: path to state.db. Defaults to ~/.local/share/knowledge-server/state.db */
+	path?: string;
+	/** Postgres only: connection URI. Also settable via STATE_DB_URI env var. */
+	uri?: string;
+}
+
 export interface KnowledgeServerConfig {
 	stores: StoreConfig[];
 	domains: DomainConfig[];
 	projects: ProjectConfig[];
+	/**
+	 * State database configuration (pending_episodes, consolidated_episode, etc.).
+	 * Defaults to local SQLite when not set.
+	 */
+	stateDb: StateDbConfig;
 	/**
 	 * Stable identifier for this user/machine in a shared DB setup.
 	 *
@@ -399,7 +424,51 @@ function validateConfigFile(
 		daemonAutoSpawn = process.env.DAEMON_AUTO_SPAWN !== "false";
 	}
 
-	return { stores, domains, projects, userId, port, host, daemonAutoSpawn };
+	// stateDb — optional, defaults to local SQLite. STATE_DB_URI env var forces Postgres.
+	let stateDb: StateDbConfig = { kind: "sqlite" };
+	if (
+		"stateDb" in obj &&
+		obj.stateDb !== null &&
+		typeof obj.stateDb === "object"
+	) {
+		const raw = obj.stateDb as Record<string, unknown>;
+		if (raw.kind !== "sqlite" && raw.kind !== "postgres") {
+			throw new Error(
+				`config.jsonc "stateDb.kind" must be "sqlite" or "postgres" (got ${JSON.stringify(raw.kind)})`,
+			);
+		}
+		stateDb = { kind: raw.kind as "sqlite" | "postgres" };
+		if (raw.kind === "sqlite" && typeof raw.path === "string") {
+			stateDb.path = raw.path;
+		}
+		if (raw.kind === "postgres") {
+			if (typeof raw.uri === "string") {
+				stateDb.uri = raw.uri;
+			} else if (!process.env.STATE_DB_URI) {
+				// Fail early — uri is required for Postgres and STATE_DB_URI not set.
+				throw new Error(
+					`config.jsonc "stateDb" has kind "postgres" but no "uri" field. ` +
+						`Set "uri" in config.jsonc or provide the STATE_DB_URI environment variable.`,
+				);
+			}
+		}
+	}
+	// STATE_DB_URI env var overrides config — forces Postgres state DB.
+	const stateDbUriEnv = process.env.STATE_DB_URI;
+	if (stateDbUriEnv) {
+		stateDb = { kind: "postgres", uri: stateDbUriEnv };
+	}
+
+	return {
+		stores,
+		domains,
+		projects,
+		stateDb,
+		userId,
+		port,
+		host,
+		daemonAutoSpawn,
+	};
 }
 
 function validateDomain(
@@ -611,6 +680,9 @@ export const DEFAULT_CONFIG: KnowledgeServerConfig = {
 	],
 	domains: [],
 	projects: [],
+	stateDb: process.env.STATE_DB_URI
+		? { kind: "postgres", uri: process.env.STATE_DB_URI }
+		: { kind: "sqlite" },
 	userId: resolveUserId(),
 	port: parsePortEnvVar(process.env.KNOWLEDGE_PORT, 3179),
 	host: process.env.KNOWLEDGE_HOST?.trim() || "127.0.0.1",

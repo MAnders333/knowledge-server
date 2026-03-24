@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { config } from "../config.js";
+import { DaemonDB } from "../db/daemon/index.js";
 import { StoreRegistry } from "../db/store-registry.js";
 import { errCode } from "../utils.js";
 
@@ -104,6 +105,7 @@ export async function runReinitialize(args: string[]): Promise<void> {
 
 	const registry = await StoreRegistry.create();
 	const { serverStateDb } = registry;
+	const daemonDb = new DaemonDB();
 
 	try {
 		// Resolve target stores
@@ -193,7 +195,7 @@ export async function runReinitialize(args: string[]): Promise<void> {
 		// Apply — operations are not cross-store atomic. If one step fails,
 		// subsequent steps are skipped. Run the command again to retry.
 		try {
-			await serverStateDb.resetDaemonCursors();
+			await daemonDb.resetDaemonCursors();
 			console.log(
 				"  ✓ Reset daemon cursor (all sources) — daemon will re-upload all episodes on next tick",
 			);
@@ -240,5 +242,6 @@ export async function runReinitialize(args: string[]): Promise<void> {
 		}
 	} finally {
 		await registry.close();
+		daemonDb.close();
 	}
 }

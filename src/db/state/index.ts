@@ -6,7 +6,6 @@ import type { IServerStateDB } from "../interface.js";
 import { logger } from "../../logger.js";
 import type {
 	ConsolidationState,
-	DaemonCursor,
 	Episode,
 	PendingEpisode,
 	ProcessedRange,
@@ -36,7 +35,8 @@ export const DEFAULT_SERVER_STATE_PATH = join(
  *   - pending_episodes: daemon writes, server drains
  *   - consolidated_episode: idempotency log
  *   - consolidation_state: global server counters
- *   - daemon_cursor: daemon upload progress
+ *
+ * daemon_cursor lives in DaemonDB (src/db/daemon/index.ts), not here.
  *
  * The actual knowledge (knowledge_entry, etc.) lives in the configured
  * knowledge stores (IKnowledgeStore), which can be local SQLite or remote Postgres.
@@ -329,55 +329,6 @@ export class ServerStateDB implements IServerStateDB {
 
 	async releaseConsolidationLock(): Promise<void> {
 		this._consolidationLockHeld = false;
-	}
-
-	// ── Daemon Cursor ─────────────────────────────────────────────────────────
-
-	async getDaemonCursor(source: string): Promise<DaemonCursor> {
-		const row = this.db
-			.prepare(
-				"SELECT last_message_time_created, last_uploaded_at FROM daemon_cursor WHERE source = ?",
-			)
-			.get(source) as {
-			last_message_time_created: number;
-			last_uploaded_at: number;
-		} | null;
-
-		if (!row) return { source, lastMessageTimeCreated: 0, lastUploadedAt: 0 };
-		return {
-			source,
-			lastMessageTimeCreated: row.last_message_time_created,
-			lastUploadedAt: row.last_uploaded_at,
-		};
-	}
-
-	async updateDaemonCursor(
-		source: string,
-		cursor: Partial<Omit<DaemonCursor, "source">>,
-	): Promise<void> {
-		// Single atomic upsert using COALESCE to preserve existing values for
-		// fields not provided by the caller — avoids a TOCTOU race from read-then-write.
-		const newLastMessageTime = cursor.lastMessageTimeCreated ?? null;
-		const newLastUploaded = cursor.lastUploadedAt ?? null;
-		this.db
-			.prepare(
-				`INSERT INTO daemon_cursor (source, last_message_time_created, last_uploaded_at)
-         VALUES (?, COALESCE(?, 0), COALESCE(?, 0))
-         ON CONFLICT (source) DO UPDATE SET
-           last_message_time_created = COALESCE(?, last_message_time_created),
-           last_uploaded_at = COALESCE(?, last_uploaded_at)`,
-			)
-			.run(
-				source,
-				newLastMessageTime,
-				newLastUploaded,
-				newLastMessageTime,
-				newLastUploaded,
-			);
-	}
-
-	async resetDaemonCursors(): Promise<void> {
-		this.db.exec("DELETE FROM daemon_cursor");
 	}
 
 	/**
