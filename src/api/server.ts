@@ -63,10 +63,26 @@ export function createApp(
 	adminTokenIsStable = false,
 	/** Store IDs that failed to connect at startup and are currently unavailable. */
 	unavailableStoreIds: ReadonlySet<string> = new Set(),
+	/**
+	 * All stores to fan out read operations across (/entries, /review, /status).
+	 * Defaults to [db] for backwards compatibility (single-store mode).
+	 * In multi-store setups, pass registry.readStores() so entries in secondary
+	 * stores are visible via the API.
+	 */
+	readDbs: IKnowledgeStore[] = [db],
 ): Hono {
 	const app = new Hono();
 	// Reuse ActivationEngine's EmbeddingClient to avoid a second model connection.
 	const service = new KnowledgeService(db, activation.embeddings);
+
+	// Pre-build a service instance for each readable store so PATCH /entries/:id
+	// can route writes to the correct store without per-request allocation.
+	const serviceByStore = new Map<IKnowledgeStore, KnowledgeService>(
+		readDbs.map((s) => [
+			s,
+			s === db ? service : new KnowledgeService(s, activation.embeddings),
+		]),
+	);
 
 	// -- /mcp streamable-http transport --
 	//
@@ -320,25 +336,30 @@ export function createApp(
 	// -- Review --
 
 	app.get("/review", async (c) => {
-		const conflicted = await db.getEntriesByStatus("conflicted");
-		const active = await db.getActiveEntries();
+		// Fan out across all readable stores and merge results.
+		const allConflicted = (
+			await Promise.all(readDbs.map((s) => s.getEntriesByStatus("conflicted")))
+		).flat();
+		const allActive = (
+			await Promise.all(readDbs.map((s) => s.getActiveEntries()))
+		).flat();
 
 		// Find stale entries (active but low strength)
-		const stale = active
+		const stale = allActive
 			.filter((e) => e.strength < REVIEW_STALE_STRENGTH_THRESHOLD)
 			.sort((a, b) => a.strength - b.strength);
 
 		// Find team-relevant entries that might need external documentation
-		const teamRelevant = active.filter(
+		const teamRelevant = allActive.filter(
 			(e) => e.scope === "team" && e.confidence >= 0.7,
 		);
 
 		return c.json({
-			conflicted: conflicted.map(stripEmbedding),
+			conflicted: allConflicted.map(stripEmbedding),
 			stale: stale.map(stripEmbedding),
 			teamRelevant: teamRelevant.map(stripEmbedding),
 			summary: {
-				conflictedCount: conflicted.length,
+				conflictedCount: allConflicted.length,
 				staleCount: stale.length,
 				teamRelevantCount: teamRelevant.length,
 			},
@@ -348,7 +369,27 @@ export function createApp(
 	// -- Status --
 
 	app.get("/status", async (c) => {
-		const stats = await db.getStats();
+		// Fan out stats across all stores and sum counts.
+		const allStats = await Promise.all(readDbs.map((s) => s.getStats()));
+		const stats = allStats.reduce(
+			(acc, s) => ({
+				total: acc.total + s.total,
+				active: acc.active + s.active,
+				superseded: acc.superseded + s.superseded,
+				archived: acc.archived + s.archived,
+				conflicted: acc.conflicted + s.conflicted,
+				tombstoned: acc.tombstoned + (s.tombstoned ?? 0),
+			}),
+			{
+				total: 0,
+				active: 0,
+				superseded: 0,
+				archived: 0,
+				conflicted: 0,
+				tombstoned: 0,
+			},
+		);
+
 		const consolidationState = await serverStateDb.getConsolidationState();
 
 		// No per-source cursors in daemon-only mode — pending_episodes is self-draining.
@@ -360,6 +401,7 @@ export function createApp(
 		// with partial data; the config block is simply omitted.
 		const isAdmin = requireAdminToken(c);
 
+		// Use primary store's embedding metadata (model is shared across all stores).
 		const embeddingMeta = await db.getEmbeddingMetadata();
 
 		return c.json({
@@ -402,22 +444,37 @@ export function createApp(
 		const type = c.req.query("type") || undefined;
 		const scope = c.req.query("scope") || undefined;
 
-		// Filtering is pushed to SQL — no full-table load + JS filter
-		const entries = await db.getEntries({ status, type, scope });
+		// Fan out across all stores — entries in secondary domain stores are included.
+		const allEntries = (
+			await Promise.all(
+				readDbs.map((s) => s.getEntries({ status, type, scope })),
+			)
+		).flat();
 
 		return c.json({
-			entries: entries.map(stripEmbedding),
-			count: entries.length,
+			entries: allEntries.map(stripEmbedding),
+			count: allEntries.length,
 		});
 	});
 
 	app.get("/entries/:id", async (c) => {
-		const entry = await db.getEntry(c.req.param("id"));
+		// Search across all stores — the entry may live in any domain store.
+		const id = c.req.param("id");
+		let entry: KnowledgeEntry | null = null;
+		let entryStore: IKnowledgeStore = db;
+		for (const store of readDbs) {
+			const found = await store.getEntry(id);
+			if (found) {
+				entry = found;
+				entryStore = store;
+				break;
+			}
+		}
 		if (!entry) {
 			return c.json({ error: "Entry not found" }, 404);
 		}
 
-		const relations = await db.getRelationsFor(entry.id);
+		const relations = await entryStore.getRelationsFor(entry.id);
 		return c.json({
 			entry: stripEmbedding(entry),
 			relations,
@@ -434,7 +491,17 @@ export function createApp(
 			return c.json({ error: "Unauthorized" }, 401);
 		}
 
-		const entry = await db.getEntry(c.req.param("id"));
+		const id = c.req.param("id");
+		let entry: KnowledgeEntry | null = null;
+		let entryStore: IKnowledgeStore = db;
+		for (const store of readDbs) {
+			const found = await store.getEntry(id);
+			if (found) {
+				entry = found;
+				entryStore = store;
+				break;
+			}
+		}
 		if (!entry) {
 			return c.json({ error: "Entry not found" }, 404);
 		}
@@ -524,8 +591,10 @@ export function createApp(
 		}
 
 		try {
-			await service.updateEntry(entry.id, updates);
-			const updated = await db.getEntry(entry.id);
+			// Route the update to whichever store holds this entry.
+			const entryService = serviceByStore.get(entryStore) ?? service;
+			await entryService.updateEntry(entry.id, updates);
+			const updated = await entryStore.getEntry(entry.id);
 			if (!updated) {
 				return c.json({ error: "Entry not found after update" }, 500);
 			}
@@ -549,7 +618,17 @@ export function createApp(
 			return c.json({ error: "Unauthorized" }, 401);
 		}
 
-		const entry = await db.getEntry(c.req.param("id"));
+		const resolveId = c.req.param("id");
+		let entry: KnowledgeEntry | null = null;
+		let entryStore: IKnowledgeStore = db;
+		for (const store of readDbs) {
+			const found = await store.getEntry(resolveId);
+			if (found) {
+				entry = found;
+				entryStore = store;
+				break;
+			}
+		}
 		if (!entry) {
 			return c.json({ error: "Entry not found" }, 404);
 		}
@@ -585,7 +664,7 @@ export function createApp(
 
 		// All resolutions need the counterpart. For 'delete', we also restore the counterpart
 		// to 'active' before deleting — otherwise it stays 'conflicted' forever with no partner.
-		const relations = await db.getRelationsFor(entry.id);
+		const relations = await entryStore.getRelationsFor(entry.id);
 		const conflictRelation = relations.find((r) => r.type === "contradicts");
 		const counterpartId = conflictRelation
 			? conflictRelation.sourceId === entry.id
@@ -593,12 +672,28 @@ export function createApp(
 				: conflictRelation.sourceId
 			: null;
 
+		// Guard against cross-store conflicts — if the counterpart lives in a different
+		// store we cannot resolve it safely via a single store's applyContradictionResolution.
+		// Return 422 rather than silently producing dangling state.
+		if (counterpartId && resolution !== "delete") {
+			const counterpartInSameStore = await entryStore.getEntry(counterpartId);
+			if (!counterpartInSameStore) {
+				return c.json(
+					{
+						error:
+							"Cross-store conflict resolution is not supported — entry and counterpart live in different stores. Use knowledge-server review to resolve manually.",
+					},
+					422,
+				);
+			}
+		}
+
 		if (resolution === "delete") {
 			// Restore the counterpart to active (deleteEntry cascades and removes the relation)
 			if (counterpartId) {
-				await db.updateEntry(counterpartId, { status: "active" });
+				await entryStore.updateEntry(counterpartId, { status: "active" });
 			}
-			await db.deleteEntry(entry.id);
+			await entryStore.deleteEntry(entry.id);
 			return c.json({
 				ok: true,
 				deleted: entry.id,
@@ -630,12 +725,17 @@ export function createApp(
 			}
 			// In applyContradictionResolution: "merge" means newEntryId content gets mergedData,
 			// existingEntryId is superseded. We treat :id as the winner (newEntryId).
-			await db.applyContradictionResolution("merge", entry.id, counterpartId, {
-				content: mergedContent,
-				type: entry.type,
-				topics: entry.topics,
-				confidence: entry.confidence,
-			});
+			await entryStore.applyContradictionResolution(
+				"merge",
+				entry.id,
+				counterpartId,
+				{
+					content: mergedContent,
+					type: entry.type,
+					topics: entry.topics,
+					confidence: entry.confidence,
+				},
+			);
 			return c.json({
 				ok: true,
 				resolution: "merge",
@@ -646,9 +746,7 @@ export function createApp(
 
 		if (resolution === "supersede_this") {
 			// :id loses — counterpart wins
-			// applyContradictionResolution("supersede_new", newEntryId=:id, existingEntryId=counterpart)
-			// means existingEntryId (counterpart) wins, newEntryId (:id) is superseded
-			await db.applyContradictionResolution(
+			await entryStore.applyContradictionResolution(
 				"supersede_new",
 				entry.id,
 				counterpartId,
@@ -662,9 +760,7 @@ export function createApp(
 		}
 
 		// supersede_other — :id wins, counterpart loses
-		// applyContradictionResolution("supersede_old", newEntryId=:id, existingEntryId=counterpart)
-		// means newEntryId (:id) wins, existingEntryId (counterpart) is superseded
-		await db.applyContradictionResolution(
+		await entryStore.applyContradictionResolution(
 			"supersede_old",
 			entry.id,
 			counterpartId,
@@ -760,7 +856,17 @@ export function createApp(
 			return c.json({ error: "Unauthorized" }, 401);
 		}
 
-		const entry = await db.getEntry(c.req.param("id"));
+		const deleteId = c.req.param("id");
+		let entry: KnowledgeEntry | null = null;
+		let entryStore: IKnowledgeStore = db;
+		for (const store of readDbs) {
+			const found = await store.getEntry(deleteId);
+			if (found) {
+				entry = found;
+				entryStore = store;
+				break;
+			}
+		}
 		if (!entry) {
 			return c.json({ error: "Entry not found" }, 404);
 		}
@@ -770,18 +876,31 @@ export function createApp(
 		// leave the counterpart stuck in 'conflicted' status with no resolvable partner.
 		let restoredCounterpart: string | null = null;
 		if (entry.status === "conflicted") {
-			const relations = await db.getRelationsFor(entry.id);
+			const relations = await entryStore.getRelationsFor(entry.id);
 			const conflictRel = relations.find((r) => r.type === "contradicts");
 			if (conflictRel) {
 				restoredCounterpart =
 					conflictRel.sourceId === entry.id
 						? conflictRel.targetId
 						: conflictRel.sourceId;
-				await db.updateEntry(restoredCounterpart, { status: "active" });
+				// Guard against cross-store counterpart — same as /resolve endpoint.
+				// If the counterpart is in a different store we can't safely restore it here.
+				const counterpartInSameStore =
+					await entryStore.getEntry(restoredCounterpart);
+				if (!counterpartInSameStore) {
+					return c.json(
+						{
+							error:
+								"Cross-store conflict: entry and counterpart live in different stores. Cannot safely restore counterpart on delete.",
+						},
+						422,
+					);
+				}
+				await entryStore.updateEntry(restoredCounterpart, { status: "active" });
 			}
 		}
 
-		await db.deleteEntry(entry.id);
+		await entryStore.deleteEntry(entry.id);
 		return c.json({ ok: true, deleted: entry.id, restoredCounterpart });
 	});
 

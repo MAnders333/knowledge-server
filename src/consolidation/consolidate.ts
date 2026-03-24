@@ -250,30 +250,41 @@ export class ConsolidationEngine {
 			logger.log("[consolidation] No new sessions to process.");
 		}
 
-		// Apply decay to ALL active entries (once, after all sources are processed).
-		const archived = await this.applyDecay();
+		// Apply decay to ALL active entries across all configured stores.
+		// Fan out to domain stores via the router; always include this.db as primary.
+		const decayStores = this.domainRouter
+			? new Set([this.db, ...this.domainRouter.allStores()])
+			: new Set([this.db]);
+		let archived = 0;
+		for (const store of decayStores) {
+			archived += await this.applyDecay(store);
+		}
 
-		// Generate embeddings for new entries (once, shared across all sources).
+		// Generate embeddings for new entries across all writable stores.
+		// ensureEmbeddings() fans out internally to this.activation.writableDbs.
 		const embeddedCount = await this.activation.ensureEmbeddings();
 		logger.log(
 			`[consolidation] Generated embeddings for ${embeddedCount} entries.`,
 		);
 
-		// If embedding metadata is missing (e.g. startup probe failed, or first
-		// consolidation after a pre-v8 upgrade), record it now from a fresh entry.
+		// Seed embedding metadata for any store that has no metadata record yet
+		// (e.g. first consolidation after a pre-v8 upgrade). Use decayStores as the
+		// scope — all writable stores — to cover stores that may have received writes
+		// in prior runs but never had metadata recorded.
 		// Only seeds when metadata is absent — the model-change path is handled
-		// exclusively by checkAndReEmbed() at startup to avoid overwriting metadata
-		// with a stale model name while old-model vectors are still in the DB.
-		if (embeddedCount > 0 && !(await this.db.getEmbeddingMetadata())) {
-			const sample = await this.db.getOneEntryWithEmbedding();
-			if (sample) {
-				await this.db.setEmbeddingMetadata(
-					config.embedding.model,
-					sample.embedding.length,
-				);
-				logger.log(
-					`[embedding] Recorded embedding model: ${config.embedding.model} (${sample.embedding.length} dimensions).`,
-				);
+		// exclusively by checkAndReEmbed() at startup.
+		for (const store of decayStores) {
+			if (!(await store.getEmbeddingMetadata())) {
+				const sample = await store.getOneEntryWithEmbedding();
+				if (sample) {
+					await store.setEmbeddingMetadata(
+						config.embedding.model,
+						sample.embedding.length,
+					);
+					logger.log(
+						`[embedding] Recorded embedding model: ${config.embedding.model} (${sample.embedding.length} dimensions).`,
+					);
+				}
 			}
 		}
 
@@ -549,13 +560,6 @@ export class ConsolidationEngine {
 			);
 		}
 
-		// Fits within budget (or is a single episode that can't be split further).
-		// Load entries from the primary writable store for reconsolidation/dedup.
-		// Cross-store deduplication (against read-only domain stores) is not implemented —
-		// entries in secondary stores may produce near-duplicates if the same knowledge
-		// surfaces in a different domain session. Accepted limitation of v1 domain routing.
-		const allEntriesForChunk = await this.db.getActiveEntriesWithEmbeddings();
-
 		// Domain routing: resolve the domain for this chunk based on the episodes' directory.
 		// Use the first episode's directory as the representative — episodes within a chunk
 		// come from the same session source. The LLM may still classify individual entries
@@ -564,8 +568,8 @@ export class ConsolidationEngine {
 		const domainResolution = this.domainRouter?.resolve(chunkDirectory) ?? null;
 
 		// If the target store for this chunk's domain is currently unavailable, skip
-		// the chunk entirely. The episodes remain in pending_episodes and will be
-		// retried on the next consolidation run when the store may be reachable again.
+		// the chunk entirely — before any DB access on the resolved store. The episodes
+		// remain in pending_episodes and will be retried on the next consolidation run.
 		if (domainResolution?.storeUnavailable) {
 			logger.warn(
 				`[consolidation/${source}] Skipping chunk — target store for domain "${domainResolution.domainId}" is unavailable. Episodes will be retried on next run.`,
@@ -578,6 +582,16 @@ export class ConsolidationEngine {
 				touchedStores: new Set(),
 			};
 		}
+
+		// Load entries from the chunk's target store for reconsolidation/dedup.
+		// Using the domain-resolved store ensures that within-domain cross-chunk
+		// deduplication works correctly: entries written to this store in prior chunks
+		// are visible for similarity comparison. Without this, chunks targeting a
+		// secondary store always see an empty entriesMap (this.db has none of their
+		// entries) and silently produce duplicates across chunk boundaries.
+		const chunkStore = domainResolution?.store ?? this.db;
+		const allEntriesForChunk =
+			await chunkStore.getActiveEntriesWithEmbeddings();
 
 		// Extract knowledge via LLM (episodes only — no existing knowledge context).
 		const extractStart = Date.now();
@@ -674,10 +688,9 @@ export class ConsolidationEngine {
 						onUpdate: (id, updated, freshEmbedding) => {
 							chunkUpdated++;
 							changedIds.add(id);
-							// Updates always go to this.db — existing entries live in this.db
-							// regardless of the incoming entry's domain (entriesMap is loaded
-							// exclusively from this.db). Only onInsert uses entryTargetStore.
-							touchedStores.add(this.db);
+							// Updates go to chunkStore (via mergeDb) — existing entries live in
+							// whichever store entriesMap was loaded from (the chunk's domain store).
+							touchedStores.add(chunkStore);
 							const existing = entriesMap.get(id);
 							const contentForLog = updated.content ?? existing?.content ?? "";
 							const typeForLog = updated.type ?? existing?.type ?? "?";
@@ -702,7 +715,8 @@ export class ConsolidationEngine {
 					chunkSessionTimestamp,
 					undefined, // precomputedEmbedding
 					"consolidation",
-					entryTargetStore,
+					entryTargetStore, // targetDb: new inserts land in the entry's domain store
+					chunkStore, // mergeDb: existing entries live in the chunk's domain store
 				);
 			} catch (err) {
 				// Log and skip this extracted entry — do NOT rethrow.
@@ -757,19 +771,19 @@ export class ConsolidationEngine {
 	 * Apply decay to all active entries.
 	 * Returns the number of entries that were archived.
 	 */
-	private async applyDecay(): Promise<number> {
+	private async applyDecay(db: IKnowledgeStore = this.db): Promise<number> {
 		// Include conflicted entries — their strength must continue aging.
 		// A conflicted entry whose strength falls to zero is effectively forgotten
 		// regardless of the conflict, and should still be archived.
 		// Single query avoids the TOCTOU window of two separate status queries.
-		const entries = await this.db.getActiveAndConflictedEntries();
+		const entries = await db.getActiveAndConflictedEntries();
 		let archived = 0;
 
 		for (const entry of entries) {
 			const newStrength = computeStrength(entry);
 
 			if (newStrength < config.decay.archiveThreshold) {
-				await this.db.updateEntry(entry.id, {
+				await db.updateEntry(entry.id, {
 					status: "archived",
 					strength: newStrength,
 				});
@@ -779,18 +793,18 @@ export class ConsolidationEngine {
 				);
 			} else if (Math.abs(newStrength - entry.strength) > 0.01) {
 				// Only update if strength changed meaningfully
-				await this.db.updateStrength(entry.id, newStrength);
+				await db.updateStrength(entry.id, newStrength);
 			}
 		}
 
 		// Tombstone long-archived entries
-		const archivedEntries = await this.db.getEntriesByStatus("archived");
+		const archivedEntries = await db.getEntriesByStatus("archived");
 		const tombstoneThreshold =
 			Date.now() - config.decay.tombstoneAfterDays * 24 * 60 * 60 * 1000;
 
 		for (const entry of archivedEntries) {
 			if (entry.updatedAt < tombstoneThreshold) {
-				await this.db.updateEntry(entry.id, { status: "tombstoned" });
+				await db.updateEntry(entry.id, { status: "tombstoned" });
 				logger.log(
 					`[decay] Tombstoned: ${JSON.stringify(entry.content)} (archived for ${config.decay.tombstoneAfterDays}+ days)`,
 				);

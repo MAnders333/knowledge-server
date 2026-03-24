@@ -105,6 +105,15 @@ export class StoreRegistry {
 	}
 
 	/**
+	 * All writable stores as an array.
+	 * Used to fan out embedding/decay/re-embed operations across all stores
+	 * that domain routing can write to.
+	 */
+	writableStores(): IKnowledgeStore[] {
+		return this.writableStoreEntries().map((e) => e.db);
+	}
+
+	/**
 	 * All stores used for activation reads.
 	 * Includes the writable store — activation draws from the full corpus.
 	 * Returns a shallow copy — callers cannot mutate the registry's internal list.

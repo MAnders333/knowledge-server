@@ -210,7 +210,11 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	const registry = await StoreRegistry.create();
 	const db = registry.writableStore();
 	const { serverStateDb } = registry;
-	const activation = new ActivationEngine(db, registry.readStores());
+	const activation = new ActivationEngine(
+		db,
+		registry.readStores(),
+		registry.writableStores(),
+	);
 	const consolidation = new ConsolidationEngine(
 		db,
 		serverStateDb,
@@ -319,6 +323,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		adminToken,
 		adminTokenIsStable,
 		registry.unavailableStoreIds,
+		registry.readStores(),
 	);
 
 	// port/host/daemonAutoSpawn come from the registry (config.jsonc with env var override)

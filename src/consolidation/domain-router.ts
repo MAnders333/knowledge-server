@@ -67,6 +67,18 @@ export class DomainRouter {
 	/** ID of the fallback (primary writable) store — used for unavailability checks. */
 	private fallbackStoreId: string;
 
+	/**
+	 * All available (non-unavailable) stores registered with this router.
+	 * Excludes stores that failed to connect at startup so callers like applyDecay()
+	 * don't attempt writes to unreachable stores.
+	 */
+	allStores(): IKnowledgeStore[] {
+		return [...this.stores.entries()]
+			.filter(([id]) => !this.unavailableStoreIds.has(id))
+			.map(([, store]) => store)
+			.filter((store, idx, arr) => arr.indexOf(store) === idx); // deduplicate by reference
+	}
+
 	constructor(
 		config: KnowledgeServerConfig,
 		stores: Map<string, IKnowledgeStore>,

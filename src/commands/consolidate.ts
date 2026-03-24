@@ -16,7 +16,11 @@ export async function runConsolidate(): Promise<void> {
 	const registry = await StoreRegistry.create();
 	const db = registry.writableStore();
 	const { serverStateDb } = registry;
-	const activation = new ActivationEngine(db, registry.readStores());
+	const activation = new ActivationEngine(
+		db,
+		registry.readStores(),
+		registry.writableStores(),
+	);
 	const consolidation = new ConsolidationEngine(
 		db,
 		serverStateDb,

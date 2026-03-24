@@ -53,12 +53,17 @@ export function splitIntoCues(prompt: string): string[] {
  */
 export class ActivationEngine {
 	/**
-	 * The writable (primary) store — used for write operations:
-	 * recordAccess, ensureEmbeddings, checkAndReEmbed, embedding metadata.
+	 * The primary writable store — used for access records and single-store compat.
 	 */
 	private db: IKnowledgeStore;
 	/**
-	 * All stores to read from during activation (includes the writable store).
+	 * All writable stores — used for ensureEmbeddings, checkAndReEmbed, and
+	 * embedding metadata writes. In multi-store setups this includes every store
+	 * that domain routing can write to, not just the primary.
+	 */
+	private writableDbs: IKnowledgeStore[];
+	/**
+	 * All stores to read from during activation (includes all writable stores).
 	 * Fan-out: each activation query runs against all read stores and results
 	 * are merged and re-ranked by similarity score.
 	 */
@@ -66,13 +71,20 @@ export class ActivationEngine {
 	readonly embeddings: EmbeddingClient;
 
 	/**
-	 * @param writableDb  The writable store — receives access records and embedding writes.
-	 * @param readDbs     All stores to fan out activation reads across.
-	 *                    If omitted, defaults to [writableDb] (single-store mode).
+	 * @param writableDb   The primary writable store — receives access records.
+	 * @param readDbs      All stores to fan out activation reads across.
+	 *                     If omitted, defaults to [writableDb] (single-store mode).
+	 * @param writableDbs  All writable stores for embedding/re-embed operations.
+	 *                     If omitted, defaults to [writableDb] (single-store mode).
 	 */
-	constructor(writableDb: IKnowledgeStore, readDbs?: IKnowledgeStore[]) {
+	constructor(
+		writableDb: IKnowledgeStore,
+		readDbs?: IKnowledgeStore[],
+		writableDbs?: IKnowledgeStore[],
+	) {
 		this.db = writableDb;
 		this.readDbs = readDbs ?? [writableDb];
+		this.writableDbs = writableDbs ?? [writableDb];
 		this.embeddings = new EmbeddingClient();
 	}
 
@@ -348,7 +360,15 @@ export class ActivationEngine {
 	 * status queries to avoid any risk of duplicate entries in the result set.
 	 */
 	async ensureEmbeddings(): Promise<number> {
-		const needsEmbedding = await this.db.getEntriesMissingEmbeddings();
+		let total = 0;
+		for (const store of this.writableDbs) {
+			total += await this.ensureEmbeddingsForStore(store);
+		}
+		return total;
+	}
+
+	private async ensureEmbeddingsForStore(db: IKnowledgeStore): Promise<number> {
+		const needsEmbedding = await db.getEntriesMissingEmbeddings();
 
 		if (needsEmbedding.length === 0) return 0;
 
@@ -361,7 +381,7 @@ export class ActivationEngine {
 		const embeddings = await this.embeddings.embedBatch(texts);
 
 		for (let i = 0; i < needsEmbedding.length; i++) {
-			await this.db.updateEntry(needsEmbedding[i].id, {
+			await db.updateEntry(needsEmbedding[i].id, {
 				embedding: embeddings[i],
 			});
 		}
@@ -388,27 +408,35 @@ export class ActivationEngine {
 	 *    c. Overwrite each entry's embedding vector with the new-model vector
 	 *
 	 * Called at startup before consolidation so all vectors are consistent.
-	 *
-	 * Multi-store note: this method operates on the writable store only (`this.db`).
-	 * Entries in read-only stores are not re-embedded when the model changes — their
-	 * embeddings may be stale/incompatible until those stores re-embed their own entries
-	 * (e.g. by toggling the embedding model config and restarting the server).
-	 * Returns true if a re-embed was performed, false otherwise.
+	 * Fans out across all writable stores. Returns true if any store was re-embedded.
 	 */
 	async checkAndReEmbed(): Promise<boolean> {
+		let anyReEmbedded = false;
+		for (const store of this.writableDbs) {
+			const did = await this.checkAndReEmbedStore(store);
+			if (did) anyReEmbedded = true;
+		}
+		return anyReEmbedded;
+	}
+
+	/**
+	 * Per-store re-embed logic — factored out so checkAndReEmbed() can fan out
+	 * across all writable stores. Returns true if a re-embed was performed.
+	 */
+	private async checkAndReEmbedStore(db: IKnowledgeStore): Promise<boolean> {
 		const configuredModel = config.embedding.model;
-		const stored = await this.db.getEmbeddingMetadata();
+		const stored = await db.getEmbeddingMetadata();
 
 		if (!stored) {
 			// First run or upgrade from pre-v8 schema — seed metadata.
 			// Probe dimensions from an existing entry if available.
-			const existing = await this.db.getActiveEntriesWithEmbeddings();
+			const existing = await db.getActiveEntriesWithEmbeddings();
 			if (existing.length > 0) {
 				const dims = existing[0].embedding.length;
 				logger.log(
 					`[embedding] No embedding metadata found. Recording current model: ${configuredModel} (${dims} dimensions, from ${existing.length} existing entries).`,
 				);
-				await this.db.setEmbeddingMetadata(configuredModel, dims);
+				await db.setEmbeddingMetadata(configuredModel, dims);
 			} else {
 				// No entries yet — probe the API for dimensions.
 				logger.log(
@@ -416,7 +444,7 @@ export class ActivationEngine {
 				);
 				try {
 					const probe = await this.embeddings.embed("dimension probe");
-					await this.db.setEmbeddingMetadata(configuredModel, probe.length);
+					await db.setEmbeddingMetadata(configuredModel, probe.length);
 					logger.log(
 						`[embedding] Recorded embedding model: ${configuredModel} (${probe.length} dimensions).`,
 					);
@@ -438,8 +466,7 @@ export class ActivationEngine {
 
 		// ── Model has changed — re-embed all entries in-place ──
 
-		const entriesWithEmbeddings =
-			await this.db.getActiveEntriesWithEmbeddings();
+		const entriesWithEmbeddings = await db.getActiveEntriesWithEmbeddings();
 		const totalEntries = entriesWithEmbeddings.length;
 
 		logger.log(
@@ -453,7 +480,7 @@ export class ActivationEngine {
 			);
 			try {
 				const probe = await this.embeddings.embed("dimension probe");
-				await this.db.setEmbeddingMetadata(configuredModel, probe.length);
+				await db.setEmbeddingMetadata(configuredModel, probe.length);
 				logger.log(
 					`[embedding] Recorded new embedding model: ${configuredModel} (${probe.length} dimensions).`,
 				);
@@ -481,9 +508,6 @@ export class ActivationEngine {
 		//   Because metadata is written AFTER the loop, next startup sees
 		//   stored.model !== configuredModel and re-runs the full re-embed. The
 		//   already-updated entries will be re-embedded redundantly but correctly.
-		//   This is preferable to the previous behaviour (metadata before loop) where
-		//   a mid-loop crash left mixed-dimension state that ensureEmbeddings could
-		//   not detect (entries had non-NULL embeddings of the wrong dimension).
 		const reEmbedStart = Date.now();
 
 		const texts = entriesWithEmbeddings.map((e) =>
@@ -495,14 +519,14 @@ export class ActivationEngine {
 			newEmbeddings.length > 0 ? newEmbeddings[0].length : 0;
 
 		for (let i = 0; i < entriesWithEmbeddings.length; i++) {
-			await this.db.updateEntry(entriesWithEmbeddings[i].id, {
+			await db.updateEntry(entriesWithEmbeddings[i].id, {
 				embedding: newEmbeddings[i],
 			});
 		}
 
 		// Write metadata AFTER the loop so a mid-loop crash does not leave the DB
 		// with mixed-dimension embeddings that look consistent to the next startup.
-		await this.db.setEmbeddingMetadata(configuredModel, newDimensions);
+		await db.setEmbeddingMetadata(configuredModel, newDimensions);
 
 		const durationSec = ((Date.now() - reEmbedStart) / 1000).toFixed(1);
 
