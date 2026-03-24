@@ -610,4 +610,116 @@ describe("HTTP API", () => {
 		});
 		expect(res.status).toBe(400);
 	});
+
+	it("POST /entries/:id/resolve returns 422 when counterpart is in a different store", async () => {
+		// Simulate a cross-store conflict: entry + contradicts relation in primary db,
+		// counterpart ONLY in a secondary store. The resolve handler finds the entry in
+		// db (entryStore), looks up the relation pointing to "counterpart-other-store",
+		// then calls entryStore.getEntry("counterpart-other-store") — which returns null
+		// because that ID only exists in db2. All resolutions should return 422.
+		const now = Date.now();
+
+		// Set up a second store with the counterpart entry
+		const db2 = new KnowledgeDBImpl(
+			join(tempDir, "test2.db"),
+			join(tempDir, "opencode-fake2.db"),
+		);
+		try {
+			await db2.insertEntry({
+				id: "counterpart-other-store",
+				type: "fact",
+				content: "Counterpart in secondary store",
+				topics: [],
+				confidence: 0.8,
+				source: "test",
+				scope: "personal",
+				status: "conflicted",
+				strength: 1.0,
+				createdAt: now,
+				updatedAt: now,
+				lastAccessedAt: now,
+				accessCount: 0,
+				observationCount: 1,
+				supersededBy: null,
+				derivedFrom: [],
+			});
+
+			// Insert the conflicted entry in the primary store
+			await db.insertEntry({
+				id: "cross-store-entry",
+				type: "fact",
+				content: "Entry in primary store",
+				topics: [],
+				confidence: 0.8,
+				source: "test",
+				scope: "personal",
+				status: "conflicted",
+				strength: 1.0,
+				createdAt: now,
+				updatedAt: now,
+				lastAccessedAt: now,
+				accessCount: 0,
+				observationCount: 1,
+				supersededBy: null,
+				derivedFrom: [],
+			});
+
+			// Insert the contradicts relation directly bypassing FK constraints, simulating
+			// the cross-store scenario where the counterpart exists only in db2 (a secondary
+			// domain store) but the relation record lives in db (the primary store).
+			// This is the exact state that arises when contradiction detection runs across
+			// store boundaries and writes a relation linking entries from different stores.
+			const rawDb = (db as unknown as { db: import("bun:sqlite").Database }).db;
+			rawDb.exec("PRAGMA foreign_keys = OFF");
+			rawDb
+				.prepare(
+					`INSERT INTO knowledge_relation (id, source_id, target_id, type, created_at)
+					 VALUES (?, ?, ?, ?, ?)`,
+				)
+				.run("cross-store-rel", "cross-store-entry", "counterpart-other-store", "contradicts", now);
+			rawDb.exec("PRAGMA foreign_keys = ON");
+
+			// Build an app that reads from both stores — so the API can find the
+			// counterpart in db2 during listing, but the relation+entry in db1 points
+			// to an ID that entryStore (db) no longer contains.
+			const crossStoreApp = createApp(
+				db,
+				serverStateDb,
+				activation,
+				{ consolidate: async () => ({}), get isConsolidating() { return false; }, tryLock: () => true, unlock: () => {}, close: () => {} } as unknown as ConsolidationEngine,
+				TEST_ADMIN_TOKEN,
+				false,
+				new Set(),
+				[db, db2],
+			);
+
+			// All resolution types should return 422
+			for (const resolution of ["supersede_this", "supersede_other", "merge", "delete"]) {
+				const body: Record<string, string> = { resolution };
+				if (resolution === "merge") body.mergedContent = "merged text";
+
+				const res = await crossStoreApp.request("/entries/cross-store-entry/resolve", {
+					method: "POST",
+					headers: {
+						Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify(body),
+				});
+				expect(res.status).toBe(422);
+				const data = await res.json();
+				expect(data.error).toMatch(/[Cc]ross.store/);
+			}
+
+			// The entry should remain untouched — not deleted, still conflicted
+			const check = await crossStoreApp.request("/entries/cross-store-entry", {
+				headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
+			});
+			expect(check.status).toBe(200);
+			const checkData = await check.json();
+			expect(checkData.entry.status).toBe("conflicted");
+		} finally {
+			await db2.close();
+		}
+	});
 });
