@@ -172,7 +172,7 @@ Hono-based HTTP server. Binds to `127.0.0.1:3179` by default.
 |---|---|---|---|
 | `/activate?q=...` | GET | — | Activate knowledge entries by query |
 | `/consolidate` | POST | admin | Run a consolidation batch |
-| `/reinitialize?confirm=yes` | POST | admin | Wipe all entries and reset state |
+| `/reinitialize?confirm=yes` | POST | admin | Wipe all entries and reset consolidation state |
 | `/status` | GET | — (config requires admin) | Health check and stats |
 | `/entries` | GET | — | List entries (filter by `status`, `type`, `scope`) |
 | `/entries/:id` | GET | — | Get a specific entry with relations |
@@ -208,6 +208,19 @@ Configuration is split across two files:
 
 **`~/.config/knowledge-server/config.jsonc`** — store topology (which databases to use and where). Created automatically on first run (default: local SQLite). Edit this for Postgres or multi-store setups.
 
+### Editor validation (`$schema`)
+
+Add a `$schema` line to `config.jsonc` for IDE autocomplete and validation:
+
+```jsonc
+{
+  "$schema": "https://raw.githubusercontent.com/MAnders333/knowledge-server/main/config.schema.json",
+  "stores": [ ... ]
+}
+```
+
+VS Code, JetBrains, and any editor with JSON Language Server support will validate your config and show hover documentation.
+
 ### Store configuration (`config.jsonc`)
 
 The default `config.jsonc` uses a single local SQLite store — no editing needed for single-machine use.
@@ -216,6 +229,7 @@ For Postgres, a non-default port, or to disable daemon auto-spawn, edit `~/.conf
 
 ```jsonc
 {
+  "$schema": "https://raw.githubusercontent.com/MAnders333/knowledge-server/main/config.schema.json",
   // Store config (required)
   "stores": [
     {
@@ -288,6 +302,7 @@ The `description` is injected into the LLM extraction prompt. Write it as a brie
 
 ```jsonc
 {
+  "$schema": "https://raw.githubusercontent.com/MAnders333/knowledge-server/main/config.schema.json",
   "stores": [
     { "id": "work",     "kind": "postgres", "uri": "postgres://user:pass@host:5432/knowledge",  "writable": true },
     { "id": "personal", "kind": "sqlite",   "path": "~/.local/share/knowledge-server/personal.db", "writable": true }
@@ -468,11 +483,36 @@ curl http://127.0.0.1:3179/review
 
 Returns conflicted, stale, and team-relevant entries. OpenCode and Claude Code users also have a `/knowledge-review` slash command (installed by `setup-tool`).
 
-### Reinitialize the knowledge store
+### Reinitialize / reset state
+
+The `reinitialize` command resets varying amounts of state depending on which flags you pass. Flags are additive — each level includes everything below it.
 
 ```bash
-knowledge-server reinitialize --confirm   # wipe all entries
+# Default — reset daemon cursor only.
+# The daemon re-uploads all historical episodes on its next tick.
+# Safe for shared stores (only local state is touched).
+# Use when: connecting to a new or existing store for the first time.
+knowledge-server reinitialize --confirm
+
+# --reset-state — also wipe consolidated_episode and reset consolidation state.
+# Episodes re-upload AND re-consolidate under the current domain config.
+# Safe for shared stores (session IDs are per-machine by nature).
+# Use when: retroactively rerouting knowledge after adding a new domain.
+knowledge-server reinitialize --reset-state --confirm
+
+# --reset-store — also wipe all knowledge entries from the store(s).
+# Full fresh start. Not safe for shared stores with other active users.
+# Use --store=<id> to scope to a single store.
+knowledge-server reinitialize --reset-store --confirm
+knowledge-server reinitialize --reset-store --store=personal --confirm
+
+# --dry-run — preview what would happen without making changes.
+knowledge-server reinitialize --reset-store --dry-run
 ```
+
+**Note:** The server must be stopped before running any reinitialize variant (`knowledge-server stop`). The command checks the PID file and exits with an error if the server is live.
+
+`--dry-run` and `--confirm` are mutually exclusive — `--dry-run` previews the action without requiring `--confirm`.
 
 ## Multi-machine / team setup
 
