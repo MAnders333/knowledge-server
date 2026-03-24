@@ -516,23 +516,33 @@ knowledge-server reinitialize --reset-store --dry-run
 
 ## Multi-machine / team setup
 
-For a team where multiple developers want to share a knowledge base, or where the consolidation server runs on a separate machine (e.g. a home server):
+There are two distinct scenarios where you'd run knowledge-daemon separately from knowledge-server:
 
-**Each local machine:**
-1. Install `knowledge-daemon` only (or full install with `DAEMON_AUTO_SPAWN=false` on the remote server)
+### Team shared knowledge base
+
+Multiple developers share a single knowledge store. Each developer runs `knowledge-daemon` locally to upload their sessions. A single `knowledge-server` instance (on a dedicated server, CI machine, or any always-on host) does the consolidation.
+
+**Each developer's machine:**
+1. Install knowledge-server (daemon only — or full install with `DAEMON_AUTO_SPAWN=false`)
 2. Point `config.jsonc` at the shared Postgres:
    ```jsonc
    { "stores": [{ "id": "main", "kind": "postgres", "uri": "postgres://...", "writable": true }] }
    ```
 3. Run the daemon: `knowledge-daemon` or `knowledge-server setup-tool daemon`
 
-**Remote server:**
+**The server (dedicated host, not a developer machine):**
 1. Install `knowledge-server`
 2. Point `config.jsonc` at the same Postgres
-3. Set `DAEMON_AUTO_SPAWN=false`
+3. Set `DAEMON_AUTO_SPAWN=false` (the server doesn't collect local sessions — the developers' daemons do that)
 4. Start: `knowledge-server`
 
-The daemon uploads episodes directly to Postgres. The server consolidates from there. All machines' knowledge accumulates in one place.
+All developers' episodes upload directly to Postgres. The server consolidates from there. The shared knowledge base accumulates everyone's sessions.
+
+### Personal multi-machine setup
+
+You work across multiple machines (e.g. a work laptop and a personal machine) and want a single knowledge base that spans both. Each machine runs `knowledge-daemon` to upload its sessions. One machine (or a dedicated host) runs `knowledge-server` to consolidate.
+
+The setup is identical to the team case above — replace "each developer's machine" with "each of your machines".
 
 ## Knowledge entry types
 

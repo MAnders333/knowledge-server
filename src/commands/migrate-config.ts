@@ -117,6 +117,7 @@ export function runMigrateConfig(): void {
 	}
 
 	const content = `{
+  "$schema": "https://raw.githubusercontent.com/MAnders333/knowledge-server/main/config.schema.json",
   // Knowledge Server configuration
   // See: https://github.com/MAnders333/knowledge-server#configuration
   //
