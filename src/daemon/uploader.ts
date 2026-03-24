@@ -242,14 +242,11 @@ export class EpisodeUploader {
 			if (shuttingDown) return;
 			try {
 				const result = await this.upload();
-				// A source is "caught up" when it returned fewer sessions than
-				// maxSessionsPerRun. If ANY source returned a full batch, there
-				// may be more history — run the next cycle immediately.
-				// Only sleep when ALL sources are caught up (or nothing uploaded).
-				const anySourceHasMore = result.sources.some(
-					(s) => s.sessions >= config.consolidation.maxSessionsPerRun,
-				);
-				scheduleNext(anySourceHasMore);
+				// If anything was uploaded, run the next cycle immediately —
+				// the cursor advanced and there may be more history behind it.
+				// Only sleep for intervalMs when nothing was uploaded (all sources
+				// are genuinely caught up with no new sessions).
+				scheduleNext(result.episodesUploaded > 0);
 			} catch (err) {
 				logger.error("[daemon] Upload cycle failed:", err);
 				scheduleNext(false);
