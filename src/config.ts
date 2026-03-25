@@ -195,7 +195,7 @@ export const config = {
 			process.env.LLM_EXTRACTION_MODEL || "anthropic/claude-sonnet-4-6",
 		mergeModel: process.env.LLM_MERGE_MODEL || "anthropic/claude-haiku-4-5",
 		contradictionModel:
-			process.env.LLM_CONTRADICTION_MODEL || "anthropic/claude-sonnet-4-6",
+			process.env.LLM_CONTRADICTION_MODEL || "anthropic/claude-haiku-4-5",
 		// Synthesis fires per cluster when membership changes since last synthesis.
 		// Defaults to extractionModel so existing deployments are unaffected without
 		// LLM_SYNTHESIS_MODEL set.
