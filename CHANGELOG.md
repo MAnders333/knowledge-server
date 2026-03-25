@@ -1,5 +1,15 @@
 # Changelog
 
+## [3.6.3](https://github.com/MAnders333/knowledge-server/compare/v3.6.2...v3.6.3) (2026-03-25)
+
+
+### Bug Fixes
+
+* add mock.restore() to afterEach in the ConsolidationEngine lock suite. ([5878478](https://github.com/MAnders333/knowledge-server/commit/58784781d5c9d0b3a5f363add3001674e360b4ac))
+* cast bigint OID to Number for postgres.js template parameter ([698e66f](https://github.com/MAnders333/knowledge-server/commit/698e66fdc727ba675518400d612451d18c3c0231))
+* OID bigint cast, releaseConsolidationLock try/finally, stale JSDoc ([0174bd5](https://github.com/MAnders333/knowledge-server/commit/0174bd5b3a6bde993bbdccd2470ae8b74cac5d9a))
+* **tests:** restore prototype spies in afterEach to prevent cross-file leakage ([5878478](https://github.com/MAnders333/knowledge-server/commit/58784781d5c9d0b3a5f363add3001674e360b4ac))
+
 ## [3.6.2](https://github.com/MAnders333/knowledge-server/compare/v3.6.1...v3.6.2) (2026-03-25)
 
 
