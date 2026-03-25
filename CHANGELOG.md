@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.6.2](https://github.com/MAnders333/knowledge-server/compare/v3.6.1...v3.6.2) (2026-03-25)
+
+
+### Bug Fixes
+
+* **consolidation:** checkPending() calls prepare() for accurate session count ([5f9c691](https://github.com/MAnders333/knowledge-server/commit/5f9c6919f1ec21bc6c87df67d9b727528e35135b))
+* **consolidation:** checkPending() reads countPendingSessions() directly ([b140f90](https://github.com/MAnders333/knowledge-server/commit/b140f907dd558765141540d2c7654a1dbc37feeb))
+
 ## [3.6.1](https://github.com/MAnders333/knowledge-server/compare/v3.6.0...v3.6.1) (2026-03-25)
 
 
