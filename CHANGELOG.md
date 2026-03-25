@@ -1,5 +1,18 @@
 # Changelog
 
+## [3.6.1](https://github.com/MAnders333/knowledge-server/compare/v3.6.0...v3.6.1) (2026-03-25)
+
+
+### Bug Fixes
+
+* **consolidation:** restore within-batch dedup; remove double JSDoc ([9defc8f](https://github.com/MAnders333/knowledge-server/commit/9defc8f35696dbd519b2fa92ac7883df89654613))
+
+
+### Performance Improvements
+
+* **consolidation:** batch decideMerge — N LLM calls → 1 per chunk ([880883b](https://github.com/MAnders333/knowledge-server/commit/880883b9c7c9392e8a896ea0941bc638d897095b))
+* **llm:** switch contradictionModel default from sonnet to haiku ([9e55a7a](https://github.com/MAnders333/knowledge-server/commit/9e55a7a6d19c857a0ea7bb80e1aba58f3e777d07))
+
 ## [3.6.0](https://github.com/MAnders333/knowledge-server/compare/v3.5.1...v3.6.0) (2026-03-25)
 
 
