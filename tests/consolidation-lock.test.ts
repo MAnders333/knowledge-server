@@ -8,7 +8,15 @@
  * - ConsolidationEngine: releases store lock in finally even when consolidation throws
  * - ConsolidationEngine.tryLock / unlock: in-process guard is independent of store locks
  */
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -125,6 +133,9 @@ describe("ConsolidationEngine: store lock in consolidateExtractedToStore", () =>
 	});
 
 	afterEach(async () => {
+		// Restore all prototype spies (e.g. ConsolidationLLM.prototype.extractKnowledge)
+		// to prevent leaking into other test files in CI where Bun runs all tests in one process.
+		mock.restore();
 		await db.close();
 		await serverStateDb.close();
 		rmSync(tempDir, { recursive: true, force: true });
