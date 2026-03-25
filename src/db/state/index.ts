@@ -42,8 +42,6 @@ export const DEFAULT_SERVER_STATE_PATH = join(
  */
 export class ServerStateDB implements IServerStateDB {
 	private readonly db: Database;
-	private _consolidationLockHeld = false;
-
 	constructor(dbPath = DEFAULT_SERVER_STATE_PATH) {
 		const dir = dirname(dbPath);
 		if (!existsSync(dir)) {
@@ -339,18 +337,6 @@ export class ServerStateDB implements IServerStateDB {
 				`UPDATE consolidation_state SET ${fields.join(", ")} WHERE id = 1`,
 			)
 			.run(...values);
-	}
-
-	// ── Consolidation Lock ────────────────────────────────────────────────────
-
-	async tryAcquireConsolidationLock(): Promise<boolean> {
-		if (this._consolidationLockHeld) return false;
-		this._consolidationLockHeld = true;
-		return true;
-	}
-
-	async releaseConsolidationLock(): Promise<void> {
-		this._consolidationLockHeld = false;
 	}
 
 	/**

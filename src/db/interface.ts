@@ -95,20 +95,6 @@ export interface IServerStateDB {
 
 	updateConsolidationState(state: Partial<ConsolidationState>): Promise<void>;
 
-	// ── Consolidation Lock ────────────────────────────────────────────────────
-
-	/**
-	 * Try to acquire an exclusive consolidation lock.
-	 * Returns true if acquired, false if another process holds it.
-	 * SQLite: in-process boolean flag.
-	 */
-	tryAcquireConsolidationLock(): Promise<boolean>;
-
-	/**
-	 * Release the consolidation lock.
-	 */
-	releaseConsolidationLock(): Promise<void>;
-
 	/**
 	 * Wipe staging data: pending_episodes, consolidated_episode, and reset
 	 * consolidation_state counters.
@@ -272,6 +258,34 @@ export interface IKnowledgeStore {
 	markClusterSynthesized(clusterId: string): Promise<void>;
 
 	clearAllEmbeddings(): Promise<number>;
+
+	// ── Consolidation Lock ──────────────────────────────────────────────────
+	// Per-store advisory lock that prevents concurrent consolidation runs across
+	// different processes targeting the same physical database.
+	//
+	// The lock key is derived from the database's own OID (Postgres) or is a
+	// no-op (SQLite — single-process by design). This makes the lock config-
+	// name independent: two users who assign different local names to the same
+	// Postgres database will still share the same lock automatically.
+	//
+	// Owned by consolidateExtractedToStore() in the ConsolidationEngine. Each
+	// store acquires its own lock independently, allowing stores backed by
+	// different physical databases to consolidate in parallel.
+
+	/**
+	 * Try to acquire an exclusive per-database consolidation lock.
+	 * Returns true if acquired, false if another process holds it.
+	 *
+	 * Postgres: uses pg_try_advisory_lock(db_oid) on a reserved connection.
+	 * SQLite: always returns true (single-process, no cross-process risk).
+	 */
+	tryAcquireConsolidationLock(): Promise<boolean>;
+
+	/**
+	 * Release the consolidation lock acquired by tryAcquireConsolidationLock().
+	 * No-op if the lock is not held.
+	 */
+	releaseConsolidationLock(): Promise<void>;
 
 	close(): Promise<void>;
 }

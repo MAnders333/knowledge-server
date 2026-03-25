@@ -77,20 +77,11 @@ const PG_CREATE_STATE_TABLES = `
  * developer machine writes pending_episodes to shared Postgres; the remote
  * server drains it from there.
  *
- * Consolidation lock uses a Postgres advisory lock (same key as the knowledge
- * store lock) to serialize consolidation runs across server instances.
- *
  * Does NOT hold daemon_cursor — that lives in DaemonDB (always local SQLite).
  */
 export class PostgresServerStateDB implements IServerStateDB {
 	private readonly sql: postgres.Sql;
 	private initPromise: Promise<void> | null = null;
-
-	/** Advisory lock key for consolidation serialization. */
-	private static readonly ADVISORY_LOCK_KEY = 3180; // distinct from knowledge store (3179)
-
-	/** Reserved connection held for the duration of a consolidation lock. */
-	private lockConnection: postgres.ReservedSql | null = null;
 
 	constructor(uri: string) {
 		this.sql = postgres(uri, {
@@ -343,47 +334,6 @@ export class PostgresServerStateDB implements IServerStateDB {
 		`;
 	}
 
-	// ── Consolidation Lock ────────────────────────────────────────────────────
-
-	async tryAcquireConsolidationLock(): Promise<boolean> {
-		await this.initialize();
-		// Guard against double-acquire: if we already hold the connection, warn and
-		// return false rather than reserving a second connection and orphaning the first.
-		if (this.lockConnection !== null) {
-			logger.warn(
-				"[pg-state-db] tryAcquireConsolidationLock called while lock already held — returning false. " +
-					"Check for a missing releaseConsolidationLock() call.",
-			);
-			return false;
-		}
-		this.lockConnection = await this.sql.reserve();
-		try {
-			const result = await this.lockConnection`
-				SELECT pg_try_advisory_lock(${PostgresServerStateDB.ADVISORY_LOCK_KEY}) as acquired
-			`;
-			const acquired = (result[0] as { acquired: boolean }).acquired;
-			if (!acquired) {
-				this.lockConnection.release();
-				this.lockConnection = null;
-			}
-			return acquired;
-		} catch (e) {
-			// Query failed — release reserved connection to avoid leaking it.
-			this.lockConnection?.release();
-			this.lockConnection = null;
-			throw e;
-		}
-	}
-
-	async releaseConsolidationLock(): Promise<void> {
-		if (!this.lockConnection) return;
-		await this.lockConnection`
-			SELECT pg_advisory_unlock(${PostgresServerStateDB.ADVISORY_LOCK_KEY})
-		`;
-		this.lockConnection.release();
-		this.lockConnection = null;
-	}
-
 	// ── Reinitialize ──────────────────────────────────────────────────────────
 
 	async reinitialize(): Promise<void> {
@@ -410,9 +360,6 @@ export class PostgresServerStateDB implements IServerStateDB {
 	// ── Close ─────────────────────────────────────────────────────────────────
 
 	async close(): Promise<void> {
-		if (this.lockConnection) {
-			await this.releaseConsolidationLock();
-		}
 		await this.sql.end();
 	}
 }

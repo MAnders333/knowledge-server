@@ -1209,6 +1209,19 @@ export class KnowledgeDB implements IKnowledgeStore {
 		return result.changes;
 	}
 
+	// ── Consolidation Lock ────────────────────────────────────────────────────
+	// SQLite is always single-process (one writer at a time enforced by the
+	// file system lock). The in-process ConsolidationEngine flag (Layer 1) is
+	// sufficient — no cross-process advisory lock is needed.
+
+	async tryAcquireConsolidationLock(): Promise<boolean> {
+		return true;
+	}
+
+	async releaseConsolidationLock(): Promise<void> {
+		// no-op
+	}
+
 	async close(): Promise<void> {
 		this.db.close();
 	}

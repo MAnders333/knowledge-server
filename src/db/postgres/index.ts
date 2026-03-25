@@ -92,6 +92,23 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	private initPromise: Promise<void> | null = null;
 
 	/**
+	 * Advisory lock key derived from the Postgres database OID at init time.
+	 * Null until initialize() completes. Using the OID makes the lock key
+	 * config-name independent: any two processes pointing at the same physical
+	 * database will compute the same key regardless of the local store name.
+	 *
+	 * Stored as bigint to avoid the signed 32-bit overflow that `oid::integer`
+	 * would introduce on high-OID databases (OIDs are unsigned 32-bit; values
+	 * ≥ 2^31 wrap negative under a signed cast, producing a different lock key
+	 * across processes that receive the OID at different points in time).
+	 * pg_try_advisory_lock(bigint) accepts the full 64-bit range.
+	 */
+	private advisoryLockKey: bigint | null = null;
+
+	/** Reserved connection held for the duration of a consolidation lock. */
+	private lockConnection: postgres.ReservedSql | null = null;
+
+	/**
 	 * @param connectionUri  Full postgres:// connection string.
 	 * @param poolMax        Maximum pool connections. Defaults to POSTGRES_POOL_MAX
 	 *                       env var if set, otherwise 10. Useful for hosted services
@@ -106,7 +123,15 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	) {
 		this.sql = postgres(connectionUri, {
 			max: poolMax,
-			idle_timeout: 30, // seconds
+			// idle_timeout is intentionally disabled (0 = no timeout).
+			// The advisory lock acquired by tryAcquireConsolidationLock() is
+			// session-scoped: it is silently released if the underlying connection
+			// is recycled by the pool. A consolidation run can hold the lock for
+			// several minutes (LLM calls, embeddings, contradiction scan). Setting
+			// idle_timeout > 0 risks losing the advisory lock mid-run and allowing
+			// a second process to enter the critical section. Pool connections are
+			// released explicitly after each operation so they do not accumulate.
+			idle_timeout: 0,
 			connect_timeout: 10, // seconds — surface cold-start failures early
 		});
 	}
@@ -143,6 +168,18 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	}
 
 	private async _initialize(): Promise<void> {
+		// Fetch the database OID for use as the per-DB advisory lock key.
+		// This is config-name independent: any two processes connected to the
+		// same physical database will compute the same key, regardless of what
+		// local store name the user has assigned in their config.
+		// Cast to bigint (not integer) to avoid signed 32-bit overflow: OIDs are
+		// unsigned 32-bit values and can exceed 2^31-1 on active systems, which
+		// would produce a negative (incorrect) value under a ::integer cast.
+		const oidRows = await this.sql`
+			SELECT oid::bigint AS oid FROM pg_database WHERE datname = current_database()
+		`;
+		this.advisoryLockKey = BigInt((oidRows[0] as { oid: string | number }).oid);
+
 		// Create schema_version table first
 		await this.sql`
 			CREATE TABLE IF NOT EXISTS schema_version (
@@ -1008,7 +1045,72 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		return result.count;
 	}
 
+	// ── Consolidation Lock ────────────────────────────────────────────────────
+
+	async tryAcquireConsolidationLock(): Promise<boolean> {
+		await this.initialize();
+		// advisoryLockKey is set during _initialize(). If it is somehow still null
+		// after initialize() completes, that is a programming error — throw rather
+		// than silently proceeding without any lock, which would allow concurrent
+		// writes to the same database.
+		if (this.advisoryLockKey === null) {
+			throw new Error(
+				"[pg-db] Advisory lock key not set after initialize() — cannot acquire consolidation lock.",
+			);
+		}
+		// Double-acquire indicates a missing releaseConsolidationLock() call upstream.
+		// Throw rather than returning false: the caller (consolidateExtractedToStore)
+		// would treat false as "another process holds the lock" and silently skip the
+		// store, masking the bug. A throw surfaces it immediately.
+		if (this.lockConnection !== null) {
+			throw new Error(
+				"[pg-db] tryAcquireConsolidationLock called while lock already held. " +
+					"Check for a missing releaseConsolidationLock() call.",
+			);
+		}
+		// Reserve a dedicated connection for the advisory lock. The idle_timeout on
+		// this connection is disabled (set in the pool constructor below) to prevent
+		// Postgres from dropping the session while a long consolidation run is in
+		// progress — advisory locks are session-scoped and would be silently released
+		// if the underlying connection is recycled.
+		this.lockConnection = await this.sql.reserve();
+		try {
+			const result = await this.lockConnection`
+				SELECT pg_try_advisory_lock(${this.advisoryLockKey}) as acquired
+			`;
+			const acquired = (result[0] as { acquired: boolean }).acquired;
+			if (!acquired) {
+				this.lockConnection.release();
+				this.lockConnection = null;
+			}
+			return acquired;
+		} catch (e) {
+			this.lockConnection?.release();
+			this.lockConnection = null;
+			throw e;
+		}
+	}
+
+	async releaseConsolidationLock(): Promise<void> {
+		if (!this.lockConnection || this.advisoryLockKey === null) return;
+		// Always release the reserved connection, even if pg_advisory_unlock throws
+		// (e.g. transient network error). A stale lockConnection would permanently
+		// consume a pool slot and cause the double-acquire guard to throw on the
+		// next consolidation run.
+		try {
+			await this.lockConnection`
+				SELECT pg_advisory_unlock(${this.advisoryLockKey})
+			`;
+		} finally {
+			this.lockConnection.release();
+			this.lockConnection = null;
+		}
+	}
+
 	async close(): Promise<void> {
+		if (this.lockConnection) {
+			await this.releaseConsolidationLock();
+		}
 		await this.sql.end();
 	}
 }
