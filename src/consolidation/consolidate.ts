@@ -149,8 +149,14 @@ export class ConsolidationEngine {
 		const state = await this.serverStateDb.getConsolidationState();
 		let pendingSessions = 0;
 
-		// pending_episodes is self-draining — pass 0 to count all remaining rows.
+		// Call prepare() on readers that support it so countNewSessions() returns
+		// the actual count rather than the conservative placeholder of 1.
+		// prepare() resets its own state at the start so calling it here is safe —
+		// the consolidation engine will call it again when processing begins.
 		for (const reader of this.readers) {
+			if (reader.prepare) {
+				await reader.prepare(0);
+			}
 			pendingSessions += reader.countNewSessions(0);
 		}
 
