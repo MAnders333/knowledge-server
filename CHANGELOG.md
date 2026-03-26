@@ -1,5 +1,14 @@
 # Changelog
 
+## [3.6.5](https://github.com/MAnders333/knowledge-server/compare/v3.6.4...v3.6.5) (2026-03-26)
+
+
+### Bug Fixes
+
+* **extraction:** generalise local-path and domain routing rules ([c49c1e7](https://github.com/MAnders333/knowledge-server/commit/c49c1e766b66abd8a2053f3bf4086df3d16bdc01))
+* **extraction:** improve prompt — local paths, episode independence ([48a8252](https://github.com/MAnders333/knowledge-server/commit/48a82522a432a49ad2f6b4dfce566e53f710da80))
+* **extraction:** local paths route to personal domain, not excluded entirely ([e81da25](https://github.com/MAnders333/knowledge-server/commit/e81da253a014e600a7763a5e0342705fd98d647e))
+
 ## [3.6.4](https://github.com/MAnders333/knowledge-server/compare/v3.6.3...v3.6.4) (2026-03-26)
 
 
