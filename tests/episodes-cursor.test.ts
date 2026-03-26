@@ -959,6 +959,12 @@ describe("CursorEpisodeReader — workspace root resolution", () => {
 			const candidates = reader.getCandidateSessions(0);
 			const episodes = reader.getNewEpisodes([candidates[0].id], new Map());
 			expect(episodes).toHaveLength(1);
+			// Both files are under my-project/src/, so the longest common directory
+			// prefix resolves to that subdirectory rather than the project root.
+			// projectName is therefore "src", not "my-project". This is a known
+			// limitation of the algorithm: when all collected URIs are in the same
+			// subdirectory, the resolved directory is that subdirectory. Domain
+			// routing is still correct because bestProjectMatch uses startsWith().
 			expect(episodes[0].directory).toBe("/Users/x/Documents/my-project/src");
 			expect(episodes[0].projectName).toBe("src");
 			reader.close();
