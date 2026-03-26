@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.6.6](https://github.com/MAnders333/knowledge-server/compare/v3.6.5...v3.6.6) (2026-03-26)
+
+
+### Bug Fixes
+
+* **extraction:** extend user-specific detail rule to usernames and account names ([53c59d9](https://github.com/MAnders333/knowledge-server/commit/53c59d9a68add0996dc9d60e29a6f270380c1b66))
+* **extraction:** replace enumerated user-specific list with a general principle ([3c59d93](https://github.com/MAnders333/knowledge-server/commit/3c59d936ff3ed0bb5c099806f221d9e7724abd09))
+
 ## [3.6.5](https://github.com/MAnders333/knowledge-server/compare/v3.6.4...v3.6.5) (2026-03-26)
 
 
