@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { homedir, platform } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { config } from "../../config.js";
 import type {
 	Episode,
@@ -110,6 +110,10 @@ interface ParsedSession {
 	/** Format B only — ordered bubble stubs. Empty for Format A. */
 	headers: CursorConversationHeader[];
 	isAgentic: boolean;
+	/** Resolved workspace root directory (e.g. "/Users/x/Documents/projectX"). Empty if unresolvable. */
+	directory: string;
+	/** Human-readable project name — last segment of directory (e.g. "projectX"). Empty if unresolvable. */
+	projectName: string;
 }
 
 // ── CursorEpisodeReader ───────────────────────────────────────────────────────
@@ -315,6 +319,10 @@ export class CursorEpisodeReader implements IEpisodeReader {
 		// Skip sessions with no conversation data at all
 		if (inlineTurns.length === 0 && headers.length === 0) return null;
 
+		// Resolve workspace root from file:// URIs scattered across DB entries
+		const directory = this.resolveWorkspaceRoot(sessionId, raw);
+		const projectName = directory ? basename(directory) : "";
+
 		return {
 			sessionId,
 			title,
@@ -323,6 +331,8 @@ export class CursorEpisodeReader implements IEpisodeReader {
 			inlineTurns,
 			headers,
 			isAgentic: data.isAgentic ?? false,
+			directory,
+			projectName,
 		};
 	}
 
@@ -356,9 +366,8 @@ export class CursorEpisodeReader implements IEpisodeReader {
 				startMessageId: startId,
 				endMessageId: endId,
 				sessionTitle: session.title || "Untitled",
-				// Cursor doesn't expose a per-session working directory
-				projectName: "",
-				directory: "",
+				projectName: session.projectName,
+				directory: session.directory,
 				timeCreated: session.createdAt,
 				maxMessageTime: chunk[chunk.length - 1].timestamp,
 				content,
@@ -521,6 +530,154 @@ export class CursorEpisodeReader implements IEpisodeReader {
 
 		return messages;
 	}
+
+	// ── Workspace root resolution ────────────────────────────────────────────
+
+	/**
+	 * Resolve the workspace root directory for a Cursor session by collecting
+	 * absolute file:// URIs from all available sources in the DB, then computing
+	 * the longest common directory prefix.
+	 *
+	 * Sources probed (in order, stops early once paths are found):
+	 * 1. composerData itself — context.fileSelections, allAttachedFileCodeChunksUris
+	 * 2. checkpointId:<id>:* — edit diffs with external file:// URIs
+	 * 3. bubbleId:<id>:* — codebase context chunks, relevant files
+	 * 4. messageRequestContext:<id>:* — currentFileLocationData, git status
+	 *
+	 * Returns "" if no file paths can be found (pure chat session).
+	 */
+	private resolveWorkspaceRoot(
+		sessionId: string,
+		composerDataRaw: string,
+	): string {
+		let db: Database;
+		try {
+			db = this.getDb();
+		} catch {
+			return "";
+		}
+
+		const filePaths: string[] = [];
+
+		// Source 1: composerData itself (context.fileSelections, attached files, etc.)
+		collectFilePathsFromString(composerDataRaw, filePaths);
+
+		// Source 2: checkpointId entries (edit diffs with absolute paths)
+		if (filePaths.length === 0) {
+			try {
+				const rows = db
+					.query<{ value: string }, [string]>(
+						"SELECT value FROM cursorDiskKV WHERE key LIKE ? LIMIT 10",
+					)
+					.all(`checkpointId:${sessionId}:%`);
+				for (const row of rows) {
+					collectFilePathsFromString(row.value, filePaths);
+					if (filePaths.length >= 2) break; // enough for a meaningful prefix
+				}
+			} catch {
+				// ignore — try next source
+			}
+		}
+
+		// Source 3: bubbleId entries (only those containing file:// URIs)
+		if (filePaths.length === 0) {
+			try {
+				const rows = db
+					.query<{ value: string }, [string]>(
+						"SELECT value FROM cursorDiskKV WHERE key LIKE ? AND value LIKE '%file:///%' LIMIT 10",
+					)
+					.all(`bubbleId:${sessionId}:%`);
+				for (const row of rows) {
+					collectFilePathsFromString(row.value, filePaths);
+					if (filePaths.length >= 2) break;
+				}
+			} catch {
+				// ignore — try next source
+			}
+		}
+
+		// Source 4: messageRequestContext entries
+		if (filePaths.length === 0) {
+			try {
+				const rows = db
+					.query<{ value: string }, [string]>(
+						"SELECT value FROM cursorDiskKV WHERE key LIKE ? LIMIT 5",
+					)
+					.all(`messageRequestContext:${sessionId}:%`);
+				for (const row of rows) {
+					collectFilePathsFromString(row.value, filePaths);
+					if (filePaths.length >= 2) break;
+				}
+			} catch {
+				// ignore
+			}
+		}
+
+		if (filePaths.length === 0) return "";
+		if (filePaths.length === 1) return dirname(filePaths[0]);
+
+		return longestCommonDirectoryPrefix(filePaths);
+	}
+}
+
+// ── Workspace root helpers ────────────────────────────────────────────────────
+
+/**
+ * Extract absolute file paths from file:// URIs found anywhere in a string.
+ * Paths are decoded and pushed into the output array.
+ */
+function collectFilePathsFromString(str: string, out: string[]): void {
+	// Use a fresh regex per call to avoid shared lastIndex state
+	const re = /file:\/\/\/([\w/._@+%-]+)/g;
+	for (const match of str.matchAll(re)) {
+		// Reconstruct the absolute path (the URI strips the leading /)
+		const decoded = decodeURIComponent(match[1]);
+		out.push(`/${decoded}`);
+	}
+}
+
+/**
+ * Compute the longest common directory prefix across a list of absolute file paths.
+ *
+ * Example:
+ *   ["/Users/x/Documents/projectX/src/a.ts", "/Users/x/Documents/projectX/lib/b.ts"]
+ *   → "/Users/x/Documents/projectX"
+ *
+ * The result is always a directory (never a partial filename match):
+ *   ["/Users/x/foo-bar/a.ts", "/Users/x/foo-baz/b.ts"]
+ *   → "/Users/x"  (not "/Users/x/foo-")
+ *
+ * Returns "" if no meaningful common prefix exists (less than 2 path segments).
+ */
+function longestCommonDirectoryPrefix(paths: string[]): string {
+	if (paths.length === 0) return "";
+	if (paths.length === 1) return dirname(paths[0]);
+
+	const split = paths.map((p) => p.split("/"));
+	const minLen = Math.min(...split.map((s) => s.length));
+
+	let commonDepth = 0;
+	for (let i = 0; i < minLen; i++) {
+		const segment = split[0][i];
+		if (split.every((s) => s[i] === segment)) {
+			commonDepth = i + 1;
+		} else {
+			break;
+		}
+	}
+
+	// Join the common segments back into a path. Require at least 2 non-empty
+	// segments (e.g. "/Users") to avoid returning just "/".
+	const commonSegments = split[0].slice(0, commonDepth);
+	const result = commonSegments.join("/");
+
+	// If the result points to a file (last common segment has an extension and
+	// matches a specific file path), return its parent directory instead.
+	if (paths.some((p) => p === result)) {
+		return dirname(result);
+	}
+
+	return result || "";
 }
 
 // ── Path resolution ───────────────────────────────────────────────────────────
