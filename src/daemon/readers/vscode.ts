@@ -218,8 +218,7 @@ export class VSCodeEpisodeReader implements IEpisodeReader {
 						folder?: string;
 					};
 					if (wsJson.folder) {
-						// folder is a file:// URI — strip the scheme
-						workspaceDir = wsJson.folder.replace(/^file:\/\//, "");
+						workspaceDir = resolveWorkspaceFolder(wsJson.folder);
 					}
 				}
 			} catch {
@@ -429,6 +428,89 @@ export class VSCodeEpisodeReader implements IEpisodeReader {
 
 		return messages;
 	}
+}
+
+// ── Workspace folder resolution ───────────────────────────────────────────────
+
+/**
+ * Resolve a workspace folder URI from workspace.json into a usable filesystem path.
+ *
+ * VSCode stores workspace folders as URIs in three forms:
+ *
+ * 1. Local:         file:///Users/x/Documents/project
+ *    → /Users/x/Documents/project
+ *
+ *    Note: on Windows this would yield /C:/Users/... after stripping the scheme,
+ *    but Windows is not a supported platform for knowledge-server.
+ *
+ * 2. SSH Remote:    vscode-remote://ssh-remote+<host>/<remote-path>
+ *    (stored percent-encoded as vscode-remote://ssh-remote%2B<host>/<remote-path>)
+ *    → /<remote-path>  (the remote filesystem path, e.g. /home/user/project)
+ *
+ * 3. Dev Container: vscode-remote://dev-container+<hex-encoded-json>/<container-path>
+ *    The authority contains hex-encoded JSON with a `hostPath` field pointing to
+ *    the local project directory that was mounted into the container. We decode
+ *    and extract that host path, which is the real project directory on the local
+ *    machine.
+ *    → /Users/x/Documents/project  (the host path from the JSON payload)
+ *    If decoding fails, returns "" rather than falling back to the container-internal
+ *    path (e.g. /opt/app) which would be useless for domain routing on the host.
+ *
+ * Returns "" if the URI cannot be parsed, uses an unknown scheme, or if a
+ * Dev Container URI cannot be decoded. An empty string propagates cleanly
+ * through the domain router (no match) rather than silently routing incorrectly.
+ */
+export function resolveWorkspaceFolder(folderUri: string): string {
+	// Case 1: file:// URI — strip scheme, decode percent-encoding
+	if (folderUri.startsWith("file://")) {
+		return decodeURIComponent(folderUri.replace(/^file:\/\//, ""));
+	}
+
+	// Case 2 & 3: vscode-remote:// URI
+	if (folderUri.startsWith("vscode-remote://")) {
+		let url: URL;
+		try {
+			url = new URL(folderUri);
+		} catch {
+			return "";
+		}
+
+		const authority = decodeURIComponent(url.hostname);
+
+		// Case 3: Dev Container — authority is "dev-container+<hex-encoded-json>"
+		// The JSON payload contains a `hostPath` field with the local project directory.
+		// On decode failure we return "" rather than falling through to pathname —
+		// the container-internal path (e.g. /opt/app) is not meaningful on the host.
+		if (authority.startsWith("dev-container+")) {
+			try {
+				const hexPayload = authority.slice("dev-container+".length);
+				const jsonStr = Buffer.from(hexPayload, "hex").toString("utf-8");
+				const containerConfig: unknown = JSON.parse(jsonStr);
+				if (
+					containerConfig &&
+					typeof containerConfig === "object" &&
+					"hostPath" in containerConfig &&
+					typeof (containerConfig as Record<string, unknown>).hostPath ===
+						"string"
+				) {
+					return (containerConfig as Record<string, string>).hostPath;
+				}
+			} catch {
+				// Hex decode or JSON parse failed — return "" (container-internal
+				// path would be useless for domain routing on the host machine)
+			}
+			return "";
+		}
+
+		// Case 2: SSH Remote — use the pathname which is the remote filesystem path.
+		const remotePath = decodeURIComponent(url.pathname);
+		return remotePath || "";
+	}
+
+	// Unknown scheme — return "" rather than the raw URI, which would fail
+	// silently in domain routing just like an empty string but is harder to
+	// reason about.
+	return "";
 }
 
 // ── Path resolution ───────────────────────────────────────────────────────────

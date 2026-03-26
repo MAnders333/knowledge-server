@@ -32,6 +32,7 @@ import { config } from "../src/config";
 import {
 	VSCodeEpisodeReader,
 	resolveVSCodeDataDir,
+	resolveWorkspaceFolder,
 } from "../src/daemon/readers/vscode";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -799,6 +800,62 @@ describe("VSCodeEpisodeReader — edge cases", () => {
 		expect(ids).toContain("session-ws1");
 		expect(ids).toContain("session-ws2");
 		reader.close();
+	});
+});
+
+// ── resolveWorkspaceFolder ────────────────────────────────────────────────────
+
+describe("resolveWorkspaceFolder", () => {
+	it("resolves a local file:// URI", () => {
+		expect(resolveWorkspaceFolder("file:///Users/x/Documents/project")).toBe(
+			"/Users/x/Documents/project",
+		);
+	});
+
+	it("decodes percent-encoded characters in file:// URIs", () => {
+		expect(
+			resolveWorkspaceFolder("file:///Users/dennis%20paul/Documents/project"),
+		).toBe("/Users/dennis paul/Documents/project");
+	});
+
+	it("resolves an SSH Remote vscode-remote:// URI to the remote pathname", () => {
+		expect(
+			resolveWorkspaceFolder(
+				"vscode-remote://ssh-remote%2B192.168.0.6/home/dpaul/openclaw",
+			),
+		).toBe("/home/dpaul/openclaw");
+	});
+
+	it("resolves a Dev Container URI to the host machine's project path", () => {
+		// Encode {"hostPath":"/Users/x/Documents/iu-dwh"} as hex
+		const payload = Buffer.from(
+			JSON.stringify({ hostPath: "/Users/x/Documents/iu-dwh" }),
+		).toString("hex");
+		const uri = `vscode-remote://dev-container%2B${encodeURIComponent(payload)}/opt/app`;
+		expect(resolveWorkspaceFolder(uri)).toBe("/Users/x/Documents/iu-dwh");
+	});
+
+	it("returns empty string for a Dev Container URI when hex decoding fails", () => {
+		// Malformed hex payload — should return "" not the container-internal path
+		const uri =
+			"vscode-remote://dev-container%2Bnotvalidhex/opt/app";
+		expect(resolveWorkspaceFolder(uri)).toBe("");
+	});
+
+	it("returns empty string for a Dev Container URI when JSON has no hostPath", () => {
+		const payload = Buffer.from(JSON.stringify({ other: "field" })).toString(
+			"hex",
+		);
+		const uri = `vscode-remote://dev-container%2B${encodeURIComponent(payload)}/opt/app`;
+		expect(resolveWorkspaceFolder(uri)).toBe("");
+	});
+
+	it("returns empty string for an unknown scheme", () => {
+		expect(resolveWorkspaceFolder("customscheme://some/path")).toBe("");
+	});
+
+	it("returns empty string for a vscode-remote:// URI that fails URL parsing", () => {
+		expect(resolveWorkspaceFolder("vscode-remote://")).toBe("");
 	});
 });
 
