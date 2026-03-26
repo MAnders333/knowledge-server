@@ -291,7 +291,7 @@ DO NOT ENCODE if:
 - The session was mostly back-and-forth clarification with no concrete outcome
 - It's a specific numerical result, statistical output, or data finding from a one-off analysis (e.g., "the R2 shift centerline moved from 0.57 to 0.50", "bootstrap delta was -1.3pp"). Ask: is the *conclusion* reusable, or just the number? The number itself is almost never worth encoding — the conclusion it supports might be (e.g., "App→CR conversion rate shows a structural decline unrelated to per-application behaviour" is encodable; the specific coefficients that proved it are not).
 - It's general technical or domain knowledge that any competent LLM already knows. Examples of things NOT worth encoding: how regression modelling works, what a p-value is, standard SQL syntax, general software engineering patterns (e.g. "use indexes for performance"), well-known ML concepts, widely-documented framework behaviour. Only encode knowledge that is SPECIFIC TO THIS USER, PROJECT, TEAM, OR CODEBASE — things that cannot be inferred from general training. Ask: "Would a knowledgeable colleague who had just joined this team need this, or would they already know it?" If they'd already know it, skip it.
-- It's a local filesystem path (e.g. "/Users/alice/projects/foo", "~/work/bar", "C:\\Users\\...") in a shared/team context. Local paths are user- and machine-specific — they are not portable knowledge. Exception: if a personal domain is available (see DOMAIN ASSIGNMENT), a path that is genuinely useful to remember for the user's own machine context may be assigned there. In the absence of a personal domain, the concept a path represents may be worth encoding; the literal path is not.
+- It contains user- or machine-specific details (e.g. local filesystem paths like "/Users/alice/projects/foo", personal credentials, individual tool configs) that would not be useful to other users or on a different machine. Such details belong in the most individual/personal domain available (see DOMAIN ASSIGNMENT). If no such domain exists, encode the portable concept (e.g. "the project lives in a local clone of repo X") but omit the machine-specific detail (e.g. the literal path).
 
 KNOWLEDGE EVOLUTION — when existing knowledge should be upgraded:
 - If a new episode reinforces an earlier observation into a recurring pattern, extract the generalized version.
@@ -316,7 +316,7 @@ ${domainContext.domains.map((d) => `- "${d.id}": ${d.description}`).join("\n")}
 Assignment rules:
 - Read the domain descriptions carefully. The content of the entry — not the session origin — determines the domain.
 - Default to "${domainContext.defaultDomain}" unless the content clearly matches a different domain's description.
-- User-specific or machine-specific knowledge (e.g. local filesystem paths, personal tool configs, individual credentials or preferences) should be routed to a personal domain if one is available, rather than to a shared/team domain.
+- User-specific or machine-specific knowledge (e.g. local filesystem paths, personal tool configs, individual preferences) should be routed to the most individual/private domain available based on its description, rather than to a shared or team-wide domain.
 - The domain field must be exactly one of: ${domainContext.domains.map((d) => `"${d.id}"`).join(", ")}.
 
 `
