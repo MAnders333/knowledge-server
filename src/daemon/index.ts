@@ -28,7 +28,8 @@
  * daemon installed, not the full knowledge server.
  */
 
-import { config, validateConfig } from "../config.js";
+// Load .env from default config location for binary installs — must be first.
+import "../env.js";
 import { createEpisodeReaders } from "./readers/index.js";
 import { DaemonDB } from "../db/daemon/index.js";
 import { createServerStateDB } from "../db/state/factory.js";
@@ -54,18 +55,26 @@ const intervalMs =
 
 const onceFlag = args.includes("--once");
 
-// Validate config
-const errors = validateConfig();
-if (errors.length > 0) {
-	for (const err of errors) console.error(`  ✗ ${err}`);
-	process.exit(1);
-}
+// No validateConfig() call here — the daemon does not use LLM or embedding.
+// It only needs state.db (SQLite or Postgres), which createServerStateDB()
+// resolves from config.jsonc. Connection failures surface naturally at runtime.
 
 // Server state DB — holds pending_episodes. Can be local SQLite or Postgres
 // depending on stateDb config. Daemon writes episodes here; server reads them.
 // Uses createServerStateDB (thin factory) rather than StoreRegistry to avoid
 // importing the full knowledge-store surface, keeping the daemon binary small.
-const serverStateDb = await createServerStateDB();
+let serverStateDb: Awaited<ReturnType<typeof createServerStateDB>>;
+try {
+	serverStateDb = await createServerStateDB();
+} catch (err) {
+	console.error(
+		`  ✗ Failed to connect to state DB: ${err instanceof Error ? err.message : String(err)}`,
+	);
+	console.error(
+		"  Check stateDb config in config.jsonc (or STATE_DB_URI env var for Postgres).",
+	);
+	process.exit(1);
+}
 
 // Daemon-local DB — holds daemon_cursor only. Always local SQLite.
 const daemonDb = new DaemonDB();

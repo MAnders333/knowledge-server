@@ -1,3 +1,5 @@
+// Load .env from default config location for binary installs — must be first.
+import "./env.js";
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
