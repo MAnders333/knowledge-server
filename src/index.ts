@@ -25,6 +25,7 @@ import { main as mcpMain } from "./mcp/index.js";
 import { runSetupTool } from "./commands/setup-tool.js";
 import { runStop } from "./commands/stop.js";
 import { downloadAndInstallDaemon, runUpdate } from "./commands/update.js";
+import { runClaudeAuth } from "./commands/claude-auth.js";
 
 // Bun normalises process.argv the same way for both compiled binaries and `bun run`:
 //   argv[0] = "bun"
@@ -131,6 +132,12 @@ async function main() {
 		process.exit(0);
 	}
 
+	// `knowledge-server claude-auth [--status|--revoke]`
+	if (subcommand === "claude-auth") {
+		await runClaudeAuth(subcommandArgs);
+		process.exit(0);
+	}
+
 	// `knowledge-server migrate-config`
 	if (subcommand === "migrate-config") {
 		runMigrateConfig();
@@ -159,6 +166,7 @@ Commands:
   calibrate                 Recommend similarity thresholds for the active embedding model
   reinitialize              Reset daemon cursor, state, or store entries (see --reset-state, --reset-store)
   setup-tool <tool>         Set up integration (opencode|claude-code|cursor|codex|vscode)
+  claude-auth               Authenticate with a Claude Pro/Max subscription (optional)
   update [--version v1.2.3] Update to the latest (or specified) release
   mcp                       Start the MCP stdio proxy (used by tool integrations)
 

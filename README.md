@@ -23,7 +23,9 @@ curl -fsSL https://raw.githubusercontent.com/MAnders333/knowledge-server/main/sc
 
 **After running:**
 
-1. Edit `~/.config/knowledge-server/.env` — set your LLM API key (e.g. `ANTHROPIC_API_KEY=sk-ant-...`)
+1. Configure an LLM credential — one of:
+   - Edit `~/.config/knowledge-server/.env` and set `ANTHROPIC_API_KEY=sk-ant-...` (or another provider key)
+   - Or authenticate with a Claude Pro/Max subscription: `knowledge-server claude-auth`
 2. Register with your tool(s):
    ```bash
    knowledge-server setup-tool opencode     # OpenCode
@@ -337,7 +339,11 @@ LLM_API_KEY=your-key
 LLM_BASE_ENDPOINT=https://your-proxy.example.com
 ```
 
-Provider-specific credentials take precedence over the unified endpoint.
+**Option C — Claude Pro/Max subscription:**
+
+Use your existing Claude subscription instead of an API key. See [Using your Anthropic subscription](#using-your-anthropic-subscription) below.
+
+Provider-specific credentials take precedence over the unified endpoint. The subscription is used only when no Anthropic API key is configured.
 
 ### LLM models
 
@@ -425,6 +431,54 @@ All sources are auto-detected. Override paths or disable sources via environment
 |---|---|---|
 | `ACTIVATION_MAX_RESULTS` | `10` | Max entries returned per activation |
 | `ACTIVATION_SIMILARITY_THRESHOLD` | `0.3` | Minimum cosine similarity to activate |
+
+## Using your Anthropic subscription
+
+If you have a Claude Pro or Max subscription you can use it instead of an API key. knowledge-server implements the same browser-based OAuth flow used by the official Claude CLI.
+
+**This is entirely optional.** API keys (Option A / B above) continue to work unchanged. The subscription is only used when no `ANTHROPIC_API_KEY` (or other Anthropic credential) is configured.
+
+### Set up
+
+Run the authentication command and follow the prompt:
+
+```bash
+knowledge-server claude-auth
+```
+
+This will print a URL. Open it in your browser, log in to claude.ai, and approve the access request. The browser will redirect to a local callback page and you'll see "Authorization complete". Tokens are stored at `~/.config/knowledge-server/claude-oauth.json` (mode `0600`, readable only by you).
+
+### Verify it's working
+
+Check that tokens are present and not expired:
+
+```bash
+knowledge-server claude-auth --status
+```
+
+When the server is running with subscription auth, the startup log will not show any API key errors. You can also trigger a manual consolidation and watch the log for successful LLM calls:
+
+```bash
+knowledge-server consolidate
+```
+
+Tokens are refreshed automatically — you never need to re-run `claude-auth` unless you explicitly revoke them.
+
+### Revert to an API key
+
+If you want to switch back to a direct API key:
+
+1. **Set the API key** in `~/.config/knowledge-server/.env`:
+   ```bash
+   ANTHROPIC_API_KEY=sk-ant-...
+   ```
+2. **Optionally remove the OAuth tokens** (not required — the API key takes precedence automatically):
+   ```bash
+   knowledge-server claude-auth --revoke
+   ```
+3. Restart the server: `knowledge-server stop && knowledge-server`
+
+The API key always wins over stored OAuth tokens — you do not need to revoke the tokens if you simply add an API key.
 
 ## Usage
 

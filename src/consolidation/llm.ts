@@ -7,6 +7,12 @@ import type { DomainContext } from "./domain-router.js";
 import { logger } from "../logger.js";
 import { clampKnowledgeType } from "../types.js";
 import type { Episode, KnowledgeType } from "../types.js";
+import {
+	ANTHROPIC_BETA_HEADERS,
+	ANTHROPIC_OAUTH_USER_AGENT,
+	getAccessToken,
+	hasOAuthTokens,
+} from "../auth/claude-oauth.js";
 
 /**
  * LLM interface for consolidation.
@@ -23,6 +29,77 @@ import type { Episode, KnowledgeType } from "../types.js";
  * - synthesisModel    — cross-session principle synthesis (LLM_SYNTHESIS_MODEL,
  *                       defaults to LLM_EXTRACTION_MODEL or claude-sonnet-4-6)
  */
+
+/**
+ * Build a custom fetch function that injects Claude OAuth credentials into
+ * every Anthropic API request.
+ *
+ * On each call it:
+ *   1. Retrieves a fresh access token (auto-refreshes from disk when needed).
+ *   2. Sets  Authorization: Bearer <token>  (OAuth bearer auth).
+ *   3. Deletes x-api-key (the SDK sets this; it must not be sent alongside OAuth).
+ *   4. Merges the required anthropic-beta header flags.
+ *   5. Sets the User-Agent expected by Anthropic's OAuth-gated endpoint.
+ *   6. Appends ?beta=true to /v1/messages requests (required for OAuth).
+ */
+function createAnthropicOAuthFetch(): typeof globalThis.fetch {
+	return async (input, init) => {
+		// Resolve URL and preserve Request properties (method, body, etc.) when
+		// input is a Request object. Merging init on top allows the caller to
+		// override individual fields while keeping body/method from the Request.
+		let url: string;
+		let baseInit: RequestInit;
+
+		if (typeof input === "string") {
+			url = input;
+			baseInit = init ?? {};
+		} else if (input instanceof URL) {
+			url = input.href;
+			baseInit = init ?? {};
+		} else {
+			// input is a Request — extract method, body, and other init-compatible
+			// fields so they are not silently dropped when we reconstruct the call.
+			const req = input as Request;
+			url = req.url;
+			baseInit = {
+				method: req.method,
+				body: req.body,
+				headers: req.headers,
+				...init,
+			};
+		}
+
+		// Append ?beta=true to /v1/messages (required for OAuth-authenticated calls).
+		if (url.includes("/v1/messages") && !url.includes("beta=true")) {
+			url += `${url.includes("?") ? "&" : "?"}beta=true`;
+		}
+
+		// Build a mutable Headers instance from whatever baseInit.headers was set.
+		const headers = new Headers(
+			baseInit.headers as HeadersInit | undefined,
+		);
+
+		// Inject OAuth bearer token (obtained fresh, refreshing if needed).
+		const token = await getAccessToken();
+		headers.set("Authorization", `Bearer ${token}`);
+
+		// Remove the API key header — OAuth and x-api-key must not coexist.
+		headers.delete("x-api-key");
+
+		// Merge required beta feature flags with any the SDK already set.
+		const existingBeta = headers.get("anthropic-beta") ?? "";
+		const betaSet = new Set([
+			...existingBeta.split(",").map((s) => s.trim()).filter(Boolean),
+			...ANTHROPIC_BETA_HEADERS,
+		]);
+		headers.set("anthropic-beta", [...betaSet].join(","));
+
+		// Set User-Agent expected by Anthropic's OAuth endpoint.
+		headers.set("User-Agent", ANTHROPIC_OAUTH_USER_AGENT);
+
+		return globalThis.fetch(url, { ...baseInit, headers });
+	};
+}
 
 /**
  * Provider routing based on model string prefix.
@@ -51,6 +128,20 @@ function createModel(modelString: string) {
 				(config.llm.baseEndpoint
 					? `${config.llm.baseEndpoint}/anthropic/v1`
 					: undefined);
+
+			// When no API key is configured, fall back to Claude subscription OAuth.
+			// The custom fetch wrapper injects Authorization + beta headers and handles
+			// silent token refresh. The placeholder apiKey is never sent to the server
+			// (the wrapper deletes x-api-key before every request).
+			if (!apiKey && hasOAuthTokens()) {
+				const provider = createAnthropic({
+					...(baseURL && { baseURL }),
+					apiKey: "oauth-placeholder",
+					fetch: createAnthropicOAuthFetch(),
+				});
+				return provider(modelId);
+			}
+
 			const provider = createAnthropic({ ...(baseURL && { baseURL }), apiKey });
 			return provider(modelId);
 		}
@@ -134,6 +225,10 @@ async function complete(
 	const { timeoutMs, maxRetries, retryBaseDelayMs } = config.llm;
 	const maxAttempts = 1 + maxRetries;
 
+	// Create the model once — avoids a synchronous disk read (hasOAuthTokens check)
+	// on every retry attempt.
+	const model = createModel(modelString);
+
 	let lastError: unknown;
 	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 		const controller = new AbortController();
@@ -146,7 +241,7 @@ async function complete(
 
 		try {
 			const { text } = await generateText({
-				model: createModel(modelString),
+				model,
 				system: systemPrompt,
 				prompt: userPrompt,
 				temperature: 0.2,

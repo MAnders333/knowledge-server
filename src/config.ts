@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { oauthTokenFileExists } from "./auth/claude-oauth.js";
 
 /**
  * Parse an integer environment variable with a fallback default and optional
@@ -432,7 +433,13 @@ export function validateConfig(): string[] {
 		!!(unifiedApiKey && unifiedApiKey !== PLACEHOLDER_API_KEY) &&
 		!!(unifiedEndpoint && unifiedEndpoint !== PLACEHOLDER_ENDPOINT);
 
-	if (!hasAnthropic && !hasOpenAI && !hasGoogle && !hasUnified) {
+	// Claude subscription OAuth tokens count as a valid Anthropic credential source.
+	// Tokens are stored at ~/.config/knowledge-server/claude-oauth.json.
+	// Run `knowledge-server claude-auth` to set them up.
+	// Uses a file-presence check only — JSON parsing is deferred until first LLM call.
+	const hasAnthropicOAuth = oauthTokenFileExists();
+
+	if (!hasAnthropic && !hasOpenAI && !hasGoogle && !hasUnified && !hasAnthropicOAuth) {
 		// Provide a more specific hint when the user has set half of the unified pair.
 		// Guard against placeholder values — a key equal to PLACEHOLDER_API_KEY means
 		// the .env was never edited, so it should not trigger the "key set but endpoint
@@ -452,7 +459,7 @@ export function validateConfig(): string[] {
 			);
 		} else {
 			errors.push(
-				`No LLM credentials configured. Edit ${envPath} and set one of:\n    ANTHROPIC_API_KEY (direct Anthropic)\n    OPENAI_API_KEY (direct OpenAI-compatible)\n    GOOGLE_API_KEY (direct Google)\n    LLM_BASE_ENDPOINT + LLM_API_KEY (unified proxy)`,
+				`No LLM credentials configured. Edit ${envPath} and set one of:\n    ANTHROPIC_API_KEY (direct Anthropic)\n    OPENAI_API_KEY (direct OpenAI-compatible)\n    GOOGLE_API_KEY (direct Google)\n    LLM_BASE_ENDPOINT + LLM_API_KEY (unified proxy)\n  Or run \`knowledge-server claude-auth\` to authenticate with a Claude Pro/Max subscription.`,
 			);
 		}
 	}
