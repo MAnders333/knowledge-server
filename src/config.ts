@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { oauthTokenFileExists } from "./auth/claude-oauth.js";
+import { hasOAuthTokens } from "./auth/claude-oauth.js";
 
 /**
  * Parse an integer environment variable with a fallback default and optional
@@ -436,8 +436,7 @@ export function validateConfig(): string[] {
 	// Claude subscription OAuth tokens count as a valid Anthropic credential source.
 	// Tokens are stored at ~/.config/knowledge-server/claude-oauth.json.
 	// Run `knowledge-server claude-auth` to set them up.
-	// Uses a file-presence check only — JSON parsing is deferred until first LLM call.
-	const hasAnthropicOAuth = oauthTokenFileExists();
+	const hasAnthropicOAuth = hasOAuthTokens();
 
 	if (!hasAnthropic && !hasOpenAI && !hasGoogle && !hasUnified && !hasAnthropicOAuth) {
 		// Provide a more specific hint when the user has set half of the unified pair.

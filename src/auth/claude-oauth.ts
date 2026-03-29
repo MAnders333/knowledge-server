@@ -102,15 +102,6 @@ export function hasOAuthTokens(): boolean {
 	return loadOAuthTokens() !== null;
 }
 
-/**
- * Lightweight file-presence check — only tests whether the token file exists.
- * Avoids the JSON parse cost of hasOAuthTokens(); intended for config validation
- * at startup where a full parse is unnecessary.
- */
-export function oauthTokenFileExists(): boolean {
-	return existsSync(getOAuthFilePath());
-}
-
 // ── PKCE helpers ──────────────────────────────────────────────────────────────
 
 function base64urlEncode(buffer: Buffer): string {
