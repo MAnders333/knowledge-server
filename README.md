@@ -459,6 +459,16 @@ curl -X POST -H "Authorization: Bearer <token>" \
   http://127.0.0.1:3179/consolidate                 # HTTP API
 ```
 
+### Process inbox (batch / cron)
+
+```bash
+knowledge-server process-inbox [dir]
+```
+
+One-shot command that runs the full pipeline end-to-end: uploads Markdown files from the inbox directory, consolidates all pending episodes, and runs KB synthesis. Designed for batch or cron use (e.g. Cloud Run Jobs) — no long-running server needed.
+
+The directory defaults to `LOCAL_FILES_DIR` (or `~/knowledge`) if omitted.
+
 ### Test knowledge activation
 
 ```bash
