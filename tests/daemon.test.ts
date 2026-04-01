@@ -268,6 +268,65 @@ describe("EpisodeUploader.upload", () => {
 		expect(pending[0].id).toBe("pre-existing");
 	});
 
+	it("advances cursor past sessions that produce zero episodes (starvation fix)", async () => {
+		// Reproduces the starvation bug: when all candidate sessions have too few
+		// messages (e.g. 2-message automated sessions), getNewEpisodes returns [],
+		// and the old cursor logic would never advance — re-fetching the same
+		// batch of ineligible sessions on every daemon cycle.
+		const now = Date.now();
+		const oldCursor = now - 100000;
+		await db.updateDaemonCursor("opencode", {
+			lastMessageTimeCreated: oldCursor,
+		});
+
+		// 50 sessions that all produce 0 episodes (reader returns empty array)
+		const sessions = Array.from({ length: 50 }, (_, i) => ({
+			id: `empty-session-${i}`,
+			maxMessageTime: oldCursor + 1000 * (i + 1),
+		}));
+
+		const reader = makeMockReader("opencode", sessions, []);
+
+		const uploader = new EpisodeUploader([reader], db, "alice");
+		const result = await uploader.upload();
+
+		expect(result.episodesUploaded).toBe(0);
+
+		const cursor = await db.getDaemonCursor("opencode");
+		// Cursor must advance past the examined sessions — it must NOT stay at oldCursor.
+		// With hitBatchLimit=true (50 sessions = default maxSessionsPerRun), the cursor
+		// should advance to lastSession.maxMessageTime - 1.
+		const expectedCursor = sessions[sessions.length - 1].maxMessageTime - 1;
+		expect(cursor.lastMessageTimeCreated).toBe(expectedCursor);
+	});
+
+	it("advances cursor past all sessions when batch is not full and zero episodes", async () => {
+		// When the batch is NOT full (fewer sessions than maxSessionsPerRun),
+		// cursor should advance to lastSession.maxMessageTime (not -1).
+		const now = Date.now();
+		const oldCursor = now - 100000;
+		await db.updateDaemonCursor("opencode", {
+			lastMessageTimeCreated: oldCursor,
+		});
+
+		// Only 3 sessions, well below the batch limit
+		const sessions = [
+			{ id: "s1", maxMessageTime: oldCursor + 1000 },
+			{ id: "s2", maxMessageTime: oldCursor + 2000 },
+			{ id: "s3", maxMessageTime: oldCursor + 3000 },
+		];
+
+		const reader = makeMockReader("opencode", sessions, []);
+
+		const uploader = new EpisodeUploader([reader], db, "alice");
+		await uploader.upload();
+
+		const cursor = await db.getDaemonCursor("opencode");
+		expect(cursor.lastMessageTimeCreated).toBe(
+			sessions[sessions.length - 1].maxMessageTime,
+		);
+	});
+
 	it("skips a failed reader and continues with others", async () => {
 		const now = Date.now();
 		const failingReader: IEpisodeReader = {

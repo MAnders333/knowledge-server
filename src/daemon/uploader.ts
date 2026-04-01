@@ -50,10 +50,12 @@ export class EpisodeUploader {
 	async upload(): Promise<{
 		episodesUploaded: number;
 		sessionsProcessed: number;
+		cursorAdvanced: boolean;
 		sources: Array<{ source: string; episodes: number; sessions: number }>;
 	}> {
 		let totalEpisodes = 0;
 		let totalSessions = 0;
+		let anyCursorAdvanced = false;
 		const sources: Array<{
 			source: string;
 			episodes: number;
@@ -65,6 +67,7 @@ export class EpisodeUploader {
 				const result = await this.uploadSource(reader);
 				totalEpisodes += result.episodes;
 				totalSessions += result.sessions;
+				if (result.cursorAdvanced) anyCursorAdvanced = true;
 				if (result.episodes > 0 || result.sessions > 0) {
 					sources.push({
 						source: reader.source,
@@ -91,13 +94,14 @@ export class EpisodeUploader {
 		return {
 			episodesUploaded: totalEpisodes,
 			sessionsProcessed: totalSessions,
+			cursorAdvanced: anyCursorAdvanced,
 			sources,
 		};
 	}
 
 	private async uploadSource(
 		reader: IEpisodeReader,
-	): Promise<{ episodes: number; sessions: number }> {
+	): Promise<{ episodes: number; sessions: number; cursorAdvanced: boolean }> {
 		// Daemon cursor and pending_episodes both live in the server-local DB.
 		const cursor = await this.serverStateDb.getDaemonCursor(reader.source);
 
@@ -107,7 +111,7 @@ export class EpisodeUploader {
 		);
 
 		if (candidateSessions.length === 0) {
-			return { episodes: 0, sessions: 0 };
+			return { episodes: 0, sessions: 0, cursorAdvanced: false };
 		}
 
 		const candidateIds = candidateSessions.map((s) => s.id);
@@ -131,7 +135,7 @@ export class EpisodeUploader {
 			episodes = reader.getNewEpisodes(candidateIds, processedRanges);
 		} catch (err) {
 			logger.error(`[daemon/${reader.source}] getNewEpisodes failed:`, err);
-			return { episodes: 0, sessions: 0 };
+			return { episodes: 0, sessions: 0, cursorAdvanced: false };
 		}
 
 		const newEpisodes = episodes.filter(
@@ -180,22 +184,56 @@ export class EpisodeUploader {
 			}
 		}
 
-		// Advance daemon cursor — mirrors consolidation engine's boundary-safety logic.
-		// Uses lastSuccessMaxTime (not all episodes) so a failed insert doesn't
-		// silently advance the cursor past episodes that were never uploaded.
+		// Advance daemon cursor.
+		//
+		// There are three cases to handle:
+		//
+		// 1. Some episodes were uploaded successfully → advance cursor to the max
+		//    message time of the last uploaded episode (lastSuccessMaxTime).
+		//    If we also hit the batch limit, cap at (lastSession.maxMessageTime - 1)
+		//    to avoid skipping sessions that share the boundary timestamp.
+		//
+		// 2. No episodes were produced (all sessions skipped — e.g. too few
+		//    messages, or all episodes already uploaded) and no insert failures →
+		//    advance cursor past all examined sessions. Without this, the daemon
+		//    would re-fetch the same batch of ineligible sessions every cycle and
+		//    the cursor would never advance (starvation bug).
+		//
+		// 3. An insert failure caused the upload loop to break early → advance
+		//    only to lastSuccessMaxTime, which stays at the old cursor if nothing
+		//    was uploaded before the failure. The failed episode will be retried
+		//    on the next daemon run.
 		const lastSession = candidateSessions[candidateSessions.length - 1];
 		const hitBatchLimit =
 			candidateSessions.length === config.consolidation.maxSessionsPerRun;
 
-		const maxTime = lastSuccessMaxTime;
+		// Detect whether the upload loop completed without insert failures.
+		// If it did, we've fully examined all candidate sessions and can safely
+		// advance past them even if none produced episodes.
+		const allUploadsSucceeded = uploadedCount === newEpisodes.length;
 
-		let newCursor = maxTime;
-		if (hitBatchLimit) {
+		let newCursor = lastSuccessMaxTime;
+		if (allUploadsSucceeded && uploadedCount === 0) {
+			// Case 2: all sessions examined, none produced episodes.
+			// Advance past the entire batch so the next run picks up fresh sessions.
+			if (hitBatchLimit) {
+				// Cap at lastSession - 1 to avoid skipping a session that might
+				// share the boundary timestamp with the next batch's first session.
+				newCursor = Math.max(
+					newCursor,
+					lastSession.maxMessageTime - 1,
+				);
+			} else {
+				newCursor = Math.max(newCursor, lastSession.maxMessageTime);
+			}
+		} else if (hitBatchLimit) {
+			// Case 1 with batch limit: cap so we don't skip boundary sessions.
 			const cap = lastSession.maxMessageTime - 1;
 			if (cap > cursor.lastMessageTimeCreated) {
 				newCursor = Math.min(newCursor, cap);
 			}
 		} else {
+			// Case 1 without batch limit: advance past all examined sessions.
 			newCursor = Math.max(newCursor, lastSession.maxMessageTime);
 		}
 
@@ -215,6 +253,7 @@ export class EpisodeUploader {
 		return {
 			episodes: uploadedCount,
 			sessions: uploadedSessionIds.size,
+			cursorAdvanced: newCursor > cursor.lastMessageTimeCreated,
 		};
 	}
 
@@ -233,16 +272,33 @@ export class EpisodeUploader {
 			`[daemon] Starting. Upload interval: ${Math.round(intervalMs / 1000)}s. User: ${this.userId}`,
 		);
 
-		// Run immediately on start
-		await this.upload();
+		let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
 
-		const interval = setInterval(async () => {
-			await this.upload().catch((err) => {
+		const scheduleNext = (immediate: boolean) => {
+			if (shuttingDown) return;
+			timeoutHandle = setTimeout(
+				() => void runCycle(),
+				immediate ? 0 : intervalMs,
+			);
+		};
+
+		const runCycle = async () => {
+			if (shuttingDown) return;
+			try {
+				const result = await this.upload();
+				// Run immediately if episodes were uploaded OR the cursor advanced
+				// (e.g. past ineligible sessions). Only sleep for intervalMs when
+				// all sources are genuinely caught up with no new sessions.
+				scheduleNext(
+					result.episodesUploaded > 0 || result.cursorAdvanced,
+				);
+			} catch (err) {
 				logger.error("[daemon] Upload cycle failed:", err);
-			});
-		}, intervalMs);
+				scheduleNext(false);
+			}
+		};
 
-		// Graceful shutdown: stop the interval, run caller cleanup, then exit.
+		// Graceful shutdown: stop the timeout, run caller cleanup, then exit.
 		// Uses process.on (not once) so both SIGTERM and SIGINT are always handled.
 		// The re-entrancy guard prevents double-cleanup if both signals fire in rapid
 		// succession before the async onShutdown resolves (process.once would leave
@@ -251,7 +307,7 @@ export class EpisodeUploader {
 		const cleanup = async () => {
 			if (shuttingDown) return;
 			shuttingDown = true;
-			clearInterval(interval);
+			if (timeoutHandle !== null) clearTimeout(timeoutHandle);
 			logger.log("[daemon] Stopping…");
 			if (onShutdown) {
 				await onShutdown().catch((err) => {
@@ -262,7 +318,12 @@ export class EpisodeUploader {
 			process.exit(0);
 		};
 
+		// Register shutdown handlers before first run so a SIGTERM during
+		// the initial upload cycle is handled cleanly.
 		process.on("SIGTERM", () => void cleanup());
 		process.on("SIGINT", () => void cleanup());
+
+		// Run immediately on start, then self-schedule via scheduleNext.
+		await runCycle();
 	}
 }
