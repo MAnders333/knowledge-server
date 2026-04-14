@@ -1100,8 +1100,12 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				: null;
 		const now = Date.now();
 
-		// Only set embedding_vec when the column exists (pgvectorReady).
+		// Three-way branch on pgvectorReady + whether an embedding was provided:
+		//   A) pgvectorReady + embedding provided → set both BYTEA and vector columns
+		//   B) pgvectorReady + no embedding       → null both columns (keeps them in sync)
+		//   C) !pgvectorReady                     → omit embedding_vec (column absent)
 		if (this.pgvectorReady && embeddingVec !== null) {
+			// Case A: write new embedding to both columns.
 			await this.sql.unsafe(
 				`UPDATE knowledge_entry
 				SET content = $1, type = $2,
@@ -1123,7 +1127,32 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 					id,
 				] as postgres.ParameterOrJSON<never>[],
 			);
+		} else if (this.pgvectorReady) {
+			// Case B: no embedding provided but column exists — null both to keep in sync.
+			// Without this, embedding (BYTEA) → NULL but embedding_vec retains its old
+			// value, causing ANN queries to return stale results until ensureEmbeddings runs.
+			await this.sql.unsafe(
+				`UPDATE knowledge_entry
+				SET content = $1, type = $2,
+				    topics = $3::jsonb,
+				    confidence = $4,
+				    derived_from = $5::jsonb,
+				    updated_at = $6, last_accessed_at = $6,
+				    observation_count = observation_count + 1,
+				    embedding = $7,
+				    embedding_vec = NULL
+				WHERE id = $8`,
+				[
+					updates.content, safeType,
+					JSON.stringify(updates.topics),
+					updates.confidence,
+					JSON.stringify(mergedSources),
+					now, embeddingBuf,
+					id,
+				] as postgres.ParameterOrJSON<never>[],
+			);
 		} else {
+			// Case C: embedding_vec column doesn't exist yet — omit it entirely.
 			await this.sql.unsafe(
 				`UPDATE knowledge_entry
 				SET content = $1, type = $2,
