@@ -267,6 +267,163 @@ describe("EpisodeUploader.upload", () => {
 		expect(ranges2.get("session-consolidated")).toHaveLength(1);
 	});
 
+	// ── Starvation fix tests (Dennis Paul, PR #68) ───────────────────────────
+
+	it("cursorAdvanced is true when episodes are uploaded", async () => {
+		const now = Date.now();
+		const oldCursor = now - 50000;
+		await daemonDb.updateDaemonCursor("opencode", {
+			lastMessageTimeCreated: oldCursor,
+		});
+
+		const reader = makeMockReader(
+			"opencode",
+			[{ id: "s1", maxMessageTime: oldCursor + 1000 }],
+			[
+				{
+					source: "opencode",
+					sessionId: "s1",
+					startMessageId: "msg-a",
+					endMessageId: "msg-b",
+					sessionTitle: "Test",
+					projectName: "proj",
+					directory: "/tmp",
+					timeCreated: oldCursor,
+					maxMessageTime: oldCursor + 1000,
+					content: "content",
+					contentType: "messages",
+					approxTokens: 50,
+				},
+			],
+		);
+
+		const uploader = new EpisodeUploader([reader], db, daemonDb, "alice");
+		const result = await uploader.upload();
+
+		expect(result.episodesUploaded).toBe(1);
+		expect(result.cursorAdvanced).toBe(true);
+	});
+
+	it("cursorAdvanced is false when no sessions exist", async () => {
+		// No candidate sessions — cursor stays at 0, cursorAdvanced must be false.
+		const reader = makeMockReader("opencode", [], []);
+		const uploader = new EpisodeUploader([reader], db, daemonDb, "alice");
+		const result = await uploader.upload();
+
+		expect(result.episodesUploaded).toBe(0);
+		expect(result.cursorAdvanced).toBe(false);
+	});
+
+	it("advances cursor past ineligible sessions when batch is full (starvation fix)", async () => {
+		// Reproduces the starvation bug: when all candidate sessions produce no
+		// episodes (e.g. below minSessionMessages), the old cursor logic never
+		// advanced — re-fetching the same batch on every daemon cycle forever.
+		// Fix: when all sessions are examined with no insert failures and
+		// uploadedCount === 0, advance cursor past the entire batch.
+		const now = Date.now();
+		const oldCursor = now - 100000;
+		await daemonDb.updateDaemonCursor("opencode", {
+			lastMessageTimeCreated: oldCursor,
+		});
+
+		// 50 sessions that all produce 0 episodes (reader returns empty array).
+		// 50 === config.consolidation.maxSessionsPerRun default, so hitBatchLimit=true.
+		const sessions = Array.from({ length: 50 }, (_, i) => ({
+			id: `empty-session-${i}`,
+			maxMessageTime: oldCursor + 1000 * (i + 1),
+		}));
+
+		const reader = makeMockReader("opencode", sessions, []);
+		const uploader = new EpisodeUploader([reader], db, daemonDb, "alice");
+		const result = await uploader.upload();
+
+		expect(result.episodesUploaded).toBe(0);
+		expect(result.cursorAdvanced).toBe(true);
+
+		const cursor = await daemonDb.getDaemonCursor("opencode");
+		// With hitBatchLimit=true, cursor caps at lastSession.maxMessageTime - 1
+		// to avoid skipping sessions that share the boundary timestamp.
+		const expectedCursor = sessions[sessions.length - 1].maxMessageTime - 1;
+		expect(cursor.lastMessageTimeCreated).toBe(expectedCursor);
+	});
+
+	it("advances cursor to lastSession.maxMessageTime when batch is not full and zero episodes", async () => {
+		// When fewer sessions than the batch limit are returned, cursor advances
+		// to lastSession.maxMessageTime (no -1 cap needed — no boundary risk).
+		const now = Date.now();
+		const oldCursor = now - 100000;
+		await daemonDb.updateDaemonCursor("opencode", {
+			lastMessageTimeCreated: oldCursor,
+		});
+
+		const sessions = [
+			{ id: "s1", maxMessageTime: oldCursor + 1000 },
+			{ id: "s2", maxMessageTime: oldCursor + 2000 },
+			{ id: "s3", maxMessageTime: oldCursor + 3000 },
+		];
+
+		const reader = makeMockReader("opencode", sessions, []);
+		const uploader = new EpisodeUploader([reader], db, daemonDb, "alice");
+		const result = await uploader.upload();
+
+		expect(result.episodesUploaded).toBe(0);
+		expect(result.cursorAdvanced).toBe(true);
+
+		const cursor = await daemonDb.getDaemonCursor("opencode");
+		expect(cursor.lastMessageTimeCreated).toBe(
+			sessions[sessions.length - 1].maxMessageTime,
+		);
+	});
+
+	it("does not advance cursor when an insert failure occurs before any upload", async () => {
+		// Case 3: insert failure on the first episode → cursor stays at old value
+		// so the failed episode is retried on the next run.
+		const now = Date.now();
+		const oldCursor = now - 50000;
+		await daemonDb.updateDaemonCursor("opencode", {
+			lastMessageTimeCreated: oldCursor,
+		});
+
+		// Override insertPendingEpisode to always throw.
+		const originalInsert = db.insertPendingEpisode.bind(db);
+		db.insertPendingEpisode = async () => {
+			throw new Error("DB insert failed");
+		};
+
+		const reader = makeMockReader(
+			"opencode",
+			[{ id: "s1", maxMessageTime: oldCursor + 1000 }],
+			[
+				{
+					source: "opencode",
+					sessionId: "s1",
+					startMessageId: "msg-a",
+					endMessageId: "msg-b",
+					sessionTitle: "Test",
+					projectName: "proj",
+					directory: "/tmp",
+					timeCreated: oldCursor,
+					maxMessageTime: oldCursor + 1000,
+					content: "content",
+					contentType: "messages",
+					approxTokens: 50,
+				},
+			],
+		);
+
+		const uploader = new EpisodeUploader([reader], db, daemonDb, "alice");
+		const result = await uploader.upload();
+
+		// Restore original method.
+		db.insertPendingEpisode = originalInsert;
+
+		expect(result.episodesUploaded).toBe(0);
+		expect(result.cursorAdvanced).toBe(false);
+
+		const cursor = await daemonDb.getDaemonCursor("opencode");
+		expect(cursor.lastMessageTimeCreated).toBe(oldCursor);
+	});
+
 	it("skips a failed reader and continues with others", async () => {
 		const now = Date.now();
 		const failingReader: IEpisodeReader = {

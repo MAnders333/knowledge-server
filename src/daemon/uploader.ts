@@ -55,6 +55,8 @@ export class EpisodeUploader {
 	async upload(): Promise<{
 		episodesUploaded: number;
 		sessionsProcessed: number;
+		/** True when any source's cursor advanced (episodes uploaded OR ineligible sessions skipped). */
+		cursorAdvanced: boolean;
 		sources: Array<{ source: string; episodes: number; sessions: number }>;
 	}> {
 		// Sources are independent — upload all concurrently.
@@ -64,6 +66,7 @@ export class EpisodeUploader {
 
 		let totalEpisodes = 0;
 		let totalSessions = 0;
+		let anyCursorAdvanced = false;
 		const sources: Array<{
 			source: string;
 			episodes: number;
@@ -76,6 +79,7 @@ export class EpisodeUploader {
 			if (result.status === "fulfilled") {
 				totalEpisodes += result.value.episodes;
 				totalSessions += result.value.sessions;
+				if (result.value.cursorAdvanced) anyCursorAdvanced = true;
 				if (result.value.episodes > 0 || result.value.sessions > 0) {
 					sources.push({
 						source: reader.source,
@@ -100,13 +104,14 @@ export class EpisodeUploader {
 		return {
 			episodesUploaded: totalEpisodes,
 			sessionsProcessed: totalSessions,
+			cursorAdvanced: anyCursorAdvanced,
 			sources,
 		};
 	}
 
 	private async uploadSource(
 		reader: IEpisodeReader,
-	): Promise<{ episodes: number; sessions: number }> {
+	): Promise<{ episodes: number; sessions: number; cursorAdvanced: boolean }> {
 		// Daemon cursor lives in DaemonDB (always local SQLite).
 		const cursor = await this.daemonDb.getDaemonCursor(reader.source);
 
@@ -116,7 +121,7 @@ export class EpisodeUploader {
 		);
 
 		if (candidateSessions.length === 0) {
-			return { episodes: 0, sessions: 0 };
+			return { episodes: 0, sessions: 0, cursorAdvanced: false };
 		}
 
 		const candidateIds = candidateSessions.map((s) => s.id);
@@ -132,7 +137,7 @@ export class EpisodeUploader {
 			newEpisodes = reader.getNewEpisodes(candidateIds, processedRanges);
 		} catch (err) {
 			logger.error(`[daemon/${reader.source}] getNewEpisodes failed:`, err);
-			return { episodes: 0, sessions: 0 };
+			return { episodes: 0, sessions: 0, cursorAdvanced: false };
 		}
 
 		let uploadedCount = 0;
@@ -174,22 +179,58 @@ export class EpisodeUploader {
 			}
 		}
 
-		// Advance daemon cursor — mirrors consolidation engine's boundary-safety logic.
-		// Uses lastSuccessMaxTime (not all episodes) so a failed insert doesn't
-		// silently advance the cursor past episodes that were never uploaded.
+		// Advance daemon cursor.
+		//
+		// Three cases:
+		//
+		// 1. Episodes uploaded successfully → advance to lastSuccessMaxTime.
+		//    If the batch limit was hit, cap at (lastSession.maxMessageTime - 1)
+		//    to avoid skipping sessions that share the boundary timestamp.
+		//
+		// 2. No episodes produced AND no insert failures (all sessions examined
+		//    but ineligible — e.g. too few messages) → advance past all examined
+		//    sessions. Without this, the cursor never moves when facing a block of
+		//    ineligible sessions and the daemon re-fetches the same batch forever
+		//    (starvation bug). Fix contributed by Dennis Paul (PR #68).
+		//
+		// 3. Insert failure before any episodes uploaded → keep cursor at old value
+		//    so the failed episode is retried on the next daemon run.
 		const lastSession = candidateSessions[candidateSessions.length - 1];
 		const hitBatchLimit =
 			candidateSessions.length === config.consolidation.maxSessionsPerRun;
 
-		const maxTime = lastSuccessMaxTime;
+		// True when the upload loop ran to completion without any insert failure.
+		// (0 === 0 when newEpisodes is empty — intentional; it means all sessions
+		// were examined and none produced episodes, not that we failed mid-loop.)
+		const allExamined = uploadedCount === newEpisodes.length;
 
-		let newCursor = maxTime;
-		if (hitBatchLimit) {
+		let newCursor = lastSuccessMaxTime;
+
+		if (!allExamined) {
+			// Case 3: insert failure before all episodes were processed.
+			// Keep cursor at lastSuccessMaxTime (= old cursor when nothing uploaded)
+			// so the failed episode is retried on the next daemon run.
+			// newCursor is already set to lastSuccessMaxTime — nothing to do.
+		} else if (uploadedCount === 0) {
+			// Case 2: all sessions examined, none produced episodes (e.g. all below
+			// minSessionMessages). Advance past the entire batch so the daemon does
+			// not re-fetch the same ineligible sessions on the next cycle (starvation
+			// fix — contributed by Dennis Paul, PR #68).
+			if (hitBatchLimit) {
+				// Cap at lastSession - 1 to avoid skipping sessions that share
+				// the boundary timestamp with the next batch's first session.
+				newCursor = Math.max(newCursor, lastSession.maxMessageTime - 1);
+			} else {
+				newCursor = Math.max(newCursor, lastSession.maxMessageTime);
+			}
+		} else if (hitBatchLimit) {
+			// Case 1 with batch limit: cap to avoid skipping boundary sessions.
 			const cap = lastSession.maxMessageTime - 1;
 			if (cap > cursor.lastMessageTimeCreated) {
 				newCursor = Math.min(newCursor, cap);
 			}
 		} else {
+			// Case 1 without batch limit: advance past all examined sessions.
 			newCursor = Math.max(newCursor, lastSession.maxMessageTime);
 		}
 
@@ -209,6 +250,7 @@ export class EpisodeUploader {
 		return {
 			episodes: uploadedCount,
 			sessions: uploadedSessionIds.size,
+			cursorAdvanced: newCursor > cursor.lastMessageTimeCreated,
 		};
 	}
 
@@ -242,11 +284,11 @@ export class EpisodeUploader {
 			if (shuttingDown) return;
 			try {
 				const result = await this.upload();
-				// If anything was uploaded, run the next cycle immediately —
-				// the cursor advanced and there may be more history behind it.
-				// Only sleep for intervalMs when nothing was uploaded (all sources
-				// are genuinely caught up with no new sessions).
-				scheduleNext(result.episodesUploaded > 0);
+				// Re-run immediately when the cursor advanced — either episodes were
+				// uploaded or ineligible sessions were skipped past. Only sleep for
+				// intervalMs when all sources are genuinely caught up with no new or
+				// skippable sessions.
+				scheduleNext(result.episodesUploaded > 0 || result.cursorAdvanced);
 			} catch (err) {
 				logger.error("[daemon] Upload cycle failed:", err);
 				scheduleNext(false);
