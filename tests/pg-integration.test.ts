@@ -76,18 +76,21 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		// consolidated_episode and consolidation_state are NOT truncated here —
 		// they now live in state.db (ServerStateDB), not in Postgres.
 		await truncSql`TRUNCATE knowledge_entry, knowledge_cluster, embedding_metadata, schema_version CASCADE`;
-		// Drop embedding_vec column and HNSW index between tests so each test
-		// starts with a clean schema state. ensureVectorColumn() creates them
-		// lazily when setEmbeddingMetadata() is called, so dropping here is safe.
-		// Without this, a test that calls setEmbeddingMetadata() leaves behind
-		// a vector(N) column and index that interferes with subsequent tests.
+		// Drop embedding_vec column and HNSW index so each test starts with a
+		// clean schema state. ensureVectorColumn() creates them lazily when
+		// setEmbeddingMetadata() is called; dropping here prevents a test that
+		// calls setEmbeddingMetadata() from leaving behind a vector(N) column
+		// that interferes with subsequent tests.
+		// We close and reopen `db` after the DDL so the connection pool is fresh
+		// and no cached prepared statements reference the dropped column.
 		await truncSql`DROP INDEX IF EXISTS idx_entry_embedding_vec_hnsw`;
 		await truncSql.unsafe(
 			"ALTER TABLE knowledge_entry DROP COLUMN IF EXISTS embedding_vec",
 		);
-		// Re-initialize to re-stamp schema_version (truncated above).
-		// Clear initPromise (private field) so initialize() re-runs on next call.
-		(db as unknown as { initPromise: null }).initPromise = null;
+		// Close the existing db pool (flushes any cached plans referencing embedding_vec)
+		// and create a fresh instance for the next test.
+		await db.close();
+		db = new PostgresKnowledgeDB(uri);
 		await (db as PostgresKnowledgeDB).initialize();
 		// Fresh ServerStateDB for each test — staging methods now live here.
 		// Use a counter rather than Date.now() to avoid filename collisions on fast machines.
