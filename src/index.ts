@@ -11,6 +11,8 @@ import { createApp } from "./api/server.js";
 import { runActivate } from "./commands/activate.js";
 import { runCalibrate } from "./commands/calibrate.js";
 import { runConsolidate } from "./commands/consolidate.js";
+import { runProcessInbox } from "./commands/process-inbox.js";
+import { runClaudeAuth } from "./commands/claude-auth.js";
 import { runMigrateConfig } from "./commands/migrate-config.js";
 import { runReinitialize } from "./commands/reinitialize.js";
 import { runReview } from "./commands/review.js";
@@ -98,6 +100,25 @@ async function main() {
 		process.exit(0);
 	}
 
+	// `knowledge-server process-inbox [dir]`
+	if (subcommand === "process-inbox") {
+		const errors = validateConfig();
+		if (errors.length > 0) {
+			for (const err of errors) console.error(`  ✗ ${err}`);
+			process.exit(1);
+		}
+		await runProcessInbox(subcommandArgs);
+		process.exit(0);
+	}
+
+	// `knowledge-server claude-auth [--status|--revoke]`
+	// Note: no validateConfig() check — claude-auth is used to SET UP credentials,
+	// so it must work even when no credentials are configured yet.
+	if (subcommand === "claude-auth") {
+		await runClaudeAuth(subcommandArgs);
+		process.exit(0);
+	}
+
 	// `knowledge-server activate <query>`
 	if (subcommand === "activate") {
 		const errors = validateConfig();
@@ -154,6 +175,8 @@ Commands:
   stop                      Stop the running HTTP server
   status                    Show server state and knowledge graph stats
   consolidate               Run a manual consolidation cycle
+  process-inbox [dir]       Upload local files and run full pipeline (upload → consolidate → synthesize)
+  claude-auth               Authenticate with a Claude Pro/Max subscription (optional)
   activate <query>          Test knowledge activation for a query
   review [--filter <f>]     Interactively review entries (filter: conflicted|stale|all)
   calibrate                 Recommend similarity thresholds for the active embedding model
