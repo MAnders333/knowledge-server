@@ -7,7 +7,7 @@
  *
  * Usage:
  *   docker run -d --name ks-pg-test -p 5433:5432 \
- *     -e POSTGRES_USER=ks -e POSTGRES_PASSWORD=ks -e POSTGRES_DB=knowledge --rm postgres:16-alpine
+ *     -e POSTGRES_USER=ks -e POSTGRES_PASSWORD=ks -e POSTGRES_DB=knowledge --rm pgvector/pgvector:pg16
  *   PG_TEST_URI=postgres://ks:ks@localhost:5433/knowledge bun test tests/pg-integration.test.ts
  */
 
@@ -76,6 +76,15 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		// consolidated_episode and consolidation_state are NOT truncated here —
 		// they now live in state.db (ServerStateDB), not in Postgres.
 		await truncSql`TRUNCATE knowledge_entry, knowledge_cluster, embedding_metadata, schema_version CASCADE`;
+		// Drop embedding_vec column and HNSW index between tests so each test
+		// starts with a clean schema state. ensureVectorColumn() creates them
+		// lazily when setEmbeddingMetadata() is called, so dropping here is safe.
+		// Without this, a test that calls setEmbeddingMetadata() leaves behind
+		// a vector(N) column and index that interferes with subsequent tests.
+		await truncSql`DROP INDEX IF EXISTS idx_entry_embedding_vec_hnsw`;
+		await truncSql.unsafe(
+			"ALTER TABLE knowledge_entry DROP COLUMN IF EXISTS embedding_vec",
+		);
 		// Re-initialize to re-stamp schema_version (truncated above).
 		// Clear initPromise (private field) so initialize() re-runs on next call.
 		(db as unknown as { initPromise: null }).initPromise = null;
