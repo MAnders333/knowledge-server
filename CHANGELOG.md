@@ -1,5 +1,18 @@
 # Changelog
 
+## [3.7.0](https://github.com/MAnders333/knowledge-server/compare/v3.6.7...v3.7.0) (2026-04-14)
+
+
+### Features
+
+* Claude Pro/Max subscription OAuth authentication ([d1d9320](https://github.com/MAnders333/knowledge-server/commit/d1d932032c9c786d60620fcf46e0e5ea9dc998be))
+* Claude subscription OAuth, process-inbox command, starvation fix ([#71](https://github.com/MAnders333/knowledge-server/issues/71)) ([421c356](https://github.com/MAnders333/knowledge-server/commit/421c3563d3ddb3f7791d555847cc1c9bfb98b0e7))
+
+
+### Bug Fixes
+
+* daemon cursor starvation when sessions produce zero episodes ([d1d9320](https://github.com/MAnders333/knowledge-server/commit/d1d932032c9c786d60620fcf46e0e5ea9dc998be))
+
 ## [3.6.7](https://github.com/MAnders333/knowledge-server/compare/v3.6.6...v3.6.7) (2026-03-27)
 
 
