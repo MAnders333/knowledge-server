@@ -1,5 +1,20 @@
 # Changelog
 
+## [3.8.0](https://github.com/MAnders333/knowledge-server/compare/v3.7.0...v3.8.0) (2026-04-14)
+
+
+### Features
+
+* pgvector ANN search for Postgres stores (schema v16) ([6ba75f7](https://github.com/MAnders333/knowledge-server/commit/6ba75f784980cebf76f433d618ab8df0169ca9b7))
+
+
+### Bug Fixes
+
+* close and reopen db pool after DROP COLUMN in pg test beforeEach ([a5e2e25](https://github.com/MAnders333/knowledge-server/commit/a5e2e25e4fb310c6a1a98ec5793e07e4859af8e6))
+* **db:** correct JSONB serialization and replace invalid bit cast with JS backfill ([cae0084](https://github.com/MAnders333/knowledge-server/commit/cae00843491b2ba999a0dc5dc6d646bc39a38615))
+* guard embedding_vec column references behind pgvectorReady ([c0b8658](https://github.com/MAnders333/knowledge-server/commit/c0b86584c80855f7e675f85ffd87bdfd253cf38a))
+* null embedding_vec in mergeEntry when no embedding provided ([a4b2721](https://github.com/MAnders333/knowledge-server/commit/a4b2721df49817f68c210143c6089734bd20b587))
+
 ## [3.7.0](https://github.com/MAnders333/knowledge-server/compare/v3.6.7...v3.7.0) (2026-04-14)
 
 
