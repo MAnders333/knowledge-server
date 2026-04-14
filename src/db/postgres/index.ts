@@ -51,6 +51,15 @@ function floatsToBuffer(arr: number[]): Buffer {
 }
 
 /**
+ * Convert a float32 number[] to a pgvector literal string: '[f0,f1,...,fN]'.
+ * postgres.js passes this as a plain string parameter; the column's vector type
+ * handles parsing.  Using a string avoids the need for a custom type codec.
+ */
+function floatsToVectorLiteral(arr: number[]): string {
+	return `[${arr.join(",")}]`;
+}
+
+/**
  * Convert a PostgreSQL BYTEA Buffer back to a number[] of float32 values.
  */
 function bufferToFloats(buf: Buffer | Uint8Array): number[] {
@@ -107,6 +116,18 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 
 	/** Reserved connection held for the duration of a consolidation lock. */
 	private lockConnection: postgres.ReservedSql | null = null;
+
+	/**
+	 * True once ensureVectorColumn() has confirmed that:
+	 *   1. The pgvector extension is installed.
+	 *   2. The `embedding_vec vector(N)` column exists on knowledge_entry.
+	 *   3. The HNSW index exists.
+	 *
+	 * Set to false on construction; lazily set to true by ensureVectorColumn().
+	 * When false, findSimilarEntries falls back gracefully (returns empty so
+	 * callers revert to the in-process full scan) rather than throwing.
+	 */
+	private pgvectorReady = false;
 
 	/**
 	 * @param connectionUri  Full postgres:// connection string.
@@ -218,12 +239,28 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		}
 
 		// PG_MIGRATIONS is imported from ./migrations.ts — see that file for history.
+		//
+		// Gap-safe: migrations are filtered to version > currentVersion and applied
+		// in ascending order.  If the DB is at v10 and migrations v11–v16 all exist,
+		// every one of them runs in sequence even though intermediate versions (e.g.
+		// v12, v13) were never individually stamped on this database.  Each migration
+		// stamps its own version row, so a crash mid-sequence leaves the DB at the
+		// last successfully committed version and restarts cleanly from there.
 		if (currentVersion < SCHEMA_VERSION) {
-			let migratedTo = currentVersion;
-			for (const migration of PG_MIGRATIONS) {
-				if (migratedTo >= migration.version) continue;
+			const pending = PG_MIGRATIONS
+				.filter((m) => m.version > currentVersion)
+				.sort((a, b) => a.version - b.version);
+
+			if (pending.length > 0) {
 				logger.log(
-					`[pg-db] Applying incremental migration v${migratedTo} → v${migration.version}: ${migration.label}.`,
+					`[pg-db] Schema at v${currentVersion}, target v${SCHEMA_VERSION}. Applying ${pending.length} migration(s): ${pending.map((m) => `v${m.version} (${m.label})`).join(", ")}.`,
+				);
+			}
+
+			let migratedTo = currentVersion;
+			for (const migration of pending) {
+				logger.log(
+					`[pg-db] Applying migration v${migration.version}: ${migration.label}.`,
 				);
 				await this.sql.begin(async (sql: TxSql) => {
 					await migration.up(sql);
@@ -234,7 +271,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				});
 				migratedTo = migration.version;
 				logger.log(
-					`[pg-db] Incremental migration → v${migration.version} complete.`,
+					`[pg-db] Migration v${migration.version} complete.`,
 				);
 			}
 
@@ -270,6 +307,165 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				});
 			}
 		}
+
+		// ── pgvector: ensure embedding_vec column + HNSW index ───────────────────
+		// Called unconditionally after every initialize() path (fresh, migrated,
+		// or already up-to-date).  The method is idempotent: it checks for the
+		// extension, column, and index before creating anything.  If embedding
+		// dimensions are not yet known (no metadata row) it sets pgvectorReady=false
+		// and defers column creation to the next setEmbeddingMetadata() call.
+		await this.ensureVectorColumn();
+	}
+
+	// ── pgvector helpers ──
+
+	/**
+	 * Ensure the pgvector extension, `embedding_vec vector(N)` column, and HNSW
+	 * index all exist.  Idempotent — safe to call on every startup.
+	 *
+	 * Defers silently when no embedding_metadata row exists yet (dimensions
+	 * unknown).  setEmbeddingMetadata() calls this again once dimensions are
+	 * recorded, completing the setup.
+	 *
+	 * Sets this.pgvectorReady = true on success, false when the extension is
+	 * unavailable or dimensions are not yet known.
+	 */
+	private async ensureVectorColumn(): Promise<void> {
+		// Check extension availability first — pgvector may not be installed.
+		try {
+			await this.sql`CREATE EXTENSION IF NOT EXISTS vector`;
+		} catch {
+			// pgvector not installed on this Postgres instance — degrade gracefully.
+			logger.warn(
+				"[pg-db] pgvector extension not available — vector search disabled. " +
+					"Install pgvector to enable ANN search (see https://github.com/pgvector/pgvector).",
+			);
+			this.pgvectorReady = false;
+			return;
+		}
+
+		// Read dimension from metadata singleton.
+		const meta = await this.sql`
+			SELECT dimensions FROM embedding_metadata WHERE id = 1
+		`;
+		if (meta.length === 0) {
+			// Dimensions not yet known — defer until setEmbeddingMetadata() is called.
+			this.pgvectorReady = false;
+			return;
+		}
+		const dims = Number(meta[0].dimensions);
+
+		// Add embedding_vec column if absent.
+		const colExists = await this.sql`
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema()
+			  AND table_name   = 'knowledge_entry'
+			  AND column_name  = 'embedding_vec'
+		`;
+
+		if (colExists.length === 0) {
+			// Wrap ADD COLUMN + backfill UPDATE in a transaction so a crash between
+			// the two leaves the DB in a clean state (column absent) rather than
+			// present-but-empty (which would cause pgvectorReady=true with no data).
+			await this.sql.begin(async (sql: TxSql) => {
+				await sql.unsafe(
+					`ALTER TABLE knowledge_entry ADD COLUMN embedding_vec vector(${dims})`,
+				);
+				logger.log(`[pg-db] Added embedding_vec vector(${dims}) column.`);
+
+				// Backfill from BYTEA — convert packed float32 bytes to a pgvector
+				// literal. Runs in-DB to avoid round-tripping every row through JS.
+				await sql.unsafe(`
+					UPDATE knowledge_entry
+					SET embedding_vec = (
+						SELECT CAST(
+							'[' || string_agg(val::text, ',' ORDER BY idx) || ']'
+							AS vector
+						)
+						FROM (
+							SELECT
+								idx,
+								(
+									get_byte(embedding, idx * 4)::bit(8)::bit(32) |
+									(get_byte(embedding, idx * 4 + 1)::bit(8)::bit(32) << 8) |
+									(get_byte(embedding, idx * 4 + 2)::bit(8)::bit(32) << 16) |
+									(get_byte(embedding, idx * 4 + 3)::bit(8)::bit(32) << 24)
+								)::bit(32)::float4 AS val
+							FROM generate_series(0, (octet_length(embedding) / 4) - 1) AS idx
+						) AS floats
+					)
+					WHERE embedding IS NOT NULL
+				`);
+				logger.log("[pg-db] Backfilled embedding_vec from existing BYTEA embeddings.");
+			});
+		} else {
+			// Column exists — check its declared dimension matches metadata.
+			// If the model changed (dims changed), drop and recreate the column.
+			// checkAndReEmbed() calls setEmbeddingMetadata() after re-embedding all
+			// rows, which calls ensureVectorColumn() again. We set pgvectorReady=false
+			// here so activations during the re-embed window fall back to Path B
+			// (full scan) rather than returning empty ANN results.
+			const dimRows = await this.sql`
+				SELECT atttypmod
+				FROM pg_attribute
+				WHERE attrelid = 'knowledge_entry'::regclass
+				  AND attname  = 'embedding_vec'
+				  AND attnum   > 0
+			`;
+			if (dimRows.length > 0) {
+				// pgvector uses the same typmod convention as varchar:
+				//   atttypmod = N + 4  (where N is the declared dimension)
+				// -1 means no modifier — not possible for a typed vector(N) column.
+				const rawTypmod = Number(dimRows[0].atttypmod);
+				const storedDim = rawTypmod === -1 ? -1 : rawTypmod - 4;
+				if (storedDim !== -1 && storedDim !== dims) {
+					logger.log(
+						`[pg-db] embedding_vec dimension mismatch (stored=${storedDim}, expected=${dims}) — recreating column. ANN search disabled until re-embed completes.`,
+					);
+					// Wrap the three DDL statements in a transaction so a crash mid-sequence
+					// leaves the table in a consistent state (either old column present or
+					// new empty column present — never column-absent with data still there).
+					await this.sql.begin(async (sql: TxSql) => {
+						await sql`DROP INDEX IF EXISTS idx_entry_embedding_vec_hnsw`;
+						await sql.unsafe(
+							"ALTER TABLE knowledge_entry DROP COLUMN embedding_vec",
+						);
+						await sql.unsafe(
+							`ALTER TABLE knowledge_entry ADD COLUMN embedding_vec vector(${dims})`,
+						);
+					});
+					logger.log(`[pg-db] Recreated embedding_vec as vector(${dims}). Rows will be backfilled by the re-embed cycle.`);
+					// Column is empty — set false so Path B is used until re-embed
+					// populates the column via updateEntry() calls.
+					this.pgvectorReady = false;
+					return;
+				}
+			}
+		}
+
+		// Create HNSW index if absent (idempotent due to IF NOT EXISTS).
+		// Executed outside the backfill transaction so a transient index-build
+		// failure (e.g. OOM on a large table) doesn't roll back the backfill.
+		// If index creation fails, we degrade gracefully: pgvectorReady stays
+		// false and activations continue on Path B (full scan) until the next
+		// startup successfully builds the index.
+		try {
+			await this.sql.unsafe(`
+				CREATE INDEX IF NOT EXISTS idx_entry_embedding_vec_hnsw
+				ON knowledge_entry
+				USING hnsw (embedding_vec vector_cosine_ops)
+				WITH (m = 16, ef_construction = 64)
+			`);
+		} catch (err) {
+			logger.warn(
+				`[pg-db] HNSW index creation failed — ANN search disabled. Will retry on next startup. Error: ${err instanceof Error ? err.message : String(err)}`,
+			);
+			this.pgvectorReady = false;
+			return;
+		}
+
+		this.pgvectorReady = true;
+		logger.log(`[pg-db] pgvector ready (vector(${dims}), HNSW index).`);
 	}
 
 	// ── Helpers ──
@@ -316,22 +512,36 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		const embeddingBuf = entry.embedding
 			? floatsToBuffer(entry.embedding)
 			: null;
+		const embeddingVec =
+			this.pgvectorReady && entry.embedding
+				? floatsToVectorLiteral(entry.embedding)
+				: null;
 
-		await this.sql`
-			INSERT INTO knowledge_entry
+		// embedding_vec: cast the literal to vector only when non-null.
+		// Passing null with an explicit ::vector cast can cause a type error in
+		// some postgres.js versions ("cannot cast type unknown to vector").
+		// CASE WHEN NULL THEN NULL avoids the cast entirely for null values.
+		await this.sql.unsafe(
+			`INSERT INTO knowledge_entry
 			(id, type, content, topics, confidence, source, status, strength,
 			 created_at, updated_at, last_accessed_at, access_count, observation_count,
-			 superseded_by, derived_from, is_synthesized, embedding)
+			 superseded_by, derived_from, is_synthesized, embedding, embedding_vec)
 			VALUES (
-				${entry.id}, ${entry.type}, ${entry.content},
-				${this.sql.json(entry.topics)},
-				${entry.confidence}, ${entry.source}, ${entry.status},
-				${entry.strength}, ${entry.createdAt}, ${entry.updatedAt},
-				${entry.lastAccessedAt}, ${entry.accessCount}, ${entry.observationCount},
-				${entry.supersededBy}, ${this.sql.json(entry.derivedFrom)},
-				${entry.isSynthesized ? 1 : 0}, ${embeddingBuf}
-			)
-		`;
+				$1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+				$14, $15::jsonb, $16, $17,
+				CASE WHEN $18::text IS NULL THEN NULL ELSE $18::vector END
+			)`,
+			[
+				entry.id, entry.type, entry.content,
+				JSON.stringify(entry.topics),
+				entry.confidence, entry.source, entry.status,
+				entry.strength, entry.createdAt, entry.updatedAt,
+				entry.lastAccessedAt, entry.accessCount, entry.observationCount,
+				entry.supersededBy, JSON.stringify(entry.derivedFrom),
+				entry.isSynthesized ? 1 : 0, embeddingBuf,
+				embeddingVec,
+			] as postgres.ParameterOrJSON<never>[],
+		);
 	}
 
 	async updateEntry(
@@ -370,6 +580,12 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		if (updates.embedding !== undefined) {
 			setClauses.push(`embedding = $${idx++}`);
 			values.push(floatsToBuffer(updates.embedding));
+			if (this.pgvectorReady) {
+				// updates.embedding is always a non-null number[] in this branch
+				// (guarded by `updates.embedding !== undefined` above). Cast directly.
+				setClauses.push(`embedding_vec = $${idx++}::vector`);
+				values.push(floatsToVectorLiteral(updates.embedding));
+			}
 		}
 		if (updates.isSynthesized !== undefined) {
 			setClauses.push(`is_synthesized = $${idx++}`);
@@ -857,19 +1073,33 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		];
 		const safeType = clampKnowledgeType(updates.type);
 		const embeddingBuf = embedding ? floatsToBuffer(embedding) : null;
+		const embeddingVec =
+			this.pgvectorReady && embedding
+				? floatsToVectorLiteral(embedding)
+				: null;
 		const now = Date.now();
 
-		await this.sql`
-			UPDATE knowledge_entry
-			SET content = ${updates.content}, type = ${safeType},
-			    topics = ${this.sql.json(updates.topics)},
-			    confidence = ${updates.confidence},
-			    derived_from = ${this.sql.json(mergedSources)},
-			    updated_at = ${now}, last_accessed_at = ${now},
+		await this.sql.unsafe(
+			`UPDATE knowledge_entry
+			SET content = $1, type = $2,
+			    topics = $3::jsonb,
+			    confidence = $4,
+			    derived_from = $5::jsonb,
+			    updated_at = $6, last_accessed_at = $6,
 			    observation_count = observation_count + 1,
-			    embedding = ${embeddingBuf}
-			WHERE id = ${id}
-		`;
+			    embedding = $7,
+			    embedding_vec = CASE WHEN $8::text IS NULL THEN NULL ELSE $8::vector END
+			WHERE id = $9`,
+			[
+				updates.content, safeType,
+				JSON.stringify(updates.topics),
+				updates.confidence,
+				JSON.stringify(mergedSources),
+				now, embeddingBuf,
+				embeddingVec,
+				id,
+			] as postgres.ParameterOrJSON<never>[],
+		);
 	}
 
 	async reinitialize(): Promise<void> {
@@ -880,6 +1110,11 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			await sql`DELETE FROM knowledge_entry`;
 			await sql`DELETE FROM embedding_metadata`;
 		});
+		// Deleting embedding_metadata invalidates the stored dimensions.
+		// Reset pgvectorReady so the next setEmbeddingMetadata() call re-runs
+		// ensureVectorColumn(), preventing dimension-mismatch corruption when
+		// a new model is configured after a knowledge reset.
+		this.pgvectorReady = false;
 	}
 
 	// ── Embedding Metadata ──
@@ -911,6 +1146,9 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				dimensions = EXCLUDED.dimensions,
 				recorded_at = EXCLUDED.recorded_at
 		`;
+		// Lazily create (or recreate after a model/dimension change) the vector
+		// column and HNSW index now that the dimension is known.
+		await this.ensureVectorColumn();
 	}
 
 	// ── Cluster Management ──
@@ -1039,10 +1277,156 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 
 	async clearAllEmbeddings(): Promise<number> {
 		const result = await this.sql`
-			UPDATE knowledge_entry SET embedding = NULL
+			UPDATE knowledge_entry SET embedding = NULL, embedding_vec = NULL
 			WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL
 		`;
 		return result.count;
+	}
+
+	// ── Vector Search ─────────────────────────────────────────────────────────
+
+	/**
+	 * Returns true when pgvector is fully operational: extension installed,
+	 * embedding_vec column present, HNSW index built, and dimensions known.
+	 * ActivationEngine checks this (via allStoresSupportAnn) before taking Path A.
+	 */
+	isVectorSearchReady(): boolean {
+		return this.pgvectorReady;
+	}
+
+	/**
+	 * Return the count of active+conflicted entries.
+	 * Used by ActivationEngine (Path A) to report an accurate totalActive without
+	 * loading all entries into memory.
+	 */
+	async getActiveEntryCount(): Promise<number> {
+		const rows = await this.sql`
+			SELECT COUNT(*) AS cnt FROM knowledge_entry
+			WHERE status IN ('active', 'conflicted')
+		`;
+		return Number((rows[0] as { cnt: string | number }).cnt);
+	}
+
+	/**
+	 * Find the `limit` entries most similar to `queryVector` using the HNSW index.
+	 *
+	 * Returns entries whose cosine similarity to `queryVector` is >= `threshold`,
+	 * ordered by similarity descending (closest first).
+	 *
+	 * Falls back to returning an empty array when pgvector is not available
+	 * (pgvectorReady = false), signalling callers to use the in-process full scan.
+	 *
+	 * The cosine distance operator `<=>` returns values in [0, 2]:
+	 *   0 = identical, 2 = opposite.
+	 * We convert to similarity: similarity = 1 − distance.
+	 *
+	 * `statuses` defaults to ['active', 'conflicted'] to match
+	 * getActiveEntriesWithEmbeddings() behaviour.
+	 */
+	async findSimilarEntries(
+		queryVector: number[],
+		limit: number,
+		threshold: number,
+		statuses: KnowledgeStatus[] = ["active", "conflicted"],
+	): Promise<
+		Array<{ entry: KnowledgeEntry & { embedding: number[] }; similarity: number }>
+	> {
+		if (!this.pgvectorReady) return [];
+
+		const vectorLiteral = floatsToVectorLiteral(queryVector);
+		// cosine distance <=> ∈ [0, 2]; similarity = 1 − distance.
+		// The HNSW index is used when the ORDER BY clause references the <=> operator.
+		// The WHERE filter is expressed in distance space (`<= maxDist`) so the planner
+		// can use the index for both ordering and filtering — writing it as
+		// `(1 - distance) >= threshold` would obscure the distance expression and
+		// prevent the index from being used for filtering.
+		const maxDist = 1 - threshold; // distance <= maxDist ↔ similarity >= threshold
+		const rows = await this.sql.unsafe(
+			`SELECT *, (1 - (embedding_vec <=> $1::vector)) AS similarity
+			 FROM knowledge_entry
+			 WHERE status = ANY($2::text[])
+			   AND embedding_vec IS NOT NULL
+			   AND embedding_vec <=> $1::vector <= $3
+			 ORDER BY embedding_vec <=> $1::vector
+			 LIMIT $4`,
+			[
+				vectorLiteral,
+				statuses,
+				maxDist,
+				limit,
+			] as postgres.ParameterOrJSON<never>[],
+		);
+
+		return (rows as unknown as (RawEntryRow & { similarity: number })[])
+			.map((r) => ({
+				entry: this.rowToEntry(r) as KnowledgeEntry & { embedding: number[] },
+				similarity: Number(r.similarity),
+			}))
+			.filter((r): r is { entry: KnowledgeEntry & { embedding: number[] }; similarity: number } =>
+				!!r.entry.embedding,
+			);
+	}
+
+	/**
+	 * Find active/conflicted entries that share at least one topic with `topics`
+	 * AND whose cosine similarity to `queryVector` falls in [minSimilarity, maxSimilarity).
+	 * IDs in `excludeIds` are always excluded.
+	 *
+	 * Implemented with pgvector's `<=>` operator so both filters execute in the DB,
+	 * avoiding the round-trip of loading all topic-overlapping rows into memory.
+	 *
+	 * Falls back to returning an empty array when pgvector is not ready — the caller
+	 * (ContradictionScanner) then falls back to getEntriesWithOverlappingTopics().
+	 */
+	async findContradictionCandidates(
+		queryVector: number[],
+		topics: string[],
+		excludeIds: string[],
+		minSimilarity: number,
+		maxSimilarity: number,
+	): Promise<Array<KnowledgeEntry & { embedding: number[] }>> {
+		if (!this.pgvectorReady || topics.length === 0) return [];
+
+		const vectorLiteral = floatsToVectorLiteral(queryVector);
+		// similarity = 1 − distance; band is [minSimilarity, maxSimilarity).
+		// In distance space: distance ∈ (1−maxSimilarity, 1−minSimilarity].
+		const minDist = 1 - maxSimilarity; // exclusive lower bound on distance
+		const maxDist = 1 - minSimilarity; // inclusive upper bound on distance
+
+		// Use a CTE so the distance expression is computed once per row, not twice.
+		// The DISTINCT on the outer query deduplicates rows that match multiple topics.
+		// `id != ALL($2::text[])` with an empty array is always TRUE in Postgres, so
+		// we always include the clause and always pass excludeIds — even when empty.
+		// This keeps parameter numbering fixed ($1…$5) regardless of excludeIds content.
+		const rows = await this.sql.unsafe(
+			`WITH candidates AS (
+			   SELECT DISTINCT ke.*,
+			          (ke.embedding_vec <=> $3::vector) AS dist
+			   FROM knowledge_entry ke,
+			        jsonb_array_elements_text(ke.topics) AS t(value)
+			   WHERE ke.status IN ('active', 'conflicted')
+			     AND ke.embedding_vec IS NOT NULL
+			     AND t.value = ANY($1::text[])
+			     AND ke.id != ALL($2::text[])
+			 )
+			 SELECT * FROM candidates
+			 WHERE dist >  $4
+			   AND dist <= $5
+			 ORDER BY dist`,
+			[
+				topics,
+				excludeIds,
+				vectorLiteral,
+				minDist,
+				maxDist,
+			] as postgres.ParameterOrJSON<never>[],
+		);
+
+		return (rows as unknown as RawEntryRow[])
+			.map((r) => this.rowToEntry(r))
+			.filter(
+				(e): e is KnowledgeEntry & { embedding: number[] } => !!e.embedding,
+			);
 	}
 
 	// ── Consolidation Lock ────────────────────────────────────────────────────

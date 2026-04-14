@@ -175,6 +175,26 @@ export interface IKnowledgeStore {
 		excludeIds: string[],
 	): Promise<Array<KnowledgeEntry & { embedding: number[] }>>;
 
+	/**
+	 * Find entries that share at least one topic with `topics` AND whose cosine
+	 * similarity to `queryVector` falls in the band [minSimilarity, maxSimilarity).
+	 * IDs in `excludeIds` are always excluded.
+	 *
+	 * Optional — implemented by PostgresKnowledgeDB when pgvector is available.
+	 * When absent, callers fall back to getEntriesWithOverlappingTopics() + in-process
+	 * similarity filtering (existing behaviour).
+	 *
+	 * The combined topic + similarity filter in a single DB query avoids loading
+	 * all topic-overlapping candidates into memory just to discard most of them.
+	 */
+	findContradictionCandidates?(
+		queryVector: number[],
+		topics: string[],
+		excludeIds: string[],
+		minSimilarity: number,
+		maxSimilarity: number,
+	): Promise<Array<KnowledgeEntry & { embedding: number[] }>>;
+
 	applyContradictionResolution(
 		resolution: "supersede_old" | "supersede_new" | "merge" | "irresolvable",
 		newEntryId: string,
@@ -258,6 +278,62 @@ export interface IKnowledgeStore {
 	markClusterSynthesized(clusterId: string): Promise<void>;
 
 	clearAllEmbeddings(): Promise<number>;
+
+	// ── Vector Search (optional — Postgres + pgvector only) ─────────────────
+	//
+	// When present, callers use DB-side approximate nearest-neighbour (ANN) search
+	// via an HNSW index instead of loading all entries into memory and computing
+	// cosine similarity in JS.  SQLite stores do not implement this method; all
+	// callers must fall back to getActiveEntriesWithEmbeddings() + in-process
+	// cosineSimilarity when findSimilarEntries is absent.
+	//
+	// Return type includes the pre-computed similarity so callers avoid
+	// re-computing it (the DB already did the work).  similarity is a cosine
+	// similarity value in [0, 1] (NOT a distance; 1 = identical).
+	//
+	// statuses defaults to ['active', 'conflicted'] when omitted, mirroring
+	// the behaviour of getActiveEntriesWithEmbeddings.  Pass an explicit list
+	// when a caller needs a different filter (e.g. contradiction scan).
+
+	/**
+	 * Returns true when DB-side ANN search is fully operational — pgvector
+	 * extension installed, embedding_vec column present, HNSW index built, and
+	 * embedding dimensions known.
+	 *
+	 * Callers MUST check this before relying on findSimilarEntries returning
+	 * meaningful results.  findSimilarEntries returns [] when this is false.
+	 *
+	 * Optional — only implemented by PostgresKnowledgeDB.  Absent on SQLite stores.
+	 */
+	isVectorSearchReady?(): boolean;
+
+	/**
+	 * Return the count of active+conflicted entries in this store.
+	 *
+	 * Used by ActivationEngine on Path A (ANN search) to report an accurate
+	 * `totalActive` without loading all entries into memory.  On Path B the count
+	 * is derived from the full-scan result set without an extra query.
+	 *
+	 * Optional — falls back to returning undefined when absent, in which case
+	 * callers should use an alternative (e.g. the length of the full-scan result).
+	 */
+	getActiveEntryCount?(): Promise<number>;
+
+	/**
+	 * Find the `limit` most similar entries to `queryVector` above `threshold`
+	 * using DB-side ANN search.  Optional — only implemented by
+	 * PostgresKnowledgeDB when the pgvector extension is available.
+	 *
+	 * Always check isVectorSearchReady() first — returns [] when not ready.
+	 */
+	findSimilarEntries?(
+		queryVector: number[],
+		limit: number,
+		threshold: number,
+		statuses?: KnowledgeStatus[],
+	): Promise<
+		Array<{ entry: KnowledgeEntry & { embedding: number[] }; similarity: number }>
+	>;
 
 	// ── Consolidation Lock ──────────────────────────────────────────────────
 	// Per-store advisory lock that prevents concurrent consolidation runs across

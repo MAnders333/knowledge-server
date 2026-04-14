@@ -156,7 +156,7 @@ describe("v11 SQLite migration chain (v10 → v15)", () => {
 		await serverStateDb.close();
 	});
 
-	it("stamps schema version 15 after full migration chain", async () => {
+	it("stamps schema version 16 after full migration chain", async () => {
 		db = new KnowledgeDB(dbPath);
 
 		const raw = new Database(dbPath, { readonly: true });
@@ -165,7 +165,7 @@ describe("v11 SQLite migration chain (v10 → v15)", () => {
 			.get() as { v: number };
 		raw.close();
 
-		expect(row.v).toBe(15);
+		expect(row.v).toBe(16);
 	});
 
 	it("v3 data migration runs automatically on ServerStateDB init (uses DEFAULT_SQLITE_PATH)", async () => {

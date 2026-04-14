@@ -130,31 +130,28 @@ export class ActivationEngine {
 		const similarityThreshold =
 			options?.threshold ?? config.activation.similarityThreshold;
 
-		// Fan out across all read stores and merge results.
-		// Entries from different stores may have overlapping IDs if the same entry
-		// was synced to multiple stores — deduplicate by ID keeping the first occurrence.
-		const allEntriesPerStore = await Promise.all(
-			this.readDbs.map((db) => db.getActiveEntriesWithEmbeddings()),
-		);
-		const seenIds = new Set<string>();
-		const entries = allEntriesPerStore.flat().filter((e) => {
-			if (seenIds.has(e.id)) return false;
-			seenIds.add(e.id);
-			return true;
-		});
-
-		if (entries.length === 0) {
-			return { entries: [], query: primaryQuery, totalActive: 0 };
-		}
-
 		// Embed all queries in a single batched API call
 		const queryEmbeddings = await this.embeddings.embedBatch(queryList);
 
 		const now = Date.now();
 		const DAY_MS = 1000 * 60 * 60 * 24;
 
-		// Score each entry against ALL query vectors; keep its best similarity.
-		// This ensures a multi-topic message activates relevant entries for each topic.
+		// ── Candidate retrieval ────────────────────────────────────────────────────
+		// Two paths depending on whether the store supports DB-side ANN search:
+		//
+		// Path A — pgvector (PostgresKnowledgeDB with findSimilarEntries):
+		//   For each query vector, run one ANN query against each store and union
+		//   results. The HNSW index does the heavy lifting in the DB; we receive
+		//   only the top candidates above the threshold. Similarity values are
+		//   pre-computed by the DB (1 − cosine distance).
+		//
+		// Path B — in-process full scan (SQLite or pgvector unavailable):
+		//   Load all active+conflicted entries from every store into memory and
+		//   compute cosine similarity in JS. Correct at any scale; linear cost.
+		//
+		// In both paths the result type is the same: an array of
+		// { entry, rawSimilarity } deduplicated by ID (first-store-wins).
+
 		// Typed as KnowledgeEntry (not the narrower & { embedding: number[] }) so that
 		// source entries fetched via getSupportSourcesForIds() can be pushed later without
 		// a type error (those entries may have embedding undefined).
@@ -168,29 +165,128 @@ export class ActivationEngine {
 				lastAccessedDaysAgo: number;
 				mayBeStale: boolean;
 			};
-		}> = entries
-			.map((entry) => {
+		}> = [];
+
+		// Track IDs across stores to deduplicate (first-store-wins). Used only on Path B.
+		const seenIds = new Set<string>();
+		// Sum of per-store active+conflicted counts from Path A's parallel COUNT queries.
+		// Zero on Path B (totalActive comes from seenIds.size there instead).
+		// biome-ignore lint/style/useConst: assigned in the Path A branch
+		let annTotalActive = 0;
+
+		// Determine whether every read store supports ANN search AND is ready.
+		// Two conditions must both be true for a store:
+		//   1. findSimilarEntries is present (PostgresKnowledgeDB, not SQLite).
+		//   2. isVectorSearchReady() returns true — pgvector extension installed,
+		//      embedding_vec column populated, HNSW index ready. This can be false
+		//      during a model-change re-embed window; without this check Path A
+		//      would silently return zero results instead of falling back to Path B.
+		const allStoresSupportAnn = this.readDbs.every(
+			(db) =>
+				typeof db.findSimilarEntries === "function" &&
+				(typeof db.isVectorSearchReady !== "function" || db.isVectorSearchReady()),
+		);
+
+		if (allStoresSupportAnn) {
+			// ── Path A: DB-side ANN search (pgvector) ─────────────────────────────
+			// For each query vector, fan out across all stores and union results.
+			// We request maxResults per query vector per store so the union covers
+			// relevant entries for every topic in a multi-cue message.
+			// The COUNT query runs in parallel with ANN queries so it adds no latency.
+			const [annResultsPerQuery, perStoreCounts] = await Promise.all([
+				Promise.all(
+					queryEmbeddings.map((qEmb) =>
+						Promise.all(
+							this.readDbs.map((db) =>
+								// biome-ignore lint/style/noNonNullAssertion: guarded by allStoresSupportAnn
+								db.findSimilarEntries!(qEmb, maxResults, similarityThreshold),
+							),
+						),
+					),
+				),
+				Promise.all(
+					this.readDbs.map((db) =>
+						typeof db.getActiveEntryCount === "function"
+							? db.getActiveEntryCount()
+							: Promise.resolve(0),
+					),
+				),
+			]);
+			annTotalActive = perStoreCounts.reduce((sum, n) => sum + n, 0);
+
+			// Build a map: entry ID → best rawSimilarity across all query vectors.
+			// This mirrors the in-process "max over cues" logic in Path B.
+			const bestSimilarityById = new Map<
+				string,
+				{ entry: KnowledgeEntry & { embedding: number[] }; rawSimilarity: number }
+			>();
+			for (const storeResultsPerQuery of annResultsPerQuery) {
+				for (const storeResults of storeResultsPerQuery) {
+					for (const { entry, similarity } of storeResults) {
+						const existing = bestSimilarityById.get(entry.id);
+						if (!existing || similarity > existing.rawSimilarity) {
+							bestSimilarityById.set(entry.id, { entry, rawSimilarity: similarity });
+						}
+					}
+				}
+			}
+
+			// Score each deduplicated candidate (bestSimilarityById already deduplicates
+			// by entry ID — no further seenIds check needed here).
+			for (const { entry, rawSimilarity } of bestSimilarityById.values()) {
+				const ageDays = (now - entry.createdAt) / DAY_MS;
+				const lastAccessedDaysAgo = (now - entry.lastAccessedAt) / DAY_MS;
+				const halfLife =
+					config.decay.typeHalfLife[entry.type] ||
+					config.decay.typeHalfLife.fact;
+				const liveStrength = computeStrength(entry, now);
+
+				scored.push({
+					entry,
+					rawSimilarity,
+					similarity: rawSimilarity * liveStrength,
+					staleness: {
+						ageDays: Math.round(ageDays),
+						strength: liveStrength,
+						lastAccessedDaysAgo: Math.round(lastAccessedDaysAgo),
+						mayBeStale: ageDays > halfLife && entry.accessCount < 3,
+					},
+				});
+			}
+		} else {
+			// ── Path B: in-process full scan ───────────────────────────────────────
+			// Fan out across all read stores and merge results.
+			// Entries from different stores may have overlapping IDs if the same entry
+			// was synced to multiple stores — deduplicate by ID keeping the first occurrence.
+			const allEntriesPerStore = await Promise.all(
+				this.readDbs.map((db) => db.getActiveEntriesWithEmbeddings()),
+			);
+			const entries = allEntriesPerStore.flat().filter((e) => {
+				if (seenIds.has(e.id)) return false;
+				seenIds.add(e.id);
+				return true;
+			});
+
+			if (entries.length === 0) {
+				return { entries: [], query: primaryQuery, totalActive: 0 };
+			}
+
+			for (const entry of entries) {
 				const rawSimilarity = Math.max(
 					...queryEmbeddings.map((qEmb) =>
 						cosineSimilarity(qEmb, entry.embedding),
 					),
 				);
+				if (rawSimilarity < similarityThreshold) continue;
+
 				const ageDays = (now - entry.createdAt) / DAY_MS;
 				const lastAccessedDaysAgo = (now - entry.lastAccessedAt) / DAY_MS;
-
-				// Determine staleness: facts older than their half-life with low access are suspect
 				const halfLife =
 					config.decay.typeHalfLife[entry.type] ||
 					config.decay.typeHalfLife.fact;
-				const mayBeStale = ageDays > halfLife && entry.accessCount < 3;
-
-				// Compute strength live at query time rather than relying on the DB-stored
-				// value, which is only updated during consolidation runs and may be stale
-				// by days or weeks between runs. Pass `now` so all entries in this batch
-				// are scored against the same instant (pure, no per-entry clock skew).
 				const liveStrength = computeStrength(entry, now);
 
-				return {
+				scored.push({
 					entry,
 					// Threshold filtering uses raw cosine similarity so entry age never
 					// prevents a semantically relevant entry from activating.
@@ -203,13 +299,24 @@ export class ActivationEngine {
 						ageDays: Math.round(ageDays),
 						strength: liveStrength,
 						lastAccessedDaysAgo: Math.round(lastAccessedDaysAgo),
-						mayBeStale,
+						mayBeStale: ageDays > halfLife && entry.accessCount < 3,
 					},
-				};
-			})
-			.filter((s) => s.rawSimilarity >= similarityThreshold)
-			.sort((a, b) => b.similarity - a.similarity)
-			.slice(0, maxResults);
+				});
+			}
+		}
+
+		// Determine totalActive for the response.
+		// Path A: sum of per-store active+conflicted counts (from parallel COUNT queries).
+		// Path B: seenIds.size is exact (we loaded every entry).
+		const totalActive = allStoresSupportAnn ? annTotalActive : seenIds.size;
+
+		if (scored.length === 0) {
+			return { entries: [], query: primaryQuery, totalActive };
+		}
+
+		// Sort and cap.
+		scored.sort((a, b) => b.similarity - a.similarity);
+		scored.splice(maxResults);
 
 		// Record access for activated entries (reinforces their strength)
 		for (const { entry } of scored) {
@@ -342,7 +449,7 @@ export class ActivationEngine {
 				}),
 			),
 			query: primaryQuery,
-			totalActive: entries.length,
+			totalActive,
 		};
 	}
 

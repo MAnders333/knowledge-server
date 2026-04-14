@@ -11,6 +11,14 @@
  * - No PRAGMA support (WAL, foreign_keys are handled differently)
  *
  * Schema version is kept in sync with the SQLite schema.
+ *
+ * v16 (pgvector):
+ * `embedding_vec vector(N)` is NOT included in PG_CREATE_TABLES because the
+ * dimension N is only known after the first setEmbeddingMetadata() call.
+ * PostgresKnowledgeDB.ensureVectorColumn() creates it lazily and is called:
+ *   - from setEmbeddingMetadata() (first call / model change)
+ *   - from _initialize() when embedding_metadata already exists (upgrade path)
+ * The HNSW index is created by ensureVectorColumn() as well.
  */
 
 export { SCHEMA_VERSION } from "../sqlite/schema.js";

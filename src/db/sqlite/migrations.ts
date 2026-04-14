@@ -305,4 +305,14 @@ export const MIGRATIONS: Array<{
 			}
 		},
 	},
+	{
+		version: 16,
+		label: "pgvector ANN search — no-op for SQLite (Postgres-only feature)",
+		up: (_db) => {
+			// v16 adds the pgvector `embedding_vec vector(N)` column and HNSW index
+			// to the Postgres schema (see src/db/postgres/migrations.ts).
+			// SQLite stores continue to use the BLOB `embedding` column with in-process
+			// cosine similarity; no schema changes are needed here.
+		},
+	},
 ];

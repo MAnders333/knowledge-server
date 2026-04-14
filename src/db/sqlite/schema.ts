@@ -84,7 +84,7 @@
  * - These tables are dropped from Postgres on migration.
  * - SQLite knowledge.db: no change — these tables were already handled in v13.
  */
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 
 /**
  * Expected columns for each table, derived from the DDL below.

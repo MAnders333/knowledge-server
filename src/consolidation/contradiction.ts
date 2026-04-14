@@ -222,26 +222,44 @@ export class ContradictionScanner {
 			if (supersededInThisScan.has(entry.id)) continue;
 			if (!entry.topics.length || !entry.embedding) continue;
 
-			// Pass 1: Find topic-overlapping pre-existing entries from DB.
+			// Pass 1: Find topic-overlapping pre-existing entries from DB, filtered to
+			// the mid-similarity band [minSim, reconsolidationThreshold).
 			// Exclude all changedIds — they were either handled by decideMerge (sim ≥ threshold)
 			// or will be covered in pass 2 (intra-chunk pairs, below).
-			const candidates = await db.getEntriesWithOverlappingTopics(
-				entry.topics,
-				[...changedIds], // only exclude chunk-changed entries, not all of entriesMap
-			);
+			const excludeList = [...changedIds];
 
-			if (candidates.length === 0) continue;
+			let midBandCandidates: Array<KnowledgeEntry & { embedding: number[] }>;
 
-			// Filter to the mid-similarity band: low enough to have been missed by
-			// decideMerge, high enough to be plausibly related (not just same topic word)
-			const entryEmbedding = entry.embedding;
-			const midBandCandidates = candidates.filter((c) => {
-				if (supersededInThisScan.has(c.id)) return false; // skip already-resolved candidates
-				const sim = cosineSimilarity(entryEmbedding, c.embedding);
-				return (
-					sim >= minSim && sim < config.consolidation.reconsolidationThreshold
+			if (typeof db.findContradictionCandidates === "function") {
+				// pgvector path: topic filter + similarity band computed in-DB.
+				// Returns only entries in [minSim, reconsolidationThreshold) — no in-process
+				// similarity filter needed. Already excludes supersededInThisScan IDs would
+				// require a larger excludeIds list, so we still post-filter below.
+				const pgCandidates = await db.findContradictionCandidates(
+					entry.embedding,
+					entry.topics,
+					excludeList,
+					minSim,
+					config.consolidation.reconsolidationThreshold,
 				);
-			});
+				midBandCandidates = pgCandidates.filter(
+					(c) => !supersededInThisScan.has(c.id),
+				);
+			} else {
+				// Fallback: fetch all topic-overlapping entries and filter in-process.
+				const candidates = await db.getEntriesWithOverlappingTopics(
+					entry.topics,
+					excludeList,
+				);
+				const entryEmbedding = entry.embedding;
+				midBandCandidates = candidates.filter((c) => {
+					if (supersededInThisScan.has(c.id)) return false;
+					const sim = cosineSimilarity(entryEmbedding, c.embedding);
+					return (
+						sim >= minSim && sim < config.consolidation.reconsolidationThreshold
+					);
+				});
+			}
 
 			if (midBandCandidates.length === 0) continue;
 

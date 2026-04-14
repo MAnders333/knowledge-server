@@ -310,4 +310,108 @@ export const PG_MIGRATIONS: Array<{
 			}
 		},
 	},
+	{
+		version: 16,
+		label: "pgvector: add embedding_vec column and HNSW index",
+		up: async (sql: TxSql) => {
+			// NOTE: CREATE EXTENSION cannot run inside a transaction block on
+			// Postgres ≤ 14 and some managed providers (RDS, etc.).  Extension
+			// installation is handled by PostgresKnowledgeDB.ensureVectorColumn()
+			// which runs outside any transaction at startup.  The migration only
+			// sets up the column and index — it assumes the extension is already
+			// present or will be installed by ensureVectorColumn() after migrations.
+
+			// ── 1. Add embedding_vec column if absent ─────────────────────────────
+			// We keep the existing BYTEA `embedding` column as the authoritative
+			// source of truth (SQLite compatibility, crash-recovery, re-embed path).
+			// `embedding_vec` is a derived, Postgres-only column used exclusively for
+			// ANN index search.  Its dimension is read from embedding_metadata so we
+			// don't hard-code it; if no metadata exists yet we defer column creation
+			// to the setEmbeddingMetadata() path (see PostgresKnowledgeDB).
+			const vecColExists = await sql`
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = current_schema()
+				  AND table_name   = 'knowledge_entry'
+				  AND column_name  = 'embedding_vec'
+			`;
+
+			if (vecColExists.length === 0) {
+				// Read the dimension from the singleton metadata row.
+				const meta = await sql`
+					SELECT dimensions FROM embedding_metadata WHERE id = 1
+				`;
+
+				if (meta.length > 0) {
+					const dims = Number(meta[0].dimensions);
+					// ALTER TABLE with a dynamic dimension: use sql.unsafe so we can
+					// interpolate `dims` into the DDL string.  The value comes from our
+					// own DB row (not user input) so this is safe.
+					await sql.unsafe(
+						`ALTER TABLE knowledge_entry ADD COLUMN embedding_vec vector(${dims})`,
+					);
+
+					// ── 3. Backfill embedding_vec from existing BYTEA embeddings ──────
+					// Convert each non-NULL BYTEA embedding (packed float32 LE) into a
+					// pgvector literal '[f0,f1,...,fN]' and write it back.
+					// We do this in a single UPDATE using a PL/pgSQL helper so we avoid
+					// round-tripping every row through the application layer.
+					//
+					// Conversion logic:
+					//   - The BYTEA column stores N×4 bytes (float32, little-endian).
+					//   - We split into 4-byte chunks, decode each as a float4 via
+					//     get_byte + bit arithmetic, and join into a vector literal.
+					//   - Using CAST(... AS vector) lets pgvector parse the literal.
+					//
+					// This runs inside the migration transaction so a crash mid-backfill
+					// leaves the column NULL on affected rows; ensureEmbeddings() will
+					// re-populate them on the next consolidation run via updateEntry().
+					await sql.unsafe(`
+						UPDATE knowledge_entry
+						SET embedding_vec = (
+							SELECT CAST(
+								'[' || string_agg(val::text, ',' ORDER BY idx) || ']'
+								AS vector
+							)
+							FROM (
+								SELECT
+									idx,
+									-- Reconstruct float32 from 4 bytes (little-endian IEEE 754).
+									-- get_byte is 0-indexed; idx iterates over 4-byte group offsets.
+									(
+										get_byte(embedding, idx * 4)::bit(8)::bit(32) |
+										(get_byte(embedding, idx * 4 + 1)::bit(8)::bit(32) << 8) |
+										(get_byte(embedding, idx * 4 + 2)::bit(8)::bit(32) << 16) |
+										(get_byte(embedding, idx * 4 + 3)::bit(8)::bit(32) << 24)
+									)::bit(32)::float4 AS val
+								FROM generate_series(0, (octet_length(embedding) / 4) - 1) AS idx
+							) AS floats
+						)
+						WHERE embedding IS NOT NULL
+					`);
+
+					// ── 4. Create HNSW index ───────────────────────────────────────────
+					// HNSW (Hierarchical Navigable Small World) builds incrementally —
+					// no training step required, works on empty or partial tables.
+					// cosine distance (<=>): consistent with in-process cosineSimilarity.
+					// m=16, ef_construction=64: pgvector defaults; good for most KB sizes.
+					await sql.unsafe(`
+						CREATE INDEX IF NOT EXISTS idx_entry_embedding_vec_hnsw
+						ON knowledge_entry
+						USING hnsw (embedding_vec vector_cosine_ops)
+						WITH (m = 16, ef_construction = 64)
+					`);
+				}
+				// If no embedding_metadata exists yet the column and index are created
+				// lazily by ensureVectorColumn() called from setEmbeddingMetadata().
+			} else {
+				// Column already exists — ensure the HNSW index exists (idempotent).
+				await sql.unsafe(`
+					CREATE INDEX IF NOT EXISTS idx_entry_embedding_vec_hnsw
+					ON knowledge_entry
+					USING hnsw (embedding_vec vector_cosine_ops)
+					WITH (m = 16, ef_construction = 64)
+				`);
+			}
+		},
+	},
 ];
