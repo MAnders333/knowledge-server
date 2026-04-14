@@ -7,6 +7,12 @@ import type { DomainContext } from "./domain-router.js";
 import { logger } from "../logger.js";
 import { clampKnowledgeType } from "../types.js";
 import type { Episode, KnowledgeType } from "../types.js";
+import {
+	ANTHROPIC_BETA_HEADERS,
+	ANTHROPIC_OAUTH_USER_AGENT,
+	getAccessToken,
+	hasOAuthTokens,
+} from "../auth/claude-oauth.js";
 
 /**
  * LLM interface for consolidation.
@@ -25,6 +31,69 @@ import type { Episode, KnowledgeType } from "../types.js";
  */
 
 /**
+ * Build a custom fetch function that injects Claude OAuth credentials into
+ * every Anthropic API request.
+ *
+ * On each call it:
+ *   1. Retrieves a fresh access token (auto-refreshes from disk when needed).
+ *   2. Sets  Authorization: Bearer <token>  (OAuth bearer auth).
+ *   3. Deletes x-api-key (the SDK sets this; must not coexist with OAuth bearer).
+ *   4. Merges the required anthropic-beta header flags.
+ *   5. Sets the User-Agent expected by Anthropic's OAuth-gated endpoint.
+ *   6. Appends ?beta=true to /v1/messages requests (required for OAuth calls).
+ */
+function createAnthropicOAuthFetch(): typeof globalThis.fetch {
+	return (async (input: RequestInfo | URL, init?: RequestInit) => {
+		// Resolve URL and preserve Request properties when input is a Request object.
+		let url: string;
+		let baseInit: RequestInit;
+
+		if (typeof input === "string") {
+			url = input;
+			baseInit = init ?? {};
+		} else if (input instanceof URL) {
+			url = input.href;
+			baseInit = init ?? {};
+		} else {
+			// input is a Request — extract its properties so they are not dropped.
+			const req = input as Request;
+			url = req.url;
+			baseInit = {
+				method: req.method,
+				body: req.body,
+				headers: req.headers,
+				...init,
+			};
+		}
+
+		// Append ?beta=true to /v1/messages (required for OAuth-authenticated calls).
+		if (url.includes("/v1/messages") && !url.includes("beta=true")) {
+			url += `${url.includes("?") ? "&" : "?"}beta=true`;
+		}
+
+		const headers = new Headers(baseInit.headers as HeadersInit | undefined);
+
+		// Inject OAuth bearer token, replacing the SDK's x-api-key header.
+		const token = await getAccessToken();
+		headers.set("Authorization", `Bearer ${token}`);
+		headers.delete("x-api-key");
+
+		// Merge required beta feature flags with any the SDK already added.
+		const existingBeta = headers.get("anthropic-beta") ?? "";
+		const betaSet = new Set([
+			...existingBeta.split(",").map((s) => s.trim()).filter(Boolean),
+			...ANTHROPIC_BETA_HEADERS,
+		]);
+		headers.set("anthropic-beta", [...betaSet].join(","));
+
+		// Set the User-Agent expected by Anthropic's OAuth-gated endpoint.
+		headers.set("User-Agent", ANTHROPIC_OAUTH_USER_AGENT);
+
+		return globalThis.fetch(url, { ...baseInit, headers });
+	}) as typeof globalThis.fetch;
+}
+
+/**
  * Provider routing based on model string prefix.
  *
  * Model format: "provider/model-name"
@@ -36,6 +105,7 @@ import type { Episode, KnowledgeType } from "../types.js";
  *   1. Per-provider env vars (ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY)
  *      with optional per-provider base URL (ANTHROPIC_BASE_URL, etc.)
  *   2. Unified proxy (LLM_BASE_ENDPOINT + LLM_API_KEY) — appends provider path suffix
+ *   3. Claude subscription OAuth (when no Anthropic API key is configured)
  */
 function createModel(modelString: string) {
 	const [providerName, ...modelParts] = modelString.split("/");
@@ -51,6 +121,20 @@ function createModel(modelString: string) {
 				(config.llm.baseEndpoint
 					? `${config.llm.baseEndpoint}/anthropic/v1`
 					: undefined);
+
+			// When no API key is configured, fall back to Claude subscription OAuth.
+			// The custom fetch wrapper injects Authorization + beta headers and handles
+			// silent token refresh. The placeholder apiKey is never sent (x-api-key is
+			// deleted by the wrapper before every request).
+			if (!apiKey && hasOAuthTokens()) {
+				const provider = createAnthropic({
+					...(baseURL && { baseURL }),
+					apiKey: "oauth-placeholder",
+					fetch: createAnthropicOAuthFetch(),
+				});
+				return provider(modelId);
+			}
+
 			const provider = createAnthropic({ ...(baseURL && { baseURL }), apiKey });
 			return provider(modelId);
 		}
