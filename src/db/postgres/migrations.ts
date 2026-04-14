@@ -1,4 +1,8 @@
 import { logger } from "../../logger.js";
+import {
+	bufferToFloats,
+	floatsToVectorLiteral,
+} from "./embedding-codec.js";
 
 // biome-ignore lint: TS limitation with Omit stripping call signatures from postgres Sql
 type TxSql = any;
@@ -351,43 +355,28 @@ export const PG_MIGRATIONS: Array<{
 					);
 
 					// ── 3. Backfill embedding_vec from existing BYTEA embeddings ──────
-					// Convert each non-NULL BYTEA embedding (packed float32 LE) into a
-					// pgvector literal '[f0,f1,...,fN]' and write it back.
-					// We do this in a single UPDATE using a PL/pgSQL helper so we avoid
-					// round-tripping every row through the application layer.
-					//
-					// Conversion logic:
-					//   - The BYTEA column stores N×4 bytes (float32, little-endian).
-					//   - We split into 4-byte chunks, decode each as a float4 via
-					//     get_byte + bit arithmetic, and join into a vector literal.
-					//   - Using CAST(... AS vector) lets pgvector parse the literal.
-					//
-					// This runs inside the migration transaction so a crash mid-backfill
-					// leaves the column NULL on affected rows; ensureEmbeddings() will
-					// re-populate them on the next consolidation run via updateEntry().
-					await sql.unsafe(`
-						UPDATE knowledge_entry
-						SET embedding_vec = (
-							SELECT CAST(
-								'[' || string_agg(val::text, ',' ORDER BY idx) || ']'
-								AS vector
-							)
-							FROM (
-								SELECT
-									idx,
-									-- Reconstruct float32 from 4 bytes (little-endian IEEE 754).
-									-- get_byte is 0-indexed; idx iterates over 4-byte group offsets.
-									(
-										get_byte(embedding, idx * 4)::bit(8)::bit(32) |
-										(get_byte(embedding, idx * 4 + 1)::bit(8)::bit(32) << 8) |
-										(get_byte(embedding, idx * 4 + 2)::bit(8)::bit(32) << 16) |
-										(get_byte(embedding, idx * 4 + 3)::bit(8)::bit(32) << 24)
-									)::bit(32)::float4 AS val
-								FROM generate_series(0, (octet_length(embedding) / 4) - 1) AS idx
-							) AS floats
-						)
-						WHERE embedding IS NOT NULL
-					`);
+					// ::bit(32)::float4 is not a valid cast in standard Postgres 16, so
+					// we fetch BYTEA rows and convert in JS, then write back in a single
+					// batched UNNEST UPDATE (one round-trip regardless of row count).
+					const toBackfill = await sql<
+						{ id: string; embedding: Buffer }[]
+					>`SELECT id, embedding FROM knowledge_entry WHERE embedding IS NOT NULL`;
+
+					if (toBackfill.length > 0) {
+						const ids: string[] = [];
+						const vecs: string[] = [];
+						for (const row of toBackfill) {
+							ids.push(row.id);
+							vecs.push(floatsToVectorLiteral(bufferToFloats(row.embedding)));
+						}
+						await sql.unsafe(
+							"UPDATE knowledge_entry SET embedding_vec = v.vec::vector " +
+							"FROM (SELECT UNNEST($1::text[]) AS id, UNNEST($2::text[]) AS vec) v " +
+							"WHERE knowledge_entry.id = v.id",
+							[ids, vecs],
+						);
+						logger.log(`[pg-db] Migration v16: backfilled embedding_vec for ${toBackfill.length} rows.`);
+					}
 
 					// ── 4. Create HNSW index ───────────────────────────────────────────
 					// HNSW (Hierarchical Navigable Small World) builds incrementally —

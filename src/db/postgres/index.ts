@@ -8,6 +8,11 @@ import type {
 	KnowledgeStatus,
 } from "../../types.js";
 import type { IKnowledgeStore } from "../interface.js";
+import {
+	bufferToFloats,
+	floatsToBuffer,
+	floatsToVectorLiteral,
+} from "./embedding-codec.js";
 import { PG_MIGRATIONS } from "./migrations.js";
 import { PG_CREATE_TABLES, SCHEMA_VERSION } from "./schema.js";
 
@@ -41,38 +46,6 @@ interface RawEntryRow {
 	derived_from: string[] | string;
 	is_synthesized: number | string;
 	embedding: Buffer | Uint8Array | null;
-}
-
-/**
- * Convert a float32 number[] to a Buffer for PostgreSQL BYTEA storage.
- */
-function floatsToBuffer(arr: number[]): Buffer {
-	return Buffer.from(new Float32Array(arr).buffer);
-}
-
-/**
- * Convert a float32 number[] to a pgvector literal string: '[f0,f1,...,fN]'.
- * postgres.js passes this as a plain string parameter; the column's vector type
- * handles parsing.  Using a string avoids the need for a custom type codec.
- */
-function floatsToVectorLiteral(arr: number[]): string {
-	return `[${arr.join(",")}]`;
-}
-
-/**
- * Convert a PostgreSQL BYTEA Buffer back to a number[] of float32 values.
- */
-function bufferToFloats(buf: Buffer | Uint8Array): number[] {
-	const uint8 =
-		buf instanceof Buffer
-			? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
-			: buf;
-	const float32 = new Float32Array(
-		uint8.buffer,
-		uint8.byteOffset,
-		uint8.byteLength / 4,
-	);
-	return Array.from(float32);
 }
 
 /**
@@ -364,40 +337,36 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		`;
 
 		if (colExists.length === 0) {
-			// Wrap ADD COLUMN + backfill UPDATE in a transaction so a crash between
-			// the two leaves the DB in a clean state (column absent) rather than
-			// present-but-empty (which would cause pgvectorReady=true with no data).
-			await this.sql.begin(async (sql: TxSql) => {
-				await sql.unsafe(
-					`ALTER TABLE knowledge_entry ADD COLUMN embedding_vec vector(${dims})`,
-				);
-				logger.log(`[pg-db] Added embedding_vec vector(${dims}) column.`);
+			// Add the column (DDL cannot run inside a transaction on some managed
+			// Postgres providers, but ALTER TABLE ADD COLUMN is safe here because
+			// the column did not exist a moment ago — no concurrent writers).
+			await this.sql.unsafe(
+				`ALTER TABLE knowledge_entry ADD COLUMN embedding_vec vector(${dims})`,
+			);
+			logger.log(`[pg-db] Added embedding_vec vector(${dims}) column.`);
 
-				// Backfill from BYTEA — convert packed float32 bytes to a pgvector
-				// literal. Runs in-DB to avoid round-tripping every row through JS.
-				await sql.unsafe(`
-					UPDATE knowledge_entry
-					SET embedding_vec = (
-						SELECT CAST(
-							'[' || string_agg(val::text, ',' ORDER BY idx) || ']'
-							AS vector
-						)
-						FROM (
-							SELECT
-								idx,
-								(
-									get_byte(embedding, idx * 4)::bit(8)::bit(32) |
-									(get_byte(embedding, idx * 4 + 1)::bit(8)::bit(32) << 8) |
-									(get_byte(embedding, idx * 4 + 2)::bit(8)::bit(32) << 16) |
-									(get_byte(embedding, idx * 4 + 3)::bit(8)::bit(32) << 24)
-								)::bit(32)::float4 AS val
-							FROM generate_series(0, (octet_length(embedding) / 4) - 1) AS idx
-						) AS floats
-					)
-					WHERE embedding IS NOT NULL
-				`);
-				logger.log("[pg-db] Backfilled embedding_vec from existing BYTEA embeddings.");
-			});
+			// Backfill embedding_vec from existing BYTEA embeddings via JS.
+			// ::bit(32)::float4 is not a valid cast in standard Postgres 16, so we
+			// fetch BYTEA rows, convert in JS, and write back in a single batched
+			// UNNEST update (one round-trip regardless of row count).
+			const toBackfill = await this.sql<{ id: string; embedding: Buffer }[]>`
+				SELECT id, embedding FROM knowledge_entry WHERE embedding IS NOT NULL
+			`;
+			if (toBackfill.length > 0) {
+				const ids: string[] = [];
+				const vecs: string[] = [];
+				for (const row of toBackfill) {
+					ids.push(row.id);
+					vecs.push(floatsToVectorLiteral(bufferToFloats(row.embedding)));
+				}
+				await this.sql.unsafe(
+					"UPDATE knowledge_entry SET embedding_vec = v.vec::vector " +
+					"FROM (SELECT UNNEST($1::text[]) AS id, UNNEST($2::text[]) AS vec) v " +
+					"WHERE knowledge_entry.id = v.id",
+					[ids, vecs],
+				);
+				logger.log(`[pg-db] Backfilled embedding_vec for ${toBackfill.length} rows.`);
+			}
 		} else {
 			// Column exists — check its declared dimension matches metadata.
 			// If the model changed (dims changed), drop and recreate the column.
@@ -533,11 +502,11 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				)`,
 				[
 					entry.id, entry.type, entry.content,
-					JSON.stringify(entry.topics),
+					this.sql.json(entry.topics),
 					entry.confidence, entry.source, entry.status,
 					entry.strength, entry.createdAt, entry.updatedAt,
 					entry.lastAccessedAt, entry.accessCount, entry.observationCount,
-					entry.supersededBy, JSON.stringify(entry.derivedFrom),
+					entry.supersededBy, this.sql.json(entry.derivedFrom),
 					entry.isSynthesized ? 1 : 0, embeddingBuf,
 					embeddingVec,
 				] as postgres.ParameterOrJSON<never>[],
@@ -554,11 +523,11 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				)`,
 				[
 					entry.id, entry.type, entry.content,
-					JSON.stringify(entry.topics),
+					this.sql.json(entry.topics),
 					entry.confidence, entry.source, entry.status,
 					entry.strength, entry.createdAt, entry.updatedAt,
 					entry.lastAccessedAt, entry.accessCount, entry.observationCount,
-					entry.supersededBy, JSON.stringify(entry.derivedFrom),
+					entry.supersededBy, this.sql.json(entry.derivedFrom),
 					entry.isSynthesized ? 1 : 0, embeddingBuf,
 				] as postgres.ParameterOrJSON<never>[],
 			);
@@ -580,7 +549,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		}
 		if (updates.topics !== undefined) {
 			setClauses.push(`topics = $${idx++}::jsonb`);
-			values.push(JSON.stringify(updates.topics));
+			values.push(this.sql.json(updates.topics));
 		}
 		if (updates.confidence !== undefined) {
 			setClauses.push(`confidence = $${idx++}`);
@@ -1119,9 +1088,9 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				WHERE id = $9`,
 				[
 					updates.content, safeType,
-					JSON.stringify(updates.topics),
+					this.sql.json(updates.topics),
 					updates.confidence,
-					JSON.stringify(mergedSources),
+					this.sql.json(mergedSources),
 					now, embeddingBuf,
 					embeddingVec,
 					id,
@@ -1144,9 +1113,9 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				WHERE id = $8`,
 				[
 					updates.content, safeType,
-					JSON.stringify(updates.topics),
+					this.sql.json(updates.topics),
 					updates.confidence,
-					JSON.stringify(mergedSources),
+					this.sql.json(mergedSources),
 					now, embeddingBuf,
 					id,
 				] as postgres.ParameterOrJSON<never>[],
@@ -1165,9 +1134,9 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				WHERE id = $8`,
 				[
 					updates.content, safeType,
-					JSON.stringify(updates.topics),
+					this.sql.json(updates.topics),
 					updates.confidence,
-					JSON.stringify(mergedSources),
+					this.sql.json(mergedSources),
 					now, embeddingBuf,
 					id,
 				] as postgres.ParameterOrJSON<never>[],
