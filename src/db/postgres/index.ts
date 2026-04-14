@@ -517,31 +517,52 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				? floatsToVectorLiteral(entry.embedding)
 				: null;
 
-		// embedding_vec: cast the literal to vector only when non-null.
-		// Passing null with an explicit ::vector cast can cause a type error in
-		// some postgres.js versions ("cannot cast type unknown to vector").
-		// CASE WHEN NULL THEN NULL avoids the cast entirely for null values.
-		await this.sql.unsafe(
-			`INSERT INTO knowledge_entry
-			(id, type, content, topics, confidence, source, status, strength,
-			 created_at, updated_at, last_accessed_at, access_count, observation_count,
-			 superseded_by, derived_from, is_synthesized, embedding, embedding_vec)
-			VALUES (
-				$1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-				$14, $15::jsonb, $16, $17,
-				CASE WHEN $18::text IS NULL THEN NULL ELSE $18::vector END
-			)`,
-			[
-				entry.id, entry.type, entry.content,
-				JSON.stringify(entry.topics),
-				entry.confidence, entry.source, entry.status,
-				entry.strength, entry.createdAt, entry.updatedAt,
-				entry.lastAccessedAt, entry.accessCount, entry.observationCount,
-				entry.supersededBy, JSON.stringify(entry.derivedFrom),
-				entry.isSynthesized ? 1 : 0, embeddingBuf,
-				embeddingVec,
-			] as postgres.ParameterOrJSON<never>[],
-		);
+		// Include embedding_vec in the INSERT only when pgvectorReady — the column
+		// does not exist until ensureVectorColumn() creates it (which requires
+		// embedding_metadata to be set first). Referencing a non-existent column
+		// in the column list causes an immediate SQL error regardless of the value.
+		if (this.pgvectorReady && embeddingVec !== null) {
+			await this.sql.unsafe(
+				`INSERT INTO knowledge_entry
+				(id, type, content, topics, confidence, source, status, strength,
+				 created_at, updated_at, last_accessed_at, access_count, observation_count,
+				 superseded_by, derived_from, is_synthesized, embedding, embedding_vec)
+				VALUES (
+					$1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+					$14, $15::jsonb, $16, $17, $18::vector
+				)`,
+				[
+					entry.id, entry.type, entry.content,
+					JSON.stringify(entry.topics),
+					entry.confidence, entry.source, entry.status,
+					entry.strength, entry.createdAt, entry.updatedAt,
+					entry.lastAccessedAt, entry.accessCount, entry.observationCount,
+					entry.supersededBy, JSON.stringify(entry.derivedFrom),
+					entry.isSynthesized ? 1 : 0, embeddingBuf,
+					embeddingVec,
+				] as postgres.ParameterOrJSON<never>[],
+			);
+		} else {
+			await this.sql.unsafe(
+				`INSERT INTO knowledge_entry
+				(id, type, content, topics, confidence, source, status, strength,
+				 created_at, updated_at, last_accessed_at, access_count, observation_count,
+				 superseded_by, derived_from, is_synthesized, embedding)
+				VALUES (
+					$1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+					$14, $15::jsonb, $16, $17
+				)`,
+				[
+					entry.id, entry.type, entry.content,
+					JSON.stringify(entry.topics),
+					entry.confidence, entry.source, entry.status,
+					entry.strength, entry.createdAt, entry.updatedAt,
+					entry.lastAccessedAt, entry.accessCount, entry.observationCount,
+					entry.supersededBy, JSON.stringify(entry.derivedFrom),
+					entry.isSynthesized ? 1 : 0, embeddingBuf,
+				] as postgres.ParameterOrJSON<never>[],
+			);
+		}
 	}
 
 	async updateEntry(
@@ -1079,27 +1100,50 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				: null;
 		const now = Date.now();
 
-		await this.sql.unsafe(
-			`UPDATE knowledge_entry
-			SET content = $1, type = $2,
-			    topics = $3::jsonb,
-			    confidence = $4,
-			    derived_from = $5::jsonb,
-			    updated_at = $6, last_accessed_at = $6,
-			    observation_count = observation_count + 1,
-			    embedding = $7,
-			    embedding_vec = CASE WHEN $8::text IS NULL THEN NULL ELSE $8::vector END
-			WHERE id = $9`,
-			[
-				updates.content, safeType,
-				JSON.stringify(updates.topics),
-				updates.confidence,
-				JSON.stringify(mergedSources),
-				now, embeddingBuf,
-				embeddingVec,
-				id,
-			] as postgres.ParameterOrJSON<never>[],
-		);
+		// Only set embedding_vec when the column exists (pgvectorReady).
+		if (this.pgvectorReady && embeddingVec !== null) {
+			await this.sql.unsafe(
+				`UPDATE knowledge_entry
+				SET content = $1, type = $2,
+				    topics = $3::jsonb,
+				    confidence = $4,
+				    derived_from = $5::jsonb,
+				    updated_at = $6, last_accessed_at = $6,
+				    observation_count = observation_count + 1,
+				    embedding = $7,
+				    embedding_vec = $8::vector
+				WHERE id = $9`,
+				[
+					updates.content, safeType,
+					JSON.stringify(updates.topics),
+					updates.confidence,
+					JSON.stringify(mergedSources),
+					now, embeddingBuf,
+					embeddingVec,
+					id,
+				] as postgres.ParameterOrJSON<never>[],
+			);
+		} else {
+			await this.sql.unsafe(
+				`UPDATE knowledge_entry
+				SET content = $1, type = $2,
+				    topics = $3::jsonb,
+				    confidence = $4,
+				    derived_from = $5::jsonb,
+				    updated_at = $6, last_accessed_at = $6,
+				    observation_count = observation_count + 1,
+				    embedding = $7
+				WHERE id = $8`,
+				[
+					updates.content, safeType,
+					JSON.stringify(updates.topics),
+					updates.confidence,
+					JSON.stringify(mergedSources),
+					now, embeddingBuf,
+					id,
+				] as postgres.ParameterOrJSON<never>[],
+			);
+		}
 	}
 
 	async reinitialize(): Promise<void> {
@@ -1276,10 +1320,16 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	}
 
 	async clearAllEmbeddings(): Promise<number> {
-		const result = await this.sql`
-			UPDATE knowledge_entry SET embedding = NULL, embedding_vec = NULL
-			WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL
-		`;
+		// Only clear embedding_vec when the column exists.
+		const result = this.pgvectorReady
+			? await this.sql`
+				UPDATE knowledge_entry SET embedding = NULL, embedding_vec = NULL
+				WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL
+			`
+			: await this.sql`
+				UPDATE knowledge_entry SET embedding = NULL
+				WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL
+			`;
 		return result.count;
 	}
 
