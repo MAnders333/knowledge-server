@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.8.4](https://github.com/MAnders333/knowledge-server/compare/v3.8.3...v3.8.4) (2026-04-15)
+
+
+### Bug Fixes
+
+* **release:** avoid daemon smoke-test hang in macOS verification ([001b861](https://github.com/MAnders333/knowledge-server/commit/001b861c3f4b50559c2e39d844f2b86075194bb9))
+
 ## [3.8.3](https://github.com/MAnders333/knowledge-server/compare/v3.8.2...v3.8.3) (2026-04-15)
 
 
