@@ -70,6 +70,16 @@ jobs:
           bun build --compile --minify src/index.ts --outfile dist/knowledge-server-${{ matrix.suffix }}
           bun build --compile --minify src/daemon/index.ts --outfile dist/knowledge-daemon-${{ matrix.suffix }}
 
+      - name: Re-sign macOS binaries (ad-hoc)
+        if: ${{ matrix.suffix == 'darwin-arm64' }}
+        run: |
+          # Bun-compiled Mach-O artifacts can carry invalid embedded signature
+          # metadata depending on toolchain/runtime combination. Re-signing with
+          # an ad-hoc identity makes the binary structurally valid for macOS
+          # verification/execution and avoids publishing unusable artifacts.
+          codesign --force --sign - dist/knowledge-server-${{ matrix.suffix }}
+          codesign --force --sign - dist/knowledge-daemon-${{ matrix.suffix }}
+
       - name: Verify macOS binaries are executable
         if: ${{ matrix.suffix == 'darwin-arm64' }}
         run: |
