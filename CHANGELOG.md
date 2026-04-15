@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.8.1](https://github.com/MAnders333/knowledge-server/compare/v3.8.0...v3.8.1) (2026-04-15)
+
+
+### Bug Fixes
+
+* **db:** use halfvec ANN + exact rerank for high-dimension embeddings ([5d791f8](https://github.com/MAnders333/knowledge-server/commit/5d791f8e3511fab81ee806997a0e40a8f170961a))
+
 ## [3.8.0](https://github.com/MAnders333/knowledge-server/compare/v3.7.0...v3.8.0) (2026-04-14)
 
 
