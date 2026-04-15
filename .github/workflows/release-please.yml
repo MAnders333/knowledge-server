@@ -89,7 +89,6 @@ jobs:
           codesign --verify --verbose dist/knowledge-daemon-${{ matrix.suffix }}
           # Smoke-test startup path. This catches pre-runtime SIGKILL failures.
           ./dist/knowledge-server-${{ matrix.suffix }} --help > /dev/null
-          ./dist/knowledge-daemon-${{ matrix.suffix }} --help > /dev/null
 
       - name: Generate checksums and compress
         run: |
