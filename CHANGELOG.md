@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.8.5](https://github.com/MAnders333/knowledge-server/compare/v3.8.4...v3.8.5) (2026-04-15)
+
+
+### Bug Fixes
+
+* **db:** add v17 pgvector ANN repair migration and startup self-heal ([d60e43e](https://github.com/MAnders333/knowledge-server/commit/d60e43ea8f9bb65d2f15ff5a716aea2361690b88))
+
 ## [3.8.4](https://github.com/MAnders333/knowledge-server/compare/v3.8.3...v3.8.4) (2026-04-15)
 
 
