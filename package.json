@@ -1,6 +1,6 @@
 {
 	"name": "knowledge-server",
-	"version": "3.8.1",
+	"version": "3.8.2",
 	"description": "A consolidation-aware knowledge system that distills episodic memory from OpenCode sessions into retrievable knowledge, with embedding-based associative activation.",
 	"type": "module",
 	"scripts": {

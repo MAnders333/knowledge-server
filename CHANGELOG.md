@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.8.2](https://github.com/MAnders333/knowledge-server/compare/v3.8.1...v3.8.2) (2026-04-15)
+
+
+### Bug Fixes
+
+* **release:** pin Bun and verify macOS binaries before upload ([7db3982](https://github.com/MAnders333/knowledge-server/commit/7db3982565cd6dff2c0c12ca1ee92ce3a65d645e))
+
 ## [3.8.1](https://github.com/MAnders333/knowledge-server/compare/v3.8.0...v3.8.1) (2026-04-15)
 
 
