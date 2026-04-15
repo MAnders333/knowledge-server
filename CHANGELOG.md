@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.8.3](https://github.com/MAnders333/knowledge-server/compare/v3.8.2...v3.8.3) (2026-04-15)
+
+
+### Bug Fixes
+
+* **release:** ad-hoc re-sign darwin binaries before verification ([0953c9d](https://github.com/MAnders333/knowledge-server/commit/0953c9d812cdcf41ddbbd0f22920bf727a17b9fe))
+
 ## [3.8.2](https://github.com/MAnders333/knowledge-server/compare/v3.8.1...v3.8.2) (2026-04-15)
 
 
