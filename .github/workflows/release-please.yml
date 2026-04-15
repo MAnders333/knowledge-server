@@ -57,7 +57,10 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # Pin Bun for reproducible binaries. Newer Bun releases have produced
+          # darwin-arm64 artifacts that fail macOS exec/signature validation on
+          # some machines (SIGKILL before process startup).
+          bun-version: 1.3.9
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -66,6 +69,17 @@ jobs:
         run: |
           bun build --compile --minify src/index.ts --outfile dist/knowledge-server-${{ matrix.suffix }}
           bun build --compile --minify src/daemon/index.ts --outfile dist/knowledge-daemon-${{ matrix.suffix }}
+
+      - name: Verify macOS binaries are executable
+        if: ${{ matrix.suffix == 'darwin-arm64' }}
+        run: |
+          # Ensure Mach-O signature/load commands are acceptable to macOS
+          # before publishing the release assets.
+          codesign --verify --verbose dist/knowledge-server-${{ matrix.suffix }}
+          codesign --verify --verbose dist/knowledge-daemon-${{ matrix.suffix }}
+          # Smoke-test startup path. This catches pre-runtime SIGKILL failures.
+          ./dist/knowledge-server-${{ matrix.suffix }} --help > /dev/null
+          ./dist/knowledge-daemon-${{ matrix.suffix }} --help > /dev/null
 
       - name: Generate checksums and compress
         run: |
