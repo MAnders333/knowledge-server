@@ -316,7 +316,7 @@ export const PG_MIGRATIONS: Array<{
 	},
 	{
 		version: 16,
-		label: "pgvector: add embedding_vec column and HNSW index",
+		label: "pgvector: add embedding_vec column and ANN index",
 		up: async (sql: TxSql) => {
 			// NOTE: CREATE EXTENSION cannot run inside a transaction block on
 			// Postgres ≤ 14 and some managed providers (RDS, etc.).  Extension
@@ -378,28 +378,56 @@ export const PG_MIGRATIONS: Array<{
 						logger.log(`[pg-db] Migration v16: backfilled embedding_vec for ${toBackfill.length} rows.`);
 					}
 
-					// ── 4. Create HNSW index ───────────────────────────────────────────
-					// HNSW (Hierarchical Navigable Small World) builds incrementally —
-					// no training step required, works on empty or partial tables.
-					// cosine distance (<=>): consistent with in-process cosineSimilarity.
-					// m=16, ef_construction=64: pgvector defaults; good for most KB sizes.
-					await sql.unsafe(`
-						CREATE INDEX IF NOT EXISTS idx_entry_embedding_vec_hnsw
-						ON knowledge_entry
-						USING hnsw (embedding_vec vector_cosine_ops)
-						WITH (m = 16, ef_construction = 64)
-					`);
+					// ── 4. Create ANN index (best-effort) ────────────────────────────
+					// Use halfvec HNSW + exact rerank path to support large embeddings.
+					// HNSW supports halfvec up to 4000 dimensions.
+					if (dims <= 4000) {
+						try {
+							await sql.unsafe(`
+								CREATE INDEX IF NOT EXISTS idx_entry_embedding_halfvec_hnsw
+								ON knowledge_entry
+								USING hnsw ((embedding_vec::halfvec(${dims})) halfvec_cosine_ops)
+								WITH (m = 16, ef_construction = 64)
+							`);
+						} catch (err) {
+							logger.warn(
+								`[pg-db] Migration v16: ANN index creation skipped. ANN search disabled for this store. Error: ${err instanceof Error ? err.message : String(err)}`,
+							);
+						}
+					} else {
+						logger.warn(
+							`[pg-db] Migration v16: embedding dimension ${dims} exceeds halfvec HNSW limit (4000). ANN index skipped for this store.`,
+						);
+					}
 				}
 				// If no embedding_metadata exists yet the column and index are created
 				// lazily by ensureVectorColumn() called from setEmbeddingMetadata().
 			} else {
-				// Column already exists — ensure the HNSW index exists (idempotent).
-				await sql.unsafe(`
-					CREATE INDEX IF NOT EXISTS idx_entry_embedding_vec_hnsw
-					ON knowledge_entry
-					USING hnsw (embedding_vec vector_cosine_ops)
-					WITH (m = 16, ef_construction = 64)
-				`);
+				// Column already exists — ensure ANN index exists when dimensions are known.
+				const meta = await sql`
+					SELECT dimensions FROM embedding_metadata WHERE id = 1
+				`;
+				if (meta.length > 0) {
+					const dims = Number(meta[0].dimensions);
+					if (dims <= 4000) {
+						try {
+							await sql.unsafe(`
+								CREATE INDEX IF NOT EXISTS idx_entry_embedding_halfvec_hnsw
+								ON knowledge_entry
+								USING hnsw ((embedding_vec::halfvec(${dims})) halfvec_cosine_ops)
+								WITH (m = 16, ef_construction = 64)
+							`);
+						} catch (err) {
+							logger.warn(
+								`[pg-db] Migration v16: existing embedding_vec found, but ANN index creation skipped. ANN search disabled for this store. Error: ${err instanceof Error ? err.message : String(err)}`,
+							);
+						}
+					} else {
+						logger.warn(
+							`[pg-db] Migration v16: embedding dimension ${dims} exceeds halfvec HNSW limit (4000). ANN index skipped for this store.`,
+						);
+					}
+				}
 			}
 		},
 	},

@@ -84,6 +84,7 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		// We close and reopen `db` after the DDL so the connection pool is fresh
 		// and no cached prepared statements reference the dropped column.
 		await truncSql`DROP INDEX IF EXISTS idx_entry_embedding_vec_hnsw`;
+		await truncSql`DROP INDEX IF EXISTS idx_entry_embedding_halfvec_hnsw`;
 		await truncSql.unsafe(
 			"ALTER TABLE knowledge_entry DROP COLUMN IF EXISTS embedding_vec",
 		);
@@ -691,6 +692,36 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		const updated = await db.getEmbeddingMetadata();
 		expect(updated?.model).toBe("text-embedding-3-large");
 		expect(updated?.dimensions).toBe(3072);
+	});
+
+	it("enables ANN with halfvec index for >2000 dimensions", async () => {
+		const pg = db as PostgresKnowledgeDB;
+		await pg.setEmbeddingMetadata("text-embedding-3-large", 3072);
+
+		const idx = await truncSql`
+			SELECT 1
+			FROM pg_indexes
+			WHERE schemaname = current_schema()
+			  AND indexname = 'idx_entry_embedding_halfvec_hnsw'
+		`;
+		expect(idx.length).toBe(1);
+		expect(await pg.isVectorSearchReady()).toBe(true);
+
+		const q = Array.from({ length: 3072 }, (_, i) => (i === 0 ? 1 : 0));
+		const orth = Array.from({ length: 3072 }, (_, i) => (i === 1 ? 1 : 0));
+
+		await pg.insertEntry(makeEntry("ann3072-high", { embedding: q }));
+		await pg.insertEntry(makeEntry("ann3072-low", { embedding: orth }));
+
+		const result = await pg.findSimilarEntries(q, 5, 0.5);
+		expect(result.some((r) => r.entry.id === "ann3072-high")).toBe(true);
+		expect(result.some((r) => r.entry.id === "ann3072-low")).toBe(false);
+	});
+
+	it("degrades gracefully when dimensions exceed halfvec HNSW limit", async () => {
+		const pg = db as PostgresKnowledgeDB;
+		await pg.setEmbeddingMetadata("oversized-model", 4096);
+		expect(await pg.isVectorSearchReady()).toBe(false);
 	});
 
 	// ── Clusters ──

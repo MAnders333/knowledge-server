@@ -94,13 +94,16 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	 * True once ensureVectorColumn() has confirmed that:
 	 *   1. The pgvector extension is installed.
 	 *   2. The `embedding_vec vector(N)` column exists on knowledge_entry.
-	 *   3. The HNSW index exists.
+	 *   3. The ANN index path required by similarity queries is available.
 	 *
 	 * Set to false on construction; lazily set to true by ensureVectorColumn().
 	 * When false, findSimilarEntries falls back gracefully (returns empty so
 	 * callers revert to the in-process full scan) rather than throwing.
 	 */
 	private pgvectorReady = false;
+
+	/** Active embedding dimensionality from embedding_metadata.id = 1. */
+	private embeddingDims: number | null = null;
 
 	/**
 	 * @param connectionUri  Full postgres:// connection string.
@@ -323,10 +326,12 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		`;
 		if (meta.length === 0) {
 			// Dimensions not yet known — defer until setEmbeddingMetadata() is called.
+			this.embeddingDims = null;
 			this.pgvectorReady = false;
 			return;
 		}
 		const dims = Number(meta[0].dimensions);
+		this.embeddingDims = dims;
 
 		// Add embedding_vec column if absent.
 		const colExists = await this.sql`
@@ -396,6 +401,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 					// new empty column present — never column-absent with data still there).
 					await this.sql.begin(async (sql: TxSql) => {
 						await sql`DROP INDEX IF EXISTS idx_entry_embedding_vec_hnsw`;
+						await sql`DROP INDEX IF EXISTS idx_entry_embedding_halfvec_hnsw`;
 						await sql.unsafe(
 							"ALTER TABLE knowledge_entry DROP COLUMN embedding_vec",
 						);
@@ -412,29 +418,47 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			}
 		}
 
-		// Create HNSW index if absent (idempotent due to IF NOT EXISTS).
+		// Create ANN index if absent (idempotent due to IF NOT EXISTS).
+		//
+		// We intentionally use halfvec HNSW + exact rerank to support common large
+		// embedding models (>2000 dims) while keeping ANN. pgvector supports HNSW:
+		//   - vector: up to 2000 dims
+		//   - halfvec: up to 4000 dims
+		//
+		// Query plan in findSimilarEntries()/findContradictionCandidates():
+		//   1) ANN candidate selection on (embedding_vec::halfvec(N))
+		//   2) exact cosine rerank on embedding_vec
+		//
 		// Executed outside the backfill transaction so a transient index-build
 		// failure (e.g. OOM on a large table) doesn't roll back the backfill.
 		// If index creation fails, we degrade gracefully: pgvectorReady stays
 		// false and activations continue on Path B (full scan) until the next
 		// startup successfully builds the index.
+		if (dims > 4000) {
+			logger.warn(
+				`[pg-db] embedding dimension ${dims} exceeds halfvec HNSW limit (4000). ANN search disabled for this store.`,
+			);
+			this.pgvectorReady = false;
+			return;
+		}
 		try {
+			await this.sql`DROP INDEX IF EXISTS idx_entry_embedding_vec_hnsw`;
 			await this.sql.unsafe(`
-				CREATE INDEX IF NOT EXISTS idx_entry_embedding_vec_hnsw
+				CREATE INDEX IF NOT EXISTS idx_entry_embedding_halfvec_hnsw
 				ON knowledge_entry
-				USING hnsw (embedding_vec vector_cosine_ops)
+				USING hnsw ((embedding_vec::halfvec(${dims})) halfvec_cosine_ops)
 				WITH (m = 16, ef_construction = 64)
 			`);
 		} catch (err) {
 			logger.warn(
-				`[pg-db] HNSW index creation failed — ANN search disabled. Will retry on next startup. Error: ${err instanceof Error ? err.message : String(err)}`,
+				`[pg-db] ANN index creation failed — ANN search disabled. Will retry on next startup. Error: ${err instanceof Error ? err.message : String(err)}`,
 			);
 			this.pgvectorReady = false;
 			return;
 		}
 
 		this.pgvectorReady = true;
-		logger.log(`[pg-db] pgvector ready (vector(${dims}), HNSW index).`);
+		logger.log(`[pg-db] pgvector ready (vector(${dims}), halfvec HNSW + exact rerank).`);
 	}
 
 	// ── Helpers ──
@@ -1157,6 +1181,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		// ensureVectorColumn(), preventing dimension-mismatch corruption when
 		// a new model is configured after a knowledge reset.
 		this.pgvectorReady = false;
+		this.embeddingDims = null;
 	}
 
 	// ── Embedding Metadata ──
@@ -1379,27 +1404,35 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	): Promise<
 		Array<{ entry: KnowledgeEntry & { embedding: number[] }; similarity: number }>
 	> {
-		if (!this.pgvectorReady) return [];
+		if (!this.pgvectorReady || this.embeddingDims === null) return [];
 
 		const vectorLiteral = floatsToVectorLiteral(queryVector);
-		// cosine distance <=> ∈ [0, 2]; similarity = 1 − distance.
-		// The HNSW index is used when the ORDER BY clause references the <=> operator.
-		// The WHERE filter is expressed in distance space (`<= maxDist`) so the planner
-		// can use the index for both ordering and filtering — writing it as
-		// `(1 - distance) >= threshold` would obscure the distance expression and
-		// prevent the index from being used for filtering.
+		// Two-step ANN + exact rerank:
+		//  1) candidate_ids CTE uses halfvec HNSW index
+		//  2) outer query reranks candidates with exact cosine on embedding_vec
+		// This keeps ANN speed while preserving full-vector ranking quality.
 		const maxDist = 1 - threshold; // distance <= maxDist ↔ similarity >= threshold
+		const annCandidates = Math.max(limit * 8, 100);
 		const rows = await this.sql.unsafe(
-			`SELECT *, (1 - (embedding_vec <=> $1::vector)) AS similarity
-			 FROM knowledge_entry
-			 WHERE status = ANY($2::text[])
-			   AND embedding_vec IS NOT NULL
-			   AND embedding_vec <=> $1::vector <= $3
-			 ORDER BY embedding_vec <=> $1::vector
-			 LIMIT $4`,
+			`WITH candidate_ids AS (
+			   SELECT id
+			   FROM knowledge_entry
+			   WHERE status = ANY($2::text[])
+			     AND embedding_vec IS NOT NULL
+			   ORDER BY (embedding_vec::halfvec(${this.embeddingDims}) <=> $1::halfvec(${this.embeddingDims}))
+			   LIMIT $3
+			 )
+			 SELECT ke.*, (1 - (ke.embedding_vec <=> $4::vector)) AS similarity
+			 FROM knowledge_entry ke
+			 JOIN candidate_ids c ON c.id = ke.id
+			 WHERE ke.embedding_vec <=> $4::vector <= $5
+			 ORDER BY ke.embedding_vec <=> $4::vector
+			 LIMIT $6`,
 			[
 				vectorLiteral,
 				statuses,
+				annCandidates,
+				vectorLiteral,
 				maxDist,
 				limit,
 			] as postgres.ParameterOrJSON<never>[],
@@ -1433,40 +1466,52 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		minSimilarity: number,
 		maxSimilarity: number,
 	): Promise<Array<KnowledgeEntry & { embedding: number[] }>> {
-		if (!this.pgvectorReady || topics.length === 0) return [];
+		if (!this.pgvectorReady || this.embeddingDims === null || topics.length === 0)
+			return [];
 
 		const vectorLiteral = floatsToVectorLiteral(queryVector);
 		// similarity = 1 − distance; band is [minSimilarity, maxSimilarity).
 		// In distance space: distance ∈ (1−maxSimilarity, 1−minSimilarity].
 		const minDist = 1 - maxSimilarity; // exclusive lower bound on distance
 		const maxDist = 1 - minSimilarity; // inclusive upper bound on distance
+		const annCandidates = 300;
 
-		// Use a CTE so the distance expression is computed once per row, not twice.
-		// The DISTINCT on the outer query deduplicates rows that match multiple topics.
+		// Two-step ANN + exact rerank with topic pre-filtering.
+		// topic_candidates limits the ANN search space to only overlapping-topic rows,
+		// then candidate_ids uses halfvec HNSW, and the outer query applies the exact
+		// contradiction similarity band on full vectors.
 		// `id != ALL($2::text[])` with an empty array is always TRUE in Postgres, so
 		// we always include the clause and always pass excludeIds — even when empty.
-		// This keeps parameter numbering fixed ($1…$5) regardless of excludeIds content.
+		// This keeps parameter numbering fixed regardless of excludeIds content.
 		const rows = await this.sql.unsafe(
-			`WITH candidates AS (
-			   SELECT DISTINCT ke.*,
-			          (ke.embedding_vec <=> $3::vector) AS dist
+			`WITH topic_candidates AS (
+			   SELECT DISTINCT ke.id, ke.embedding_vec
 			   FROM knowledge_entry ke,
 			        jsonb_array_elements_text(ke.topics) AS t(value)
 			   WHERE ke.status IN ('active', 'conflicted')
 			     AND ke.embedding_vec IS NOT NULL
 			     AND t.value = ANY($1::text[])
 			     AND ke.id != ALL($2::text[])
+			 ),
+			 candidate_ids AS (
+			   SELECT id
+			   FROM topic_candidates
+			   ORDER BY (embedding_vec::halfvec(${this.embeddingDims}) <=> $3::halfvec(${this.embeddingDims}))
+			   LIMIT $6
 			 )
-			 SELECT * FROM candidates
-			 WHERE dist >  $4
-			   AND dist <= $5
-			 ORDER BY dist`,
+			 SELECT ke.*
+			 FROM knowledge_entry ke
+			 JOIN candidate_ids c ON c.id = ke.id
+			 WHERE (ke.embedding_vec <=> $3::vector) >  $4
+			   AND (ke.embedding_vec <=> $3::vector) <= $5
+			 ORDER BY (ke.embedding_vec <=> $3::vector)`,
 			[
 				topics,
 				excludeIds,
 				vectorLiteral,
 				minDist,
 				maxDist,
+				annCandidates,
 			] as postgres.ParameterOrJSON<never>[],
 		);
 
