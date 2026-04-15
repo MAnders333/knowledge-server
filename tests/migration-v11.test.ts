@@ -1,5 +1,5 @@
 /**
- * Tests for the SQLite migration chain from v10 → v15.
+ * Tests for the SQLite migration chain from v10 → v17.
  *
  * Creates a v10-schema database (source_cursor and consolidated_episode
  * without user_id), opens it with KnowledgeDB (which triggers migrations
@@ -7,7 +7,8 @@
  *
  * v11 added user_id to both tables; v13 removed source_cursor entirely and
  * removed user_id from consolidated_episode; v14 is a no-op for knowledge.db
- * (staging tables moved to state.db); v15 drops the scope column.
+ * (staging tables moved to state.db); v15 drops the scope column; v16/v17 are
+ * Postgres-only pgvector migrations and no-op for SQLite.
  * This test verifies the full migration chain produces the correct final schema version.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
@@ -86,7 +87,7 @@ function createV10Fixture(dbPath: string): void {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-describe("v11 SQLite migration chain (v10 → v15)", () => {
+describe("v11 SQLite migration chain (v10 → v17)", () => {
 	let tempDir: string;
 	let dbPath: string;
 	let db: KnowledgeDB;
@@ -156,7 +157,7 @@ describe("v11 SQLite migration chain (v10 → v15)", () => {
 		await serverStateDb.close();
 	});
 
-	it("stamps schema version 16 after full migration chain", async () => {
+	it("stamps schema version 17 after full migration chain", async () => {
 		db = new KnowledgeDB(dbPath);
 
 		const raw = new Database(dbPath, { readonly: true });
@@ -165,7 +166,7 @@ describe("v11 SQLite migration chain (v10 → v15)", () => {
 			.get() as { v: number };
 		raw.close();
 
-		expect(row.v).toBe(16);
+		expect(row.v).toBe(17);
 	});
 
 	it("v3 data migration runs automatically on ServerStateDB init (uses DEFAULT_SQLITE_PATH)", async () => {

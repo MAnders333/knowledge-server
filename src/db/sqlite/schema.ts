@@ -84,7 +84,13 @@
  * - These tables are dropped from Postgres on migration.
  * - SQLite knowledge.db: no change — these tables were already handled in v13.
  */
-export const SCHEMA_VERSION = 16;
+/**
+ * v17: pgvector ANN repair migration (Postgres-only) + startup self-heal.
+ * - Existing Postgres stores that were already at v16 can have `embedding_vec`
+ *   present but unpopulated and/or missing ANN indexes (legacy rollout edge case).
+ * - v17 applies the repair migration on Postgres; SQLite remains a no-op.
+ */
+export const SCHEMA_VERSION = 17;
 
 /**
  * Expected columns for each table, derived from the DDL below.

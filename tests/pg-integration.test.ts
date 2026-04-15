@@ -724,6 +724,33 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		expect(await pg.isVectorSearchReady()).toBe(false);
 	});
 
+	it("self-heals missing embedding_vec rows when ensureVectorColumn reruns", async () => {
+		let pg = db as PostgresKnowledgeDB;
+		await pg.setEmbeddingMetadata("text-embedding-3-large", 3072);
+
+		const q = Array.from({ length: 3072 }, (_, i) => (i === 0 ? 1 : 0));
+		await pg.insertEntry(makeEntry("heal1", { embedding: q }));
+
+		// Simulate partial/legacy state: BYTEA embedding present but embedding_vec missing.
+		await truncSql`UPDATE knowledge_entry SET embedding_vec = NULL WHERE id = 'heal1'`;
+
+		// Recreate db instance, then trigger ensureVectorColumn() again via
+		// setEmbeddingMetadata (same model/dims) so legacy partial states are repaired.
+		await db.close();
+		db = new PostgresKnowledgeDB(uri);
+		pg = db as PostgresKnowledgeDB;
+		await pg.setEmbeddingMetadata("text-embedding-3-large", 3072);
+
+		const counts = await truncSql`
+			SELECT COUNT(*)::int AS missing
+			FROM knowledge_entry
+			WHERE embedding IS NOT NULL
+			  AND embedding_vec IS NULL
+		`;
+		expect(Number((counts[0] as { missing: number }).missing)).toBe(0);
+		expect(await pg.isVectorSearchReady()).toBe(true);
+	});
+
 	// ── Clusters ──
 
 	it("getClustersWithMembers returns empty when no clusters", async () => {

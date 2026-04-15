@@ -380,18 +380,18 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			// here so activations during the re-embed window fall back to Path B
 			// (full scan) rather than returning empty ANN results.
 			const dimRows = await this.sql`
-				SELECT atttypmod
+				SELECT format_type(atttypid, atttypmod) AS declared_type
 				FROM pg_attribute
 				WHERE attrelid = 'knowledge_entry'::regclass
 				  AND attname  = 'embedding_vec'
 				  AND attnum   > 0
 			`;
 			if (dimRows.length > 0) {
-				// pgvector uses the same typmod convention as varchar:
-				//   atttypmod = N + 4  (where N is the declared dimension)
-				// -1 means no modifier — not possible for a typed vector(N) column.
-				const rawTypmod = Number(dimRows[0].atttypmod);
-				const storedDim = rawTypmod === -1 ? -1 : rawTypmod - 4;
+				// Parse declared type text (e.g. "vector(3072)") instead of relying on
+				// atttypmod encoding, which differs across pgvector/Postgres builds.
+				const declared = String((dimRows[0] as { declared_type: string }).declared_type);
+				const m = declared.match(/\((\d+)\)/);
+				const storedDim = m ? Number(m[1]) : -1;
 				if (storedDim !== -1 && storedDim !== dims) {
 					logger.log(
 						`[pg-db] embedding_vec dimension mismatch (stored=${storedDim}, expected=${dims}) — recreating column. ANN search disabled until re-embed completes.`,
@@ -416,6 +416,30 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 					return;
 				}
 			}
+		}
+
+		// Self-heal: if embedding_vec exists but rows are missing (legacy rollout
+		// edge case), backfill only the NULL subset from BYTEA embedding.
+		const toBackfill = await this.sql<{ id: string; embedding: Buffer }[]>`
+			SELECT id, embedding
+			FROM knowledge_entry
+			WHERE embedding IS NOT NULL
+			  AND embedding_vec IS NULL
+		`;
+		if (toBackfill.length > 0) {
+			const ids: string[] = [];
+			const vecs: string[] = [];
+			for (const row of toBackfill) {
+				ids.push(row.id);
+				vecs.push(floatsToVectorLiteral(bufferToFloats(row.embedding)));
+			}
+			await this.sql.unsafe(
+				"UPDATE knowledge_entry SET embedding_vec = v.vec::vector " +
+				"FROM (SELECT UNNEST($1::text[]) AS id, UNNEST($2::text[]) AS vec) v " +
+				"WHERE knowledge_entry.id = v.id",
+				[ids, vecs],
+			);
+			logger.log(`[pg-db] Self-healed embedding_vec backfill for ${toBackfill.length} rows.`);
 		}
 
 		// Create ANN index if absent (idempotent due to IF NOT EXISTS).

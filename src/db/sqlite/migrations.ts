@@ -315,4 +315,13 @@ export const MIGRATIONS: Array<{
 			// cosine similarity; no schema changes are needed here.
 		},
 	},
+	{
+		version: 17,
+		label: "pgvector ANN repair — no-op for SQLite (Postgres-only feature)",
+		up: (_db) => {
+			// v17 repairs existing Postgres stores that may have `embedding_vec`
+			// present but unpopulated and/or missing ANN indexes.
+			// SQLite stores require no schema changes.
+		},
+	},
 ];
