@@ -718,6 +718,39 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		expect(result.some((r) => r.entry.id === "ann3072-low")).toBe(false);
 	});
 
+	it("findSimilarEntries does not starve active results behind many filtered statuses", async () => {
+		const pg = db as PostgresKnowledgeDB;
+		await pg.setEmbeddingMetadata("text-embedding-3-large", 3072);
+
+		const q = Array.from({ length: 3072 }, (_, i) => (i === 0 ? 1 : 0));
+		const near = Array.from({ length: 3072 }, (_, i) => {
+			if (i === 0) return 0.99;
+			if (i === 1) return 0.01;
+			return 0;
+		});
+
+		for (let i = 0; i < 180; i++) {
+			await pg.insertEntry(
+				makeEntry(`ann3072-sup-${i}`, {
+					status: "superseded",
+					supersededBy: "ann3072-active",
+					embedding: q,
+				}),
+			);
+		}
+
+		await pg.insertEntry(
+			makeEntry("ann3072-active", {
+				status: "active",
+				embedding: near,
+			}),
+		);
+
+		const result = await pg.findSimilarEntries(q, 5, 0.5, ["active"]);
+		expect(result.some((r) => r.entry.id === "ann3072-active")).toBe(true);
+		expect(result.every((r) => r.entry.status === "active")).toBe(true);
+	});
+
 	it("degrades gracefully when dimensions exceed halfvec HNSW limit", async () => {
 		const pg = db as PostgresKnowledgeDB;
 		await pg.setEmbeddingMetadata("oversized-model", 4096);

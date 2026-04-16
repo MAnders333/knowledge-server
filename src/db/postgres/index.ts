@@ -1436,26 +1436,29 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		//  2) outer query reranks candidates with exact cosine on embedding_vec
 		// This keeps ANN speed while preserving full-vector ranking quality.
 		const maxDist = 1 - threshold; // distance <= maxDist ↔ similarity >= threshold
-		const annCandidates = Math.max(limit * 8, 100);
+		// Keep ANN candidate selection index-friendly by avoiding status filtering
+		// in the ANN step. We over-sample candidates, then apply status + exact
+		// threshold/rerank in the outer query.
+		const annCandidates = Math.max(limit * 16, 200);
 		const rows = await this.sql.unsafe(
 			`WITH candidate_ids AS (
 			   SELECT id
 			   FROM knowledge_entry
-			   WHERE status = ANY($2::text[])
-			     AND embedding_vec IS NOT NULL
+			   WHERE embedding_vec IS NOT NULL
 			   ORDER BY (embedding_vec::halfvec(${this.embeddingDims}) <=> $1::halfvec(${this.embeddingDims}))
-			   LIMIT $3
+			   LIMIT $2
 			 )
 			 SELECT ke.*, (1 - (ke.embedding_vec <=> $4::vector)) AS similarity
 			 FROM knowledge_entry ke
 			 JOIN candidate_ids c ON c.id = ke.id
-			 WHERE ke.embedding_vec <=> $4::vector <= $5
+			 WHERE ke.status = ANY($3::text[])
+			   AND ke.embedding_vec <=> $4::vector <= $5
 			 ORDER BY ke.embedding_vec <=> $4::vector
 			 LIMIT $6`,
 			[
 				vectorLiteral,
-				statuses,
 				annCandidates,
+				statuses,
 				vectorLiteral,
 				maxDist,
 				limit,
