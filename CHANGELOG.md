@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.8.6](https://github.com/MAnders333/knowledge-server/compare/v3.8.5...v3.8.6) (2026-04-16)
+
+
+### Bug Fixes
+
+* **db:** make ANN candidate selection index-first ([25d39dd](https://github.com/MAnders333/knowledge-server/commit/25d39ddbfd27d085889a54116e119749e7678b74))
+
 ## [3.8.5](https://github.com/MAnders333/knowledge-server/compare/v3.8.4...v3.8.5) (2026-04-15)
 
 
