@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.8.7](https://github.com/MAnders333/knowledge-server/compare/v3.8.6...v3.8.7) (2026-05-26)
+
+
+### Bug Fixes
+
+* **local-files:** floor mtimeMs to integer for BIGINT compatibility ([66e1135](https://github.com/MAnders333/knowledge-server/commit/66e113544539883acd62f8a1d20782a222869145))
+* **local-files:** floor mtimeMs to integer for BIGINT compatibility ([d7fcf86](https://github.com/MAnders333/knowledge-server/commit/d7fcf867afe0ab75544991e6c8db25d40dbccc6d))
+
 ## [3.8.6](https://github.com/MAnders333/knowledge-server/compare/v3.8.5...v3.8.6) (2026-04-16)
 
 
