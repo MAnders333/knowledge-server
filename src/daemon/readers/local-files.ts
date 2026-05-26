@@ -96,7 +96,13 @@ export class LocalFilesEpisodeReader implements IEpisodeReader {
 
 			try {
 				content = readFileSync(filePath, "utf8");
-				mtimeMs = statSync(filePath).mtimeMs;
+				// fs.Stats.mtimeMs is a float on most filesystems (sub-millisecond
+				// precision is preserved when available — see Node fs docs). Coerce
+				// to integer ms here so the value can be stored in the BIGINT
+				// columns used for created_at / updated_at / last_accessed_at /
+				// max_message_time. Postgres rejects fractional bigints with
+				// "invalid input syntax for type bigint: \"…\".\"…\"".
+				mtimeMs = Math.floor(statSync(filePath).mtimeMs);
 			} catch {
 				// File disappeared between scan and read — skip silently.
 				continue;
@@ -171,7 +177,8 @@ export class LocalFilesEpisodeReader implements IEpisodeReader {
 			const fullPath = join(this.dir, entry.name);
 			try {
 				const stat = statSync(fullPath);
-				results.push({ path: fullPath, mtimeMs: stat.mtimeMs });
+				// Coerce to integer ms — see comment in getNewEpisodes.
+				results.push({ path: fullPath, mtimeMs: Math.floor(stat.mtimeMs) });
 			} catch {
 				// File disappeared between readdir and stat — skip.
 			}
