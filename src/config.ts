@@ -243,6 +243,14 @@ export const config = {
 		dimensions: process.env.EMBEDDING_DIMENSIONS
 			? parseIntEnv(process.env.EMBEDDING_DIMENSIONS, 1, 1)
 			: undefined,
+		// Hard per-call timeout for the embedding fetch. Without this, a slow or
+		// rate-limited embedding proxy (e.g. the unified LLM proxy) causes the
+		// request to hang indefinitely and holds the TCP connection open until
+		// the OS-level keepalive eventually reaps it — silently breaking both
+		// the /activate HTTP route and the MCP `activate` tool.
+		//
+		// Override via EMBEDDING_TIMEOUT_MS env var. Must be a positive integer.
+		timeoutMs: parseIntEnv(process.env.EMBEDDING_TIMEOUT_MS, 20_000, 1),
 	},
 
 	// Decay parameters
