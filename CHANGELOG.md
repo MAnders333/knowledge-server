@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.8.8](https://github.com/MAnders333/knowledge-server/compare/v3.8.7...v3.8.8) (2026-06-05)
+
+
+### Bug Fixes
+
+* **activation:** add per-call timeout to embedding fetch ([79d3cf8](https://github.com/MAnders333/knowledge-server/commit/79d3cf8859d2d409015f16a51fa7f3ada4b14154))
+* **activation:** add per-call timeout to embedding fetch ([5507fd1](https://github.com/MAnders333/knowledge-server/commit/5507fd169f2567d41f77504526096c8b891c672f))
+
 ## [3.8.7](https://github.com/MAnders333/knowledge-server/compare/v3.8.6...v3.8.7) (2026-05-26)
 
 
