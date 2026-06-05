@@ -17,8 +17,9 @@ export class EmbeddingClient {
 	private apiKey: string;
 	private model: string;
 	private dimensions: number | undefined;
+	private timeoutMs: number;
 
-	constructor() {
+	constructor(opts?: { timeoutMs?: number }) {
 		// Resolve endpoint and key using the priority chain.
 		if (config.embedding.baseURL) {
 			// Dedicated embedding endpoint — use as-is (user provides full base URL).
@@ -42,6 +43,7 @@ export class EmbeddingClient {
 		}
 		this.model = config.embedding.model;
 		this.dimensions = config.embedding.dimensions;
+		this.timeoutMs = opts?.timeoutMs ?? config.embedding.timeoutMs;
 	}
 
 	/**
@@ -77,6 +79,11 @@ export class EmbeddingClient {
 					// text-embedding-3-* models; omitting it lets the model use its default.
 					...(this.dimensions !== undefined && { dimensions: this.dimensions }),
 				}),
+				// Hard per-call timeout. Without this, a slow or rate-limited
+				// embedding proxy causes the fetch to hang indefinitely and
+				// holds the TCP connection open — silently breaking /activate
+				// (HTTP route + MCP tool) for the duration. See config.embedding.timeoutMs.
+				signal: AbortSignal.timeout(this.timeoutMs),
 			});
 
 			if (!response.ok) {
