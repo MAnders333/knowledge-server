@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.8.9](https://github.com/MAnders333/knowledge-server/compare/v3.8.8...v3.8.9) (2026-06-07)
+
+
+### Bug Fixes
+
+* **pgvector:** skip HNSW index creation when index already exists ([6480890](https://github.com/MAnders333/knowledge-server/commit/6480890c4e287def2a3d11278adb30554510eb53))
+* **pgvector:** skip HNSW index creation when index already exists ([db45ca7](https://github.com/MAnders333/knowledge-server/commit/db45ca7af5cd7d3797b421d88108e0629674feba))
+
 ## [3.8.8](https://github.com/MAnders333/knowledge-server/compare/v3.8.7...v3.8.8) (2026-06-05)
 
 
