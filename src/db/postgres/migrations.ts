@@ -514,17 +514,31 @@ export const PG_MIGRATIONS: Array<{
 			// Replace legacy vector HNSW index with halfvec ANN index when supported.
 			await sql`DROP INDEX IF EXISTS idx_entry_embedding_vec_hnsw`;
 			if (dims <= 4000) {
-				try {
-					await sql.unsafe(`
-						CREATE INDEX IF NOT EXISTS idx_entry_embedding_halfvec_hnsw
-						ON knowledge_entry
-						USING hnsw ((embedding_vec::halfvec(${dims})) halfvec_cosine_ops)
-						WITH (m = 16, ef_construction = 64)
-					`);
-				} catch (err) {
-					logger.warn(
-						`[pg-db] Migration v17: ANN index creation skipped. ANN search disabled for this store. Error: ${err instanceof Error ? err.message : String(err)}`,
-					);
+				// Skip CREATE INDEX if the halfvec HNSW index is already present.
+				// CREATE INDEX IF NOT EXISTS still requires table ownership and
+				// fails with "must be owner of table" on managed Postgres where
+				// the schema was bootstrapped by a separate admin user. When the
+				// index exists from a prior run, treat that as success.
+				const hnswExists = await sql`
+					SELECT 1 FROM pg_class c
+					JOIN pg_namespace n ON n.oid = c.relnamespace
+					WHERE c.relkind = 'i'
+					  AND n.nspname = current_schema()
+					  AND c.relname = 'idx_entry_embedding_halfvec_hnsw'
+				`;
+				if (hnswExists.length === 0) {
+					try {
+						await sql.unsafe(`
+							CREATE INDEX IF NOT EXISTS idx_entry_embedding_halfvec_hnsw
+							ON knowledge_entry
+							USING hnsw ((embedding_vec::halfvec(${dims})) halfvec_cosine_ops)
+							WITH (m = 16, ef_construction = 64)
+						`);
+					} catch (err) {
+						logger.warn(
+							`[pg-db] Migration v17: ANN index creation skipped. ANN search disabled for this store. Error: ${err instanceof Error ? err.message : String(err)}`,
+						);
+					}
 				}
 			} else {
 				logger.warn(

@@ -465,14 +465,30 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			this.pgvectorReady = false;
 			return;
 		}
+		// Check whether the HNSW index already exists. CREATE INDEX IF NOT EXISTS
+		// still requires table ownership, so it can fail with "must be owner of
+		// table" on managed Postgres where the schema was bootstrapped by a
+		// different role (e.g. Cloud SQL with a separate admin user). When the
+		// index is already there from a prior run, treat that as success and
+		// keep ANN enabled instead of degrading to Path B.
+		const hnswExists = await this.sql`
+			SELECT 1 FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE c.relkind = 'i'
+			  AND n.nspname = current_schema()
+			  AND c.relname = 'idx_entry_embedding_halfvec_hnsw'
+		`;
+
 		try {
 			await this.sql`DROP INDEX IF EXISTS idx_entry_embedding_vec_hnsw`;
-			await this.sql.unsafe(`
-				CREATE INDEX IF NOT EXISTS idx_entry_embedding_halfvec_hnsw
-				ON knowledge_entry
-				USING hnsw ((embedding_vec::halfvec(${dims})) halfvec_cosine_ops)
-				WITH (m = 16, ef_construction = 64)
-			`);
+			if (hnswExists.length === 0) {
+				await this.sql.unsafe(`
+					CREATE INDEX IF NOT EXISTS idx_entry_embedding_halfvec_hnsw
+					ON knowledge_entry
+					USING hnsw ((embedding_vec::halfvec(${dims})) halfvec_cosine_ops)
+					WITH (m = 16, ef_construction = 64)
+				`);
+			}
 		} catch (err) {
 			logger.warn(
 				`[pg-db] ANN index creation failed — ANN search disabled. Will retry on next startup. Error: ${err instanceof Error ? err.message : String(err)}`,
