@@ -36,6 +36,7 @@ jobs:
         run: |
           gh release upload "${{ steps.release.outputs.tag_name }}" \
             plugin/knowledge.ts \
+            plugin/pi-knowledge.ts \
             commands/consolidate.md \
             commands/knowledge-review.md \
             scripts/install.sh

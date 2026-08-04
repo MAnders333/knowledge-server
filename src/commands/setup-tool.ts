@@ -4,13 +4,14 @@ import {
 	existsSync,
 	mkdirSync,
 	readFileSync,
+	readdirSync,
 	renameSync,
 	symlinkSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 // @ts-ignore — Bun supports JSON imports natively
 import pkg from "../../package.json" with { type: "json" };
 import { config } from "../config.js";
@@ -1025,6 +1026,203 @@ function forceSymlink(src: string, dst: string): void {
 	symlinkSync(src, dst);
 }
 
+// ── pi setup ─────────────────────────────────────────────────────────────────
+
+/**
+ * pi (https://github.com/earendil-works/pi-mono) has no MCP support, so the
+ * integration is extension-only: plugin/pi-knowledge.ts hooks pi's
+ * `before_agent_start` event and queries GET /activate over HTTP — the same
+ * endpoint the OpenCode plugin uses. There is no MCP entry to register.
+ *
+ * What this setup does:
+ *
+ * 1. Places the extension file:
+ *    - If ~/.pi/shared/extensions/ exists (layered setups that share extensions
+ *      across PI_CODING_AGENT_DIR layers — pi's agent dir is a swap, not a
+ *      merge), the file is placed there as knowledge.ts.
+ *    - Otherwise it goes to ~/.pi/agent/extensions/knowledge.ts — pi's
+ *      canonical global location, auto-discovered by the default layer with
+ *      zero config edits.
+ *    Source install: symlink (repo edits go live immediately).
+ *    Binary install: copy from the install dir, or download the release asset.
+ *
+ * 2. Registers the extension path in the `extensions` array of every pi layer
+ *    settings found at ~/.pi/<layer>/settings.json. Skipped for the default
+ *    `agent` layer when the file sits in ~/.pi/agent/extensions/ (pi
+ *    auto-discovers that directory — explicit registration would double-load).
+ *    pi settings arrays support absolute paths (documented).
+ */
+function setupPi(): void {
+	const piRoot = join(homedir(), ".pi");
+
+	console.log("Setting up pi integration...\n");
+
+	if (!existsSync(piRoot)) {
+		console.error(
+			"  ✗ ~/.pi not found — pi does not appear to be installed (or has never run).",
+		);
+		console.error(
+			"    Install pi (npm i -g @earendil-works/pi-coding-agent), run it once, then re-run this setup.",
+		);
+		process.exit(1);
+	}
+
+	const sourceInstall = isSourceInstall();
+	const projectDir = sourceInstall ? getProjectDir() : "";
+
+	// ── 1. Place the extension file ──
+	const sharedExtDir = join(piRoot, "shared", "extensions");
+	const useSharedDir = existsSync(sharedExtDir);
+	const extDst = useSharedDir
+		? join(sharedExtDir, "knowledge.ts")
+		: join(piRoot, "agent", "extensions", "knowledge.ts");
+
+	if (sourceInstall) {
+		const extSrc = join(projectDir, "plugin", "pi-knowledge.ts");
+		if (!existsSync(extSrc)) {
+			console.error(`  ✗ Extension source not found: ${extSrc}`);
+			console.error(
+				"    Make sure you are running from the knowledge-server project directory.",
+			);
+			process.exit(1);
+		}
+		mkdirSync(dirname(extDst), { recursive: true });
+		forceSymlink(extSrc, extDst);
+		console.log(`  ✓ Extension: ${extDst}`);
+		console.log(`       → ${extSrc}`);
+	} else {
+		// Binary install: copy from <install-dir>/ if present, otherwise download
+		// from the GitHub release (same asset flow as the OpenCode plugin).
+		mkdirSync(dirname(extDst), { recursive: true });
+		const cached = join(getBinaryInstallDir(), "pi-knowledge.ts");
+		if (existsSync(cached)) {
+			try {
+				copyFileSync(cached, extDst);
+				console.log(`  ✓ Extension: ${extDst}`);
+			} catch (err) {
+				console.error(`  ✗ Failed to copy pi-knowledge.ts: ${err}`);
+				process.exit(1);
+			}
+		} else {
+			process.stdout.write("  Downloading pi-knowledge.ts... ");
+			try {
+				downloadAssetSync("pi-knowledge.ts", extDst);
+				console.log("done");
+			} catch (err) {
+				console.error(
+					`failed: ${err instanceof Error ? err.message : err}`,
+				);
+				console.error(
+					"    Extension is required for pi integration — aborting.",
+				);
+				process.exit(1);
+			}
+		}
+	}
+
+	// ── 2. Register in every layer settings.json under ~/.pi ──
+	// The default agent layer auto-discovers ~/.pi/agent/extensions/ — skip
+	// explicit registration there to avoid double-loading. Every other layer
+	// (and the shared-dir case) needs the explicit path.
+	const agentExtDir = join(piRoot, "agent", "extensions");
+	const inAgentExtDir = extDst.startsWith(`${agentExtDir}/`);
+
+	let settingsFiles: string[] = [];
+	try {
+		settingsFiles = readdirSync(piRoot, { withFileTypes: true })
+			.filter((d) => d.isDirectory())
+			.map((d) => join(piRoot, d.name, "settings.json"))
+			.filter((p) => existsSync(p));
+	} catch {
+		// unreadable — handled below as "no settings found"
+	}
+
+	let registered = 0;
+	for (const settingsPath of settingsFiles) {
+		const layer = basename(dirname(settingsPath));
+		if (inAgentExtDir && layer === "agent") {
+			console.log(
+				`  ✓ ${settingsPath}: auto-discovered from agent/extensions (no edit needed)`,
+			);
+			continue;
+		}
+		if (registerPiExtension(settingsPath, extDst)) registered += 1;
+	}
+
+	if (settingsFiles.length === 0) {
+		if (inAgentExtDir) {
+			console.log(
+				"  ✓ No layer settings found — relying on agent/extensions auto-discovery",
+			);
+		} else {
+			// Shared-dir layout but no settings anywhere: create a minimal default.
+			const fresh = join(piRoot, "agent", "settings.json");
+			mkdirSync(dirname(fresh), { recursive: true });
+			writeFileSync(
+				fresh,
+				`${JSON.stringify({ extensions: [extDst] }, null, 2)}\n`,
+			);
+			console.log(`  ✓ Created ${fresh} with the extension registered`);
+			registered = 1;
+		}
+	}
+
+	maybeSetupDaemon();
+
+	const startHint = sourceInstall
+		? `bun run ${join(projectDir, "src", "index.ts")}`
+		: "knowledge-server";
+
+	console.log(`
+Start the knowledge server before using pi:
+  ${startHint}
+
+Setup complete!${registered > 0 ? ` (${registered} layer settings updated)` : ""}`);
+}
+
+/**
+ * Ensure `extensionPath` is present in the `extensions` array of a pi
+ * settings.json. Returns true if the file was modified or already contained
+ * the path; false on parse errors (warns and skips — manual fix is trivial).
+ */
+function registerPiExtension(settingsPath: string, extensionPath: string): boolean {
+	let raw: string;
+	try {
+		raw = readFileSync(settingsPath, "utf8");
+	} catch (err) {
+		console.log(`  ⚠ Cannot read ${settingsPath}: ${err} — skipping`);
+		return false;
+	}
+
+	let settings: Record<string, unknown>;
+	try {
+		settings = JSON.parse(raw) as Record<string, unknown>;
+	} catch {
+		console.log(
+			`  ⚠ ${settingsPath} is not plain JSON — skipping. Add this to its "extensions" array manually:`,
+		);
+		console.log(`      "${extensionPath}"`);
+		return false;
+	}
+
+	const existing = Array.isArray(settings.extensions)
+		? (settings.extensions as unknown[]).filter((e) => typeof e === "string")
+		: [];
+
+	// pi settings support "~" — normalize both sides before comparing.
+	const normalize = (p: string) =>
+		p.startsWith("~/") ? join(homedir(), p.slice(2)) : p;
+	if (existing.map((e) => normalize(e as string)).includes(extensionPath)) {
+		console.log(`  ✓ ${settingsPath}: already registered (no change)`);
+		return true;
+	}
+
+	settings.extensions = [...existing, extensionPath];
+	writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
+	console.log(`  ✓ ${settingsPath}: extension registered`);
+	return true;
+}
+
 // ── Daemon auto-registration ──────────────────────────────────────────────────
 
 /**
@@ -1254,6 +1452,7 @@ export function runSetupTool(args: string[]): void {
 Available tools:
   opencode      Symlink plugin + commands; register MCP server in opencode.jsonc
   claude-code   Register MCP server + hook; symlink commands into ~/.claude/commands/
+  pi            Place extension; register it in pi layer settings (pi has no MCP)
   cursor        Register MCP server in ~/.cursor/mcp.json
   codex         Register MCP server in ~/.codex/config.toml
   vscode        Register MCP server via \`code --add-mcp\`
@@ -1268,6 +1467,9 @@ Available tools:
 			break;
 		case "claude-code":
 			setupClaudeCode();
+			break;
+		case "pi":
+			setupPi();
 			break;
 		case "cursor":
 			setupCursor();
@@ -1284,7 +1486,7 @@ Available tools:
 		default:
 			console.error(`Unknown tool: ${tool}`);
 			console.error(
-				"Valid options: opencode, claude-code, cursor, codex, vscode, daemon",
+				"Valid options: opencode, claude-code, pi, cursor, codex, vscode, daemon",
 			);
 			process.exit(1);
 	}

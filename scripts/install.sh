@@ -327,6 +327,7 @@ echo ""
 echo "Downloading plugin and slash commands..."
 
 curl --fail --location --silent --show-error "$BASE_URL/knowledge.ts"         -o "$INSTALL_DIR/knowledge.ts"
+curl --fail --location --silent --show-error "$BASE_URL/pi-knowledge.ts"      -o "$INSTALL_DIR/pi-knowledge.ts"
 curl --fail --location --silent --show-error "$BASE_URL/consolidate.md"       -o "$INSTALL_DIR/consolidate.md"
 curl --fail --location --silent --show-error "$BASE_URL/knowledge-review.md"  -o "$INSTALL_DIR/knowledge-review.md"
 echo "  ✓ plugin and commands"

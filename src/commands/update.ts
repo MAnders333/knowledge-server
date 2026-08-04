@@ -419,6 +419,11 @@ export async function runUpdate(
 		try {
 			const assets = [
 				["knowledge.ts", pluginDest],
+				// pi extension is optional — only refreshed when a previous
+				// install/update placed it in the install dir.
+				...([join(inferredInstallDir, "pi-knowledge.ts")]
+					.filter((p) => existsSync(p))
+					.map((p) => ["pi-knowledge.ts", p]) as Array<[string, string]>),
 				...commandFiles.filter(([, dest]) => existsSync(dest)),
 			] as Array<[string, string]>;
 

@@ -8,11 +8,13 @@ import {
 /**
  * Tests for src/activation/format.ts.
  *
- * Critically: the plugin (plugin/knowledge.ts) maintains a local copy of the
- * contradiction tag logic because it cannot import from src/ at runtime.
- * The PLUGIN_CONTRADICTION_TAG tests below replicate that logic verbatim so
- * that any drift between the canonical helpers and the plugin copy causes a
- * test failure here — making the coupling explicit and detectable.
+ * Critically: the plugin (plugin/knowledge.ts) and the pi extension
+ * (plugin/pi-knowledge.ts) each maintain a local copy of the contradiction
+ * tag logic because they cannot import from src/ at runtime (symlinked
+ * single-file integrations). The PLUGIN_CONTRADICTION_TAG tests below
+ * replicate that logic verbatim so that any drift between the canonical
+ * helpers and the plugin copies causes a test failure here — making the
+ * coupling explicit and detectable. Both plugin copies must stay identical.
  */
 
 // ---------------------------------------------------------------------------
