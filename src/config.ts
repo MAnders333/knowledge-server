@@ -147,6 +147,15 @@ export const config = {
 	//   no error) — the feature is opt-in by creating the directory.
 	localFilesDir: process.env.LOCAL_FILES_DIR || join(homedir(), "knowledge"),
 
+	// piSessionsRoot: root directory scanned for pi session JSONL files.
+	//   pi stores sessions at <agentDir>/sessions/, where the agent dir defaults to
+	//   ~/.pi/agent but can be swapped per-invocation via PI_CODING_AGENT_DIR
+	//   (e.g. separate work/personal layers). The reader therefore scans every
+	//   <piSessionsRoot>/<dir>/sessions it finds — with the default ~/.pi root this
+	//   covers the standard `agent` layer plus any custom layers automatically.
+	//   Override with PI_SESSIONS_ROOT (point at ~/.pi or directly at an agent dir).
+	piSessionsRoot: process.env.PI_SESSIONS_ROOT || join(homedir(), ".pi"),
+
 	// Explicit source enable/disable.
 	// All default to true (auto-detect); set to "false" to hard-disable a source.
 	opencodeEnabled: process.env.OPENCODE_ENABLED !== "false",
@@ -155,6 +164,7 @@ export const config = {
 	codexEnabled: process.env.CODEX_ENABLED !== "false",
 	vscodeEnabled: process.env.VSCODE_ENABLED !== "false",
 	localFilesEnabled: process.env.LOCAL_FILES_ENABLED !== "false",
+	piEnabled: process.env.PI_ENABLED !== "false",
 
 	// LLM credentials — three tiers, evaluated per-provider at call time:
 	//

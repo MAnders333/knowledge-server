@@ -8,6 +8,7 @@ import { CodexEpisodeReader, resolveCodexSessionsDir } from "./codex.js";
 import { CursorEpisodeReader, resolveCursorDbPath } from "./cursor.js";
 import { LocalFilesEpisodeReader } from "./local-files.js";
 import { OpenCodeEpisodeReader } from "./opencode.js";
+import { PiEpisodeReader, resolvePiSessionsDirs } from "./pi.js";
 import { VSCodeEpisodeReader, resolveVSCodeDataDir } from "./vscode.js";
 
 export { OpenCodeEpisodeReader } from "./opencode.js";
@@ -16,6 +17,7 @@ export { CursorEpisodeReader } from "./cursor.js";
 export { CodexEpisodeReader } from "./codex.js";
 export { VSCodeEpisodeReader } from "./vscode.js";
 export { LocalFilesEpisodeReader } from "./local-files.js";
+export { PiEpisodeReader } from "./pi.js";
 
 /**
  * Probe list of candidate OpenCode DB paths to check when OPENCODE_DB_PATH is not set.
@@ -194,6 +196,23 @@ export function createEpisodeReaders(): IEpisodeReader[] {
 		}
 	} else {
 		logger.log("[sources] Local files: disabled (LOCAL_FILES_ENABLED=false)");
+	}
+
+	// ── pi ──
+	if (config.piEnabled) {
+		const piSessionsDirs = resolvePiSessionsDirs();
+		if (piSessionsDirs.length > 0) {
+			readers.push(new PiEpisodeReader(piSessionsDirs));
+			logger.log(`[sources] pi: ${piSessionsDirs.join(", ")}`);
+		} else {
+			// Not a warning — pi may simply not be installed on this machine, and
+			// its layer dirs (agent/work/personal/…) only appear after first use.
+			logger.log(
+				`[sources] pi: no sessions directories found under ${config.piSessionsRoot} — skipping. Set PI_SESSIONS_ROOT or disable with PI_ENABLED=false.`,
+			);
+		}
+	} else {
+		logger.log("[sources] pi: disabled (PI_ENABLED=false)");
 	}
 
 	return readers;
