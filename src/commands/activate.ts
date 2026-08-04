@@ -1,4 +1,5 @@
 import { ActivationEngine } from "../activation/activate.js";
+import { createRerankerFromConfig } from "../activation/rerank.js";
 import { StoreRegistry } from "../db/store-registry.js";
 
 /**
@@ -18,6 +19,7 @@ export async function runActivate(query: string): Promise<void> {
 		registry.writableStore(),
 		registry.readStores(),
 		registry.writableStores(),
+		createRerankerFromConfig(),
 	);
 
 	try {

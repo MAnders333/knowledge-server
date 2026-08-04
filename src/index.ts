@@ -7,6 +7,7 @@ import { serve } from "bun";
 // @ts-ignore — Bun supports JSON imports natively
 import pkg from "../package.json" with { type: "json" };
 import { ActivationEngine } from "./activation/activate.js";
+import { createRerankerFromConfig } from "./activation/rerank.js";
 import { createApp } from "./api/server.js";
 import { runActivate } from "./commands/activate.js";
 import { runCalibrate } from "./commands/calibrate.js";
@@ -240,6 +241,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		db,
 		registry.readStores(),
 		registry.writableStores(),
+		createRerankerFromConfig(),
 	);
 	const consolidation = new ConsolidationEngine(
 		db,

@@ -251,8 +251,14 @@ export interface ActivationResult {
 		entry: KnowledgeEntry;
 		/** Pure cosine similarity between query and entry embedding. Reflects semantic match quality. */
 		rawSimilarity: number;
-		/** Decay-weighted ranking score: rawSimilarity × strength. Used for sorting. */
+		/** Decay-weighted ranking score: rawSimilarity × strength (dense-only) or rerankScore × strength (when the local reranker is active). Used for sorting. */
 		similarity: number;
+		/**
+		 * Cross-encoder relevance score in [0, 1]. Present only when the local
+		 * reranker scored this entry; absent on rerank failure fallback and for
+		 * relation-pulled support sources (which inherit their principle's rank).
+		 */
+		rerankScore?: number;
 		staleness: {
 			ageDays: number;
 			strength: number;

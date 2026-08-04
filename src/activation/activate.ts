@@ -12,6 +12,7 @@ import {
 	cosineSimilarity,
 	formatEmbeddingText,
 } from "./embeddings.js";
+import type { RerankScorer } from "./rerank.js";
 
 /**
  * Split a prompt into activation cues for multi-topic retrieval.
@@ -71,21 +72,119 @@ export class ActivationEngine {
 	readonly embeddings: EmbeddingClient;
 
 	/**
+	 * Optional second-stage reranker (local cross-encoder). When present,
+	 * dense retrieval overfetches candidates and the reranker re-scores them
+	 * for precision. Null = dense-only ordering (zero behavior change).
+	 * Injected by the composition root; tests pass fakes or omit.
+	 */
+	private readonly reranker: RerankScorer | null;
+
+	/**
+	 * Per-store timestamp (ms since epoch) of the last failure.
+	 * Stores in this map are excluded from fan-out until RETRY_INTERVAL_MS
+	 * elapses, after which they are retried. This prevents a dead store
+	 * (e.g. remote Postgres behind a VPN that went down) from blocking
+	 * every activation call with a TCP timeout.
+	 */
+	private unreachableSince: Map<string, number> = new Map();
+
+	/** Per-store call timeout — a dead store is skipped after this duration. */
+	private static readonly STORE_TIMEOUT_MS = 5_000;
+
+	/** How long to skip a failed store before retrying it. */
+	private static readonly STORE_RETRY_INTERVAL_MS = 60_000;
+
+	/**
 	 * @param writableDb   The primary writable store — receives access records.
 	 * @param readDbs      All stores to fan out activation reads across.
 	 *                     If omitted, defaults to [writableDb] (single-store mode).
 	 * @param writableDbs  All writable stores for embedding/re-embed operations.
 	 *                     If omitted, defaults to [writableDb] (single-store mode).
+	 * @param reranker     Optional cross-encoder scorer for the second rerank
+	 *                     stage. Null/omitted = dense-only ordering.
 	 */
 	constructor(
 		writableDb: IKnowledgeStore,
 		readDbs?: IKnowledgeStore[],
 		writableDbs?: IKnowledgeStore[],
+		reranker?: RerankScorer | null,
 	) {
 		this.db = writableDb;
 		this.readDbs = readDbs ?? [writableDb];
 		this.writableDbs = writableDbs ?? [writableDb];
 		this.embeddings = new EmbeddingClient();
+		this.reranker = reranker ?? null;
+	}
+
+	/**
+	 * Read stores that are either healthy or due for a retry.
+	 * Stores that failed within the last STORE_RETRY_INTERVAL_MS are excluded
+	 * so a dead store doesn't block every activation call. After the retry
+	 * interval elapses the store is included again — if it's still down it
+	 * will fail, be re-marked, and excluded for another interval.
+	 */
+	private reachableReadDbs(): IKnowledgeStore[] {
+		const now = Date.now();
+		return this.readDbs.filter((db) => {
+			const since = this.unreachableSince.get(db.id);
+			if (since === undefined) return true;
+			return now - since >= ActivationEngine.STORE_RETRY_INTERVAL_MS;
+		});
+	}
+
+	/**
+	 * Fan out a function across stores, tolerating per-store failures.
+	 *
+	 * Each store call is wrapped in a per-store timeout (STORE_TIMEOUT_MS).
+	 * Results are collected via Promise.allSettled so one dead store cannot
+	 * reject the entire operation — the remaining stores' results are returned.
+	 *
+	 * Failed stores are marked unreachable (see reachableReadDbs) so subsequent
+	 * activation calls skip them for STORE_RETRY_INTERVAL_MS, avoiding repeated
+	 * timeouts on every call.
+	 */
+	private async fanOutSafe<T>(
+		stores: IKnowledgeStore[],
+		fn: (db: IKnowledgeStore) => Promise<T>,
+		label: string,
+	): Promise<T[]> {
+		if (stores.length === 0) return [];
+
+		const results = await Promise.allSettled(
+			stores.map((db) =>
+				Promise.race([
+					fn(db),
+					new Promise<never>((_, reject) =>
+						setTimeout(
+							() =>
+								reject(
+									new Error(
+										`timeout after ${ActivationEngine.STORE_TIMEOUT_MS / 1000}s`,
+									),
+								),
+							ActivationEngine.STORE_TIMEOUT_MS,
+						),
+					),
+				]),
+			),
+		);
+
+		const ok: T[] = [];
+		for (let i = 0; i < results.length; i++) {
+			const r = results[i];
+			if (r.status === "fulfilled") {
+				this.unreachableSince.delete(stores[i].id);
+				ok.push(r.value);
+			} else {
+				this.unreachableSince.set(stores[i].id, Date.now());
+				logger.warn(
+					`[activation] Store "${stores[i].id}" failed during ${label} — skipping. ` +
+						`Will retry in ${ActivationEngine.STORE_RETRY_INTERVAL_MS / 1000}s. ` +
+						`Reason: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`,
+				);
+			}
+		}
+		return ok;
 	}
 
 	/**
@@ -130,6 +229,13 @@ export class ActivationEngine {
 		const similarityThreshold =
 			options?.threshold ?? config.activation.similarityThreshold;
 
+		// Candidate pool size for dense retrieval. With a reranker active we
+		// overfetch (dense = recall stage) and let the cross-encoder pick the
+		// final maxResults; without one the pool IS the final result set.
+		const fetchLimit = this.reranker
+			? Math.max(config.activation.rerank.candidates, maxResults)
+			: maxResults;
+
 		// Embed all queries in a single batched API call
 		const queryEmbeddings = await this.embeddings.embedBatch(queryList);
 
@@ -159,6 +265,7 @@ export class ActivationEngine {
 			entry: KnowledgeEntry;
 			rawSimilarity: number;
 			similarity: number;
+			rerankScore?: number;
 			staleness: {
 				ageDays: number;
 				strength: number;
@@ -171,62 +278,80 @@ export class ActivationEngine {
 		const seenIds = new Set<string>();
 		// Sum of per-store active+conflicted counts from Path A's parallel COUNT queries.
 		// Zero on Path B (totalActive comes from seenIds.size there instead).
-		// biome-ignore lint/style/useConst: assigned in the Path A branch
 		let annTotalActive = 0;
 
-		// Determine whether every read store supports ANN search AND is ready.
+		// Determine whether every *reachable* read store supports ANN search AND
+		// is ready. Unreachable stores are excluded from this check so an
+		// unreachable SQLite store doesn't force a full-scan path when all
+		// reachable stores support ANN.
+		//
 		// Two conditions must both be true for a store:
 		//   1. findSimilarEntries is present (PostgresKnowledgeDB, not SQLite).
 		//   2. isVectorSearchReady() returns true — pgvector extension installed,
 		//      embedding_vec column populated, HNSW index ready. This can be false
 		//      during a model-change re-embed window; without this check Path A
 		//      would silently return zero results instead of falling back to Path B.
-		const allStoresSupportAnn = this.readDbs.every(
+		const reachable = this.reachableReadDbs();
+		const allStoresSupportAnn = reachable.every(
 			(db) =>
 				typeof db.findSimilarEntries === "function" &&
-				(typeof db.isVectorSearchReady !== "function" || db.isVectorSearchReady()),
+				(typeof db.isVectorSearchReady !== "function" ||
+					db.isVectorSearchReady()),
 		);
 
 		if (allStoresSupportAnn) {
 			// ── Path A: DB-side ANN search (pgvector) ─────────────────────────────
-			// For each query vector, fan out across all stores and union results.
+			// For each query vector, fan out across reachable stores and union results.
 			// We request maxResults per query vector per store so the union covers
 			// relevant entries for every topic in a multi-cue message.
 			// The COUNT query runs in parallel with ANN queries so it adds no latency.
+			// fanOutSafe tolerates per-store failures — a dead store is skipped after
+			// STORE_TIMEOUT_MS and its results simply omitted from the union.
+			// Results are flattened across stores (.flat()) so annResultsPerQuery is
+			// [query][result], not [query][store][result].
 			const [annResultsPerQuery, perStoreCounts] = await Promise.all([
 				Promise.all(
-					queryEmbeddings.map((qEmb) =>
-						Promise.all(
-							this.readDbs.map((db) =>
-								// biome-ignore lint/style/noNonNullAssertion: guarded by allStoresSupportAnn
-								db.findSimilarEntries!(qEmb, maxResults, similarityThreshold),
-							),
-						),
+					queryEmbeddings.map(async (qEmb) =>
+						(
+							await this.fanOutSafe(
+								reachable,
+								(db) =>
+									// biome-ignore lint/style/noNonNullAssertion: guarded by allStoresSupportAnn
+									db.findSimilarEntries!(qEmb, fetchLimit, similarityThreshold),
+								"ANN search",
+							)
+						).flat(),
 					),
 				),
-				Promise.all(
-					this.readDbs.map((db) =>
+				this.fanOutSafe(
+					reachable,
+					(db) =>
 						typeof db.getActiveEntryCount === "function"
 							? db.getActiveEntryCount()
 							: Promise.resolve(0),
-					),
+					"active entry count",
 				),
 			]);
 			annTotalActive = perStoreCounts.reduce((sum, n) => sum + n, 0);
 
 			// Build a map: entry ID → best rawSimilarity across all query vectors.
 			// This mirrors the in-process "max over cues" logic in Path B.
+			// annResultsPerQuery is [query][result] (already flattened across stores).
 			const bestSimilarityById = new Map<
 				string,
-				{ entry: KnowledgeEntry & { embedding: number[] }; rawSimilarity: number }
+				{
+					entry: KnowledgeEntry & { embedding: number[] };
+					rawSimilarity: number;
+				}
 			>();
-			for (const storeResultsPerQuery of annResultsPerQuery) {
-				for (const storeResults of storeResultsPerQuery) {
-					for (const { entry, similarity } of storeResults) {
-						const existing = bestSimilarityById.get(entry.id);
-						if (!existing || similarity > existing.rawSimilarity) {
-							bestSimilarityById.set(entry.id, { entry, rawSimilarity: similarity });
-						}
+			for (const queryResults of annResultsPerQuery) {
+				for (const { entry, similarity } of queryResults) {
+					const existing = bestSimilarityById.get(entry.id);
+					if (!existing || similarity > existing.rawSimilarity) {
+						bestSimilarityById.set(entry.id, {
+							entry,
+							rawSimilarity: similarity,
+						});
 					}
 				}
 			}
@@ -255,11 +380,14 @@ export class ActivationEngine {
 			}
 		} else {
 			// ── Path B: in-process full scan ───────────────────────────────────────
-			// Fan out across all read stores and merge results.
+			// Fan out across reachable stores and merge results.
 			// Entries from different stores may have overlapping IDs if the same entry
 			// was synced to multiple stores — deduplicate by ID keeping the first occurrence.
-			const allEntriesPerStore = await Promise.all(
-				this.readDbs.map((db) => db.getActiveEntriesWithEmbeddings()),
+			// fanOutSafe tolerates per-store failures — a dead store is skipped.
+			const allEntriesPerStore = await this.fanOutSafe(
+				reachable,
+				(db) => db.getActiveEntriesWithEmbeddings(),
+				"full-scan load",
 			);
 			const entries = allEntriesPerStore.flat().filter((e) => {
 				if (seenIds.has(e.id)) return false;
@@ -314,6 +442,46 @@ export class ActivationEngine {
 			return { entries: [], query: primaryQuery, totalActive };
 		}
 
+		// ── Second stage: cross-encoder rerank ─────────────────────────────────
+		// Dense retrieval (above) is the recall stage — it overfetched
+		// `fetchLimit` candidates per cue. The reranker is the precision stage:
+		// it jointly encodes each (query, candidate) pair and produces a much
+		// sharper relevance signal than cosine similarity over lossy single
+		// vectors. Decay-strength modulation is preserved exactly: the final
+		// ranking score becomes rerankScore × liveStrength (was: rawSimilarity ×
+		// liveStrength), so well-consolidated entries still sort higher.
+		//
+		// Fail-open: any reranker error (model load, inference, timeout) logs a
+		// warning and leaves the dense-only ordering intact.
+		if (this.reranker && scored.length > 1) {
+			// Bound the rerank input: across multiple cues and stores the pool
+			// can exceed `candidates` — keep the dense-best slice.
+			const maxCandidates = config.activation.rerank.candidates;
+			if (scored.length > maxCandidates) {
+				scored.sort((a, b) => b.rawSimilarity - a.rawSimilarity);
+				scored.length = maxCandidates;
+			}
+
+			try {
+				const documents = scored.map((s) =>
+					formatEmbeddingText(s.entry.type, s.entry.content, s.entry.topics),
+				);
+				const scores = await this.reranker.scoreBatch(
+					primaryQuery,
+					documents,
+				);
+				for (let i = 0; i < scored.length; i++) {
+					scored[i].rerankScore = scores[i];
+					scored[i].similarity = scores[i] * scored[i].staleness.strength;
+				}
+			} catch (err) {
+				logger.warn(
+					`[activation] Rerank failed — using dense-only ordering. ` +
+						`Reason: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+		}
+
 		// Sort and cap.
 		scored.sort((a, b) => b.similarity - a.similarity);
 		scored.splice(maxResults);
@@ -344,9 +512,11 @@ export class ActivationEngine {
 		const scoredIdSet = new Set(scored.map(({ entry }) => entry.id));
 
 		if (synthesizedIds.length > 0) {
-			// Fan out support sources lookup across all read stores and merge maps.
-			const sourceMaps = await Promise.all(
-				this.readDbs.map((db) => db.getSupportSourcesForIds(synthesizedIds)),
+			// Fan out support sources lookup across reachable stores and merge maps.
+			const sourceMaps = await this.fanOutSafe(
+				this.reachableReadDbs(),
+				(db) => db.getSupportSourcesForIds(synthesizedIds),
+				"support sources lookup",
 			);
 			const sourcesMap = mergeMaps(sourceMaps);
 
@@ -409,9 +579,11 @@ export class ActivationEngine {
 			.filter(({ entry }) => entry.status === "conflicted")
 			.map(({ entry }) => entry.id);
 
-		// Fan out contradiction pairs lookup across all read stores and merge.
-		const contradictMaps = await Promise.all(
-			this.readDbs.map((db) => db.getContradictPairsForIds(conflictedIds)),
+		// Fan out contradiction pairs lookup across reachable stores and merge.
+		const contradictMaps = await this.fanOutSafe(
+			this.reachableReadDbs(),
+			(db) => db.getContradictPairsForIds(conflictedIds),
+			"contradict pairs lookup",
 		);
 		const contradictPairs = mergeMaps(contradictMaps);
 
@@ -440,10 +612,11 @@ export class ActivationEngine {
 
 		return {
 			entries: scored.map(
-				({ entry, rawSimilarity, similarity, staleness }) => ({
+				({ entry, rawSimilarity, similarity, rerankScore, staleness }) => ({
 					entry: { ...entry, embedding: undefined } as KnowledgeEntry,
 					similarity,
 					rawSimilarity,
+					rerankScore,
 					staleness,
 					contradiction: contradictionMap.get(entry.id),
 				}),

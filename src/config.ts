@@ -365,6 +365,30 @@ export const config = {
 			process.env.ACTIVATION_SIMILARITY_THRESHOLD,
 			DEFAULT_ACTIVATION_SIMILARITY_THRESHOLD,
 		),
+		// Local cross-encoder reranker (second stage of retrieve & re-rank).
+		// Dense retrieval overfetches `candidates` entries for recall; the
+		// in-process cross-encoder (onnxruntime-web WASM, no network/vendor)
+		// then re-scores them for precision. On any failure the engine falls
+		// back to dense-only ordering — reranking never breaks activation.
+		rerank: {
+			// Default on. RERANK_ENABLED=false restores pure dense ordering.
+			enabled: process.env.RERANK_ENABLED !== "false",
+			// Hugging Face model ID. Default is the classic English MS MARCO
+			// cross-encoder (int8 ONNX, ~23MB, ~2ms/pair on Apple Silicon).
+			// For multilingual knowledge bases use a multilingual ONNX
+			// cross-encoder instead (e.g. a jina/bge multilingual reranker export).
+			model: process.env.RERANK_MODEL || "Xenova/ms-marco-MiniLM-L-6-v2",
+			// Cache directory for the downloaded model (one-time ~23MB fetch).
+			modelsDir:
+				process.env.RERANK_MODELS_DIR ||
+				join(homedir(), ".local", "share", "knowledge-server", "models"),
+			// Candidate pool size fetched by dense retrieval when reranking is
+			// active (overfetch). Must be >= activation.maxResults to be useful.
+			candidates: parseIntEnv(process.env.RERANK_CANDIDATES, 40, 1),
+			// Hard timeout per rerank call; on expiry the result is abandoned
+			// and dense-only ordering is used.
+			timeoutMs: parseIntEnv(process.env.RERANK_TIMEOUT_MS, 2_000, 100),
+		},
 	},
 } as const;
 
