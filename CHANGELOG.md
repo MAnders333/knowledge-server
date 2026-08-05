@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.9.1](https://github.com/MAnders333/knowledge-server/compare/v3.9.0...v3.9.1) (2026-08-05)
+
+
+### Bug Fixes
+
+* **activation:** repair reranker WASM load under Bun source/dev runs ([9a906a2](https://github.com/MAnders333/knowledge-server/commit/9a906a27f0eb0de5bc5d9de15b398e109aba4a98))
+* **activation:** repair reranker WASM load under Bun source/dev runs ([56fb7f4](https://github.com/MAnders333/knowledge-server/commit/56fb7f4cf19bae6f2016ea40c5574fa8a25f71ba))
+
 ## [3.9.0](https://github.com/MAnders333/knowledge-server/compare/v3.8.9...v3.9.0) (2026-08-05)
 
 
