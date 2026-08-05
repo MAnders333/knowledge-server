@@ -13,17 +13,18 @@ import {
 	contradictionTagInline,
 	staleTag,
 } from "../activation/format.js";
-import { config, REVIEW_STALE_STRENGTH_THRESHOLD } from "../config.js";
+import { REVIEW_STALE_STRENGTH_THRESHOLD, config } from "../config.js";
 import type { ConsolidationEngine } from "../consolidation/consolidate.js";
 import type { IKnowledgeStore } from "../db/index.js";
-import { KnowledgeService } from "../services/knowledge-service.js";
 import { logger } from "../logger.js";
 import { activateInputSchema } from "../mcp/index.js";
+import { KnowledgeService } from "../services/knowledge-service.js";
 import type {
 	ActivationResult,
 	KnowledgeEntry,
 	KnowledgeStatus,
 } from "../types.js";
+import { withTimeout } from "../utils.js";
 
 /**
  * HTTP API for the knowledge server.
@@ -349,11 +350,20 @@ export function createApp(
 
 	app.get("/review", async (c) => {
 		// Fan out across all readable stores and merge results.
+		// fanOutReads tolerates per-store failures — a dead store is skipped.
 		const allConflicted = (
-			await Promise.all(readDbs.map((s) => s.getEntriesByStatus("conflicted")))
+			await fanOutReads(
+				readDbs,
+				(s) => s.getEntriesByStatus("conflicted"),
+				"review getEntriesByStatus",
+			)
 		).flat();
 		const allActive = (
-			await Promise.all(readDbs.map((s) => s.getActiveEntries()))
+			await fanOutReads(
+				readDbs,
+				(s) => s.getActiveEntries(),
+				"review getActiveEntries",
+			)
 		).flat();
 
 		// Find stale entries (active but low strength)
@@ -375,7 +385,13 @@ export function createApp(
 
 	app.get("/status", async (c) => {
 		// Fan out stats across all stores and sum counts.
-		const allStats = await Promise.all(readDbs.map((s) => s.getStats()));
+		// fanOutReads tolerates per-store failures — a dead store is skipped
+		// and its counts simply omitted from the sum.
+		const allStats = await fanOutReads(
+			readDbs,
+			(s) => s.getStats(),
+			"status getStats",
+		);
 		const stats = allStats.reduce(
 			(acc, s) => ({
 				total: acc.total + s.total,
@@ -449,8 +465,13 @@ export function createApp(
 		const type = c.req.query("type") || undefined;
 
 		// Fan out across all stores — entries in secondary domain stores are included.
+		// fanOutReads tolerates per-store failures — a dead store is skipped.
 		const allEntries = (
-			await Promise.all(readDbs.map((s) => s.getEntries({ status, type })))
+			await fanOutReads(
+				readDbs,
+				(s) => s.getEntries({ status, type }),
+				"entries list",
+			)
 		).flat();
 
 		return c.json({
@@ -462,19 +483,11 @@ export function createApp(
 	app.get("/entries/:id", async (c) => {
 		// Search across all stores — the entry may live in any domain store.
 		const id = c.req.param("id");
-		let entry: KnowledgeEntry | null = null;
-		let entryStore: IKnowledgeStore = db;
-		for (const store of readDbs) {
-			const found = await store.getEntry(id);
-			if (found) {
-				entry = found;
-				entryStore = store;
-				break;
-			}
-		}
-		if (!entry) {
+		const found = await findEntryAcrossStores(readDbs, id);
+		if (!found) {
 			return c.json({ error: "Entry not found" }, 404);
 		}
+		const { entry, store: entryStore } = found;
 
 		const relations = await entryStore.getRelationsFor(entry.id);
 		return c.json({
@@ -494,19 +507,11 @@ export function createApp(
 		}
 
 		const id = c.req.param("id");
-		let entry: KnowledgeEntry | null = null;
-		let entryStore: IKnowledgeStore = db;
-		for (const store of readDbs) {
-			const found = await store.getEntry(id);
-			if (found) {
-				entry = found;
-				entryStore = store;
-				break;
-			}
-		}
-		if (!entry) {
+		const found = await findEntryAcrossStores(readDbs, id);
+		if (!found) {
 			return c.json({ error: "Entry not found" }, 404);
 		}
+		const { entry, store: entryStore } = found;
 
 		let body: Record<string, unknown>;
 		try {
@@ -605,19 +610,11 @@ export function createApp(
 		}
 
 		const resolveId = c.req.param("id");
-		let entry: KnowledgeEntry | null = null;
-		let entryStore: IKnowledgeStore = db;
-		for (const store of readDbs) {
-			const found = await store.getEntry(resolveId);
-			if (found) {
-				entry = found;
-				entryStore = store;
-				break;
-			}
-		}
-		if (!entry) {
+		const found = await findEntryAcrossStores(readDbs, resolveId);
+		if (!found) {
 			return c.json({ error: "Entry not found" }, 404);
 		}
+		const { entry, store: entryStore } = found;
 		if (entry.status !== "conflicted") {
 			return c.json(
 				{ error: `Entry is not conflicted (status: ${entry.status})` },
@@ -815,8 +812,10 @@ export function createApp(
 				});
 
 				const additionalContext = [
+					"<addrl-activated-knowledge>",
 					"Relevant knowledge from your knowledge base:",
 					...lines,
+					"</addrl-activated-knowledge>",
 				].join("\n");
 
 				return c.json({
@@ -842,19 +841,11 @@ export function createApp(
 		}
 
 		const deleteId = c.req.param("id");
-		let entry: KnowledgeEntry | null = null;
-		let entryStore: IKnowledgeStore = db;
-		for (const store of readDbs) {
-			const found = await store.getEntry(deleteId);
-			if (found) {
-				entry = found;
-				entryStore = store;
-				break;
-			}
-		}
-		if (!entry) {
+		const found = await findEntryAcrossStores(readDbs, deleteId);
+		if (!found) {
 			return c.json({ error: "Entry not found" }, 404);
 		}
+		const { entry, store: entryStore } = found;
 
 		// If the entry is conflicted, restore its counterpart to active before deleting.
 		// deleteEntry cascades and removes the contradicts relation, which would otherwise
@@ -890,6 +881,81 @@ export function createApp(
 	});
 
 	return app;
+}
+
+/**
+ * Fan out a read operation across stores, tolerating per-store failures.
+ *
+ * Each store call is wrapped in a per-store timeout. Results are collected via
+ * Promise.allSettled so one dead store (e.g. remote Postgres behind a VPN that
+ * went down) cannot block or reject the entire request — the remaining stores'
+ * results are returned. Failed stores are logged as warnings.
+ *
+ * Used by /status, /review, and /entries which all fan out reads across
+ * readDbs and previously used Promise.all (fail-fast, no timeout).
+ */
+async function fanOutReads<T>(
+	stores: IKnowledgeStore[],
+	fn: (db: IKnowledgeStore) => Promise<T>,
+	label: string,
+	timeoutMs = 5_000,
+): Promise<T[]> {
+	if (stores.length === 0) return [];
+	const results = await Promise.allSettled(
+		stores.map((db) =>
+			Promise.race([
+				fn(db),
+				new Promise<never>((_, reject) =>
+					setTimeout(
+						() => reject(new Error(`timeout after ${timeoutMs / 1000}s`)),
+						timeoutMs,
+					),
+				),
+			]),
+		),
+	);
+	const ok: T[] = [];
+	for (let i = 0; i < results.length; i++) {
+		const r = results[i];
+		if (r.status === "fulfilled") {
+			ok.push(r.value);
+		} else {
+			logger.warn(
+				`[api] Store "${stores[i].id}" failed during ${label} — skipping. ` +
+					`Reason: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`,
+			);
+		}
+	}
+	return ok;
+}
+
+/**
+ * Search for a single entry across stores, tolerating per-store failures.
+ *
+ * Iterates stores sequentially (breaks on first hit) with a per-store timeout
+ * so a dead store is skipped after 5 s rather than hanging the request.
+ * Used by /entries/:id GET, PATCH, resolve, and DELETE handlers.
+ */
+async function findEntryAcrossStores(
+	stores: IKnowledgeStore[],
+	id: string,
+): Promise<{ entry: KnowledgeEntry; store: IKnowledgeStore } | null> {
+	for (const store of stores) {
+		try {
+			const found = await withTimeout(
+				store.getEntry(id),
+				5_000,
+				`getEntry "${id}"`,
+			);
+			if (found) return { entry: found, store };
+		} catch (e) {
+			logger.warn(
+				`[api] Store "${store.id}" failed during getEntry — skipping. ` +
+					`Reason: ${e instanceof Error ? e.message : String(e)}`,
+			);
+		}
+	}
+	return null;
 }
 
 /**

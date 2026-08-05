@@ -66,6 +66,8 @@ function toNum(val: number | string): number {
  */
 export class PostgresKnowledgeDB implements IKnowledgeStore {
 	private sql: postgres.Sql;
+	/** Store ID — set by StoreRegistry; defaults to "postgres" in standalone/test use. */
+	id = "postgres";
 	/**
 	 * Promise-based init lock: null = not started, pending Promise = in-flight,
 	 * resolved Promise = complete. All callers await the same Promise so
@@ -223,9 +225,9 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		// stamps its own version row, so a crash mid-sequence leaves the DB at the
 		// last successfully committed version and restarts cleanly from there.
 		if (currentVersion < SCHEMA_VERSION) {
-			const pending = PG_MIGRATIONS
-				.filter((m) => m.version > currentVersion)
-				.sort((a, b) => a.version - b.version);
+			const pending = PG_MIGRATIONS.filter(
+				(m) => m.version > currentVersion,
+			).sort((a, b) => a.version - b.version);
 
 			if (pending.length > 0) {
 				logger.log(
@@ -246,9 +248,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 					`;
 				});
 				migratedTo = migration.version;
-				logger.log(
-					`[pg-db] Migration v${migration.version} complete.`,
-				);
+				logger.log(`[pg-db] Migration v${migration.version} complete.`);
 			}
 
 			// Safety net: if migrations still didn't reach SCHEMA_VERSION (e.g.
@@ -366,11 +366,13 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				}
 				await this.sql.unsafe(
 					"UPDATE knowledge_entry SET embedding_vec = v.vec::vector " +
-					"FROM (SELECT UNNEST($1::text[]) AS id, UNNEST($2::text[]) AS vec) v " +
-					"WHERE knowledge_entry.id = v.id",
+						"FROM (SELECT UNNEST($1::text[]) AS id, UNNEST($2::text[]) AS vec) v " +
+						"WHERE knowledge_entry.id = v.id",
 					[ids, vecs],
 				);
-				logger.log(`[pg-db] Backfilled embedding_vec for ${toBackfill.length} rows.`);
+				logger.log(
+					`[pg-db] Backfilled embedding_vec for ${toBackfill.length} rows.`,
+				);
 			}
 		} else {
 			// Column exists — check its declared dimension matches metadata.
@@ -389,7 +391,9 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			if (dimRows.length > 0) {
 				// Parse declared type text (e.g. "vector(3072)") instead of relying on
 				// atttypmod encoding, which differs across pgvector/Postgres builds.
-				const declared = String((dimRows[0] as { declared_type: string }).declared_type);
+				const declared = String(
+					(dimRows[0] as { declared_type: string }).declared_type,
+				);
 				const m = declared.match(/\((\d+)\)/);
 				const storedDim = m ? Number(m[1]) : -1;
 				if (storedDim !== -1 && storedDim !== dims) {
@@ -409,7 +413,9 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 							`ALTER TABLE knowledge_entry ADD COLUMN embedding_vec vector(${dims})`,
 						);
 					});
-					logger.log(`[pg-db] Recreated embedding_vec as vector(${dims}). Rows will be backfilled by the re-embed cycle.`);
+					logger.log(
+						`[pg-db] Recreated embedding_vec as vector(${dims}). Rows will be backfilled by the re-embed cycle.`,
+					);
 					// Column is empty — set false so Path B is used until re-embed
 					// populates the column via updateEntry() calls.
 					this.pgvectorReady = false;
@@ -435,11 +441,13 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			}
 			await this.sql.unsafe(
 				"UPDATE knowledge_entry SET embedding_vec = v.vec::vector " +
-				"FROM (SELECT UNNEST($1::text[]) AS id, UNNEST($2::text[]) AS vec) v " +
-				"WHERE knowledge_entry.id = v.id",
+					"FROM (SELECT UNNEST($1::text[]) AS id, UNNEST($2::text[]) AS vec) v " +
+					"WHERE knowledge_entry.id = v.id",
 				[ids, vecs],
 			);
-			logger.log(`[pg-db] Self-healed embedding_vec backfill for ${toBackfill.length} rows.`);
+			logger.log(
+				`[pg-db] Self-healed embedding_vec backfill for ${toBackfill.length} rows.`,
+			);
 		}
 
 		// Create ANN index if absent (idempotent due to IF NOT EXISTS).
@@ -498,7 +506,9 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		}
 
 		this.pgvectorReady = true;
-		logger.log(`[pg-db] pgvector ready (vector(${dims}), halfvec HNSW + exact rerank).`);
+		logger.log(
+			`[pg-db] pgvector ready (vector(${dims}), halfvec HNSW + exact rerank).`,
+		);
 	}
 
 	// ── Helpers ──
@@ -565,13 +575,23 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 					$14, $15::jsonb, $16, $17, $18::vector
 				)`,
 				[
-					entry.id, entry.type, entry.content,
+					entry.id,
+					entry.type,
+					entry.content,
 					this.sql.json(entry.topics),
-					entry.confidence, entry.source, entry.status,
-					entry.strength, entry.createdAt, entry.updatedAt,
-					entry.lastAccessedAt, entry.accessCount, entry.observationCount,
-					entry.supersededBy, this.sql.json(entry.derivedFrom),
-					entry.isSynthesized ? 1 : 0, embeddingBuf,
+					entry.confidence,
+					entry.source,
+					entry.status,
+					entry.strength,
+					entry.createdAt,
+					entry.updatedAt,
+					entry.lastAccessedAt,
+					entry.accessCount,
+					entry.observationCount,
+					entry.supersededBy,
+					this.sql.json(entry.derivedFrom),
+					entry.isSynthesized ? 1 : 0,
+					embeddingBuf,
 					embeddingVec,
 				] as postgres.ParameterOrJSON<never>[],
 			);
@@ -586,13 +606,23 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 					$14, $15::jsonb, $16, $17
 				)`,
 				[
-					entry.id, entry.type, entry.content,
+					entry.id,
+					entry.type,
+					entry.content,
 					this.sql.json(entry.topics),
-					entry.confidence, entry.source, entry.status,
-					entry.strength, entry.createdAt, entry.updatedAt,
-					entry.lastAccessedAt, entry.accessCount, entry.observationCount,
-					entry.supersededBy, this.sql.json(entry.derivedFrom),
-					entry.isSynthesized ? 1 : 0, embeddingBuf,
+					entry.confidence,
+					entry.source,
+					entry.status,
+					entry.strength,
+					entry.createdAt,
+					entry.updatedAt,
+					entry.lastAccessedAt,
+					entry.accessCount,
+					entry.observationCount,
+					entry.supersededBy,
+					this.sql.json(entry.derivedFrom),
+					entry.isSynthesized ? 1 : 0,
+					embeddingBuf,
 				] as postgres.ParameterOrJSON<never>[],
 			);
 		}
@@ -1128,9 +1158,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		const safeType = clampKnowledgeType(updates.type);
 		const embeddingBuf = embedding ? floatsToBuffer(embedding) : null;
 		const embeddingVec =
-			this.pgvectorReady && embedding
-				? floatsToVectorLiteral(embedding)
-				: null;
+			this.pgvectorReady && embedding ? floatsToVectorLiteral(embedding) : null;
 		const now = Date.now();
 
 		// Three-way branch on pgvectorReady + whether an embedding was provided:
@@ -1151,11 +1179,13 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				    embedding_vec = $8::vector
 				WHERE id = $9`,
 				[
-					updates.content, safeType,
+					updates.content,
+					safeType,
 					this.sql.json(updates.topics),
 					updates.confidence,
 					this.sql.json(mergedSources),
-					now, embeddingBuf,
+					now,
+					embeddingBuf,
 					embeddingVec,
 					id,
 				] as postgres.ParameterOrJSON<never>[],
@@ -1176,11 +1206,13 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				    embedding_vec = NULL
 				WHERE id = $8`,
 				[
-					updates.content, safeType,
+					updates.content,
+					safeType,
 					this.sql.json(updates.topics),
 					updates.confidence,
 					this.sql.json(mergedSources),
-					now, embeddingBuf,
+					now,
+					embeddingBuf,
 					id,
 				] as postgres.ParameterOrJSON<never>[],
 			);
@@ -1197,11 +1229,13 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				    embedding = $7
 				WHERE id = $8`,
 				[
-					updates.content, safeType,
+					updates.content,
+					safeType,
 					this.sql.json(updates.topics),
 					updates.confidence,
 					this.sql.json(mergedSources),
-					now, embeddingBuf,
+					now,
+					embeddingBuf,
 					id,
 				] as postgres.ParameterOrJSON<never>[],
 			);
@@ -1442,7 +1476,10 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		threshold: number,
 		statuses: KnowledgeStatus[] = ["active", "conflicted"],
 	): Promise<
-		Array<{ entry: KnowledgeEntry & { embedding: number[] }; similarity: number }>
+		Array<{
+			entry: KnowledgeEntry & { embedding: number[] };
+			similarity: number;
+		}>
 	> {
 		if (!this.pgvectorReady || this.embeddingDims === null) return [];
 
@@ -1486,8 +1523,13 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				entry: this.rowToEntry(r) as KnowledgeEntry & { embedding: number[] },
 				similarity: Number(r.similarity),
 			}))
-			.filter((r): r is { entry: KnowledgeEntry & { embedding: number[] }; similarity: number } =>
-				!!r.entry.embedding,
+			.filter(
+				(
+					r,
+				): r is {
+					entry: KnowledgeEntry & { embedding: number[] };
+					similarity: number;
+				} => !!r.entry.embedding,
 			);
 	}
 
@@ -1509,7 +1551,11 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		minSimilarity: number,
 		maxSimilarity: number,
 	): Promise<Array<KnowledgeEntry & { embedding: number[] }>> {
-		if (!this.pgvectorReady || this.embeddingDims === null || topics.length === 0)
+		if (
+			!this.pgvectorReady ||
+			this.embeddingDims === null ||
+			topics.length === 0
+		)
 			return [];
 
 		const vectorLiteral = floatsToVectorLiteral(queryVector);

@@ -120,6 +120,14 @@ export interface IServerStateDB {
  * Does NOT hold staging or bookkeeping tables — those live in IServerStateDB.
  */
 export interface IKnowledgeStore {
+	/**
+	 * Store identifier from config.jsonc (e.g. "work", "personal").
+	 * Set by StoreRegistry after construction. Defaults to the store kind
+	 * ("sqlite" / "postgres") when not set through the registry (e.g. in tests).
+	 * Used for logging in fan-out error paths.
+	 */
+	id: string;
+
 	// ── Entry CRUD ──
 
 	insertEntry(
@@ -332,7 +340,10 @@ export interface IKnowledgeStore {
 		threshold: number,
 		statuses?: KnowledgeStatus[],
 	): Promise<
-		Array<{ entry: KnowledgeEntry & { embedding: number[] }; similarity: number }>
+		Array<{
+			entry: KnowledgeEntry & { embedding: number[] };
+			similarity: number;
+		}>
 	>;
 
 	// ── Consolidation Lock ──────────────────────────────────────────────────

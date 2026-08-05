@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { ActivationEngine } from "../src/activation/activate";
 import { KnowledgeDB } from "../src/db/sqlite/index";
 import { StoreRegistry } from "../src/db/store-registry";
-import { makeEntry, fakeEmbedding } from "./fixtures";
+import { fakeEmbedding, makeEntry } from "./fixtures";
 
 describe("StoreRegistry", () => {
 	let tempDir: string;
@@ -207,5 +207,84 @@ describe("ActivationEngine multi-store fan-out", () => {
 
 		const result = await engine.activate("only store");
 		expect(result.entries.map((e) => e.entry.id)).toContain("e1");
+	});
+
+	it("returns results from healthy stores when one store throws", async () => {
+		// Simulate a dead store: db2.getActiveEntriesWithEmbeddings throws.
+		// The activation should still return entries from db1.
+		await db1.insertEntry(
+			makeEntry({
+				id: "e1",
+				content: "entry from healthy store",
+				embedding: fakeEmbedding("entry from healthy store"),
+			}),
+		);
+		await db2.insertEntry(
+			makeEntry({
+				id: "e2",
+				content: "entry from dead store",
+				embedding: fakeEmbedding("entry from dead store"),
+			}),
+		);
+
+		// Set store IDs so warnings are meaningful
+		db1.id = "healthy";
+		db2.id = "dead";
+
+		const engine = new ActivationEngine(db1, [db1, db2]);
+		spyOn(engine.embeddings, "embedBatch").mockResolvedValue([
+			fakeEmbedding("entry from healthy store"),
+		]);
+		// Make db2 throw on full-scan load (Path B — neither store has ANN)
+		spyOn(db2, "getActiveEntriesWithEmbeddings").mockRejectedValue(
+			new Error("connection refused"),
+		);
+
+		const result = await engine.activate("entry from healthy store");
+
+		const ids = result.entries.map((e) => e.entry.id);
+		expect(ids).toContain("e1");
+		expect(ids).not.toContain("e2");
+	});
+
+	it("skips a previously-failed store on subsequent calls (health tracking)", async () => {
+		await db1.insertEntry(
+			makeEntry({
+				id: "e1",
+				content: "healthy entry",
+				embedding: fakeEmbedding("healthy entry"),
+			}),
+		);
+		await db2.insertEntry(
+			makeEntry({
+				id: "e2",
+				content: "dead entry",
+				embedding: fakeEmbedding("dead entry"),
+			}),
+		);
+
+		db1.id = "healthy";
+		db2.id = "dead";
+
+		const engine = new ActivationEngine(db1, [db1, db2]);
+		spyOn(engine.embeddings, "embedBatch").mockResolvedValue([
+			fakeEmbedding("healthy entry"),
+		]);
+		// db2 always fails
+		const failSpy = spyOn(
+			db2,
+			"getActiveEntriesWithEmbeddings",
+		).mockRejectedValue(new Error("connection refused"));
+
+		// First call — db2 is tried and fails
+		const result1 = await engine.activate("healthy entry");
+		expect(result1.entries.map((e) => e.entry.id)).toContain("e1");
+		expect(failSpy).toHaveBeenCalledTimes(1);
+
+		// Second call — db2 should be skipped (health tracking), not retried
+		const result2 = await engine.activate("healthy entry");
+		expect(result2.entries.map((e) => e.entry.id)).toContain("e1");
+		// failSpy still at 1 — db2 was not called again
+		expect(failSpy).toHaveBeenCalledTimes(1);
 	});
 });

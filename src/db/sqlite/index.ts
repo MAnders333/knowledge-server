@@ -32,6 +32,8 @@ export class KnowledgeDB implements IKnowledgeStore {
 	private db: Database;
 	/** Absolute path to the SQLite file — exposed for migration tooling. */
 	readonly dbPath: string;
+	/** Store ID — set by StoreRegistry; defaults to "sqlite" in standalone/test use. */
+	id = "sqlite";
 
 	/**
 	 * @param dbPath Path to the SQLite DB file. Defaults to DEFAULT_SQLITE_PATH

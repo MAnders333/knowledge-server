@@ -8,11 +8,11 @@ import {
 import type { KnowledgeServerConfig, StoreConfig } from "../config-file.js";
 import { DomainRouter } from "../consolidation/domain-router.js";
 import { logger } from "../logger.js";
-import { KnowledgeDB } from "./sqlite/index.js";
 import type { IKnowledgeStore, IServerStateDB } from "./interface.js";
 import { PostgresKnowledgeDB } from "./postgres/index.js";
-import { PostgresServerStateDB } from "./state/postgres.js";
+import { KnowledgeDB } from "./sqlite/index.js";
 import { ServerStateDB } from "./state/index.js";
+import { PostgresServerStateDB } from "./state/postgres.js";
 
 /**
  * StoreRegistry — manages a configured set of IKnowledgeStore instances.
@@ -273,7 +273,9 @@ async function initStore(storeConfig: StoreConfig): Promise<IKnowledgeStore> {
 	if (storeConfig.kind === "sqlite") {
 		const path = resolveSqlitePath(storeConfig);
 		logger.log(`[db] Store "${storeConfig.id}": SQLite at ${path}`);
-		return new KnowledgeDB(path);
+		const db = new KnowledgeDB(path);
+		db.id = storeConfig.id;
+		return db;
 	}
 
 	if (storeConfig.kind === "postgres") {
@@ -290,6 +292,7 @@ async function initStore(storeConfig: StoreConfig): Promise<IKnowledgeStore> {
 			`[db] Store "${storeConfig.id}": PostgreSQL at ${redactUri(uri)}`,
 		);
 		const db = new PostgresKnowledgeDB(uri);
+		db.id = storeConfig.id;
 		try {
 			await db.initialize();
 		} catch (e) {
