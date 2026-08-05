@@ -146,7 +146,17 @@ export class LocalReranker implements RerankScorer {
 			// biome-ignore lint/suspicious/noExplicitAny: env typing is partial
 			const wasmEnv = (ort.env as any).wasm;
 			wasmEnv.numThreads = 1; // worker spawn fails under Bun (fetch of local URL)
-			wasmEnv.wasmPaths = { mjs: wasmRuntimeMjs, wasm: wasmRuntimeBin };
+			// Bun's `with { type: "file" }` import attribute caches the module
+			// as a path string, which breaks ORT's internal
+			// `await import(mjsPath).default` in source/dev runs — it gets the
+			// path string instead of the ortWasmThreaded factory, producing
+			// "TypeError: c is not a function". In compiled binaries the
+			// /$bunfs/ virtual path imports correctly, so we only need a
+			// cache-busting query suffix for real filesystem paths.
+			const mjsPath = wasmRuntimeMjs.includes("/$bunfs/")
+				? wasmRuntimeMjs
+				: `${wasmRuntimeMjs}?import`;
+			wasmEnv.wasmPaths = { mjs: mjsPath, wasm: wasmRuntimeBin };
 		} catch {
 			// onnxruntime-web version differences — non-fatal.
 		}
