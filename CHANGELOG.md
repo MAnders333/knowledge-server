@@ -1,5 +1,20 @@
 # Changelog
 
+## [3.9.0](https://github.com/MAnders333/knowledge-server/compare/v3.8.9...v3.9.0) (2026-08-05)
+
+
+### Features
+
+* **activation:** add local cross-encoder rerank stage ([00276ac](https://github.com/MAnders333/knowledge-server/commit/00276ac38d6e3132960b5e5513e3eb6f673c02d3))
+* **activation:** add pi knowledge extension + setup-tool pi ([1c78722](https://github.com/MAnders333/knowledge-server/commit/1c787227e62a7c0dc8b30a0460b7a0e4427f7bca))
+* **daemon:** add pi session reader ([234a00e](https://github.com/MAnders333/knowledge-server/commit/234a00e1140f5b34396c6cc8952c4a6f8322326f))
+* **db:** multi-store support with per-store ids and fan-out ([21f1161](https://github.com/MAnders333/knowledge-server/commit/21f116191a9075621f09af8565899d43e5c0e18a))
+
+
+### Bug Fixes
+
+* **activation:** make reranker work in single-file compiled binaries ([ce4552c](https://github.com/MAnders333/knowledge-server/commit/ce4552c9bb5f449335190396ab9cd6507e69f105))
+
 ## [3.8.9](https://github.com/MAnders333/knowledge-server/compare/v3.8.8...v3.8.9) (2026-06-07)
 
 
