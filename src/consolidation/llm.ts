@@ -94,6 +94,43 @@ function createAnthropicOAuthFetch(): typeof globalThis.fetch {
 }
 
 /**
+ * Request-body transform that renames `max_tokens` → `max_completion_tokens`.
+ *
+ * The Vercel AI SDK's OpenAI-compatible provider always emits `max_tokens`,
+ * but newer OpenAI models (gpt-5.x, o-series) reject that parameter and
+ * require `max_completion_tokens` instead. Installed on the provider via
+ * `transformRequestBody` when OPENAI_MAX_TOKENS_PARAM=max_completion_tokens
+ * is configured. Exported for testing.
+ */
+export function renameMaxTokensParam(
+	args: Record<string, unknown>,
+): Record<string, unknown> {
+	if (args.max_tokens == null) return args;
+	const { max_tokens: maxTokens, ...rest } = args;
+	return { ...rest, max_completion_tokens: maxTokens };
+}
+
+/**
+ * Request-body transform that omits the given parameters.
+ *
+ * Some OpenAI-compatible models reject non-default sampling parameters
+ * outright — gpt-5.x/o-series reasoning models only accept the default
+ * temperature (1), so the hardcoded `temperature: 0.2` in complete() fails
+ * with HTTP 400. Installed on the provider via `transformRequestBody` with
+ * the OPENAI_DROP_PARAMS list. Exported for testing.
+ */
+export function omitRequestParams(
+	args: Record<string, unknown>,
+	params: readonly string[],
+): Record<string, unknown> {
+	if (params.length === 0) return args;
+	const drop = new Set(params);
+	return Object.fromEntries(
+		Object.entries(args).filter(([key]) => !drop.has(key)),
+	);
+}
+
+/**
  * Provider routing based on model string prefix.
  *
  * Model format: "provider/model-name"
@@ -160,10 +197,27 @@ function createModel(modelString: string) {
 				(config.llm.baseEndpoint
 					? `${config.llm.baseEndpoint}/openai/v1`
 					: "https://api.openai.com/v1");
+			// Transport-boundary fixes for picky OpenAI-compatible models:
+			// gpt-5.x/o-series reject the legacy `max_tokens` parameter and/or
+			// non-default sampling parameters (e.g. temperature). The SDK always
+			// emits them; rewrite the body when configured — by default no
+			// transform is installed and the request passes through untouched.
+			const { maxTokensParam, dropParams } = config.llm.openai;
 			const provider = createOpenAICompatible({
 				name: providerName,
 				baseURL,
 				apiKey,
+				...(maxTokensParam === "max_completion_tokens" || dropParams.length > 0
+					? {
+							transformRequestBody: (args: Record<string, unknown>) => {
+								let body = args;
+								if (maxTokensParam === "max_completion_tokens") {
+									body = renameMaxTokensParam(body);
+								}
+								return omitRequestParams(body, dropParams);
+							},
+						}
+					: {}),
 			});
 			return provider.chatModel(modelId);
 		}
