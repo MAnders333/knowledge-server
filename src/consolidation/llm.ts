@@ -94,6 +94,23 @@ function createAnthropicOAuthFetch(): typeof globalThis.fetch {
 }
 
 /**
+ * Request-body transform that renames `max_tokens` → `max_completion_tokens`.
+ *
+ * The Vercel AI SDK's OpenAI-compatible provider always emits `max_tokens`,
+ * but newer OpenAI models (gpt-5.x, o-series) reject that parameter and
+ * require `max_completion_tokens` instead. Installed on the provider via
+ * `transformRequestBody` when OPENAI_MAX_TOKENS_PARAM=max_completion_tokens
+ * is configured. Exported for testing.
+ */
+export function renameMaxTokensParam(
+	args: Record<string, unknown>,
+): Record<string, unknown> {
+	if (args.max_tokens == null) return args;
+	const { max_tokens: maxTokens, ...rest } = args;
+	return { ...rest, max_completion_tokens: maxTokens };
+}
+
+/**
  * Provider routing based on model string prefix.
  *
  * Model format: "provider/model-name"
@@ -164,6 +181,13 @@ function createModel(modelString: string) {
 				name: providerName,
 				baseURL,
 				apiKey,
+				// Newer OpenAI models (gpt-5.x, o-series) reject the legacy
+				// `max_tokens` parameter and require `max_completion_tokens`.
+				// The SDK always emits `max_tokens`; rename it at the transport
+				// boundary when configured — default keeps legacy behaviour.
+				...(config.llm.openai.maxTokensParam === "max_completion_tokens"
+					? { transformRequestBody: renameMaxTokensParam }
+					: {}),
 			});
 			return provider.chatModel(modelId);
 		}

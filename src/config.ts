@@ -197,6 +197,16 @@ export const config = {
 		openai: {
 			baseURL: process.env.OPENAI_BASE_URL || "",
 			apiKey: process.env.OPENAI_API_KEY || "",
+			// Name of the request parameter carrying the output-token limit on
+			// OpenAI-compatible chat calls. The AI SDK always emits `max_tokens`;
+			// newer OpenAI models (gpt-5.x, o-series) reject it and require
+			// `max_completion_tokens` instead. Set OPENAI_MAX_TOKENS_PARAM to
+			// "max_completion_tokens" for those; anything else keeps the legacy
+			// default. Validated in validateConfig().
+			maxTokensParam:
+				process.env.OPENAI_MAX_TOKENS_PARAM === "max_completion_tokens"
+					? "max_completion_tokens"
+					: "max_tokens",
 		},
 		google: {
 			baseURL: process.env.GOOGLE_BASE_URL || "",
@@ -503,6 +513,19 @@ export function validateConfig(): string[] {
 				`No LLM credentials configured. Edit ${envPath} and set one of:\n    ANTHROPIC_API_KEY (direct Anthropic)\n    OPENAI_API_KEY (direct OpenAI-compatible)\n    GOOGLE_API_KEY (direct Google)\n    LLM_BASE_ENDPOINT + LLM_API_KEY (unified proxy)\n  Or run \`knowledge-server claude-auth\` to authenticate with a Claude Pro/Max subscription.`,
 			);
 		}
+	}
+
+	// Validate OPENAI_MAX_TOKENS_PARAM — only two values are meaningful. An
+	// invalid value would silently fall back to `max_tokens` at call time,
+	// leaving the user wondering why the setting has no effect.
+	if (
+		process.env.OPENAI_MAX_TOKENS_PARAM !== undefined &&
+		process.env.OPENAI_MAX_TOKENS_PARAM !== "max_tokens" &&
+		process.env.OPENAI_MAX_TOKENS_PARAM !== "max_completion_tokens"
+	) {
+		errors.push(
+			`OPENAI_MAX_TOKENS_PARAM must be "max_tokens" or "max_completion_tokens" (got "${process.env.OPENAI_MAX_TOKENS_PARAM}").`,
+		);
 	}
 
 	// Warn when a dedicated embedding endpoint is configured but no API key is

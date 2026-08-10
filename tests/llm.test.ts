@@ -10,7 +10,11 @@
  */
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as aiModule from "ai";
-import { ConsolidationLLM, formatEpisodes } from "../src/consolidation/llm";
+import {
+	ConsolidationLLM,
+	formatEpisodes,
+	renameMaxTokensParam,
+} from "../src/consolidation/llm";
 import type { Episode } from "../src/types";
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -575,5 +579,32 @@ describe("ConsolidationLLM.synthesizePrinciple", () => {
 		expect(results).toHaveLength(2);
 		expect(results[0].type).toBe("principle");
 		expect(results[1].type).toBe("pattern");
+	});
+});
+
+// ── renameMaxTokensParam ───────────────────────────────────────────────────────
+
+describe("renameMaxTokensParam", () => {
+	it("renames max_tokens to max_completion_tokens, preserving the value", () => {
+		expect(
+			renameMaxTokensParam({
+				model: "gpt-5.6-luna",
+				max_tokens: 8192,
+				temperature: 0.2,
+			}),
+		).toEqual({
+			model: "gpt-5.6-luna",
+			max_completion_tokens: 8192,
+			temperature: 0.2,
+		});
+	});
+
+	it("leaves bodies without max_tokens untouched", () => {
+		const body = { model: "gpt-5.6-luna", messages: [] };
+		expect(renameMaxTokensParam(body)).toEqual(body);
+	});
+
+	it("passes through an absent max_tokens instead of emitting an undefined value", () => {
+		expect(renameMaxTokensParam({ max_tokens: undefined })).toEqual({});
 	});
 });
