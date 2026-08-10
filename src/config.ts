@@ -207,6 +207,16 @@ export const config = {
 				process.env.OPENAI_MAX_TOKENS_PARAM === "max_completion_tokens"
 					? "max_completion_tokens"
 					: "max_tokens",
+			// Comma-separated request parameters to omit from OpenAI-compatible
+			// chat calls. Some models reject non-default sampling parameters
+			// outright — gpt-5.x/o-series reasoning models only accept the default
+			// temperature (1), so the hardcoded temperature in the request fails
+			// with HTTP 400. Typical usage: OPENAI_DROP_PARAMS=temperature
+			dropParams: process.env.OPENAI_DROP_PARAMS
+				? process.env.OPENAI_DROP_PARAMS.split(",")
+						.map((s) => s.trim())
+						.filter(Boolean)
+				: [],
 		},
 		google: {
 			baseURL: process.env.GOOGLE_BASE_URL || "",

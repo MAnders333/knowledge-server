@@ -350,6 +350,7 @@ Provider-specific credentials take precedence over the unified endpoint.
 | `LLM_TIMEOUT_MS` | `300000` | Per-call LLM timeout in ms |
 | `LLM_MAX_RETRIES` | `2` | Retry attempts on timeout/error |
 | `OPENAI_MAX_TOKENS_PARAM` | `max_tokens` | Token-limit parameter sent on OpenAI-compatible calls. Set to `max_completion_tokens` for newer OpenAI models (gpt-5.x, o-series) that reject `max_tokens` |
+| `OPENAI_DROP_PARAMS` | *(none)* | Comma-separated request parameters to omit from OpenAI-compatible calls (e.g. `temperature` for gpt-5.x/o-series models that only accept the default value) |
 
 ### Embeddings
 

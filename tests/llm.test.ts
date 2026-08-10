@@ -13,6 +13,7 @@ import * as aiModule from "ai";
 import {
 	ConsolidationLLM,
 	formatEpisodes,
+	omitRequestParams,
 	renameMaxTokensParam,
 } from "../src/consolidation/llm";
 import type { Episode } from "../src/types";
@@ -606,5 +607,34 @@ describe("renameMaxTokensParam", () => {
 
 	it("passes through an absent max_tokens instead of emitting an undefined value", () => {
 		expect(renameMaxTokensParam({ max_tokens: undefined })).toEqual({});
+	});
+});
+
+// ── omitRequestParams ─────────────────────────────────────────────────────────
+
+describe("omitRequestParams", () => {
+	it("removes the listed parameters, preserving the rest", () => {
+		expect(
+			omitRequestParams(
+				{
+					model: "gpt-5.6-luna",
+					temperature: 0.2,
+					top_p: 0.9,
+					max_completion_tokens: 8192,
+				},
+				["temperature", "top_p"],
+			),
+		).toEqual({ model: "gpt-5.6-luna", max_completion_tokens: 8192 });
+	});
+
+	it("ignores parameters that are not present in the body", () => {
+		expect(omitRequestParams({ model: "m" }, ["temperature"])).toEqual({
+			model: "m",
+		});
+	});
+
+	it("returns the body unchanged when the list is empty", () => {
+		const body = { model: "m", temperature: 0.2 };
+		expect(omitRequestParams(body, [])).toEqual(body);
 	});
 });
