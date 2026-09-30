@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { type AddressInfo, type Socket, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ActivationEngine } from "../src/activation/activate";
 import { KnowledgeDB } from "../src/db/sqlite/index";
 import { StoreRegistry } from "../src/db/store-registry";
+import * as loggerModule from "../src/logger";
 import { fakeEmbedding, makeEntry } from "./fixtures";
 
 describe("StoreRegistry", () => {
@@ -107,6 +109,114 @@ describe("StoreRegistry", () => {
 
 		expect(closeSpy0).toHaveBeenCalledTimes(1);
 		expect(closeSpy1).toHaveBeenCalledTimes(1);
+	});
+
+	// ── Degraded init (unreachable / accepting-but-silent servers) ────────────
+
+	function startStallServer(): Promise<{
+		server: ReturnType<typeof createServer>;
+		port: number;
+		sockets: Set<Socket>;
+	}> {
+		return new Promise((resolve) => {
+			const sockets = new Set<Socket>();
+			// Accepts TCP but never speaks the Postgres protocol — the shape of a
+			// proxy whose backend is down: nothing in initStore can reject on its own.
+			const server = createServer((socket) => {
+				sockets.add(socket);
+				socket.on("close", () => sockets.delete(socket));
+			});
+			server.listen(0, "127.0.0.1", () => {
+				const { port } = server.address() as AddressInfo;
+				resolve({ server, port, sockets });
+			});
+		});
+	}
+
+	function restoreTimeoutEnv(previous: string | undefined): void {
+		// "" reads as absent to parseIntEnv (NaN -> default), so this restores
+		// the unset state without the delete operator.
+		process.env.STORE_INIT_TIMEOUT_MS = previous ?? "";
+	}
+
+	it("bounds an accepting-but-silent store, excludes it, and warns immediately", async () => {
+		const { server, port, sockets } = await startStallServer();
+		const previousTimeout = process.env.STORE_INIT_TIMEOUT_MS;
+		process.env.STORE_INIT_TIMEOUT_MS = "500";
+		const warnSpy = spyOn(loggerModule.logger, "warn");
+		const configPath = join(tempDir, "config.jsonc");
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				stores: [
+					{
+						id: "tunnel",
+						kind: "postgres",
+						uri: `postgres://user@127.0.0.1:${port}/knowledge`,
+						writable: false,
+					},
+					{
+						id: "main",
+						kind: "sqlite",
+						path: join(tempDir, "degraded.db"),
+						writable: true,
+					},
+				],
+			}),
+		);
+
+		try {
+			const started = Date.now();
+			const registry = await StoreRegistry.create(configPath);
+			try {
+				expect(Date.now() - started).toBeLessThan(4_000);
+				expect(registry.unavailableStoreIds.has("tunnel")).toBe(true);
+				expect(registry.readStores()).toHaveLength(1);
+				expect(registry.writableStore()).toBeInstanceOf(KnowledgeDB);
+				expect(warnSpy).toHaveBeenCalledWith(
+					expect.stringContaining('Store "tunnel" is unavailable'),
+				);
+			} finally {
+				await registry.close();
+			}
+		} finally {
+			warnSpy.mockRestore();
+			restoreTimeoutEnv(previousTimeout);
+			for (const socket of sockets) socket.destroy();
+			server.close();
+		}
+	});
+
+	it("hard-fails promptly when the only writable store hangs, instead of blocking forever", async () => {
+		const { server, port, sockets } = await startStallServer();
+		const previousTimeout = process.env.STORE_INIT_TIMEOUT_MS;
+		process.env.STORE_INIT_TIMEOUT_MS = "500";
+		const configPath = join(tempDir, "config.jsonc");
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				stores: [
+					{
+						id: "only",
+						kind: "postgres",
+						uri: `postgres://user@127.0.0.1:${port}/knowledge`,
+						writable: true,
+					},
+				],
+			}),
+		);
+
+		try {
+			const started = Date.now();
+			await expect(StoreRegistry.create(configPath)).rejects.toThrow(
+				/No writable stores are reachable/,
+			);
+			expect(Date.now() - started).toBeLessThan(4_000);
+		} finally {
+			restoreTimeoutEnv(previousTimeout);
+			for (const socket of sockets) socket.destroy();
+			server.close();
+		}
 	});
 
 	// ── Error cases ────────────────────────────────────────────────────────────
