@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.9.2](https://github.com/MAnders333/knowledge-server/compare/v3.9.1...v3.9.2) (2026-09-30)
+
+
+### Bug Fixes
+
+* **db:** bound store init so a silent store cannot block degraded startup ([f6ae24f](https://github.com/MAnders333/knowledge-server/commit/f6ae24f4edee16020b824b5c1cb2cc4d41467630))
+* **db:** bound store init so a silent store cannot block degraded startup ([3209277](https://github.com/MAnders333/knowledge-server/commit/3209277f446c348414a21c30012e5019f345a096))
+* **llm:** add OPENAI_DROP_PARAMS to omit unsupported request parameters ([0a9a34a](https://github.com/MAnders333/knowledge-server/commit/0a9a34ae1227319806cad35aa41da9c318aba5d8))
+* **llm:** configurable OpenAI-compatible request transforms for gpt-5.x/o-series models ([9ce754f](https://github.com/MAnders333/knowledge-server/commit/9ce754fc3221c07dfc139826c423e252559d883c))
+* **llm:** make OpenAI token-limit parameter configurable via OPENAI_MAX_TOKENS_PARAM ([b101239](https://github.com/MAnders333/knowledge-server/commit/b101239f69ff7af36fb5aa952de45c932d8b7412))
+
 ## [3.9.1](https://github.com/MAnders333/knowledge-server/compare/v3.9.0...v3.9.1) (2026-08-05)
 
 
