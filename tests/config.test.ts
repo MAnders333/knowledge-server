@@ -18,19 +18,20 @@ import { validateConfig } from "../src/config";
 
 // ── env var helpers ───────────────────────────────────────────────────────────
 
-const FLOAT_VARS = [
+const ENV_VARS = [
 	"DECAY_ARCHIVE_THRESHOLD",
 	"RECONSOLIDATION_SIMILARITY_THRESHOLD",
 	"CONTRADICTION_MIN_SIMILARITY",
 	"ACTIVATION_SIMILARITY_THRESHOLD",
 	"EMBEDDING_DIMENSIONS",
+	"OPENAI_MAX_TOKENS_PARAM",
 ] as const;
 
-type FloatVar = (typeof FLOAT_VARS)[number];
-const snapshot: Partial<Record<FloatVar, string>> = {};
+type EnvVar = (typeof ENV_VARS)[number];
+const snapshot: Partial<Record<EnvVar, string>> = {};
 
 beforeEach(() => {
-	for (const v of FLOAT_VARS) {
+	for (const v of ENV_VARS) {
 		snapshot[v] = process.env[v];
 		// Unset each optional validator so the baseline is clean for each test
 		Reflect.deleteProperty(process.env, v);
@@ -38,7 +39,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-	for (const v of FLOAT_VARS) {
+	for (const v of ENV_VARS) {
 		if (snapshot[v] === undefined) {
 			Reflect.deleteProperty(process.env, v);
 		} else {
@@ -47,18 +48,18 @@ afterEach(() => {
 	}
 });
 
-/** Only the float-range and EMBEDDING_DIMENSIONS errors — filters out the
+/** Only the errors for the env vars under test — filters out the
  *  singleton-sourced errors (LLM_API_KEY, LLM_BASE_ENDPOINT, host, opencodeDbPath)
  *  that depend on how the test process was launched. */
 function envErrors(): string[] {
-	return validateConfig().filter((e) => FLOAT_VARS.some((v) => e.includes(v)));
+	return validateConfig().filter((e) => ENV_VARS.some((v) => e.includes(v)));
 }
 
 // ── baseline ──────────────────────────────────────────────────────────────────
 
 describe("validateConfig — float-range baseline (all optional vars unset)", () => {
 	it("produces no float-range errors when optional vars are unset", () => {
-		// All FLOAT_VARS are deleted in beforeEach — validateConfig should skip them.
+		// All ENV_VARS are deleted in beforeEach — validateConfig should skip them.
 		expect(envErrors()).toEqual([]);
 	});
 });
@@ -260,6 +261,38 @@ describe("validateConfig — EMBEDDING_DIMENSIONS", () => {
 		// Already deleted in beforeEach
 		expect(
 			envErrors().filter((e) => e.includes("EMBEDDING_DIMENSIONS")),
+		).toHaveLength(0);
+	});
+});
+
+// ── OPENAI_MAX_TOKENS_PARAM ───────────────────────────────────────────────────
+
+describe("validateConfig — OPENAI_MAX_TOKENS_PARAM", () => {
+	it("accepts max_tokens", () => {
+		process.env.OPENAI_MAX_TOKENS_PARAM = "max_tokens";
+		expect(
+			envErrors().filter((e) => e.includes("OPENAI_MAX_TOKENS_PARAM")),
+		).toHaveLength(0);
+	});
+
+	it("accepts max_completion_tokens", () => {
+		process.env.OPENAI_MAX_TOKENS_PARAM = "max_completion_tokens";
+		expect(
+			envErrors().filter((e) => e.includes("OPENAI_MAX_TOKENS_PARAM")),
+		).toHaveLength(0);
+	});
+
+	it("rejects an unknown parameter name", () => {
+		process.env.OPENAI_MAX_TOKENS_PARAM = "max_output_tokens";
+		expect(envErrors().some((e) => e.includes("OPENAI_MAX_TOKENS_PARAM"))).toBe(
+			true,
+		);
+	});
+
+	it("produces no error when OPENAI_MAX_TOKENS_PARAM is unset", () => {
+		// Already deleted in beforeEach
+		expect(
+			envErrors().filter((e) => e.includes("OPENAI_MAX_TOKENS_PARAM")),
 		).toHaveLength(0);
 	});
 });
