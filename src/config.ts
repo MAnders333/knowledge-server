@@ -156,6 +156,14 @@ export const config = {
 	//   Override with PI_SESSIONS_ROOT (point at ~/.pi or directly at an agent dir).
 	piSessionsRoot: process.env.PI_SESSIONS_ROOT || join(homedir(), ".pi"),
 
+	// ompSessionsRoot: root directory scanned for oh-my-pi (the `omp` harness,
+	//   package @oh-my-pi/pi-coding-agent) session JSONL files. oh-my-pi keeps a
+	//   shared <root>/agent layer plus per-mode layers at
+	//   <root>/profiles/<mode>/agent — the reader scans <root>/agent/sessions and
+	//   every <root>/profiles/<mode>/agent/sessions. Same JSONL format as pi.
+	//   Override with OMP_SESSIONS_ROOT.
+	ompSessionsRoot: process.env.OMP_SESSIONS_ROOT || join(homedir(), ".omp"),
+
 	// Explicit source enable/disable.
 	// All default to true (auto-detect); set to "false" to hard-disable a source.
 	opencodeEnabled: process.env.OPENCODE_ENABLED !== "false",
@@ -165,6 +173,7 @@ export const config = {
 	vscodeEnabled: process.env.VSCODE_ENABLED !== "false",
 	localFilesEnabled: process.env.LOCAL_FILES_ENABLED !== "false",
 	piEnabled: process.env.PI_ENABLED !== "false",
+	ompEnabled: process.env.OMP_ENABLED !== "false",
 
 	// LLM credentials — three tiers, evaluated per-provider at call time:
 	//
