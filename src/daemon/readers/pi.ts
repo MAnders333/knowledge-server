@@ -136,7 +136,7 @@ interface ParsedSession {
  *   where message IDs are the pi entry `id` (8-char hex, unique within a session).
  */
 export class PiEpisodeReader implements IEpisodeReader {
-	readonly source = "pi";
+	readonly source: string;
 
 	private readonly sessionsDirs: string[];
 
@@ -152,9 +152,12 @@ export class PiEpisodeReader implements IEpisodeReader {
 	 * @param sessionsDirs Explicit list of sessions directories to scan
 	 *   (each containing <projectDir>/<file>.jsonl subdirectories).
 	 *   Defaults to resolvePiSessionsDirs(config.piSessionsRoot).
+	 * @param source Source id stamped on produced episodes (idempotency keys).
+	 *   Overridden by the oh-my-pi reader, which shares this parser.
 	 */
-	constructor(sessionsDirs?: string[]) {
+	constructor(sessionsDirs?: string[], source = "pi") {
 		this.sessionsDirs = sessionsDirs ?? resolvePiSessionsDirs();
+		this.source = source;
 	}
 
 	// ── IEpisodeReader implementation ─────────────────────────────────────────

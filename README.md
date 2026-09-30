@@ -142,6 +142,8 @@ The daemon and server share the same database. In single-machine setups this is 
 | **VSCode** | `~/Library/Application Support/Code/User/workspaceStorage/*/chatSessions/*.json` | macOS |
 | **VSCode** | `~/.config/Code/User/workspaceStorage/*/chatSessions/*.json` | Linux |
 | **Local files** | `~/knowledge/*.md` (Markdown) | macOS, Linux |
+| **pi** | `~/.pi/*/sessions/<projectDir>/*.jsonl` (JSONL session logs, v3) | macOS, Linux |
+| **oh-my-pi (omp)** | `~/.omp/agent/sessions/**` and `~/.omp/profiles/*/agent/sessions/**` (JSONL, v3) | macOS, Linux |
 
 All sources are auto-detected. Disable any with `OPENCODE_ENABLED=false`, etc. Override a path with `OPENCODE_DB_PATH`, etc.
 
@@ -402,6 +404,10 @@ All sources are auto-detected. Override paths or disable sources via environment
 | `VSCODE_ENABLED` | `true` | Set to `false` to disable |
 | `LOCAL_FILES_DIR` | `~/knowledge` | Markdown files to ingest |
 | `LOCAL_FILES_ENABLED` | `true` | Set to `false` to disable |
+| `PI_SESSIONS_ROOT` | `~/.pi` | pi sessions root (scans `<root>/*/sessions`) |
+| `PI_ENABLED` | `true` | Set to `false` to disable |
+| `OMP_SESSIONS_ROOT` | `~/.omp` | oh-my-pi sessions root (scans shared + profile layers) |
+| `OMP_ENABLED` | `true` | Set to `false` to disable |
 
 ### Consolidation
 

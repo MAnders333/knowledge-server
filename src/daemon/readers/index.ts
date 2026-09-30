@@ -7,6 +7,7 @@ import { ClaudeCodeEpisodeReader } from "./claude-code.js";
 import { CodexEpisodeReader, resolveCodexSessionsDir } from "./codex.js";
 import { CursorEpisodeReader, resolveCursorDbPath } from "./cursor.js";
 import { LocalFilesEpisodeReader } from "./local-files.js";
+import { OhMyPiEpisodeReader, resolveOhMyPiSessionsDirs } from "./oh-my-pi.js";
 import { OpenCodeEpisodeReader } from "./opencode.js";
 import { PiEpisodeReader, resolvePiSessionsDirs } from "./pi.js";
 import { VSCodeEpisodeReader, resolveVSCodeDataDir } from "./vscode.js";
@@ -18,6 +19,7 @@ export { CodexEpisodeReader } from "./codex.js";
 export { VSCodeEpisodeReader } from "./vscode.js";
 export { LocalFilesEpisodeReader } from "./local-files.js";
 export { PiEpisodeReader } from "./pi.js";
+export { OhMyPiEpisodeReader, resolveOhMyPiSessionsDirs } from "./oh-my-pi.js";
 
 /**
  * Probe list of candidate OpenCode DB paths to check when OPENCODE_DB_PATH is not set.
@@ -213,6 +215,22 @@ export function createEpisodeReaders(): IEpisodeReader[] {
 		}
 	} else {
 		logger.log("[sources] pi: disabled (PI_ENABLED=false)");
+	}
+
+	// ── oh-my-pi (omp) ──
+	if (config.ompEnabled) {
+		const ompSessionsDirs = resolveOhMyPiSessionsDirs();
+		if (ompSessionsDirs.length > 0) {
+			readers.push(new OhMyPiEpisodeReader(ompSessionsDirs));
+			logger.log(`[sources] oh-my-pi: ${ompSessionsDirs.join(", ")}`);
+		} else {
+			// Same soft-skip as pi: oh-my-pi may not be installed on this machine.
+			logger.log(
+				`[sources] oh-my-pi: no sessions directories found under ${config.ompSessionsRoot} — skipping. Set OMP_SESSIONS_ROOT or disable with OMP_ENABLED=false.`,
+			);
+		}
+	} else {
+		logger.log("[sources] oh-my-pi: disabled (OMP_ENABLED=false)");
 	}
 
 	return readers;
