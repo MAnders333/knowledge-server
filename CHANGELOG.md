@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.10.0](https://github.com/MAnders333/knowledge-server/compare/v3.9.2...v3.10.0) (2026-09-30)
+
+
+### Features
+
+* **daemon:** add oh-my-pi (omp) episode reader ([0d767d0](https://github.com/MAnders333/knowledge-server/commit/0d767d041def0ccb55c459ad1bea7e88a00d1c81))
+* **daemon:** add oh-my-pi (omp) episode reader ([e1430c2](https://github.com/MAnders333/knowledge-server/commit/e1430c2a75d59bcee35f89a4744a24547176bf1f))
+
 ## [3.9.2](https://github.com/MAnders333/knowledge-server/compare/v3.9.1...v3.9.2) (2026-09-30)
 
 
