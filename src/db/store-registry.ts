@@ -6,6 +6,7 @@ import {
 	resolveSqlitePath,
 } from "../config-file.js";
 import type { KnowledgeServerConfig, StoreConfig } from "../config-file.js";
+import { parseIntEnv } from "../config.js";
 import { DomainRouter } from "../consolidation/domain-router.js";
 import { logger } from "../logger.js";
 import type { IKnowledgeStore, IServerStateDB } from "./interface.js";
@@ -189,6 +190,8 @@ export class StoreRegistry {
 		// Unreachable stores produce a warning and are excluded — not a hard error.
 		// This lets the server start in degraded mode (e.g. team Postgres is down
 		// but personal SQLite works). SQLite stores always succeed.
+		// Each init is bounded by STORE_INIT_TIMEOUT_MS so an accepting-but-silent
+		// server cannot hold the batch (and the warning loop) open forever.
 		const results = await Promise.all(
 			config.stores.map((storeConfig) => tryInitStore(storeConfig)),
 		);
@@ -196,14 +199,6 @@ export class StoreRegistry {
 		const unavailableIds = new Set(
 			results.filter((r) => !r.db).map((r) => r.id),
 		);
-
-		for (const r of results) {
-			if (!r.db) {
-				logger.warn(
-					`[db] Store "${r.id}" is unavailable — excluded from activation and consolidation. Episodes destined for it will be retried when it is reachable again. Reason: ${r.error}`,
-				);
-			}
-		}
 
 		const stores = new Map<string, IKnowledgeStore>(
 			results
@@ -253,19 +248,44 @@ export class StoreRegistry {
  * Try to initialise a store, returning null on connection failure rather than
  * throwing. SQLite always succeeds (creates file if missing). Postgres may fail
  * if the server is unreachable.
+ *
+ * The whole init is bounded by STORE_INIT_TIMEOUT_MS (default 10s): a server
+ * that accepts connections but never responds (a stalled proxy tunnel, a query
+ * that hangs mid-flight) must not block the other stores from starting.
+ *
+ * The "unavailable" warning is emitted here — as each store fails — so a
+ * degraded store surfaces immediately instead of after the slowest store in
+ * the batch settles.
  */
 async function tryInitStore(
 	storeConfig: StoreConfig,
 ): Promise<{ id: string; db: IKnowledgeStore | null; error?: string }> {
+	const timeoutMs = parseIntEnv(process.env.STORE_INIT_TIMEOUT_MS, 10_000, 1);
+	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
-		const db = await initStore(storeConfig);
+		const db = await Promise.race([
+			initStore(storeConfig),
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(
+					() =>
+						reject(
+							new Error(
+								`Store "${storeConfig.id}": init timed out after ${timeoutMs}ms without responding (server unreachable or hanging mid-query)`,
+							),
+						),
+					timeoutMs,
+				);
+			}),
+		]);
 		return { id: storeConfig.id, db };
 	} catch (e) {
-		return {
-			id: storeConfig.id,
-			db: null,
-			error: e instanceof Error ? e.message : String(e),
-		};
+		const error = e instanceof Error ? e.message : String(e);
+		logger.warn(
+			`[db] Store "${storeConfig.id}" is unavailable — excluded from activation and consolidation. Episodes destined for it will be retried when it is reachable again. Reason: ${error}`,
+		);
+		return { id: storeConfig.id, db: null, error };
+	} finally {
+		if (timer) clearTimeout(timer);
 	}
 }
 

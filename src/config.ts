@@ -9,7 +9,7 @@ import { hasOAuthTokens } from "./auth/claude-oauth.js";
  * not a valid integer. NaN-safe: a `Number.isNaN` guard ensures NaN never reaches
  * `Math.max` — an invalid string always yields `defaultVal`, never NaN.
  */
-function parseIntEnv(
+export function parseIntEnv(
 	envVar: string | undefined,
 	defaultVal: number,
 	min?: number,
