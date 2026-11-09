@@ -1435,7 +1435,8 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	/**
 	 * Returns true when pgvector is fully operational: extension installed,
 	 * embedding_vec column present, HNSW index built, and dimensions known.
-	 * ActivationEngine checks this (via allStoresSupportAnn) before taking Path A.
+	 * ActivationEngine checks this per store (via storeSupportsAnn) to choose
+	 * Path A over the full scan.
 	 */
 	isVectorSearchReady(): boolean {
 		return this.pgvectorReady;

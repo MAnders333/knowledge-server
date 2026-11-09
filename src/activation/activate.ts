@@ -88,6 +88,12 @@ export class ActivationEngine {
 	 */
 	private unreachableSince: Map<string, number> = new Map();
 
+	/**
+	 * Last logged ANN vs full-scan partition of reachable stores. Used to log the
+	 * retrieval path per store only when it changes, not on every activation.
+	 */
+	private lastPathPartition: string | undefined;
+
 	/** Per-store call timeout — a dead store is skipped after this duration. */
 	private static readonly STORE_TIMEOUT_MS = 5_000;
 
@@ -243,20 +249,22 @@ export class ActivationEngine {
 		const DAY_MS = 1000 * 60 * 60 * 24;
 
 		// ── Candidate retrieval ────────────────────────────────────────────────────
-		// Two paths depending on whether the store supports DB-side ANN search:
+		// The retrieval path is chosen per store (see storeSupportsAnn):
 		//
-		// Path A — pgvector (PostgresKnowledgeDB with findSimilarEntries):
-		//   For each query vector, run one ANN query against each store and union
-		//   results. The HNSW index does the heavy lifting in the DB; we receive
-		//   only the top candidates above the threshold. Similarity values are
-		//   pre-computed by the DB (1 − cosine distance).
+		// Path A - pgvector (PostgresKnowledgeDB with findSimilarEntries, ready):
+		//   For each query vector, run one ANN query against the store. The HNSW
+		//   index does the heavy lifting in the DB; we receive only the top
+		//   candidates above the threshold. Similarity values are pre-computed by
+		//   the DB (1 - cosine distance).
 		//
-		// Path B — in-process full scan (SQLite or pgvector unavailable):
-		//   Load all active+conflicted entries from every store into memory and
+		// Path B - in-process full scan (SQLite, or pgvector not ready):
+		//   Load all active+conflicted entries of the store into memory and
 		//   compute cosine similarity in JS. Correct at any scale; linear cost.
 		//
-		// In both paths the result type is the same: an array of
-		// { entry, rawSimilarity } deduplicated by ID (first-store-wins).
+		// Both paths run concurrently, so one scan-only store (e.g. a local SQLite)
+		// no longer forces every Postgres store into a full table load (#93).
+		// Candidates from both paths are merged by entry ID, keeping the highest
+		// rawSimilarity across query vectors and stores.
 
 		// Typed as KnowledgeEntry (not the narrower & { embedding: number[] }) so that
 		// source entries fetched via getSupportSourcesForIds() can be pushed later without
@@ -274,49 +282,45 @@ export class ActivationEngine {
 			};
 		}> = [];
 
-		// Track IDs across stores to deduplicate (first-store-wins). Used only on Path B.
-		const seenIds = new Set<string>();
-		// Sum of per-store active+conflicted counts from Path A's parallel COUNT queries.
-		// Zero on Path B (totalActive comes from seenIds.size there instead).
-		let annTotalActive = 0;
-
-		// Determine whether every *reachable* read store supports ANN search AND
-		// is ready. Unreachable stores are excluded from this check so an
-		// unreachable SQLite store doesn't force a full-scan path when all
-		// reachable stores support ANN.
-		//
-		// Two conditions must both be true for a store:
-		//   1. findSimilarEntries is present (PostgresKnowledgeDB, not SQLite).
-		//   2. isVectorSearchReady() returns true — pgvector extension installed,
-		//      embedding_vec column populated, HNSW index ready. This can be false
-		//      during a model-change re-embed window; without this check Path A
-		//      would silently return zero results instead of falling back to Path B.
+		// Split *reachable* read stores by retrieval path. Unreachable stores are
+		// already excluded by reachableReadDbs().
 		const reachable = this.reachableReadDbs();
-		const allStoresSupportAnn = reachable.every(
-			(db) =>
-				typeof db.findSimilarEntries === "function" &&
-				(typeof db.isVectorSearchReady !== "function" ||
-					db.isVectorSearchReady()),
-		);
+		const annDbs: IKnowledgeStore[] = [];
+		const scanDbs: IKnowledgeStore[] = [];
+		for (const db of reachable) {
+			(storeSupportsAnn(db) ? annDbs : scanDbs).push(db);
+		}
 
-		if (allStoresSupportAnn) {
-			// ── Path A: DB-side ANN search (pgvector) ─────────────────────────────
-			// For each query vector, fan out across reachable stores and union results.
-			// We request maxResults per query vector per store so the union covers
-			// relevant entries for every topic in a multi-cue message.
-			// The COUNT query runs in parallel with ANN queries so it adds no latency.
-			// fanOutSafe tolerates per-store failures — a dead store is skipped after
-			// STORE_TIMEOUT_MS and its results simply omitted from the union.
-			// Results are flattened across stores (.flat()) so annResultsPerQuery is
-			// [query][result], not [query][store][result].
-			const [annResultsPerQuery, perStoreCounts] = await Promise.all([
+		// Log the retrieval path per store, but only when the partition changes
+		// (first activation, store reachability, or vector search readiness flip).
+		const pathPartition = `ann=${annDbs.map((d) => d.id).join(",")};scan=${scanDbs.map((d) => d.id).join(",")}`;
+		if (pathPartition !== this.lastPathPartition) {
+			this.lastPathPartition = pathPartition;
+			const fmt = (dbs: IKnowledgeStore[]) =>
+				dbs.length > 0 ? `[${dbs.map((d) => d.id).join(", ")}]` : "none";
+			logger.log(
+				`[activation] Retrieval path per store: ANN=${fmt(annDbs)}, full scan=${fmt(scanDbs)}`,
+			);
+		}
+
+		// Run all retrieval work concurrently. fanOutSafe tolerates per-store
+		// failures (a dead store is skipped after STORE_TIMEOUT_MS and marked
+		// unreachable) and returns [] for an empty store list, so a topology
+		// without ANN or without scan stores makes no calls for that path.
+		// - ANN: one fan-out per query vector, fetchLimit per query vector per
+		//   store, flattened across stores so annResultsPerQuery is
+		//   [query][result], not [query][store][result].
+		// - COUNT: per ANN store, for totalActive without loading entries.
+		// - Full scan: every entry of every scan-only store.
+		const [annResultsPerQuery, perStoreCounts, scanEntriesPerStore] =
+			await Promise.all([
 				Promise.all(
 					queryEmbeddings.map(async (qEmb) =>
 						(
 							await this.fanOutSafe(
-								reachable,
+								annDbs,
 								(db) =>
-									// biome-ignore lint/style/noNonNullAssertion: guarded by allStoresSupportAnn
+									// biome-ignore lint/style/noNonNullAssertion: guarded by storeSupportsAnn
 									db.findSimilarEntries!(qEmb, fetchLimit, similarityThreshold),
 								"ANN search",
 							)
@@ -324,119 +328,97 @@ export class ActivationEngine {
 					),
 				),
 				this.fanOutSafe(
-					reachable,
+					annDbs,
 					(db) =>
 						typeof db.getActiveEntryCount === "function"
 							? db.getActiveEntryCount()
 							: Promise.resolve(0),
 					"active entry count",
 				),
+				this.fanOutSafe(
+					scanDbs,
+					(db) => db.getActiveEntriesWithEmbeddings(),
+					"full-scan load",
+				),
 			]);
-			annTotalActive = perStoreCounts.reduce((sum, n) => sum + n, 0);
 
-			// Build a map: entry ID → best rawSimilarity across all query vectors.
-			// This mirrors the in-process "max over cues" logic in Path B.
-			// annResultsPerQuery is [query][result] (already flattened across stores).
-			const bestSimilarityById = new Map<
-				string,
-				{
-					entry: KnowledgeEntry & { embedding: number[] };
-					rawSimilarity: number;
-				}
-			>();
-			for (const queryResults of annResultsPerQuery) {
-				for (const { entry, similarity } of queryResults) {
-					const existing = bestSimilarityById.get(entry.id);
-					if (!existing || similarity > existing.rawSimilarity) {
-						bestSimilarityById.set(entry.id, {
-							entry,
-							rawSimilarity: similarity,
-						});
-					}
-				}
+		// Scan stores: entries synced to several scan stores share an ID -
+		// deduplicate among scan stores keeping the first occurrence.
+		const scanSeenIds = new Set<string>();
+		const scanEntries = scanEntriesPerStore.flat().filter((e) => {
+			if (scanSeenIds.has(e.id)) return false;
+			scanSeenIds.add(e.id);
+			return true;
+		});
+
+		// Merge candidates from both paths: entry ID -> best rawSimilarity across
+		// all query vectors and stores. ANN candidates are inserted first, so on a
+		// tie the ANN copy is kept; otherwise the higher similarity wins and no
+		// entry is lost when the same ID lives in an ANN and a scan store.
+		const bestById = new Map<
+			string,
+			{
+				entry: KnowledgeEntry & { embedding: number[] };
+				rawSimilarity: number;
 			}
-
-			// Score each deduplicated candidate (bestSimilarityById already deduplicates
-			// by entry ID — no further seenIds check needed here).
-			for (const { entry, rawSimilarity } of bestSimilarityById.values()) {
-				const ageDays = (now - entry.createdAt) / DAY_MS;
-				const lastAccessedDaysAgo = (now - entry.lastAccessedAt) / DAY_MS;
-				const halfLife =
-					config.decay.typeHalfLife[entry.type] ||
-					config.decay.typeHalfLife.fact;
-				const liveStrength = computeStrength(entry, now);
-
-				scored.push({
-					entry,
-					rawSimilarity,
-					similarity: rawSimilarity * liveStrength,
-					staleness: {
-						ageDays: Math.round(ageDays),
-						strength: liveStrength,
-						lastAccessedDaysAgo: Math.round(lastAccessedDaysAgo),
-						mayBeStale: ageDays > halfLife && entry.accessCount < 3,
-					},
-				});
+		>();
+		const keepBest = (
+			entry: KnowledgeEntry & { embedding: number[] },
+			rawSimilarity: number,
+		) => {
+			const existing = bestById.get(entry.id);
+			if (!existing || rawSimilarity > existing.rawSimilarity) {
+				bestById.set(entry.id, { entry, rawSimilarity });
 			}
-		} else {
-			// ── Path B: in-process full scan ───────────────────────────────────────
-			// Fan out across reachable stores and merge results.
-			// Entries from different stores may have overlapping IDs if the same entry
-			// was synced to multiple stores — deduplicate by ID keeping the first occurrence.
-			// fanOutSafe tolerates per-store failures — a dead store is skipped.
-			const allEntriesPerStore = await this.fanOutSafe(
-				reachable,
-				(db) => db.getActiveEntriesWithEmbeddings(),
-				"full-scan load",
-			);
-			const entries = allEntriesPerStore.flat().filter((e) => {
-				if (seenIds.has(e.id)) return false;
-				seenIds.add(e.id);
-				return true;
-			});
-
-			if (entries.length === 0) {
-				return { entries: [], query: primaryQuery, totalActive: 0 };
-			}
-
-			for (const entry of entries) {
-				const rawSimilarity = Math.max(
-					...queryEmbeddings.map((qEmb) =>
-						cosineSimilarity(qEmb, entry.embedding),
-					),
-				);
-				if (rawSimilarity < similarityThreshold) continue;
-
-				const ageDays = (now - entry.createdAt) / DAY_MS;
-				const lastAccessedDaysAgo = (now - entry.lastAccessedAt) / DAY_MS;
-				const halfLife =
-					config.decay.typeHalfLife[entry.type] ||
-					config.decay.typeHalfLife.fact;
-				const liveStrength = computeStrength(entry, now);
-
-				scored.push({
-					entry,
-					// Threshold filtering uses raw cosine similarity so entry age never
-					// prevents a semantically relevant entry from activating.
-					// Ranking uses raw similarity weighted by live strength — well-consolidated
-					// entries sort higher, but stale entries still appear if they're on-topic.
-					// The staleness signals in the response let the LLM reason about reliability.
-					rawSimilarity,
-					similarity: rawSimilarity * liveStrength,
-					staleness: {
-						ageDays: Math.round(ageDays),
-						strength: liveStrength,
-						lastAccessedDaysAgo: Math.round(lastAccessedDaysAgo),
-						mayBeStale: ageDays > halfLife && entry.accessCount < 3,
-					},
-				});
+		};
+		for (const queryResults of annResultsPerQuery) {
+			for (const { entry, similarity } of queryResults) {
+				keepBest(entry, similarity);
 			}
 		}
+		for (const entry of scanEntries) {
+			const rawSimilarity = Math.max(
+				...queryEmbeddings.map((qEmb) =>
+					cosineSimilarity(qEmb, entry.embedding),
+				),
+			);
+			// ANN stores filter by threshold in the DB; apply the same cut here.
+			if (rawSimilarity < similarityThreshold) continue;
+			keepBest(entry, rawSimilarity);
+		}
 
-		// Determine totalActive for the response.
-		// Path A: sum of per-store active+conflicted counts (from parallel COUNT queries).
-		// Path B: seenIds.size is exact (we loaded every entry).
-		const totalActive = allStoresSupportAnn ? annTotalActive : seenIds.size;
+		for (const { entry, rawSimilarity } of bestById.values()) {
+			const ageDays = (now - entry.createdAt) / DAY_MS;
+			const lastAccessedDaysAgo = (now - entry.lastAccessedAt) / DAY_MS;
+			const halfLife =
+				config.decay.typeHalfLife[entry.type] || config.decay.typeHalfLife.fact;
+			const liveStrength = computeStrength(entry, now);
+
+			scored.push({
+				entry,
+				// Threshold filtering uses raw cosine similarity so entry age never
+				// prevents a semantically relevant entry from activating.
+				// Ranking uses raw similarity weighted by live strength - well-consolidated
+				// entries sort higher, but stale entries still appear if they're on-topic.
+				// The staleness signals in the response let the LLM reason about reliability.
+				rawSimilarity,
+				similarity: rawSimilarity * liveStrength,
+				staleness: {
+					ageDays: Math.round(ageDays),
+					strength: liveStrength,
+					lastAccessedDaysAgo: Math.round(lastAccessedDaysAgo),
+					mayBeStale: ageDays > halfLife && entry.accessCount < 3,
+				},
+			});
+		}
+
+		// totalActive: per-store COUNT for ANN stores plus unique entries loaded
+		// from scan stores. An ID present in both an ANN and a scan store is
+		// counted twice (COUNT returns no IDs to dedupe against), the same as
+		// Path A already does across several ANN stores. In single-path
+		// topologies one term is 0, so the value matches the old per-path result.
+		const totalActive =
+			perStoreCounts.reduce((sum, n) => sum + n, 0) + scanSeenIds.size;
 
 		if (scored.length === 0) {
 			return { entries: [], query: primaryQuery, totalActive };
@@ -820,6 +802,20 @@ export class ActivationEngine {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * True when a store can serve activation via DB-side ANN search (Path A):
+ * findSimilarEntries is present (PostgresKnowledgeDB, not SQLite) and
+ * isVectorSearchReady() is not false. Readiness can be false during a
+ * model-change re-embed window, where findSimilarEntries would silently
+ * return [] - such a store must use the full scan (Path B) instead.
+ */
+function storeSupportsAnn(db: IKnowledgeStore): boolean {
+	return (
+		typeof db.findSimilarEntries === "function" &&
+		(typeof db.isVectorSearchReady !== "function" || db.isVectorSearchReady())
+	);
+}
 
 /**
  * Merge an array of Maps into a single Map.
