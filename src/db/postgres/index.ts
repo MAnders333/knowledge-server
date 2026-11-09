@@ -49,6 +49,49 @@ interface RawEntryRow {
 }
 
 /**
+ * knowledge_entry columns read by rowToEntry(), qualified with the `ke` alias
+ * used by the ANN queries. Deliberately excludes `embedding_vec`: rowToEntry()
+ * never reads it, and a vector(3072) is ~35 KB as text per returned row.
+ * Keep in sync with RawEntryRow.
+ */
+const KE_ENTRY_COLUMNS =
+	"ke.id, ke.type, ke.content, ke.topics, ke.confidence, ke.source, ke.status, ke.strength, ke.created_at, ke.updated_at, ke.last_accessed_at, ke.access_count, ke.observation_count, ke.superseded_by, ke.derived_from, ke.is_synthesized, ke.embedding";
+
+/**
+ * SQLSTATEs that mean the server refuses `SET hnsw.ef_search` for this
+ * session or role, as opposed to a transient failure (connection reset,
+ * cancelled statement, shutdown). Only these latch the ef_search fallback.
+ */
+const EF_SEARCH_UNSUPPORTED_SQLSTATES = new Set([
+	"42704", // undefined_object
+	"22023", // invalid_parameter_value
+	"42501", // insufficient_privilege
+	"55P02", // cant_change_runtime_param
+	"0A000", // feature_not_supported
+]);
+
+/**
+ * ANN candidate query for findSimilarEntries(). Module-level so the plan
+ * guard in tests/pg-integration.test.ts EXPLAINs the exact production SQL.
+ */
+export function buildAnnSimilarEntriesSql(dims: number): string {
+	return `WITH candidate_ids AS (
+		   SELECT id
+		   FROM knowledge_entry
+		   WHERE embedding_vec IS NOT NULL
+		   ORDER BY (embedding_vec::halfvec(${dims}) <=> $1::halfvec(${dims}))
+		   LIMIT $2
+		 )
+		 SELECT ${KE_ENTRY_COLUMNS}, (1 - (ke.embedding_vec <=> $4::vector)) AS similarity
+		 FROM knowledge_entry ke
+		 JOIN candidate_ids c ON c.id = ke.id
+		 WHERE ke.status = ANY($3::text[])
+		   AND ke.embedding_vec <=> $4::vector <= $5
+		 ORDER BY ke.embedding_vec <=> $4::vector
+		 LIMIT $6`;
+}
+
+/**
  * Safely coerce a PG value (may be string or number) to a JS number.
  * BIGINT columns come back as strings from the pg driver.
  */
@@ -106,6 +149,15 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 
 	/** Active embedding dimensionality from embedding_metadata.id = 1. */
 	private embeddingDims: number | null = null;
+
+	/**
+	 * Latched to true if `set_config('hnsw.ef_search', ...)` fails with a
+	 * SQLSTATE that means the setting is unsupported (see
+	 * EF_SEARCH_UNSUPPORTED_SQLSTATES). findSimilarEntries() then runs the ANN
+	 * query without raising ef_search (pre-#96 behaviour) instead of failing
+	 * activation. Transient failures do not latch.
+	 */
+	private efSearchUnsupported = false;
 
 	/**
 	 * @param connectionUri  Full postgres:// connection string.
@@ -1470,6 +1522,8 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	 *
 	 * `statuses` defaults to ['active', 'conflicted'] to match
 	 * getActiveEntriesWithEmbeddings() behaviour.
+	 *
+	 * Runs in a short transaction that raises hnsw.ef_search to the ANN over-sample (see #96).
 	 */
 	async findSimilarEntries(
 		queryVector: number[],
@@ -1494,30 +1548,76 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		// in the ANN step. We over-sample candidates, then apply status + exact
 		// threshold/rerank in the outer query.
 		const annCandidates = Math.max(limit * 16, 200);
-		const rows = await this.sql.unsafe(
-			`WITH candidate_ids AS (
-			   SELECT id
-			   FROM knowledge_entry
-			   WHERE embedding_vec IS NOT NULL
-			   ORDER BY (embedding_vec::halfvec(${this.embeddingDims}) <=> $1::halfvec(${this.embeddingDims}))
-			   LIMIT $2
-			 )
-			 SELECT ke.*, (1 - (ke.embedding_vec <=> $4::vector)) AS similarity
-			 FROM knowledge_entry ke
-			 JOIN candidate_ids c ON c.id = ke.id
-			 WHERE ke.status = ANY($3::text[])
-			   AND ke.embedding_vec <=> $4::vector <= $5
-			 ORDER BY ke.embedding_vec <=> $4::vector
-			 LIMIT $6`,
-			[
-				vectorLiteral,
-				annCandidates,
-				statuses,
-				vectorLiteral,
-				maxDist,
-				limit,
-			] as postgres.ParameterOrJSON<never>[],
-		);
+		// pgvector's HNSW scan yields at most hnsw.ef_search rows (default 40)
+		// regardless of LIMIT, so raise it to the over-sample for this
+		// transaction only (is_local = true). pgvector caps it at 1000.
+		const efSearch = Math.min(Math.max(Math.ceil(annCandidates), 40), 1000);
+		const query = buildAnnSimilarEntriesSql(this.embeddingDims);
+		const params = [
+			vectorLiteral,
+			annCandidates,
+			statuses,
+			vectorLiteral,
+			maxDist,
+			limit,
+		] as postgres.ParameterOrJSON<never>[];
+
+		let rows: unknown;
+		if (this.efSearchUnsupported) {
+			rows = await this.sql.unsafe(query, params);
+		} else {
+			// set_config and the ANN query run on one reserved connection (BEGIN, ...,
+			// COMMIT). Once set_config is prepared on the connection it is pipelined
+			// with the ANN query's Parse/Describe; the unsafe() query is unprepared, so
+			// it always does describe-then-execute. A failing set_config aborts the
+			// transaction, so the query's own 25P02 is discarded and efSearchError
+			// tells the two failure modes apart: null means the query itself failed
+			// and is rethrown.
+			let efSearchError: unknown = null;
+			try {
+				// Not an async callback: postgres.js only awaits the elements (Promise.all)
+				// of an array returned synchronously; an async callback's array would hold
+				// pending queries.
+				const results = await this.sql.begin((tx: TxSql) => [
+					tx`SELECT set_config('hnsw.ef_search', ${String(efSearch)}, true)`.catch(
+						(err: unknown) => {
+							efSearchError = err;
+							throw err;
+						},
+					),
+					tx.unsafe(query, params),
+				]);
+				rows = results[1];
+			} catch (err) {
+				if (efSearchError === null) throw err;
+				const code = (efSearchError as { code?: unknown }).code;
+				const message =
+					efSearchError instanceof Error
+						? efSearchError.message
+						: String(efSearchError);
+				// Same `Store "<id>"` form as store-registry.ts. id defaults to "postgres"
+				// for a standalone instance and is overwritten by StoreRegistry.
+				const storeTag = `Store "${this.id}"`;
+				if (
+					typeof code === "string" &&
+					EF_SEARCH_UNSUPPORTED_SQLSTATES.has(code)
+				) {
+					// Latch before logging so concurrent in-flight calls do not repeat the warning.
+					if (!this.efSearchUnsupported) {
+						this.efSearchUnsupported = true;
+						logger.warn(
+							`[pg-db] ${storeTag}: could not set hnsw.ef_search. ANN recall for this store is capped at the pgvector default (40 candidates) until the process restarts. Error: ${message}`,
+						);
+					}
+				} else {
+					// Transient: run this query at the default and try again next call.
+					logger.warn(
+						`[pg-db] ${storeTag}: could not set hnsw.ef_search for this ANN query - running it at the server default. Error: ${message}`,
+					);
+				}
+				rows = await this.sql.unsafe(query, params);
+			}
+		}
 
 		return (rows as unknown as (RawEntryRow & { similarity: number })[])
 			.map((r) => ({
@@ -1589,7 +1689,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			   ORDER BY (embedding_vec::halfvec(${this.embeddingDims}) <=> $3::halfvec(${this.embeddingDims}))
 			   LIMIT $6
 			 )
-			 SELECT ke.*
+			 SELECT ${KE_ENTRY_COLUMNS}
 			 FROM knowledge_entry ke
 			 JOIN candidate_ids c ON c.id = ke.id
 			 WHERE (ke.embedding_vec <=> $3::vector) >  $4
