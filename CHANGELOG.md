@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.10.1](https://github.com/MAnders333/knowledge-server/compare/v3.10.0...v3.10.1) (2026-11-09)
+
+
+### Bug Fixes
+
+* **activation:** choose ANN vs full scan per store instead of for all stores ([be1071d](https://github.com/MAnders333/knowledge-server/commit/be1071d321628140c5021a2273eb490b5e16f458))
+* **activation:** choose ANN vs full scan per store instead of for all stores ([a49d327](https://github.com/MAnders333/knowledge-server/commit/a49d32743358044c7874463b1be60b18c02d8924)), closes [#93](https://github.com/MAnders333/knowledge-server/issues/93)
+
 ## [3.10.0](https://github.com/MAnders333/knowledge-server/compare/v3.9.2...v3.10.0) (2026-09-30)
 
 
