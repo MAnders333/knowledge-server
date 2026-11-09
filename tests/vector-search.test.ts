@@ -30,6 +30,7 @@ import type { IKnowledgeStore } from "../src/db/interface";
 import { KnowledgeDB } from "../src/db/sqlite/index";
 import { PG_MIGRATIONS } from "../src/db/postgres/migrations";
 import { SCHEMA_VERSION } from "../src/db/sqlite/schema";
+import * as loggerModule from "../src/logger";
 import { ContradictionScanner } from "../src/consolidation/contradiction";
 import { ConsolidationLLM } from "../src/consolidation/llm";
 import type { KnowledgeEntry } from "../src/types";
@@ -101,6 +102,7 @@ function makeStoreStub(
 				return Promise.resolve(results);
 			},
 		);
+		base.getActiveEntryCount = mock(() => Promise.resolve(entries.length));
 	}
 
 	return base;
@@ -226,33 +228,302 @@ describe("ActivationEngine.activate — full-scan path (Path B)", () => {
 	});
 });
 
-describe("ActivationEngine.activate — mixed stores (one ANN, one full-scan)", () => {
-	it("falls back to full-scan when any store lacks findSimilarEntries", async () => {
-		const emb = fakeEmbedding("mixed test");
-		const entry = makeEntry({ id: "e1", embedding: emb, status: "active" });
+describe("ActivationEngine.activate - mixed stores (per-store path selection)", () => {
+	const queryEmb = fakeEmbedding("hello world test");
+	// Orthogonal to queryEmb (fakeEmbedding only uses dims 0-2).
+	const orthogEmb = queryEmb.map((v) => (v === 0 ? 1 / Math.sqrt(8) : 0));
+	const orthUnit = orthogEmb.map((v) => v / Math.sqrt(5 / 8));
+	// cosine(queryEmb, midEmb) = 0.8 exactly.
+	const midEmb = queryEmb.map((v, i) => 0.8 * v + 0.6 * orthUnit[i]);
+	type E = KnowledgeEntry & { embedding: number[] };
+	const THRESHOLD = 0.5;
+
+	afterEach(() => {
+		mock.restore();
+	});
+
+	it("uses ANN for the ANN store and full scan only for the scan store", async () => {
 		const annStore = makeStoreStub(
-			[entry] as Array<KnowledgeEntry & { embedding: number[] }>,
+			[makeEntry({ id: "a1", embedding: queryEmb, status: "active" })] as E[],
 			{ supportAnn: true },
 		);
-		const fullScanStore = makeStoreStub(
-			[entry] as Array<KnowledgeEntry & { embedding: number[] }>,
-			{ supportAnn: false },
+		const scanStore = makeStoreStub([
+			makeEntry({ id: "s1", embedding: queryEmb, status: "active" }),
+		] as E[]);
+		annStore.id = "ann";
+		scanStore.id = "scan";
+
+		const activation = new ActivationEngine(annStore, [annStore, scanStore]);
+		spyOn(activation.embeddings, "embedBatch").mockResolvedValue([queryEmb]);
+
+		const result = await activation.activate("hello world test", {
+			threshold: THRESHOLD,
+		});
+
+		expect(annStore.findSimilarEntries).toHaveBeenCalled();
+		expect(annStore.getActiveEntriesWithEmbeddings).not.toHaveBeenCalled();
+		expect(scanStore.getActiveEntriesWithEmbeddings).toHaveBeenCalled();
+		const ids = result.entries.map((e) => e.entry.id);
+		expect(ids).toContain("a1");
+		expect(ids).toContain("s1");
+		expect(result.totalActive).toBe(2);
+	});
+
+	it("treats an ANN store whose vector search is not ready as a scan store", async () => {
+		const ready = makeStoreStub(
+			[makeEntry({ id: "r1", embedding: queryEmb, status: "active" })] as E[],
+			{ supportAnn: true },
+		);
+		const notReady = makeStoreStub(
+			[makeEntry({ id: "n1", embedding: queryEmb, status: "active" })] as E[],
+			{ supportAnn: true },
+		);
+		notReady.isVectorSearchReady = mock(() => false);
+		ready.id = "ready";
+		notReady.id = "notReady";
+
+		const activation = new ActivationEngine(ready, [ready, notReady]);
+		spyOn(activation.embeddings, "embedBatch").mockResolvedValue([queryEmb]);
+
+		const result = await activation.activate("hello world test", {
+			threshold: THRESHOLD,
+		});
+
+		expect(notReady.findSimilarEntries).not.toHaveBeenCalled();
+		expect(notReady.getActiveEntriesWithEmbeddings).toHaveBeenCalled();
+		expect(ready.getActiveEntriesWithEmbeddings).not.toHaveBeenCalled();
+		const ids = result.entries.map((e) => e.entry.id);
+		expect(ids).toContain("r1");
+		expect(ids).toContain("n1");
+	});
+
+	it("logs the retrieval path per store once, and again only when the partition changes", async () => {
+		let annReady = true;
+		const annStore = makeStoreStub(
+			[makeEntry({ id: "a1", embedding: queryEmb, status: "active" })] as E[],
+			{ supportAnn: true },
+		);
+		annStore.isVectorSearchReady = mock(() => annReady);
+		const scanStore = makeStoreStub([
+			makeEntry({ id: "s1", embedding: queryEmb, status: "active" }),
+		] as E[]);
+		annStore.id = "main";
+		scanStore.id = "local";
+
+		const logSpy = spyOn(loggerModule.logger, "log").mockImplementation(
+			() => {},
+		);
+		const activation = new ActivationEngine(annStore, [annStore, scanStore]);
+		spyOn(activation.embeddings, "embedBatch").mockResolvedValue([queryEmb]);
+		const pathLines = () =>
+			logSpy.mock.calls
+				.map((c) => String(c[0]))
+				.filter((m) => m.startsWith("[activation] Retrieval path per store"));
+
+		await activation.activate("hello world test", { threshold: THRESHOLD });
+		await activation.activate("hello world test", { threshold: THRESHOLD });
+		expect(pathLines()).toEqual([
+			"[activation] Retrieval path per store: ANN=[main], full scan=[local]",
+		]);
+
+		annReady = false;
+		await activation.activate("hello world test", { threshold: THRESHOLD });
+		expect(pathLines()).toEqual([
+			"[activation] Retrieval path per store: ANN=[main], full scan=[local]",
+			"[activation] Retrieval path per store: ANN=none, full scan=[main, local]",
+		]);
+	});
+
+	it("dedupes a shared id across ANN and scan stores, keeping the higher similarity (ANN copy higher)", async () => {
+		const annStore = makeStoreStub(
+			[
+				makeEntry({
+					id: "shared",
+					content: "ann copy",
+					embedding: queryEmb,
+					status: "active",
+				}),
+			] as E[],
+			{ supportAnn: true },
+		);
+		const scanStore = makeStoreStub([
+			makeEntry({
+				id: "shared",
+				content: "scan copy",
+				embedding: midEmb,
+				status: "active",
+			}),
+		] as E[]);
+		annStore.id = "ann";
+		scanStore.id = "scan";
+
+		const activation = new ActivationEngine(annStore, [annStore, scanStore]);
+		spyOn(activation.embeddings, "embedBatch").mockResolvedValue([queryEmb]);
+
+		const result = await activation.activate("hello world test", {
+			threshold: THRESHOLD,
+		});
+
+		const shared = result.entries.filter((e) => e.entry.id === "shared");
+		expect(shared.length).toBe(1);
+		expect(shared[0].entry.content).toBe("ann copy");
+		expect(shared[0].rawSimilarity).toBeCloseTo(1, 5);
+		// 1 counted for the ANN store plus 1 unique scan entry (documented double count).
+		expect(result.totalActive).toBe(2);
+	});
+
+	it("dedupes a shared id across ANN and scan stores, keeping the higher similarity (scan copy higher)", async () => {
+		const annStore = makeStoreStub(
+			[
+				makeEntry({
+					id: "shared",
+					content: "ann copy",
+					embedding: midEmb,
+					status: "active",
+				}),
+			] as E[],
+			{ supportAnn: true },
+		);
+		const scanStore = makeStoreStub([
+			makeEntry({
+				id: "shared",
+				content: "scan copy",
+				embedding: queryEmb,
+				status: "active",
+			}),
+		] as E[]);
+		annStore.id = "ann";
+		scanStore.id = "scan";
+
+		const activation = new ActivationEngine(annStore, [annStore, scanStore]);
+		spyOn(activation.embeddings, "embedBatch").mockResolvedValue([queryEmb]);
+
+		const result = await activation.activate("hello world test", {
+			threshold: THRESHOLD,
+		});
+
+		const shared = result.entries.filter((e) => e.entry.id === "shared");
+		expect(shared.length).toBe(1);
+		expect(shared[0].entry.content).toBe("scan copy");
+		expect(shared[0].rawSimilarity).toBeCloseTo(1, 5);
+	});
+
+	it("a failing ANN store still returns scan-store results", async () => {
+		const annStore = makeStoreStub(
+			[makeEntry({ id: "a1", embedding: queryEmb, status: "active" })] as E[],
+			{ supportAnn: true },
+		);
+		const scanStore = makeStoreStub([
+			makeEntry({ id: "s1", embedding: queryEmb, status: "active" }),
+		] as E[]);
+		annStore.id = "ann";
+		scanStore.id = "scan";
+		annStore.findSimilarEntries = mock(() =>
+			Promise.reject(new Error("connection refused")),
 		);
 
-		const activation = new ActivationEngine(annStore, [annStore, fullScanStore]);
-		spyOn(activation.embeddings, "embedBatch").mockResolvedValue([emb]);
+		const activation = new ActivationEngine(annStore, [annStore, scanStore]);
+		spyOn(activation.embeddings, "embedBatch").mockResolvedValue([queryEmb]);
 
-		await activation.activate("mixed test");
+		const result = await activation.activate("hello world test", {
+			threshold: THRESHOLD,
+		});
 
-		// When any store lacks ANN, fall back to full scan everywhere.
-		expect(
-			(annStore.getActiveEntriesWithEmbeddings as ReturnType<typeof mock>).mock.calls.length,
-		).toBeGreaterThan(0);
-		expect(
-			(fullScanStore.getActiveEntriesWithEmbeddings as ReturnType<typeof mock>).mock.calls.length,
-		).toBeGreaterThan(0);
+		const ids = result.entries.map((e) => e.entry.id);
+		expect(ids).toContain("s1");
+		expect(ids).not.toContain("a1");
+	});
 
-		mock.restore();
+	it("a failing scan store still returns ANN-store results", async () => {
+		const annStore = makeStoreStub(
+			[makeEntry({ id: "a1", embedding: queryEmb, status: "active" })] as E[],
+			{ supportAnn: true },
+		);
+		const scanStore = makeStoreStub([
+			makeEntry({ id: "s1", embedding: queryEmb, status: "active" }),
+		] as E[]);
+		annStore.id = "ann";
+		scanStore.id = "scan";
+		scanStore.getActiveEntriesWithEmbeddings = mock(() =>
+			Promise.reject(new Error("connection refused")),
+		);
+
+		const activation = new ActivationEngine(annStore, [annStore, scanStore]);
+		spyOn(activation.embeddings, "embedBatch").mockResolvedValue([queryEmb]);
+
+		const result = await activation.activate("hello world test", {
+			threshold: THRESHOLD,
+		});
+
+		expect(annStore.findSimilarEntries).toHaveBeenCalled();
+		expect(annStore.getActiveEntriesWithEmbeddings).not.toHaveBeenCalled();
+		const ids = result.entries.map((e) => e.entry.id);
+		expect(ids).toContain("a1");
+		expect(ids).not.toContain("s1");
+	});
+
+	it("on an equal similarity tie across ANN and scan stores, keeps the ANN copy", async () => {
+		const annStore = makeStoreStub(
+			[
+				makeEntry({
+					id: "shared",
+					content: "ann copy",
+					embedding: queryEmb,
+					status: "active",
+				}),
+			] as E[],
+			{ supportAnn: true },
+		);
+		const scanStore = makeStoreStub([
+			makeEntry({
+				id: "shared",
+				content: "scan copy",
+				embedding: queryEmb,
+				status: "active",
+			}),
+		] as E[]);
+		annStore.id = "ann";
+		scanStore.id = "scan";
+
+		const activation = new ActivationEngine(annStore, [annStore, scanStore]);
+		spyOn(activation.embeddings, "embedBatch").mockResolvedValue([queryEmb]);
+
+		const result = await activation.activate("hello world test", {
+			threshold: THRESHOLD,
+		});
+
+		const shared = result.entries.filter((e) => e.entry.id === "shared");
+		expect(shared.length).toBe(1);
+		expect(shared[0].entry.content).toBe("ann copy");
+	});
+
+	it("multi-cue: keeps max over query vectors in mixed mode", async () => {
+		const annStore = makeStoreStub(
+			[makeEntry({ id: "a1", embedding: orthUnit, status: "active" })] as E[],
+			{ supportAnn: true },
+		);
+		const scanStore = makeStoreStub([
+			makeEntry({ id: "s1", embedding: queryEmb, status: "active" }),
+		] as E[]);
+		annStore.id = "ann";
+		scanStore.id = "scan";
+
+		const activation = new ActivationEngine(annStore, [annStore, scanStore]);
+		spyOn(activation.embeddings, "embedBatch").mockResolvedValue([
+			queryEmb,
+			orthUnit,
+		]);
+
+		const result = await activation.activate(
+			"hello world test\nsecond topic line here",
+			{ threshold: THRESHOLD },
+		);
+
+		expect(annStore.findSimilarEntries).toHaveBeenCalledTimes(2);
+		expect(scanStore.getActiveEntriesWithEmbeddings).toHaveBeenCalledTimes(1);
+		const byId = new Map(result.entries.map((e) => [e.entry.id, e]));
+		expect(byId.get("a1")?.rawSimilarity).toBeCloseTo(1, 5);
+		expect(byId.get("s1")?.rawSimilarity).toBeCloseTo(1, 5);
 	});
 });
 

@@ -322,8 +322,8 @@ export interface IKnowledgeStore {
 	 * `totalActive` without loading all entries into memory.  On Path B the count
 	 * is derived from the full-scan result set without an extra query.
 	 *
-	 * Optional — falls back to returning undefined when absent, in which case
-	 * callers should use an alternative (e.g. the length of the full-scan result).
+	 * Optional - when absent, ActivationEngine counts the store as 0 toward
+	 * `totalActive`.
 	 */
 	getActiveEntryCount?(): Promise<number>;
 
