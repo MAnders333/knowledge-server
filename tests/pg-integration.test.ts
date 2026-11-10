@@ -18,14 +18,19 @@ import {
 	describe,
 	expect,
 	it,
+	spyOn,
 } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import postgres from "postgres";
 import type { IKnowledgeStore } from "../src/db/interface";
-import { PostgresKnowledgeDB } from "../src/db/postgres/index";
+import {
+	PostgresKnowledgeDB,
+	buildAnnSimilarEntriesSql,
+} from "../src/db/postgres/index";
 import { ServerStateDB } from "../src/db/state/index";
+import { logger } from "../src/logger";
 
 const PG_URI = process.env.PG_TEST_URI;
 
@@ -51,6 +56,64 @@ function makeEntry(id: string, overrides: Record<string, unknown> = {}) {
 		isSynthesized: false,
 		...overrides,
 	};
+}
+
+/**
+ * Replace a store's postgres.js handle so begin() fails the way postgres.js
+ * does when set_config or the ANN query errors: the transaction aborts (the
+ * query then reports 25P02) and the first error is rethrown. `unsafe()` and
+ * `end()` go to the real database, so the fallback path still runs for real.
+ */
+function stubAnnTransaction(
+	store: PostgresKnowledgeDB,
+	faults: { setConfig?: unknown; query?: unknown },
+) {
+	const realSql = (store as unknown as { sql: postgres.Sql }).sql;
+	const aborted = Object.assign(new Error("current transaction is aborted"), {
+		code: "25P02",
+	});
+	const calls = { begin: 0 };
+	(store as unknown as { sql: unknown }).sql = {
+		unsafe: (query: string, params: postgres.ParameterOrJSON<never>[]) =>
+			realSql.unsafe(query, params),
+		end: () => realSql.end(),
+		begin: async (cb: (tx: unknown) => unknown[]) => {
+			calls.begin++;
+			const tx = Object.assign(
+				() =>
+					faults.setConfig === undefined
+						? Promise.resolve([])
+						: Promise.reject(faults.setConfig),
+				{
+					unsafe: () => Promise.reject(faults.query ?? aborted),
+				},
+			);
+			return Promise.all(cb(tx));
+		},
+	};
+	return calls;
+}
+
+/**
+ * EXPLAIN the production ANN SQL under the same transaction-local ef_search the
+ * search uses, and assert the planner picks the HNSW index. Guards the ANN
+ * tests against passing on a seq scan.
+ */
+async function expectHnswPlan(planSql: postgres.Sql) {
+	const plan = await planSql.begin(async (tx) => {
+		await tx`SELECT set_config('hnsw.ef_search', '640', true)`;
+		return tx.unsafe(`EXPLAIN (COSTS OFF) ${buildAnnSimilarEntriesSql(8)}`, [
+			"[1,0,0,0,0,0,0,0]",
+			640,
+			["active"],
+			"[1,0,0,0,0,0,0,0]",
+			0.5,
+			40,
+		]);
+	});
+	expect(plan.map((r) => String(r["QUERY PLAN"])).join("\n")).toContain(
+		"Index Scan using idx_entry_embedding_halfvec_hnsw",
+	);
 }
 
 describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
@@ -749,6 +812,273 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		const result = await pg.findSimilarEntries(q, 5, 0.5, ["active"]);
 		expect(result.some((r) => r.entry.id === "ann3072-active")).toBe(true);
 		expect(result.every((r) => r.entry.status === "active")).toBe(true);
+	});
+
+	it("findSimilarEntries returns active rows beyond the hnsw.ef_search default when HNSW is used", async () => {
+		// enable_seqscan=off is a session startup parameter on this instance only,
+		// so the planner must use the halfvec HNSW index for every ANN query here.
+		const forcedUri = new URL(uri);
+		forcedUri.searchParams.set("enable_seqscan", "off");
+		const forced = new PostgresKnowledgeDB(forcedUri.toString(), 1);
+		const planSql = postgres(forcedUri.toString(), {
+			max: 1,
+			onnotice: () => {},
+		});
+		try {
+			await forced.initialize();
+			await forced.setEmbeddingMetadata("ann-ceiling-test", 8);
+
+			const vec = (a: number, b: number) => [1, a, b, 0, 0, 0, 0, 0];
+			const q = vec(0, 0);
+
+			// 100 superseded neighbours sit closest to the query. With limit=40,
+			// annCandidates = 640; the old code let HNSW stop at ef_search=40
+			// superseded rows, so no active row was ever reached.
+			for (let i = 0; i < 100; i++) {
+				await forced.insertEntry(
+					makeEntry(`ceil-sup-${i}`, {
+						status: "superseded",
+						supersededBy: "ceil-act-0",
+						embedding: vec(0.001 * (i + 1), 0),
+					}),
+				);
+			}
+			for (let i = 0; i < 3; i++) {
+				await forced.insertEntry(
+					makeEntry(`ceil-act-${i}`, {
+						status: "active",
+						embedding: vec(0.2, 0.01 * (i + 1)),
+					}),
+				);
+			}
+
+			await expectHnswPlan(planSql);
+
+			const result = await forced.findSimilarEntries(q, 40, 0.5, ["active"]);
+			expect(result.map((r) => r.entry.id).sort()).toEqual([
+				"ceil-act-0",
+				"ceil-act-1",
+				"ceil-act-2",
+			]);
+		} finally {
+			await Promise.all([forced.close(), planSql.end()]);
+		}
+	});
+
+	it("findSimilarEntries returns full ANN results when two calls race on a fresh pool connection", async () => {
+		// Pool of 2: initialize() leaves one idle connection. The two concurrent calls
+		// below reserve that one for the first call and open a new connection for the
+		// second. This assumes postgres.js connects lazily and reserves synchronously,
+		// so the second call runs on a backend where vector.so is not yet loaded.
+		const forcedUri = new URL(uri);
+		forcedUri.searchParams.set("enable_seqscan", "off");
+		const forced = new PostgresKnowledgeDB(forcedUri.toString(), 2);
+		const planSql = postgres(forcedUri.toString(), {
+			max: 1,
+			onnotice: () => {},
+		});
+		try {
+			await forced.initialize();
+			await forced.setEmbeddingMetadata("ann-fresh-conn-test", 8);
+
+			const vec = (a: number, b: number) => [1, a, b, 0, 0, 0, 0, 0];
+			const q = vec(0, 0);
+
+			// 50 superseded neighbours fill the default ef_search of 40 on their own,
+			// so only a raised ef_search can return the 40 active rows below.
+			for (let i = 0; i < 50; i++) {
+				await forced.insertEntry(
+					makeEntry(`fresh-sup-${i}`, {
+						status: "superseded",
+						supersededBy: "fresh-act-0",
+						embedding: vec(0.001 * (i + 1), 0),
+					}),
+				);
+			}
+			for (let i = 0; i < 60; i++) {
+				await forced.insertEntry(
+					makeEntry(`fresh-act-${i}`, {
+						status: "active",
+						embedding: vec(0.2, 0.01 * (i + 1)),
+					}),
+				);
+			}
+
+			// Nearest 40 active rows, in distance order (fresh-act-0 .. fresh-act-39).
+			const expected = Array.from(
+				{ length: 40 },
+				(_, i) => `fresh-act-${i}`,
+			).sort();
+
+			// Guard: the race must run on the HNSW path, or it proves nothing.
+			await expectHnswPlan(planSql);
+
+			const [first, second] = await Promise.all([
+				forced.findSimilarEntries(q, 40, 0.5, ["active"]),
+				forced.findSimilarEntries(q, 40, 0.5, ["active"]),
+			]);
+			expect(first.map((r) => r.entry.id).sort()).toEqual(expected);
+			expect(second.map((r) => r.entry.id).sort()).toEqual(expected);
+		} finally {
+			await Promise.all([forced.close(), planSql.end()]);
+		}
+	});
+
+	it("findSimilarEntries returns every entry field including the embedding", async () => {
+		const pg = db as PostgresKnowledgeDB;
+		await pg.setEmbeddingMetadata("parity-test", 8);
+		await pg.insertEntry(
+			makeEntry("parity-1", {
+				type: "principle",
+				topics: ["alpha", "beta"],
+				confidence: 0.7,
+				source: "parity-source",
+				strength: 0.9,
+				accessCount: 3,
+				observationCount: 2,
+				derivedFrom: ["src-a", "src-b"],
+				isSynthesized: true,
+				embedding: [1, 0.1, 0, 0, 0, 0, 0, 0],
+			}),
+		);
+
+		const result = await pg.findSimilarEntries(
+			[1, 0, 0, 0, 0, 0, 0, 0],
+			5,
+			0.5,
+		);
+		expect(result).toHaveLength(1);
+		const expected = await pg.getEntry("parity-1");
+		expect(expected).not.toBeNull();
+		expect(result[0].entry).toEqual(expected);
+		expect(result[0].entry.embedding).toHaveLength(8);
+	});
+
+	it("findContradictionCandidates returns every entry field including the embedding", async () => {
+		const pg = db as PostgresKnowledgeDB;
+		await pg.setEmbeddingMetadata("parity-test", 8);
+		await pg.insertEntry(
+			makeEntry("contra-parity", {
+				topics: ["shared-topic"],
+				derivedFrom: ["src-a"],
+				isSynthesized: true,
+				embedding: [1, 0.5, 0, 0, 0, 0, 0, 0],
+			}),
+		);
+
+		// Similarity is about 0.894, inside the [0.5, 0.99) band.
+		const res = await pg.findContradictionCandidates(
+			[1, 0, 0, 0, 0, 0, 0, 0],
+			["shared-topic"],
+			[],
+			0.5,
+			0.99,
+		);
+		expect(res).toHaveLength(1);
+		const expected = await pg.getEntry("contra-parity");
+		expect(expected).not.toBeNull();
+		expect(res[0]).toEqual(expected);
+		expect(res[0].embedding).toHaveLength(8);
+	});
+
+	it("findSimilarEntries latches the ef_search fallback only for unsupported-setting errors", async () => {
+		const store = new PostgresKnowledgeDB(uri, 1);
+		store.id = "fallback-store";
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await store.initialize();
+			await store.setEmbeddingMetadata("ef-fallback-test", 8);
+			await store.insertEntry(
+				makeEntry("fallback-1", { embedding: [1, 0, 0, 0, 0, 0, 0, 0] }),
+			);
+			const unsupported = Object.assign(
+				new Error("unrecognized configuration parameter"),
+				{ code: "42704" },
+			);
+			const calls = stubAnnTransaction(store, { setConfig: unsupported });
+
+			const q = [1, 0, 0, 0, 0, 0, 0, 0];
+			const first = await store.findSimilarEntries(q, 5, 0.5, ["active"]);
+			const second = await store.findSimilarEntries(q, 5, 0.5, ["active"]);
+			expect(first.map((r) => r.entry.id)).toEqual(["fallback-1"]);
+			expect(second.map((r) => r.entry.id)).toEqual(["fallback-1"]);
+			// Latched: the second call goes straight to the plain query.
+			expect(calls.begin).toBe(1);
+			expect(warn).toHaveBeenCalledTimes(1);
+			const latchedWarning = String(warn.mock.calls[0][0]);
+			expect(latchedWarning).toContain('Store "fallback-store"');
+			expect(latchedWarning).toContain(
+				"ANN recall for this store is capped at the pgvector default (40 candidates) until the process restarts",
+			);
+			expect(
+				(store as unknown as { efSearchUnsupported: boolean })
+					.efSearchUnsupported,
+			).toBe(true);
+		} finally {
+			warn.mockRestore();
+			await store.close();
+		}
+	});
+
+	it("findSimilarEntries falls back per call without latching on transient set_config errors", async () => {
+		const store = new PostgresKnowledgeDB(uri, 1);
+		store.id = "fallback-store";
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await store.initialize();
+			await store.setEmbeddingMetadata("ef-fallback-test", 8);
+			await store.insertEntry(
+				makeEntry("fallback-1", { embedding: [1, 0, 0, 0, 0, 0, 0, 0] }),
+			);
+			const transient = Object.assign(
+				new Error("canceling statement due to statement timeout"),
+				{ code: "57014" },
+			);
+			const calls = stubAnnTransaction(store, { setConfig: transient });
+
+			const q = [1, 0, 0, 0, 0, 0, 0, 0];
+			for (let i = 0; i < 2; i++) {
+				const res = await store.findSimilarEntries(q, 5, 0.5, ["active"]);
+				expect(res.map((r) => r.entry.id)).toEqual(["fallback-1"]);
+			}
+			// Not latched: every call still tries set_config first.
+			expect(calls.begin).toBe(2);
+			expect(warn).toHaveBeenCalledTimes(2);
+			for (const call of warn.mock.calls) {
+				expect(String(call[0])).toContain('Store "fallback-store"');
+			}
+			expect(
+				(store as unknown as { efSearchUnsupported: boolean })
+					.efSearchUnsupported,
+			).toBe(false);
+		} finally {
+			warn.mockRestore();
+			await store.close();
+		}
+	});
+
+	it("findSimilarEntries rethrows errors from the ANN query itself", async () => {
+		const store = new PostgresKnowledgeDB(uri, 1);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await store.initialize();
+			await store.setEmbeddingMetadata("ef-fallback-test", 8);
+			const boom = Object.assign(new Error("boom"), { code: "XX000" });
+			const calls = stubAnnTransaction(store, { query: boom });
+
+			await expect(
+				store.findSimilarEntries([1, 0, 0, 0, 0, 0, 0, 0], 5, 0.5, ["active"]),
+			).rejects.toBe(boom);
+			expect(calls.begin).toBe(1);
+			expect(warn).not.toHaveBeenCalled();
+			expect(
+				(store as unknown as { efSearchUnsupported: boolean })
+					.efSearchUnsupported,
+			).toBe(false);
+		} finally {
+			warn.mockRestore();
+			await store.close();
+		}
 	});
 
 	it("degrades gracefully when dimensions exceed halfvec HNSW limit", async () => {
