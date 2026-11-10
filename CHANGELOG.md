@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.10.2](https://github.com/MAnders333/knowledge-server/compare/v3.10.1...v3.10.2) (2026-11-10)
+
+
+### Bug Fixes
+
+* **db:** raise hnsw.ef_search for ANN candidates and skip embedding_vec ([f3ffc54](https://github.com/MAnders333/knowledge-server/commit/f3ffc54515e5a2f00f9204e71ea6cec1c3dd6596))
+
 ## [3.10.1](https://github.com/MAnders333/knowledge-server/compare/v3.10.0...v3.10.1) (2026-11-09)
 
 
