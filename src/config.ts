@@ -289,7 +289,16 @@ export const config = {
 		// the /activate HTTP route and the MCP `activate` tool.
 		//
 		// Override via EMBEDDING_TIMEOUT_MS env var. Must be a positive integer.
+		// Background bulk embedding uses max(this, BULK_EMBED_MIN_TIMEOUT_MS = 60s).
 		timeoutMs: parseIntEnv(process.env.EMBEDDING_TIMEOUT_MS, 20_000, 1),
+		// Retry budget per 100-text chunk for background bulk embedding only
+		// (startup re-embed after an EMBEDDING_MODEL change, post-consolidation
+		// backfill of missing embeddings). Retries transient failures: timeouts,
+		// network errors, HTTP 408/429/5xx and malformed/truncated responses,
+		// with exponential backoff from 1s. Bulk calls also use a per-attempt
+		// timeout of at least 60s. Interactive activation never retries.
+		// Set to 0 to disable.
+		maxRetries: parseIntEnv(process.env.EMBEDDING_MAX_RETRIES, 2, 0),
 	},
 
 	// Decay parameters

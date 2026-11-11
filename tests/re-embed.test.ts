@@ -15,6 +15,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ActivationEngine } from "../src/activation/activate";
+import { bulkEmbedOptions } from "../src/activation/embeddings";
 import { config } from "../src/config";
 import { KnowledgeDB } from "../src/db/sqlite/index";
 import { fakeEmbedding, makeEntry } from "./fixtures";
@@ -142,6 +143,78 @@ describe("checkAndReEmbed", () => {
 			expect(entry.embedding).toBeDefined();
 			expect(entry.embedding.length).toBe(newEmb.length);
 		}
+	});
+
+	it("passes bulk embed options to embedBatch", async () => {
+		const oldEmb = fakeEmbedding("old");
+		const newEmb = fakeEmbedding("new");
+		await db.insertEntry(
+			makeEntry({ id: "e1", content: "Entry one", embedding: oldEmb }),
+		);
+		await db.setEmbeddingMetadata("old-model", oldEmb.length);
+		config.embedding.model = "new-model";
+
+		const spy = spyOn(activation.embeddings, "embedBatch").mockResolvedValue([
+			newEmb,
+		]);
+
+		await activation.checkAndReEmbed();
+
+		expect(spy.mock.calls[0][1]).toEqual(bulkEmbedOptions());
+	});
+
+	it("bulk embed options use the 60s timeout floor and configured retries", () => {
+		const savedTimeout = config.embedding.timeoutMs;
+		const savedRetries = config.embedding.maxRetries;
+		try {
+			config.embedding.maxRetries = 2;
+			config.embedding.timeoutMs = 20_000;
+			expect(bulkEmbedOptions()).toEqual({ maxRetries: 2, timeoutMs: 60_000 });
+			config.embedding.timeoutMs = 90_000;
+			expect(bulkEmbedOptions()).toEqual({ maxRetries: 2, timeoutMs: 90_000 });
+		} finally {
+			config.embedding.timeoutMs = savedTimeout;
+			config.embedding.maxRetries = savedRetries;
+		}
+	});
+
+	it("ensureEmbeddings passes bulk embed options to embedBatch", async () => {
+		const savedTimeout = config.embedding.timeoutMs;
+		const savedRetries = config.embedding.maxRetries;
+		try {
+			config.embedding.maxRetries = 2;
+			config.embedding.timeoutMs = 20_000;
+			await db.insertEntry(makeEntry({ id: "e1", content: "Entry one" }));
+			const spy = spyOn(activation.embeddings, "embedBatch").mockResolvedValue([
+				fakeEmbedding("one"),
+			]);
+
+			expect(await activation.ensureEmbeddings()).toBe(1);
+			expect(spy.mock.calls[0][1]).toEqual({
+				maxRetries: 2,
+				timeoutMs: 60_000,
+			});
+		} finally {
+			config.embedding.timeoutMs = savedTimeout;
+			config.embedding.maxRetries = savedRetries;
+		}
+	});
+
+	it("names the failing store when re-embed fails", async () => {
+		const oldEmb = fakeEmbedding("old");
+		await db.insertEntry(
+			makeEntry({ id: "e1", content: "Entry one", embedding: oldEmb }),
+		);
+		await db.setEmbeddingMetadata("old-model", oldEmb.length);
+		config.embedding.model = "new-model";
+
+		spyOn(activation.embeddings, "embedBatch").mockRejectedValue(
+			new Error("rate limit exceeded"),
+		);
+
+		await expect(activation.checkAndReEmbed()).rejects.toThrow(
+			`store "${db.id}"`,
+		);
 	});
 
 	it("old embeddings remain intact when embedBatch fails (no NULL gap)", async () => {

@@ -9,7 +9,9 @@ import type {
 } from "../types.js";
 import {
 	EmbeddingClient,
+	bulkEmbedOptions,
 	cosineSimilarity,
+	describeError,
 	formatEmbeddingText,
 } from "./embeddings.js";
 import type { RerankScorer } from "./rerank.js";
@@ -640,7 +642,10 @@ export class ActivationEngine {
 			formatEmbeddingText(e.type, e.content, e.topics),
 		);
 
-		const embeddings = await this.embeddings.embedBatch(texts);
+		const embeddings = await this.embeddings.embedBatch(
+			texts,
+			bulkEmbedOptions(),
+		);
 
 		for (let i = 0; i < needsEmbedding.length; i++) {
 			await db.updateEntry(needsEmbedding[i].id, {
@@ -665,9 +670,10 @@ export class ActivationEngine {
 	 * 3. If stored model matches configured model → no-op
 	 * 4. If stored model differs:
 	 *    a. Log the model change clearly
-	 *    b. Write embedding metadata with the new model + dimensions FIRST
-	 *       (see inline comments on crash-recovery trade-offs below)
-	 *    c. Overwrite each entry's embedding vector with the new-model vector
+	 *    b. Compute all new vectors (nothing is written if this fails)
+	 *    c. Overwrite each entry's embedding vector with the new-model vector,
+	 *       then write the metadata LAST (see inline comments on crash-recovery
+	 *       trade-offs below)
 	 *
 	 * Called at startup before consolidation so all vectors are consistent.
 	 * Fans out across all writable stores. Returns true if any store was re-embedded.
@@ -675,7 +681,15 @@ export class ActivationEngine {
 	async checkAndReEmbed(): Promise<boolean> {
 		let anyReEmbedded = false;
 		for (const store of this.writableDbs) {
-			const did = await this.checkAndReEmbedStore(store);
+			let did: boolean;
+			try {
+				did = await this.checkAndReEmbedStore(store);
+			} catch (e) {
+				throw new Error(
+					`Re-embed check for store "${store.id}" failed: ${describeError(e)}`,
+					{ cause: e },
+				);
+			}
 			if (did) anyReEmbedded = true;
 		}
 		return anyReEmbedded;
@@ -762,9 +776,13 @@ export class ActivationEngine {
 		// then overwrite each entry's vector individually, then stamp the metadata.
 		//
 		// Failure modes:
-		// - embedBatch throws (network error, rate limit): nothing is written →
-		//   metadata still points to the old model → next startup detects mismatch
-		//   and retries in full. Safe.
+		// - embedBatch throws (after per-chunk retries for transient errors, or on a
+		//   response that fails validation): nothing is written → metadata still
+		//   points to the old model → next startup detects mismatch and retries in
+		//   full. Safe.
+		// - Response validation (count, vector shape) rejects truncated responses.
+		//   Distinct indices are sorted; duplicate indices fall back to array order
+		//   with a warning (#100).
 		// - Process crashes mid-loop: entries updated so far have new-model
 		//   embeddings; remaining entries still carry old-model embeddings (non-NULL).
 		//   Because metadata is written AFTER the loop, next startup sees
@@ -775,7 +793,10 @@ export class ActivationEngine {
 		const texts = entriesWithEmbeddings.map((e) =>
 			formatEmbeddingText(e.type, e.content, e.topics),
 		);
-		const newEmbeddings = await this.embeddings.embedBatch(texts);
+		const newEmbeddings = await this.embeddings.embedBatch(
+			texts,
+			bulkEmbedOptions(),
+		);
 
 		const newDimensions =
 			newEmbeddings.length > 0 ? newEmbeddings[0].length : 0;
