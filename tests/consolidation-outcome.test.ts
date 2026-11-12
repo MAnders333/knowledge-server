@@ -137,7 +137,8 @@ describe("store locked by another process", () => {
 		);
 		expect(drained.totalSessions).toBe(0);
 		// A batch that settles nothing stops the drain: one extraction, no retry loop.
-		expect(extract).toHaveBeenCalledTimes(1);
+		// The lock is checked before extraction, so a held lock costs no LLM call.
+		expect(extract).toHaveBeenCalledTimes(0);
 	});
 
 	it("processes the deferred rows once the lock is free", async () => {

@@ -605,6 +605,15 @@ export class ConsolidationEngine {
 			return { outcome: "deferred", ...none };
 		}
 
+		// Check the lock before paying for LLM extraction: if another process holds the
+		// default store's lock, the write phase would defer this chunk anyway.
+		if (!(await this.storeLockIsFree(domainResolution?.store ?? this.db))) {
+			logger.log(
+				`[consolidation/${source}] Deferring chunk — store consolidation lock held by another process; no extraction run.`,
+			);
+			return { outcome: "deferred", ...none };
+		}
+
 		let extracted: ExtractedKnowledge[];
 		try {
 			extracted = await this.extractFromChunk(source, chunk, domainResolution);
@@ -725,6 +734,13 @@ export class ConsolidationEngine {
 			conflictsResolved: chunkConflictsResolved,
 			touchedStores,
 		};
+	}
+
+	/** Whether the store's consolidation lock is free right now (checked, not held). */
+	private async storeLockIsFree(store: IKnowledgeStore): Promise<boolean> {
+		if (!(await store.tryAcquireConsolidationLock())) return false;
+		await store.releaseConsolidationLock();
+		return true;
 	}
 
 	/** True when the episode's target store is unavailable; its rows wait for a later run. */
