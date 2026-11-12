@@ -6,16 +6,18 @@ on:
     types: [completed]
     branches: [main]
 
-# One release run at a time. A run queued behind another waits; it is not cancelled.
-concurrency:
-  group: release-please
-  cancel-in-progress: false
-
 # No default token scope. Each job grants only what it needs below.
 permissions: {}
 
 jobs:
   release-please:
+    # One release run at a time. cancel-in-progress is false, so a run in progress is
+    # never cancelled. The group is on this job, not the workflow: the job-level `if`
+    # below is evaluated before the group is entered, so skipped runs (PRs, forks,
+    # failed CI) never take the group's pending slot and cancel a pending release.
+    concurrency:
+      group: release-please
+      cancel-in-progress: false
     # Only for CI runs of a direct push to this repository (not PR runs, not forks).
     if: >-
       github.event.workflow_run.conclusion == 'success' &&

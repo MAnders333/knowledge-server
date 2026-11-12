@@ -54,3 +54,22 @@ describe("release workflow publish job", () => {
 		expect(stage).toContain("dist/install.sh");
 	});
 });
+
+describe("release workflow concurrency", () => {
+	const workflow = read(".github/workflows/release-please.yml");
+	const header = workflow.slice(0, workflow.indexOf("\njobs:"));
+	const releaseJob = workflow.slice(
+		workflow.indexOf("\n  release-please:"),
+		workflow.indexOf("\n  build-binaries:"),
+	);
+
+	it("is not set at workflow level, where skipped runs would queue", () => {
+		expect(header).not.toMatch(/^concurrency:/m);
+	});
+
+	it("is set on the release-please job and never cancels an in-flight release", () => {
+		expect(releaseJob).toContain(
+			"concurrency:\n      group: release-please\n      cancel-in-progress: false",
+		);
+	});
+});

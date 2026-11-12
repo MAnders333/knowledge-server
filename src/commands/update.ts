@@ -1,8 +1,8 @@
 import { existsSync } from "node:fs";
 import { rename, unlink } from "node:fs/promises";
-import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { resolveDataDir } from "../config-file.js";
+import { homeDir } from "../home.js";
 import { restartDaemonAfterUpdate } from "./daemon-restart.js";
 import {
 	EXTENSION_ASSETS,
@@ -304,7 +304,7 @@ async function restartDaemonFromUpdate(): Promise<void> {
 	try {
 		await restartDaemonAfterUpdate({
 			platform: process.platform,
-			home: process.env.HOME || homedir(),
+			home: homeDir(),
 			uid: process.getuid?.() ?? 0,
 			dataDir: resolveDataDir(),
 			log: (line) => console.log(line),
@@ -438,7 +438,7 @@ export async function runUpdate(
 	// registered. Adopt the ones whose bytes match a known release; the registry
 	// entry is written only after the verified refresh below.
 	const adopted: ExtensionTarget[] = [];
-	for (const copy of findLegacyExtensionCopies(homedir())) {
+	for (const copy of findLegacyExtensionCopies(homeDir())) {
 		if (targets.some((t) => t.dst === copy.target.dst)) continue;
 		if (!copy.adoptable) {
 			console.log(

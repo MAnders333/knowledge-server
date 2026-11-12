@@ -19,7 +19,7 @@ import {
 	prepareQuery,
 	storedNorm,
 } from "./embeddings.js";
-import { formatKnowledgeLine } from "./format.js";
+import { MAX_CONTEXT_CHARS, formatKnowledgeLine } from "./format.js";
 import {
 	applyTokenBudget,
 	denseFloor,
@@ -36,6 +36,13 @@ const MAX_SESSIONS = 1000;
 const SESSION_RESCORE_MARGIN = 0.1;
 /** Relation-expanded sources are gated and ranked at this fraction of their parent. */
 const SOURCE_GATE_DISCOUNT = 0.9;
+/**
+ * Token cap of the injected block: the formatter's character cap in the same
+ * estimate the token budget uses. The budget never exceeds it, so every entry the
+ * engine keeps is rendered, and nothing is recorded, remembered or logged that the
+ * formatter would cut.
+ */
+const RENDER_TOKEN_CAP = estimateTokens(MAX_CONTEXT_CHARS);
 
 /** Server-side cap on activation cues per call (see normalizeCues). */
 export const MAX_CUES = 12;
@@ -431,14 +438,14 @@ export class ActivationEngine {
 			/** Min similarity threshold. Overrides config.activation.similarityThreshold. */
 			threshold?: number;
 			/**
-			 * Read-only: no injection writes (commitInjections never receives a plan),
-			 * so measuring activation never changes the store. Used by the replay harness and the CLI.
+			 * Read-only: no store writes (the plan's writes are empty). Session dedupe
+			 * state is recorded only when the plan is committed. Used by the replay harness and the CLI.
 			 */
 			dryRun?: boolean;
 			/**
 			 * Client-scoped session key (for example `${client}\0${sessionId}`). When set,
-			 * entries already injected in this session are suppressed (session-dedupe.ts).
-			 * Requests without a key are not deduplicated.
+			 * entries already shown in this session are suppressed (session-dedupe.ts),
+			 * once the plan is committed. Requests without a key are not deduplicated.
 			 */
 			session?: string;
 		},
@@ -703,7 +710,12 @@ export class ActivationEngine {
 					ageDays: Math.round(ageDays),
 					strength: liveStrength,
 					lastAccessedDaysAgo: Math.round(lastAccessedDaysAgo),
-					mayBeStale: ageDays > halfLife && entry.accessCount < 3,
+					mayBeStale: isMayBeStale(
+						entry,
+						ageDays,
+						lastAccessedDaysAgo,
+						halfLife,
+					),
 				},
 			});
 		}
@@ -747,7 +759,7 @@ export class ActivationEngine {
 		const nCandidates = scored.length;
 		let gateDropped = 0;
 		let gateMode: GateMode = this.reranker ? "dense" : "off";
-		if (this.reranker && scored.length > 1) {
+		if (this.reranker && scored.length > 0) {
 			// Bound the rerank input: across multiple cues and stores the pool
 			// can exceed `candidates` — keep the dense-best slice.
 			const maxCandidates = config.activation.rerank.candidates;
@@ -802,8 +814,43 @@ export class ActivationEngine {
 			scored.splice(0, scored.length, ...passing);
 		}
 
-		// Sort and cap.
+		// Sort, then drop what cannot be injected before the cap, so the cap is spent
+		// on entries that can be shown: flagged conflicted entries with no contradicts
+		// partner, and entries already shown in this session (session-dedupe.ts).
 		scored.sort((a, b) => b.similarity - a.similarity);
+		const conflictedIds = scored
+			.filter(({ entry }) => entry.status === "conflicted")
+			.map(({ entry }) => entry.id);
+		const contradictPairs = mergeMaps(
+			await this.fanOutSafe(
+				this.readDbs,
+				(db) => db.getContradictPairsForIds(conflictedIds),
+				"contradict pairs lookup",
+				slots,
+			),
+		);
+		const beforeFlagCheck = scored.length;
+		const unflagged = scored.filter(
+			({ entry }) =>
+				entry.status !== "conflicted" || contradictPairs.has(entry.id),
+		);
+		gateDropped += beforeFlagCheck - unflagged.length;
+		scored.splice(0, scored.length, ...unflagged);
+
+		const sessionKey = options?.session;
+		let deduped = 0;
+		if (sessionKey !== undefined) {
+			const fresh = scored.filter((s) => {
+				const suppressed = this.sessions.isSuppressed(
+					sessionKey,
+					{ id: s.entry.id, rawSimilarity: s.rawSimilarity },
+					now,
+				);
+				if (suppressed) deduped++;
+				return !suppressed;
+			});
+			scored.splice(0, scored.length, ...fresh);
+		}
 		scored.splice(maxResults);
 
 		// ── Relation-aware activation: pull in supports sources ───────────────────
@@ -858,6 +905,25 @@ export class ActivationEngine {
 			// Snapshot the array before iterating — we push source entries into `scored`
 			// during the loop and don't want to visit newly-added entries (which could
 			// cascade if a source is itself a principle with its own supports relations).
+			// Conflicted sources need their contradicts partners for the flag check.
+			const unfetched = [...sourcesMap.values()]
+				.flat()
+				.filter(
+					({ source }) =>
+						source.status === "conflicted" && !contradictPairs.has(source.id),
+				)
+				.map(({ source }) => source.id);
+			if (unfetched.length > 0) {
+				const more = mergeMaps(
+					await this.fanOutSafe(
+						this.readDbs,
+						(db) => db.getContradictPairsForIds(unfetched),
+						"contradict pairs lookup",
+						slots,
+					),
+				);
+				for (const [id, partner] of more) contradictPairs.set(id, partner);
+			}
 			const snapshot = [...scored];
 			for (const parent of snapshot) {
 				const { entry, rawSimilarity, similarity: synthSimilarity } = parent;
@@ -872,6 +938,26 @@ export class ActivationEngine {
 					const sourceGate = parent.gateScore * SOURCE_GATE_DISCOUNT;
 					if (floor !== null && sourceGate < floor) {
 						gateDropped++;
+						continue;
+					}
+					// Same rules as candidates: a flagged source and a source already shown in
+					// this session are not injected, and do not use up the cap.
+					if (
+						source.status === "conflicted" &&
+						!contradictPairs.has(source.id)
+					) {
+						gateDropped++;
+						continue;
+					}
+					if (
+						sessionKey !== undefined &&
+						this.sessions.isSuppressed(
+							sessionKey,
+							{ id: source.id, rawSimilarity },
+							now,
+						)
+					) {
+						deduped++;
 						continue;
 					}
 
@@ -894,7 +980,12 @@ export class ActivationEngine {
 							ageDays: Math.round(ageDays),
 							strength: liveStrength,
 							lastAccessedDaysAgo: Math.round(lastAccessedDaysAgo),
-							mayBeStale: ageDays > halfLife && source.accessCount < 3,
+							mayBeStale: isMayBeStale(
+								source,
+								ageDays,
+								lastAccessedDaysAgo,
+								halfLife,
+							),
 						},
 					});
 					scoredIdSet.add(source.id);
@@ -905,49 +996,6 @@ export class ActivationEngine {
 			}
 		}
 		// ─────────────────────────────────────────────────────────────────────────
-
-		// Batch-fetch all contradicts relations for conflicted entries in a single query,
-		// avoiding N+1 DB calls. Only fetch for entries with status 'conflicted'.
-		const conflictedIds = scored
-			.filter(({ entry }) => entry.status === "conflicted")
-			.map(({ entry }) => entry.id);
-
-		// Fan out contradiction pairs lookup across read stores and merge.
-		const contradictMaps = await this.fanOutSafe(
-			this.readDbs,
-			(db) => db.getContradictPairsForIds(conflictedIds),
-			"contradict pairs lookup",
-			slots,
-		);
-		const contradictPairs = mergeMaps(contradictMaps);
-
-		// A conflicted entry with no contradicts partner was flagged for review (not
-		// trustworthy), so it is never injected. Conflicted pairs stay and are annotated below.
-		const beforeFlagCheck = scored.length;
-		const unflagged = scored.filter(
-			({ entry }) =>
-				entry.status !== "conflicted" || contradictPairs.has(entry.id),
-		);
-		gateDropped += beforeFlagCheck - unflagged.length;
-		scored.splice(0, scored.length, ...unflagged);
-
-		// ── Session dedupe ──────────────────────────────────────────────────────
-		// Entries already injected in this session (within the TTL) are suppressed
-		// unless they now score much higher. See session-dedupe.ts.
-		const sessionKey = options?.session;
-		let deduped = 0;
-		if (sessionKey !== undefined) {
-			const fresh = scored.filter((s) => {
-				const suppressed = this.sessions.isSuppressed(
-					sessionKey,
-					{ id: s.entry.id, rawSimilarity: s.rawSimilarity },
-					now,
-				);
-				if (suppressed) deduped++;
-				return !suppressed;
-			});
-			scored.splice(0, scored.length, ...fresh);
-		}
 
 		// Build a map of activated entries for fast lookup during annotation.
 		// Used to determine whether a conflicted entry's counterpart also activated
@@ -978,9 +1026,15 @@ export class ActivationEngine {
 			});
 		}
 
-		// ── Token budget ────────────────────────────────────────────────────────
-		// Greedy prefix in ranking order; the top-ranked entry is always kept. Token
-		// counts are estimates (see gate.ts) of the formatted line of each entry.
+		// ── Token budget and render cap ─────────────────────────────────────────
+		// One cap for everything that is counted, recorded and remembered. The block
+		// cannot exceed RENDER_TOKEN_CAP, the formatter's own cap in the same estimate,
+		// and the token budget is clamped to it. Each line is costed with the
+		// formatter's newline, so the greedy prefix kept here is exactly what
+		// formatActivatedKnowledge renders. The budget applies with the gate off too.
+		const budget = gateOn
+			? Math.min(config.activation.gate.tokenBudget, RENDER_TOKEN_CAP)
+			: RENDER_TOKEN_CAP;
 		const lineTokens = new Map(
 			scored.map((s) => [
 				s,
@@ -989,21 +1043,17 @@ export class ActivationEngine {
 						entry: s.entry,
 						staleness: s.staleness,
 						contradiction: contradictionMap.get(s.entry.id),
-					}).length,
+					}).length + 1,
 				),
 			]),
 		);
-		let final = scored;
-		let budgetDropped = 0;
-		if (gateOn) {
-			final = applyTokenBudget(
-				scored,
-				config.activation.gate.tokenBudget,
-				(s) => lineTokens.get(s) ?? 0,
-				(s) => s.rawSimilarity >= similarityThreshold,
-			);
-			budgetDropped = scored.length - final.length;
-		}
+		const final = applyTokenBudget(
+			scored,
+			budget,
+			(s) => lineTokens.get(s) ?? 0,
+			(s) => s.rawSimilarity >= similarityThreshold,
+		);
+		const budgetDropped = scored.length - final.length;
 		// A counterpart the budget dropped is no longer in the response, so its
 		// annotation would point at nothing. Remove it.
 		const finalIds = new Set(final.map(({ entry }) => entry.id));
@@ -1016,17 +1066,6 @@ export class ActivationEngine {
 			(n, s) => n + (lineTokens.get(s) ?? 0),
 			0,
 		);
-
-		if (sessionKey !== undefined) {
-			this.sessions.remember(
-				sessionKey,
-				final.map(({ entry, rawSimilarity }) => ({
-					id: entry.id,
-					rawSimilarity,
-				})),
-				now,
-			);
-		}
 
 		return {
 			entries: final.map(
@@ -1050,29 +1089,49 @@ export class ActivationEngine {
 				deduped,
 				injectedTokens,
 			},
-			injection: dryRun ? undefined : this.injectionPlan(final),
+			injection: this.injectionPlan(final, { dryRun, sessionKey, now }),
 		};
 	}
 
 	/**
-	 * Injection writes for one response, grouped by owning store. Only writable
-	 * stores get a write: entries read from writable:false stores are not recorded.
+	 * What one response showed: injection writes grouped by owning store (writable
+	 * stores only, none for dryRun), and the session dedupe record. Undefined for a
+	 * dryRun without a session, which has nothing to commit.
 	 */
 	private injectionPlan(
-		items: ReadonlyArray<{ entry: KnowledgeEntry; owner: IKnowledgeStore }>,
-	): InjectionPlan {
+		items: ReadonlyArray<{
+			entry: KnowledgeEntry;
+			owner: IKnowledgeStore;
+			rawSimilarity: number;
+		}>,
+		opts: { dryRun: boolean; sessionKey: string | undefined; now: number },
+	): InjectionPlan | undefined {
+		if (opts.dryRun && opts.sessionKey === undefined) return undefined;
 		const byStore = new Map<string, string[]>();
-		for (const { entry, owner } of items) {
-			if (!this.writableDbs.some((db) => db.id === owner.id)) continue;
-			const ids = byStore.get(owner.id);
-			if (ids) ids.push(entry.id);
-			else byStore.set(owner.id, [entry.id]);
+		if (!opts.dryRun) {
+			for (const { entry, owner } of items) {
+				if (!this.writableDbs.some((db) => db.id === owner.id)) continue;
+				const ids = byStore.get(owner.id);
+				if (ids) ids.push(entry.id);
+				else byStore.set(owner.id, [entry.id]);
+			}
 		}
 		return {
 			writes: [...byStore].map(([storeId, entryIds]) => ({
 				storeId,
 				entryIds,
 			})),
+			session:
+				opts.sessionKey === undefined
+					? undefined
+					: {
+							key: opts.sessionKey,
+							at: opts.now,
+							items: items.map(({ entry, rawSimilarity }) => ({
+								id: entry.id,
+								rawSimilarity,
+							})),
+						},
 		};
 	}
 
@@ -1103,13 +1162,22 @@ export class ActivationEngine {
 	}
 
 	/**
-	 * Record one response's injections: one batched write per owning writable
-	 * store. Call it after the response is built. It is not awaited, so it adds no
-	 * latency. A failing store is logged once per failure streak and never reaches
-	 * the caller. The caller skips abandoned requests.
+	 * Record one response's injections: the session dedupe record (in memory) and one
+	 * batched write per owning writable store. Call it once the response has been
+	 * delivered. The caller skips abandoned requests, so an entry the client never
+	 * received is neither counted nor suppressed for the next prompt. Store writes
+	 * are not awaited, so they add no latency. A failing store is logged once per
+	 * failure streak and never reaches the caller.
 	 */
 	commitInjections(plan: InjectionPlan | undefined): void {
 		if (!plan) return;
+		if (plan.session) {
+			this.sessions.remember(
+				plan.session.key,
+				plan.session.items,
+				plan.session.at,
+			);
+		}
 		const now = Date.now();
 		for (const write of plan.writes) {
 			const db = this.writableDbs.find((d) => d.id === write.storeId);
@@ -1366,6 +1434,22 @@ function storeSupportsAnn(db: IKnowledgeStore): boolean {
 		typeof db.findSimilarEntries === "function" &&
 		(typeof db.isVectorSearchReady !== "function" || db.isVectorSearchReady())
 	);
+}
+
+/**
+ * Whether an entry older than its type's half-life may be outdated. Usage is the
+ * retrieval count plus the injection count: access_count no longer moves on
+ * injection, so injection_count is the live signal. An entry used within its
+ * half-life is not flagged, so an entry injected daily stays clean.
+ */
+function isMayBeStale(
+	entry: Pick<KnowledgeEntry, "accessCount" | "injectionCount">,
+	ageDays: number,
+	lastAccessedDaysAgo: number,
+	halfLife: number,
+): boolean {
+	const uses = entry.accessCount + entry.injectionCount;
+	return ageDays > halfLife && lastAccessedDaysAgo > halfLife && uses < 3;
 }
 
 /**

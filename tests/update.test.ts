@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import {
 	existsSync,
@@ -23,6 +23,7 @@ import {
 	downloadAndInstallDaemon,
 	installVerifiedAssets,
 	isDowngrade,
+	runUpdate,
 } from "../src/commands/update";
 import { tryAcquireProcessLock } from "../src/process-lock";
 import { daemonLockPath } from "../src/runtime-files";
@@ -493,5 +494,67 @@ describe("restartDaemonAfterUpdate", () => {
 			warn,
 		});
 		expect(outcome).toBe("not-running");
+	});
+});
+
+describe("runUpdate legacy extension adoption scan", () => {
+	it("scans the HOME it is given, not the account home", async () => {
+		const savedHome = process.env.HOME;
+		const savedExecPath = process.execPath;
+		const platform = detectPlatform();
+		const serverName = `knowledge-server-${platform}`;
+		const daemonName = `knowledge-daemon-${platform}`;
+		const serverBin = Buffer.from("NEW-SERVER");
+		const daemonBin = Buffer.from("NEW-DAEMON");
+		const fakeHome = join(root, "home");
+		const pluginDir = join(fakeHome, ".config", "opencode", "plugins");
+		mkdirSync(pluginDir, { recursive: true });
+		const legacy = join(pluginDir, "knowledge.ts");
+		writeFileSync(legacy, "EDITED-BY-USER");
+		const execPath = join(libexec, "knowledge-server");
+		writeFileSync(execPath, "OLD-SERVER");
+		const sums = [
+			`${sha256(serverBin)}  ${serverName}`,
+			`${sha256(daemonBin)}  ${daemonName}`,
+		].join("\n");
+		const routes = new Map<string, Buffer>([
+			[assetUrl(`SHA256SUMS-${platform}`), Buffer.from(`${sums}\n`)],
+			[assetUrl(`${serverName}.gz`), Bun.gzipSync(serverBin)],
+			[assetUrl(`${daemonName}.gz`), Bun.gzipSync(daemonBin)],
+		]);
+		const logs: string[] = [];
+		const spies = [
+			spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+				logs.push(args.map(String).join(" "));
+			}),
+			spyOn(console, "warn").mockImplementation(() => {}),
+			spyOn(console, "error").mockImplementation(() => {}),
+			spyOn(process, "exit").mockImplementation((() => {
+				throw new Error("process.exit called");
+			}) as never),
+		];
+		try {
+			process.env.HOME = fakeHome;
+			Object.defineProperty(process, "execPath", {
+				value: execPath,
+				configurable: true,
+				writable: true,
+			});
+			await runUpdate(["--version", VERSION], "v9.9.8", {
+				fetchFn: routedFetch(routes),
+				smoke: smokeAll,
+				restartDaemon: async () => {},
+			});
+		} finally {
+			for (const spy of spies) spy.mockRestore();
+			if (savedHome === undefined) Reflect.deleteProperty(process.env, "HOME");
+			else process.env.HOME = savedHome;
+			Object.defineProperty(process, "execPath", {
+				value: savedExecPath,
+				configurable: true,
+				writable: true,
+			});
+		}
+		expect(logs.some((l) => l.includes(legacy))).toBe(true);
 	});
 });

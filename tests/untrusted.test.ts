@@ -1,6 +1,5 @@
 import { describe, expect, it } from "bun:test";
 import {
-	containsInjectedKnowledge,
 	escapeUntrusted,
 	inlineUntrusted,
 	scrubUntrusted,
@@ -227,38 +226,36 @@ describe("stripInjectedKnowledge", () => {
 	});
 });
 
-describe("containsInjectedKnowledge", () => {
-	it("detects the opening and closing tag", () => {
-		expect(containsInjectedKnowledge("<addrl-activated-knowledge>\nfoo")).toBe(
-			true,
-		);
-		expect(containsInjectedKnowledge("bar\n</addrl-activated-knowledge>")).toBe(
-			true,
+describe("stripInjectedKnowledge: tag variants", () => {
+	it("removes an unclosed opening tag and everything after it", () => {
+		expect(stripInjectedKnowledge("<addrl-activated-knowledge>\nfoo")).toBe("");
+	});
+
+	it("removes a stray closing tag and keeps the text before it", () => {
+		expect(stripInjectedKnowledge("bar\n</addrl-activated-knowledge>")).toBe(
+			"bar\n",
 		);
 	});
 
-	it("detects the tag when invisible characters are inserted", () => {
-		expect(containsInjectedKnowledge("<addrl-activated-\u200Bknowledge>")).toBe(
-			true,
+	it("removes the tag when invisible characters are inserted", () => {
+		expect(stripInjectedKnowledge("<addrl-activated-\u200Bknowledge>")).toBe(
+			"",
 		);
 	});
 
-	it("ignores unrelated text", () => {
-		expect(containsInjectedKnowledge("knowledge base and <div> tags")).toBe(
-			false,
-		);
+	it("leaves unrelated text unchanged", () => {
+		const text = "knowledge base and <div> tags";
+		expect(stripInjectedKnowledge(text)).toBe(text);
 	});
 
-	it("still detects a tag with spaces and slashes inside the brackets", () => {
-		expect(containsInjectedKnowledge("< / addrl-activated-knowledge>")).toBe(
-			true,
-		);
+	it("removes a tag with spaces and slashes inside the brackets", () => {
+		expect(stripInjectedKnowledge("< / addrl-activated-knowledge>")).toBe("");
 	});
 
 	it("answers quickly on a long whitespace run after '<'", () => {
 		const hostile = `<${" ".repeat(200_000)}x`;
 		const started = performance.now();
-		expect(containsInjectedKnowledge(hostile)).toBe(false);
+		expect(stripInjectedKnowledge(hostile)).toBe(hostile);
 		expect(performance.now() - started).toBeLessThan(250);
 	});
 });

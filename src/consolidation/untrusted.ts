@@ -144,14 +144,6 @@ const INJECTED_KNOWLEDGE_TAG_RE = new RegExp(
 	"gi",
 );
 
-/**
- * True when text contains an opening or closing injection tag. Uses the same
- * bounded pattern as stripInjectedKnowledge. String.search ignores the g flag.
- */
-export function containsInjectedKnowledge(text: string): boolean {
-	return scrubUntrusted(text).search(INJECTED_KNOWLEDGE_TAG_RE) !== -1;
-}
-
 function isClosingTag(tag: string): boolean {
 	return /^<[\s/]*/.exec(tag)?.[0].includes("/") ?? false;
 }

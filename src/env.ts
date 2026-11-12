@@ -33,11 +33,5 @@ if (isBinaryInstall() || process.env.KNOWLEDGE_LOAD_ENV === "1") {
 				`[env] Warning: failed to load .env from ${envFile}: ${result.error}\n`,
 			);
 		}
-		if (result.ignored.length > 0) {
-			// One line per file. Key names only: the values may be secrets.
-			process.stderr.write(
-				`[env] Ignored ${result.ignored.length} key(s) in ${envFile} (process-control keys cannot be set from .env): ${result.ignored.join(", ")}; set them in the service environment.\n`,
-			);
-		}
 	}
 }
