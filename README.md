@@ -365,7 +365,7 @@ Provider-specific credentials take precedence over the unified endpoint.
 | `EMBEDDING_MODEL` | `text-embedding-3-large` | Embedding model. **Changing this re-embeds all entries on next startup.** |
 | `EMBEDDING_DIMENSIONS` | *(model default)* | Truncated output dimensions (only valid for `text-embedding-3-*`) |
 | `EMBEDDING_BASE_URL` | *(see below)* | Dedicated embedding endpoint. Priority: `EMBEDDING_BASE_URL` → `OPENAI_BASE_URL` → `LLM_BASE_ENDPOINT/openai/v1` |
-| `EMBEDDING_API_KEY` | *(see below)* | Falls back to `OPENAI_API_KEY` then `LLM_API_KEY` |
+| `EMBEDDING_API_KEY` | *(see below)* | Key for a dedicated `EMBEDDING_BASE_URL`. `LLM_API_KEY` is used there only when that URL shares `LLM_BASE_ENDPOINT`'s origin. Otherwise falls back to `OPENAI_API_KEY`, then `LLM_API_KEY`. |
 | `EMBEDDING_TIMEOUT_MS` | `20000` | Per-request embedding timeout in ms. Background re-embed and backfill use at least `60000` |
 | `EMBEDDING_MAX_RETRIES` | `2` | Retries per 100-text chunk on transient errors (timeouts, network errors, HTTP 408/429/5xx, truncated or malformed responses) during background re-embed and backfill. Interactive activation does not retry |
 
@@ -389,7 +389,9 @@ Credentials and paths stay in `.env`:
 
 | Variable | Default | Description |
 |---|---|---|
-| `KNOWLEDGE_ADMIN_TOKEN` | *(random per process)* | Fixed admin token for scripted use (≥16 chars) |
+| `KNOWLEDGE_ADMIN_TOKEN` | *(random per process)* | Fixed admin token for scripted use (≥16 chars; the template placeholder `your-stable-token-here` is rejected) |
+| `KNOWLEDGE_ALLOWED_HOSTS` | *(empty)* | Extra `Host` names the API accepts, comma-separated (`name` or `name:port`). `localhost`, `127.0.0.1`, `[::1]` and the bind host are always accepted. Needed when a reverse proxy forwards a different hostname. |
+| `REDACT_SECRETS` | `true` | Scrub credentials (private keys, cloud/SaaS/LLM API tokens, JWTs, `Authorization` headers, `*_SECRET`/`*_TOKEN`/`*_PASSWORD`/`*_API_KEY` values, URL passwords, long keyed secrets) from transcript text before it is staged, sent to an LLM or embedding API, or stored. Set `false` to disable. Counts are logged per run; values are never logged. |
 | `KNOWLEDGE_LOG_PATH` | `~/.local/share/knowledge-server/server.log` | Log file. Set to `""` to disable. When stdout or stderr already points at this file (the launchd plist does this), each line is written once. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. Only `debug` logs query and entry text; `info` logs lengths, ids and similarity scores. |
 
@@ -603,9 +605,15 @@ You work across multiple machines and want a single knowledge base that spans al
 
 ## Security
 
-**Admin token** — Mutation endpoints require an admin token. A random token is generated at startup. It is printed only when the server's stdout is a terminal; under launchd, systemd or redirected output it is not printed and never written to `server.log`. For service or scripted use, set `KNOWLEDGE_ADMIN_TOKEN` in `.env` (≥16 chars) for a stable token across restarts.
+**Host and Origin checks** — Every route, including `/mcp`, rejects a `Host` header that does not name `localhost`, `127.0.0.1`, `[::1]`, the bind host, or an entry in `KNOWLEDGE_ALLOWED_HOSTS` (403). A request carrying an `Origin` header must also name an allowed host over `http` or `https`, so cross-origin browser pages are refused. Clients that send no `Origin` (curl, the hook, MCP stdio proxy) are unaffected.
 
-**Localhost only** — The server binds to `127.0.0.1` by default and refuses to start if `KNOWLEDGE_HOST` is set to a non-loopback address. No TLS — not designed for network exposure.
+**Admin token** — Mutation endpoints require an admin token. A random token is generated at startup. It is printed only when the server's stdout is a terminal; under launchd, systemd or redirected output it is not printed and never written to `server.log`. For service or scripted use, set `KNOWLEDGE_ADMIN_TOKEN` in `.env` (≥16 chars) for a stable token across restarts. `PATCH`, `resolve` and `DELETE` act only on writable stores; an entry that lives only in a read-only store returns 403.
+
+**Input limits** — Request bodies are capped at 1 MB. `/activate` and the MCP `activate` tool keep at most 16 cues, truncate each query to head and tail (20k characters for the full query, 2k per segment), and clamp `limit` to 1–50. The Claude Code hook applies the same caps to the prompt. Read endpoints still record access counts for returned entries; gating that is tracked separately.
+
+**Postgres TLS** — `sslmode=require` encrypts the connection but does not verify the server certificate. For remote databases use `sslmode=verify-full` (system CAs), or `sslmode=verify-ca&sslrootcert=/path/to/ca.pem`. A non-local Postgres host connected without `sslmode` logs a one-time warning. Existing URIs without `sslmode` keep their behaviour.
+
+**Localhost only** — The server binds to `127.0.0.1` by default and refuses to start if `KNOWLEDGE_HOST` is set to a non-loopback address. No TLS on the HTTP API — not designed for network exposure.
 
 **Prompt injection** — Session content is sent to an LLM for extraction. Adversarial text in your sessions (code you pasted, web content you discussed) could influence what gets consolidated. The extraction prompt is hardened, and any injected entry must still pass similarity checks. The extraction bar (most sessions → nothing) significantly limits attack surface.
 
