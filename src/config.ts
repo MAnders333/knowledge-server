@@ -372,6 +372,17 @@ export const config = {
 			DEFAULT_CLUSTER_MIN_MEMBERS,
 			2,
 		),
+		// Maximum cluster members sent to synthesizePrinciple per call. Members are
+		// chosen closest-to-centroid first. Override via SYNTHESIS_MAX_PEERS env var.
+		synthesisMaxPeers: parseIntEnv(process.env.SYNTHESIS_MAX_PEERS, 50, 1),
+		// Approximate token budget for the members sent per synthesis prompt; members
+		// are dropped furthest-first until the estimate fits. Override via
+		// SYNTHESIS_MAX_PROMPT_TOKENS env var.
+		synthesisMaxPromptTokens: parseIntEnv(
+			process.env.SYNTHESIS_MAX_PROMPT_TOKENS,
+			30_000,
+			1000,
+		),
 		// Polling interval for background auto-consolidation while the server is running.
 		// Default: 8 hours (28_800_000 ms). Only triggers when pending sessions exist,
 		// so a quiet period costs nothing. Matches the sleep-consolidation metaphor —
