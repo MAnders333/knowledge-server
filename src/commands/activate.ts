@@ -23,7 +23,8 @@ export async function runActivate(query: string): Promise<void> {
 	);
 
 	try {
-		const result = await activation.activate(query);
+		// dryRun: a diagnostic must not bump access counts or write telemetry.
+		const result = await activation.activate(query, { dryRun: true });
 
 		console.log(`Activation results for: "${query}"`);
 		console.log("───────────────────────────────────────");

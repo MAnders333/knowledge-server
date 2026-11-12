@@ -5,6 +5,7 @@ import { logger } from "../logger.js";
 import type {
 	ActivationResult,
 	ContradictionAnnotation,
+	GateMode,
 	KnowledgeEntry,
 } from "../types.js";
 import {
@@ -219,6 +220,11 @@ export class ActivationEngine {
 			limit?: number;
 			/** Min similarity threshold. Overrides config.activation.similarityThreshold. */
 			threshold?: number;
+			/**
+			 * Read-only: no access records (recordAccess), so measuring activation
+			 * never changes the store. Used by the replay harness and the CLI.
+			 */
+			dryRun?: boolean;
 		},
 	): Promise<ActivationResult> {
 		const queryList = (Array.isArray(queries) ? queries : [queries]).filter(
@@ -233,6 +239,7 @@ export class ActivationEngine {
 		// For a single string, queryList[0] === queryList[last], so this is always correct.
 		const primaryQuery = queryList[queryList.length - 1];
 
+		const dryRun = options?.dryRun ?? false;
 		const maxResults = options?.limit ?? config.activation.maxResults;
 		const similarityThreshold =
 			options?.threshold ?? config.activation.similarityThreshold;
@@ -423,7 +430,16 @@ export class ActivationEngine {
 			perStoreCounts.reduce((sum, n) => sum + n, 0) + scanSeenIds.size;
 
 		if (scored.length === 0) {
-			return { entries: [], query: primaryQuery, totalActive };
+			return {
+				entries: [],
+				query: primaryQuery,
+				totalActive,
+				telemetry: {
+					cueCount: queryList.length,
+					nCandidates: 0,
+					gateMode: this.reranker ? "dense" : "off",
+				},
+			};
 		}
 
 		// ── Second stage: cross-encoder rerank ─────────────────────────────────
@@ -437,6 +453,8 @@ export class ActivationEngine {
 		//
 		// Fail-open: any reranker error (model load, inference, timeout) logs a
 		// warning and leaves the dense-only ordering intact.
+		const nCandidates = scored.length;
+		let gateMode: GateMode = this.reranker ? "dense" : "off";
 		if (this.reranker && scored.length > 1) {
 			// Bound the rerank input: across multiple cues and stores the pool
 			// can exceed `candidates` — keep the dense-best slice.
@@ -455,6 +473,7 @@ export class ActivationEngine {
 					scored[i].rerankScore = scores[i];
 					scored[i].similarity = scores[i] * scored[i].staleness.strength;
 				}
+				gateMode = "rerank";
 			} catch (err) {
 				logger.warn(
 					`[activation] Rerank failed — using dense-only ordering. Reason: ${err instanceof Error ? err.message : String(err)}`,
@@ -466,9 +485,12 @@ export class ActivationEngine {
 		scored.sort((a, b) => b.similarity - a.similarity);
 		scored.splice(maxResults);
 
-		// Record access for activated entries (reinforces their strength)
-		for (const { entry } of scored) {
-			await this.db.recordAccess(entry.id);
+		// Record access for activated entries (reinforces their strength).
+		// Skipped in dryRun so measuring never changes the store.
+		if (!dryRun) {
+			for (const { entry } of scored) {
+				await this.db.recordAccess(entry.id);
+			}
 		}
 
 		// ── Relation-aware activation: pull in supports sources ───────────────────
@@ -538,7 +560,7 @@ export class ActivationEngine {
 						},
 					});
 					scoredIdSet.add(source.id);
-					await this.db.recordAccess(source.id);
+					if (!dryRun) await this.db.recordAccess(source.id);
 				}
 
 				// Respect maxResults cap for the outer loop too.
@@ -603,6 +625,7 @@ export class ActivationEngine {
 			),
 			query: primaryQuery,
 			totalActive,
+			telemetry: { cueCount: queryList.length, nCandidates, gateMode },
 		};
 	}
 
