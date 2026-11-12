@@ -1,9 +1,31 @@
 import { existsSync, readFileSync } from "node:fs";
+import { resolveDataDir } from "../config-file.js";
 import { config } from "../config.js";
 import { DaemonDB } from "../db/daemon/index.js";
 import { StoreRegistry } from "../db/store-registry.js";
+import { lockHolder } from "../process-lock.js";
+import { daemonLockPath } from "../runtime-files.js";
 import { currentUserId } from "../user-id.js";
 import { errCode } from "../utils.js";
+
+/**
+ * Why a reinitialize must not run while a knowledge-daemon holds the lock for
+ * `dataDir`, or null when none does. A holder with pid 0 is a daemon still
+ * starting, and counts as live. An in-flight daemon cycle writes a fresh
+ * daemon_cursor after the reset, which defeats the full re-ingest.
+ */
+export function liveDaemonRefusal(dataDir: string): string | null {
+	const holder = lockHolder(daemonLockPath(dataDir));
+	if (!holder) return null;
+	const who = holder.pid > 0 ? `PID ${holder.pid}` : "still starting";
+	return [
+		`A knowledge-daemon is running (${who}). An in-flight daemon cycle can write a fresh daemon_cursor after the reset, which defeats the full re-ingest.`,
+		"Stop the daemon first, then run this command again:",
+		"  macOS service:  launchctl bootout gui/$(id -u)/com.knowledge-server.daemon",
+		"  Linux service:  systemctl --user stop knowledge-daemon",
+		'  otherwise:      kill <pid>   (the "pid" field of daemon.lock in the data directory)',
+	].join("\n");
+}
 
 /**
  * `knowledge-server reinitialize [--store=<id>] [--reset-state] [--reset-store] [--confirm|--dry-run]`
@@ -104,6 +126,14 @@ export async function runReinitialize(args: string[]): Promise<void> {
 				process.exit(1);
 			}
 		}
+	}
+
+	// Same guard as the server PID above, for the daemon: its cycle would write a
+	// fresh cursor after this reset.
+	const daemonRefusal = liveDaemonRefusal(resolveDataDir());
+	if (daemonRefusal) {
+		console.error(daemonRefusal);
+		process.exit(1);
 	}
 
 	const registry = await StoreRegistry.create();
