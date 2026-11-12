@@ -1,8 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
-import { resolveUserId } from "../config-file.js";
 import { config } from "../config.js";
 import { DaemonDB } from "../db/daemon/index.js";
 import { StoreRegistry } from "../db/store-registry.js";
+import { currentUserId } from "../user-id.js";
 import { errCode } from "../utils.js";
 
 /**
@@ -206,9 +206,9 @@ export async function runReinitialize(args: string[]): Promise<void> {
 			);
 
 			if (resetState) {
-				await serverStateDb.reinitialize(resolveUserId());
+				await serverStateDb.reinitialize(currentUserId());
 				console.log(
-					`  ✓ Deleted pending episodes for user "${resolveUserId()}", wiped consolidated_episode and reset consolidation state`,
+					`  ✓ Deleted pending episodes for user "${currentUserId()}", wiped consolidated_episode and reset consolidation state`,
 				);
 			}
 
