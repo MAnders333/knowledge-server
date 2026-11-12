@@ -747,9 +747,10 @@ export function createApp(
 
 		// Guard against cross-store conflicts — applies to all resolutions including
 		// delete (which needs to restore the counterpart to active).
+		let counterpart: KnowledgeEntry | null = null;
 		if (counterpartId) {
-			const counterpartInSameStore = await entryStore.getEntry(counterpartId);
-			if (!counterpartInSameStore) {
+			counterpart = await entryStore.getEntry(counterpartId);
+			if (!counterpart) {
 				return c.json(
 					{
 						error:
@@ -761,15 +762,19 @@ export function createApp(
 		}
 
 		if (resolution === "delete") {
-			// Restore the counterpart to active (deleteEntry cascades and removes the relation)
-			if (counterpartId) {
-				await entryStore.updateEntry(counterpartId, { status: "active" });
+			// Restore the counterpart to active (deleteEntry cascades and removes the relation).
+			// Only a counterpart that is still conflicted is restored: decay may have archived
+			// or tombstoned it since, and reviving that would undo the decay.
+			const restoreCounterpart = counterpart?.status === "conflicted";
+			if (counterpartId && restoreCounterpart) {
+				const entryService = serviceByStore.get(entryStore) ?? service;
+				await entryService.updateEntry(counterpartId, { status: "active" });
 			}
 			await entryStore.deleteEntry(entry.id);
 			return c.json({
 				ok: true,
 				deleted: entry.id,
-				restoredCounterpart: counterpartId,
+				restoredCounterpart: restoreCounterpart ? counterpartId : null,
 			});
 		}
 
@@ -955,20 +960,21 @@ export function createApp(
 		// If the entry is conflicted, restore its counterpart to active before deleting.
 		// deleteEntry cascades and removes the contradicts relation, which would otherwise
 		// leave the counterpart stuck in 'conflicted' status with no resolvable partner.
+		// Only a counterpart that is still conflicted is restored: decay may have archived
+		// or tombstoned it since, and reviving that would undo the decay.
 		let restoredCounterpart: string | null = null;
 		if (entry.status === "conflicted") {
 			const relations = await entryStore.getRelationsFor(entry.id);
 			const conflictRel = relations.find((r) => r.type === "contradicts");
 			if (conflictRel) {
-				restoredCounterpart =
+				const counterpartId =
 					conflictRel.sourceId === entry.id
 						? conflictRel.targetId
 						: conflictRel.sourceId;
 				// Guard against cross-store counterpart — same as /resolve endpoint.
 				// If the counterpart is in a different store we can't safely restore it here.
-				const counterpartInSameStore =
-					await entryStore.getEntry(restoredCounterpart);
-				if (!counterpartInSameStore) {
+				const counterpart = await entryStore.getEntry(counterpartId);
+				if (!counterpart) {
 					return c.json(
 						{
 							error:
@@ -977,7 +983,11 @@ export function createApp(
 						422,
 					);
 				}
-				await entryStore.updateEntry(restoredCounterpart, { status: "active" });
+				if (counterpart.status === "conflicted") {
+					const entryService = serviceByStore.get(entryStore) ?? service;
+					await entryService.updateEntry(counterpartId, { status: "active" });
+					restoredCounterpart = counterpartId;
+				}
 			}
 		}
 

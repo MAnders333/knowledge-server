@@ -25,6 +25,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import postgres from "postgres";
 import { ActivationEngine } from "../src/activation/activate";
+import type { EmbeddingClient } from "../src/activation/embeddings";
 import { config } from "../src/config";
 import type { IKnowledgeStore } from "../src/db/interface";
 import { PENDING_EPISODE_MAX_ATTEMPTS } from "../src/db/interface";
@@ -37,6 +38,7 @@ import { SCHEMA_VERSION } from "../src/db/postgres/schema";
 import { ServerStateDB } from "../src/db/state/index";
 import { PostgresServerStateDB } from "../src/db/state/postgres";
 import { logger } from "../src/logger";
+import { KnowledgeService } from "../src/services/knowledge-service";
 import type { KnowledgeEntry } from "../src/types";
 
 const PG_URI = process.env.PG_TEST_URI;
@@ -1535,6 +1537,31 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 				(h) => h.entry.id,
 			),
 		).toEqual(["ok-row"]);
+	});
+
+	it("reviving an archived entry with a stale vector re-embeds it so ANN finds it", async () => {
+		const pg = db as PostgresKnowledgeDB;
+		await pg.setEmbeddingMetadata("previous-model", 4);
+		await pg.insertEntry(
+			makeEntry("revive-me", { status: "archived", embedding: unitVec(4, 0) }),
+		);
+
+		const NEW = unitVec(4, 3);
+		const embedder = {
+			embed: async () => NEW,
+		} as unknown as EmbeddingClient;
+		const service = new KnowledgeService(pg, embedder);
+		const savedModel = config.embedding.model;
+		config.embedding.model = "current-model";
+		try {
+			await service.updateEntry("revive-me", { status: "active" });
+		} finally {
+			config.embedding.model = savedModel;
+		}
+
+		expect((await pg.getEntry("revive-me"))?.embedding).toEqual(NEW);
+		const hits = await pg.findSimilarEntries(NEW, 5, 0.5);
+		expect(hits.map((h) => h.entry.id)).toEqual(["revive-me"]);
 	});
 });
 
