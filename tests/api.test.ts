@@ -836,7 +836,7 @@ describe("HTTP API", () => {
 			contradicts("res-rel-1", "res-conflicted-a", "res-archived-b"),
 		);
 
-		const res = await app.request("/entries/res-conflicted-a/resolve", {
+		const res = await request("/entries/res-conflicted-a/resolve", {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
@@ -857,7 +857,7 @@ describe("HTTP API", () => {
 			contradicts("res-rel-2", "res-conflicted-c", "res-conflicted-b"),
 		);
 
-		const res = await app.request("/entries/res-conflicted-c/resolve", {
+		const res = await request("/entries/res-conflicted-c/resolve", {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
@@ -878,7 +878,7 @@ describe("HTTP API", () => {
 			contradicts("del-rel-1", "del-conflicted-a", "del-archived-b"),
 		);
 
-		const res = await app.request("/entries/del-conflicted-a", {
+		const res = await request("/entries/del-conflicted-a", {
 			method: "DELETE",
 			headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
 		});
@@ -893,7 +893,7 @@ describe("HTTP API", () => {
 		await db.insertEntry(revivalEntry("patch-stale", "archived", [9, 9, 9]));
 		embedSpy.mockClear();
 
-		const res = await app.request("/entries/patch-stale", {
+		const res = await request("/entries/patch-stale", {
 			method: "PATCH",
 			headers: {
 				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
@@ -914,7 +914,7 @@ describe("HTTP API", () => {
 		await db.insertEntry(revivalEntry("patch-null", "tombstoned"));
 		embedSpy.mockClear();
 
-		const res = await app.request("/entries/patch-null", {
+		const res = await request("/entries/patch-null", {
 			method: "PATCH",
 			headers: {
 				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
@@ -936,7 +936,7 @@ describe("HTTP API", () => {
 		);
 		embedSpy.mockClear();
 
-		const res = await app.request("/entries/patch-fresh", {
+		const res = await request("/entries/patch-fresh", {
 			method: "PATCH",
 			headers: {
 				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
