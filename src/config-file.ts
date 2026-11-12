@@ -160,6 +160,11 @@ export const DEFAULT_SQLITE_PATH = join(
 	"knowledge.db",
 );
 
+/** Expand a leading `~` (alone or as `~/…`) to the home directory. */
+export function expandHome(p: string): string {
+	return p.replace(/^~(?=$|\/)/, homedir());
+}
+
 // ── JSONC strip-comments ──────────────────────────────────────────────────────
 
 /**
@@ -439,7 +444,7 @@ function validateConfigFile(
 		}
 		stateDb = { kind: raw.kind as "sqlite" | "postgres" };
 		if (raw.kind === "sqlite" && typeof raw.path === "string") {
-			stateDb.path = raw.path;
+			stateDb.path = expandHome(raw.path);
 		}
 		if (raw.kind === "postgres") {
 			if (typeof raw.uri === "string") {
@@ -548,7 +553,7 @@ function validateProject(
 	}
 
 	// Expand ~ to home directory
-	const expandedPath = (p.path as string).replace(/^~/, homedir());
+	const expandedPath = expandHome(p.path as string);
 
 	return {
 		path: expandedPath,
@@ -609,7 +614,7 @@ function validateStore(
 		id: s.id as string,
 		kind: s.kind as "sqlite" | "postgres",
 		writable: s.writable as boolean,
-		...(s.path !== undefined && { path: s.path as string }),
+		...(s.path !== undefined && { path: expandHome(s.path as string) }),
 		...(s.uri !== undefined && { uri: s.uri as string }),
 	};
 }
@@ -642,6 +647,31 @@ export function resolvePostgresUri(store: StoreConfig): string {
  */
 export function resolveSqlitePath(store: StoreConfig): string {
 	return store.path ?? DEFAULT_SQLITE_PATH;
+}
+
+/**
+ * Path of the legacy knowledge.db whose v3 staging tables ServerStateDB copies
+ * into state.db. This is the first SQLite store's resolved path, or undefined
+ * when no SQLite store is configured.
+ */
+export function resolveLegacyKnowledgeDbPath(
+	config: KnowledgeServerConfig,
+): string | undefined {
+	const first = config.stores.find((s) => s.kind === "sqlite");
+	return first ? resolveSqlitePath(first) : undefined;
+}
+
+/**
+ * Resolve the HTTP address the server binds to and clients connect to.
+ * Same precedence as loadConfigFile(): KNOWLEDGE_PORT / KNOWLEDGE_HOST env →
+ * config.jsonc → defaults (127.0.0.1:3179).
+ */
+export function resolveServerAddress(configPath = DEFAULT_CONFIG_PATH): {
+	host: string;
+	port: number;
+} {
+	const config = loadConfigFile(configPath) ?? DEFAULT_CONFIG;
+	return { host: config.host, port: config.port };
 }
 
 // ── User ID resolution ────────────────────────────────────────────────────────

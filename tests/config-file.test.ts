@@ -3,9 +3,12 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	DEFAULT_CONFIG,
 	DEFAULT_SQLITE_PATH,
 	loadConfigFile,
+	resolveLegacyKnowledgeDbPath,
 	resolvePostgresUri,
+	resolveServerAddress,
 	resolveSqlitePath,
 } from "../src/config-file";
 
@@ -557,5 +560,78 @@ describe("loadConfigFile — domain and project validation", () => {
 				Reflect.deleteProperty(process.env, "DAEMON_AUTO_SPAWN");
 			else process.env.DAEMON_AUTO_SPAWN = savedDaemon;
 		}
+	});
+});
+
+describe("config path and server address resolution", () => {
+	let tempDir: string;
+	let configPath: string;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(join(tmpdir(), "ks-config-paths-"));
+		configPath = join(tempDir, "config.jsonc");
+	});
+
+	afterEach(() => {
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("expands a leading ~ in sqlite store and stateDb paths", () => {
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				stores: [
+					{ id: "main", kind: "sqlite", writable: true, path: "~/kb/work.db" },
+				],
+				stateDb: { kind: "sqlite", path: "~/kb/state.db" },
+			}),
+		);
+		const cfg = loadConfigFile(configPath);
+		expect(cfg?.stores[0].path).toBe(join(homedir(), "kb", "work.db"));
+		expect(cfg?.stateDb.path).toBe(join(homedir(), "kb", "state.db"));
+	});
+
+	it("resolveServerAddress returns the port and host from config.jsonc", () => {
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				stores: [{ id: "main", kind: "sqlite", writable: true }],
+				port: 4000,
+				host: "127.0.0.1",
+			}),
+		);
+		expect(resolveServerAddress(configPath)).toEqual({
+			host: "127.0.0.1",
+			port: 4000,
+		});
+	});
+
+	it("resolveServerAddress falls back to the default port when no config file exists", () => {
+		expect(resolveServerAddress(join(tempDir, "missing.jsonc"))).toEqual({
+			host: "127.0.0.1",
+			port: 3179,
+		});
+	});
+
+	it("resolveLegacyKnowledgeDbPath returns the first sqlite store's resolved path", () => {
+		const legacy = resolveLegacyKnowledgeDbPath({
+			...DEFAULT_CONFIG,
+			stores: [
+				{ id: "pg", kind: "postgres", writable: false, uri: "postgres://x" },
+				{ id: "main", kind: "sqlite", writable: true, path: "/data/k.db" },
+			],
+		});
+		expect(legacy).toBe("/data/k.db");
+	});
+
+	it("resolveLegacyKnowledgeDbPath is undefined when no sqlite store is configured", () => {
+		expect(
+			resolveLegacyKnowledgeDbPath({
+				...DEFAULT_CONFIG,
+				stores: [
+					{ id: "pg", kind: "postgres", writable: true, uri: "postgres://x" },
+				],
+			}),
+		).toBeUndefined();
 	});
 });
