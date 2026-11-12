@@ -30,11 +30,11 @@
 
 // Load .env from default config location for binary installs — must be first.
 import "../env.js";
-import { resolveUserId } from "../config-file.js";
 import { DaemonDB } from "../db/daemon/index.js";
 import { createServerStateDB } from "../db/state/factory.js";
 import { logger } from "../logger.js";
 import { tightenOwnedPrivatePaths } from "../private-files.js";
+import { currentUserId } from "../user-id.js";
 import { createEpisodeReaders } from "./readers/index.js";
 import { EpisodeUploader } from "./uploader.js";
 
@@ -83,7 +83,7 @@ try {
 // Daemon-local DB — holds daemon_cursor only. Always local SQLite.
 const daemonDb = new DaemonDB();
 
-const userId = resolveUserId();
+const userId = currentUserId();
 
 // Episode readers — file parsers for local AI tool session files.
 const readers = createEpisodeReaders();
