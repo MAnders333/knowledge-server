@@ -43,6 +43,22 @@ const PG_STATE_MIGRATIONS: Array<{
 			await tx.unsafe(PG_ACTIVATION_EVENT_TABLE);
 		},
 	},
+	{
+		version: 4,
+		label: "activation_event gate and budget counts (precision gate)",
+		up: async (tx: TxSql) => {
+			for (const column of [
+				"gate_dropped",
+				"budget_dropped",
+				"deduped",
+				"injected_tokens",
+			]) {
+				await tx.unsafe(
+					`ALTER TABLE activation_event ADD COLUMN IF NOT EXISTS ${column} INTEGER NOT NULL DEFAULT 0`,
+				);
+			}
+		},
+	},
 ];
 const STATE_SCHEMA_VERSION = latestVersion(PG_STATE_MIGRATIONS);
 
@@ -71,7 +87,11 @@ const PG_ACTIVATION_EVENT_TABLE = `
     rerank_scores            TEXT,
     gate_mode                TEXT      NOT NULL CHECK (gate_mode IN ('rerank', 'dense', 'off')),
     latency_ms               INTEGER   NOT NULL,
-    client_deadline_exceeded BOOLEAN   NOT NULL DEFAULT FALSE
+    client_deadline_exceeded BOOLEAN   NOT NULL DEFAULT FALSE,
+    gate_dropped             INTEGER   NOT NULL DEFAULT 0,
+    budget_dropped           INTEGER   NOT NULL DEFAULT 0,
+    deduped                  INTEGER   NOT NULL DEFAULT 0,
+    injected_tokens          INTEGER   NOT NULL DEFAULT 0
   );
 
   -- CREATE INDEX checks table ownership before IF NOT EXISTS skips, so an
@@ -169,6 +189,10 @@ function activationEventColumns(r: ActivationEventRow) {
 		gate_mode: r.gateMode,
 		latency_ms: r.latencyMs,
 		client_deadline_exceeded: r.clientDeadlineExceeded,
+		gate_dropped: r.gateDropped,
+		budget_dropped: r.budgetDropped,
+		deduped: r.deduped,
+		injected_tokens: r.injectedTokens,
 	};
 }
 
