@@ -13,6 +13,7 @@ import {
 	contradictionTagInline,
 	staleTag,
 } from "../activation/format.js";
+import { DEFAULT_CONFIG } from "../config-file.js";
 import { REVIEW_STALE_STRENGTH_THRESHOLD, config } from "../config.js";
 import type { ConsolidationEngine } from "../consolidation/consolidate.js";
 import type { IKnowledgeStore } from "../db/index.js";
@@ -77,6 +78,8 @@ export function createApp(
 	 * so all domain stores are wiped atomically on reinitialize.
 	 */
 	writableDbs: IKnowledgeStore[] = [db],
+	/** Port the server is bound to; reported by the admin /status. */
+	serverPort: number = DEFAULT_CONFIG.port,
 ): Hono {
 	const app = new Hono();
 	// Reuse ActivationEngine's EmbeddingClient to avoid a second model connection.
@@ -448,7 +451,7 @@ export function createApp(
 			}),
 			...(isAdmin && {
 				config: {
-					port: config.port,
+					port: serverPort,
 					embeddingModel: config.embedding.model,
 					extractionModel: config.llm.extractionModel,
 					mergeModel: config.llm.mergeModel,

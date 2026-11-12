@@ -24,16 +24,57 @@
  *  else to register)
  *
  * Configuration:
- *   Set KNOWLEDGE_SERVER_URL environment variable (default: http://127.0.0.1:3179)
+ *   Set KNOWLEDGE_SERVER_URL, or KNOWLEDGE_PORT / "port" in
+ *   ~/.config/knowledge-server/config.jsonc (default: 3179)
  *
  * Design principle: NEVER throw. All errors are caught and silently swallowed.
  * A broken knowledge extension must never affect pi's core functionality.
  */
 
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const KNOWLEDGE_SERVER_URL =
-	process.env.KNOWLEDGE_SERVER_URL || "http://127.0.0.1:3179";
+/**
+ * Server URL, first match wins: KNOWLEDGE_SERVER_URL → KNOWLEDGE_PORT →
+ * "port" in config.jsonc → 3179. Extensions are single standalone files and cannot
+ * import src/, so the config is read here directly (same precedence as the server).
+ */
+function resolveKnowledgeServerUrl(): string {
+	if (process.env.KNOWLEDGE_SERVER_URL) return process.env.KNOWLEDGE_SERVER_URL;
+	const envPort = Number(process.env.KNOWLEDGE_PORT);
+	if (Number.isInteger(envPort) && envPort >= 1 && envPort <= 65535) {
+		return `http://127.0.0.1:${envPort}`;
+	}
+	try {
+		const raw = readFileSync(
+			join(homedir(), ".config", "knowledge-server", "config.jsonc"),
+			"utf8",
+		);
+		// Drop comments outside string literals (keeps "http://…" values intact).
+		const json = JSON.parse(
+			raw.replace(
+				/("(?:\\.|[^"\\])*")|\/\/[^\n]*|\/\*[\s\S]*?\*\//g,
+				(_m: string, str?: string) => str ?? "",
+			),
+		) as { port?: number };
+		const port = json.port;
+		if (
+			port !== undefined &&
+			Number.isInteger(port) &&
+			port >= 1 &&
+			port <= 65535
+		) {
+			return `http://127.0.0.1:${port}`;
+		}
+	} catch {
+		// Missing or unparseable config: use the default below.
+	}
+	return "http://127.0.0.1:3179";
+}
+
+const KNOWLEDGE_SERVER_URL = resolveKnowledgeServerUrl();
 
 // Guard against KNOWLEDGE_SERVER_URL being redirected to an external host.
 // The extension sends user prompt content to this URL — it must stay on loopback.

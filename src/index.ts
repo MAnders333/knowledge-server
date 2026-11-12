@@ -353,6 +353,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		registry.unavailableStoreIds,
 		registry.readStores(),
 		registry.writableStores(),
+		registry.port,
 	);
 
 	// port/host/daemonAutoSpawn come from the registry (config.jsonc with env var override)
