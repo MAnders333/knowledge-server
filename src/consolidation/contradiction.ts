@@ -4,7 +4,8 @@ import type { IKnowledgeStore } from "../db/index.js";
 import { logger } from "../logger.js";
 import { redactSecrets } from "../redact.js";
 import type { KnowledgeEntry } from "../types.js";
-import type { ConsolidationLLM } from "./llm.js";
+import { MalformedLlmOutputError } from "./llm-output.js";
+import type { ConsolidationLLM, ContradictionResult } from "./llm.js";
 
 /** Candidates sent to the LLM in one contradiction-check call. */
 const CONTRADICTION_BATCH_SIZE = 10;
@@ -47,6 +48,10 @@ export class ContradictionScanner {
 	 * Both limits apply to each call, so the cross-store and intra-chunk paths each
 	 * get their own cap.
 	 *
+	 * A batch whose reply stays malformed after one retry is skipped and counted in
+	 * `tally.malformedBatches`; it is not treated as an error, so the post-write phase
+	 * keeps going. Other errors propagate.
+	 *
 	 * Returns { entrySuperseded, detected, resolved } so the caller can update
 	 * its outer state (loop counters, early-continue logic).
 	 */
@@ -65,6 +70,7 @@ export class ContradictionScanner {
 		supersededInThisScan: Set<string>,
 		entriesMap: Map<string, KnowledgeEntry & { embedding: number[] }>,
 		logPrefix: string,
+		tally: { malformedBatches: number },
 	): Promise<{ entrySuperseded: boolean; detected: number; resolved: number }> {
 		if (candidates.length === 0) {
 			return { entrySuperseded: false, detected: 0, resolved: 0 };
@@ -112,24 +118,40 @@ export class ContradictionScanner {
 			const validCandidateIds = new Set(batch.map((c) => c.id));
 
 			const llmStart = Date.now();
-			const results = await this.llm.detectAndResolveContradiction(
-				{
-					id: entry.id,
-					content: entry.content,
-					type: entry.type,
-					topics: entry.topics,
-					confidence: entry.confidence,
-					createdAt: entry.createdAt,
-				},
-				batch.map((c) => ({
-					id: c.id,
-					content: c.content,
-					type: c.type,
-					topics: c.topics,
-					confidence: c.confidence,
-					createdAt: c.createdAt,
-				})),
-			);
+			let results: ContradictionResult[] | undefined;
+			for (let attempt = 1; attempt <= 2 && results === undefined; attempt++) {
+				try {
+					results = await this.llm.detectAndResolveContradiction(
+						{
+							id: entry.id,
+							content: entry.content,
+							type: entry.type,
+							topics: entry.topics,
+							confidence: entry.confidence,
+							createdAt: entry.createdAt,
+						},
+						batch.map((c) => ({
+							id: c.id,
+							content: c.content,
+							type: c.type,
+							topics: c.topics,
+							confidence: c.confidence,
+							createdAt: c.createdAt,
+						})),
+					);
+				} catch (err) {
+					// The entries are already stored, so a bad reply must not fail the chunk.
+					// Only a malformed reply is retried or skipped; other errors propagate.
+					if (!(err instanceof MalformedLlmOutputError)) throw err;
+				}
+			}
+			if (results === undefined) {
+				tally.malformedBatches++;
+				logger.warn(
+					`[contradiction] ${logPrefix}malformed reply for batch ${b + 1}/${totalBatches} after one retry — batch skipped (${tally.malformedBatches} skipped this scan)`,
+				);
+				continue;
+			}
 			logger.log(
 				`[contradiction] ${logPrefix}LLM responded in ${((Date.now() - llmStart) / 1000).toFixed(1)}s (${batch.length} candidates${totalBatches > 1 ? `, batch ${b + 1}/${totalBatches}` : ""}).`,
 			);
@@ -215,17 +237,20 @@ export class ContradictionScanner {
 	 *   kept) — decideMerge already handled the merge question so only the mid-band
 	 *   [minSim, reconsolidation-threshold) pairs are worth scanning here too.
 	 *
-	 * Returns counts of detected and resolved contradictions.
+	 * Returns counts of detected and resolved contradictions, and how many batches
+	 * were skipped because their reply stayed malformed.
 	 */
 	async scan(
 		db: IKnowledgeStore,
 		entriesMap: Map<string, KnowledgeEntry & { embedding: number[] }>,
 		changedIds: Set<string>,
-	): Promise<{ detected: number; resolved: number }> {
+	): Promise<{ detected: number; resolved: number; malformedBatches: number }> {
 		let detected = 0;
 		let resolved = 0;
+		const tally = { malformedBatches: 0 };
 
-		if (changedIds.size === 0) return { detected, resolved };
+		if (changedIds.size === 0)
+			return { detected, resolved, malformedBatches: 0 };
 
 		const minSim = config.consolidation.contradictionMinSimilarity;
 
@@ -297,6 +322,7 @@ export class ContradictionScanner {
 				supersededInThisScan,
 				entriesMap,
 				"",
+				tally,
 			);
 			detected += d;
 			resolved += r;
@@ -362,6 +388,7 @@ export class ContradictionScanner {
 				supersededInThisScan,
 				entriesMap,
 				"Intra-chunk: ",
+				tally,
 			);
 			detected += d;
 			resolved += r;
@@ -375,6 +402,6 @@ export class ContradictionScanner {
 			);
 		}
 
-		return { detected, resolved };
+		return { detected, resolved, malformedBatches: tally.malformedBatches };
 	}
 }

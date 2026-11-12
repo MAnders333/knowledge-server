@@ -27,6 +27,7 @@ import { ConsolidationEngine } from "../src/consolidation/consolidate";
 import { DomainRouter } from "../src/consolidation/domain-router";
 import { ConsolidationLLM } from "../src/consolidation/llm";
 import type { ExtractedKnowledge } from "../src/consolidation/llm";
+import { MalformedLlmOutputError } from "../src/consolidation/llm-output";
 import { PendingEpisodesReader } from "../src/consolidation/readers/pending";
 import { PENDING_EPISODE_MAX_ATTEMPTS } from "../src/db/interface";
 import type { IKnowledgeStore } from "../src/db/interface";
@@ -484,6 +485,85 @@ describe("entries routed to another store", () => {
 		} finally {
 			await workDb.close();
 		}
+	});
+});
+
+describe("contradiction reply that stays malformed", () => {
+	it("keeps the stored entry and completes the episode without re-extraction", async () => {
+		// Two unit vectors with cosine 0.6: inside the contradiction band
+		// [contradictionMinSimilarity, reconsolidationThreshold), so the second
+		// episode's entry is a candidate-scanned insert rather than a merge.
+		const vec = (x: number, y: number) => {
+			const v = new Array(384).fill(0);
+			v[0] = x;
+			v[1] = y;
+			return v;
+		};
+		const activation = new ActivationEngine(db);
+		spyOn(activation.embeddings, "embed").mockImplementation(async (text) => {
+			if (text.includes("port 8080")) return vec(1, 0);
+			if (text.includes("9090")) return vec(0.6, 0.8);
+			return uniqueEmbedding(seenEmbeddings, text);
+		});
+		const malformedEngine = new ConsolidationEngine(
+			db,
+			state,
+			activation,
+			[new PendingEpisodesReader(state)],
+			null,
+		);
+		const now = Date.now();
+		await state.insertPendingEpisode(
+			pendingRow({
+				id: "row-a",
+				sessionId: "session-a",
+				content: "EPISODE A",
+				maxMessageTime: now - 3000,
+			}),
+		);
+		await state.insertPendingEpisode(
+			pendingRow({
+				id: "row-b",
+				sessionId: "session-b",
+				content: "EPISODE B",
+				maxMessageTime: now - 1000,
+			}),
+		);
+		const extract = spyOn(
+			ConsolidationLLM.prototype,
+			"extractKnowledge",
+		).mockImplementation(async (summary: string) =>
+			summary.includes("EPISODE A")
+				? [entry("The server runs on port 8080.")]
+				: [entry("The server port was changed to 9090.")],
+		);
+		const contradiction = spyOn(
+			ConsolidationLLM.prototype,
+			"detectAndResolveContradiction",
+		).mockRejectedValue(
+			new MalformedLlmOutputError("contradiction", "checked 1 of 1 candidates"),
+		);
+
+		await malformedEngine.consolidate();
+
+		// The scan retried once and then skipped the batch: no throw, so the chunk
+		// completed and both episodes are recorded.
+		expect(contradiction).toHaveBeenCalledTimes(2);
+		expect(await state.getPendingEpisodes(0)).toEqual([]);
+		expect(
+			(await state.getProcessedEpisodeRanges(["session-b"])).get("session-b"),
+		).toHaveLength(1);
+		expect(await state.countDeadLetteredEpisodes()).toBe(0);
+
+		// The entry was written once, and the next run does not re-extract it.
+		const written = (await db.getEntries({ type: "fact" })).filter((e) =>
+			e.content.includes("9090"),
+		);
+		expect(written).toHaveLength(1);
+		expect((await db.getStats()).total).toBe(2);
+
+		await malformedEngine.consolidate();
+		expect(extract).toHaveBeenCalledTimes(2);
 	});
 });
 
