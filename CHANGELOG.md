@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.10.3](https://github.com/MAnders333/knowledge-server/compare/v3.10.2...v3.10.3) (2026-11-12)
+
+
+### Bug Fixes
+
+* **embeddings:** validate embedBatch responses and retry bulk chunks ([b1d32b2](https://github.com/MAnders333/knowledge-server/commit/b1d32b2801464a8409e60568ad23ae548f62916d))
+* **embeddings:** validate embedBatch responses and retry bulk chunks ([1f32684](https://github.com/MAnders333/knowledge-server/commit/1f3268485d9b01e3d0abc3d589c751c88f629e0c)), closes [#100](https://github.com/MAnders333/knowledge-server/issues/100)
+
 ## [3.10.2](https://github.com/MAnders333/knowledge-server/compare/v3.10.1...v3.10.2) (2026-11-10)
 
 
