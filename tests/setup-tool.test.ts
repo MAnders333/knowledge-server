@@ -330,7 +330,17 @@ afterEach(() => {
 	isolation.restore();
 });
 
-describe("setup runs never register a background service", () => {
+describe("setup runs never touch the real home", () => {
+	it("writes Cursor and Codex config only under the temp HOME", () => {
+		setupCursor();
+		setupCodex();
+
+		// Both integrations must resolve their config dirs from the temp HOME, not
+		// from the account home that Bun fixed at process start.
+		expect(existsSync(join(isolation.home, ".cursor", "mcp.json"))).toBe(true);
+		expect(existsSync(join(isolation.home, ".codex", "hooks.json"))).toBe(true);
+	});
+
 	it("calls no launchctl/systemctl and writes no service file under HOME", () => {
 		setupCursor();
 		setupCodex();
@@ -385,7 +395,7 @@ describe("setupCodex UserPromptSubmit hook", () => {
 		expect(handlers[0].type).toBe("command");
 		expect(handlers[0].timeout).toBe(5);
 		expect(handlers[0].command).toContain(
-			"curl -s --max-time 4 --data-binary @-",
+			"curl -s --noproxy '*' --fail --max-time 4 --data-binary @-",
 		);
 		expect(handlers[0].command?.endsWith("|| true")).toBe(true);
 	});
