@@ -1,11 +1,15 @@
-import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
-import { BertWordPieceTokenizer } from "./bert-tokenizer.js";
+import {
+	BertWordPieceTokenizer,
+	MAX_SEQUENCE_LENGTH,
+} from "./bert-tokenizer.js";
 
-// Onnxruntime-web WASM runtime, imported with Bun's file loader:
+// Onnxruntime-web WASM runtime (plain build, not asyncify), imported with Bun's
+// file loader:
 // - source/dev runs: resolves to the real node_modules path
 // - `bun build --compile` binaries: embedded into the single-file binary and
 //   exposed under the virtual /$bunfs/ filesystem (readable via node:fs)
@@ -13,20 +17,20 @@ import { BertWordPieceTokenizer } from "./bert-tokenizer.js";
 // Why WASM and not onnxruntime-node (native)? The native .node binding does
 // not survive single-file compilation: its dependent libonnxruntime dylib is
 // not embedded, so dlopen fails (verified by binary smoke test). The WASM
-// backend is platform-agnostic and embeds cleanly. Trade-off: ~10x slower
-// than native (~23ms/pair single-threaded vs ~2ms), i.e. ~0.9s for a 40-entry
-// candidate pool — inside the activation latency budget (5s plugin timeout,
-// 2s rerank timeout). WASM threading is not used: worker spawning fails under
-// Bun (fetch() of local worker URL), so numThreads is pinned to 1.
+// backend is platform-agnostic and embeds cleanly. Measured on an M4 with the
+// default model: ~37ms per pair at ~80 tokens, one thread. WASM threading is
+// not used: worker spawning fails under Bun (fetch() of local worker URL), so
+// numThreads is pinned to 1. The asyncify variant was dropped: it added ~270MB
+// RSS and ~150ms session creation, and inference speed was unchanged.
 //
 // Paths are relative because onnxruntime-web's package `exports` does not
 // expose ./dist/* — the bundler resolves and embeds them identically.
 // @ts-ignore — path module declared in src/assets.d.ts
-import wasmRuntimeMjs from "../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.mjs" with {
+import wasmRuntimeMjs from "../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs" with {
 	type: "file",
 };
 // @ts-ignore — path module declared in src/assets.d.ts
-import wasmRuntimeBin from "../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.wasm" with {
+import wasmRuntimeBin from "../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm" with {
 	type: "file",
 };
 
@@ -49,14 +53,17 @@ import wasmRuntimeBin from "../../node_modules/onnxruntime-web/dist/ort-wasm-sim
  *   node build does not register the "wasm" execution provider, and its web
  *   build cannot read local model files under Bun — both verified by spike).
  * - Model: int8-quantized ONNX weights (~23MB) + tokenizer.json, downloaded
- *   once from Hugging Face into config.activation.rerank.modelsDir, then
- *   fully offline.
+ *   once from Hugging Face into config.activation.rerank.modelsDir (pinned to
+ *   a revision and checksum for the default model), then fully offline.
  *
  * Default model: Xenova/ms-marco-MiniLM-L-6-v2 — the classic English MS MARCO
  * passage reranker. Set RERANK_MODEL to a multilingual ONNX cross-encoder
  * (with an onnx/model_quantized.onnx artifact) for non-English knowledge
- * bases, or to a smaller member of the family (e.g. ms-marco-MiniLM-L-4-v2)
- * for lower latency.
+ * bases, or to a smaller member of the family (e.g. ms-marco-MiniLM-L-4-v2).
+ *
+ * Latency bounds: each pair is capped (query tail, document head), pairs run
+ * one at a time, and the whole call is bounded by RERANK_TIMEOUT_MS (see
+ * scoreBatch).
  *
  * Failure philosophy: reranking is a precision enhancement, never a hard
  * dependency. Any failure (model download, load, inference, timeout) throws
@@ -80,9 +87,42 @@ export interface RerankScorer {
 // biome-ignore lint/suspicious/noExplicitAny: ort session type via dynamic import
 type OrtSession = any;
 
+interface LoadedModel {
+	tokenizer: BertWordPieceTokenizer;
+	session: OrtSession;
+}
+
+/** The model the reranker ships with (English-only). */
+const DEFAULT_RERANK_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2";
+
+/**
+ * Hugging Face revisions and sha256 checksums for models we pin. Artifacts
+ * are cached at the same path as before (<modelsDir>/<model>/<file>), so an
+ * existing cache is reused when its checksum matches. Other models use `main`
+ * without a checksum: their revision is the user's choice.
+ */
+const PINNED_MODELS: Record<
+	string,
+	{ revision: string; sha256: Record<string, string> }
+> = {
+	[DEFAULT_RERANK_MODEL]: {
+		revision: "a09144355adeed5f58c8ed011d209bf8ee5a1fec",
+		sha256: {
+			"tokenizer.json":
+				"d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+			"onnx/model_quantized.onnx":
+				"e9d8ebf845c413e981c175bfe49a3bfa9b3dcce2a3ba54875ee5df5a58639fbe",
+		},
+	},
+};
+
+/** Budget for one model download (headers and body). The model is ~23 MB. */
+const MODEL_DOWNLOAD_TIMEOUT_MS = 300_000;
+
 export class LocalReranker implements RerankScorer {
 	private readonly modelId: string;
 	private readonly timeoutMs: number;
+	private readonly downloadTimeoutMs: number;
 
 	/**
 	 * Lazy load state. Tokenizer + WASM session are loaded on first
@@ -90,15 +130,18 @@ export class LocalReranker implements RerankScorer {
 	 * process lifetime. `failed` latches permanent load failures so we don't
 	 * retry a broken download on every activation call.
 	 */
-	private loadPromise: Promise<{
-		tokenizer: BertWordPieceTokenizer;
-		session: OrtSession;
-	}> | null = null;
+	private loadPromise: Promise<LoadedModel> | null = null;
 	private failed = false;
 
-	constructor(opts?: { model?: string; timeoutMs?: number }) {
+	constructor(opts?: {
+		model?: string;
+		timeoutMs?: number;
+		downloadTimeoutMs?: number;
+	}) {
 		this.modelId = opts?.model ?? config.activation.rerank.model;
 		this.timeoutMs = opts?.timeoutMs ?? config.activation.rerank.timeoutMs;
+		this.downloadTimeoutMs =
+			opts?.downloadTimeoutMs ?? MODEL_DOWNLOAD_TIMEOUT_MS;
 	}
 
 	/**
@@ -113,10 +156,7 @@ export class LocalReranker implements RerankScorer {
 		});
 	}
 
-	private async load(): Promise<{
-		tokenizer: BertWordPieceTokenizer;
-		session: OrtSession;
-	}> {
+	private async load(): Promise<LoadedModel> {
 		if (this.failed) {
 			throw new Error("reranker model failed to load previously");
 		}
@@ -132,22 +172,20 @@ export class LocalReranker implements RerankScorer {
 		return this.loadPromise;
 	}
 
-	private async doLoad(): Promise<{
-		tokenizer: BertWordPieceTokenizer;
-		session: OrtSession;
-	}> {
+	private async doLoad(): Promise<LoadedModel> {
 		const start = Date.now();
 		logger.log(
 			`[rerank] Loading cross-encoder model "${this.modelId}" (first run downloads ~23MB into ${config.activation.rerank.modelsDir})...`,
 		);
 
 		// ── Tokenizer (vendored WordPiece, pure JS) + ONNX weights ──
-		const [tokenizer, onnxPath] = await Promise.all([
-			this.ensureTokenizerFile().then(async (p) =>
-				BertWordPieceTokenizer.fromString(await readFile(p, "utf8")),
-			),
-			this.ensureOnnxFile(),
-		]);
+		// Sequential: the tokenizer is small, and a failure here must not leave
+		// the model download running in the background.
+		const tokenizerBytes = await this.readArtifact("tokenizer.json");
+		const modelBytes = await this.readArtifact("onnx/model_quantized.onnx");
+		const tokenizer = BertWordPieceTokenizer.fromString(
+			tokenizerBytes.toString("utf8"),
+		);
 
 		// ── WASM inference session (external onnxruntime-web) ──
 		const ort = await import("onnxruntime-web");
@@ -169,7 +207,6 @@ export class LocalReranker implements RerankScorer {
 		} catch {
 			// onnxruntime-web version differences — non-fatal.
 		}
-		const modelBytes = await readFile(onnxPath);
 		const session = await ort.InferenceSession.create(modelBytes, {
 			executionProviders: ["wasm"],
 		});
@@ -181,58 +218,131 @@ export class LocalReranker implements RerankScorer {
 	}
 
 	/**
-	 * Locate a model artifact (tokenizer.json / ONNX weights), downloading it
-	 * from Hugging Face on first use. Follows the transformers.js v4 cache
-	 * layout (<modelsDir>/<modelId>/<rel>) so a cache populated by other
-	 * transformers.js usage is reused.
+	 * Bytes of one model artifact: the cached copy when it passes its pinned
+	 * checksum, otherwise a fresh download. A cached copy that fails the
+	 * checksum (for example a file cut short by an older version) is replaced
+	 * instead of being loaded forever.
 	 */
-	private async ensureModelArtifact(relPath: string): Promise<string> {
+	private async readArtifact(relPath: string): Promise<Buffer> {
 		const localPath = join(
 			config.activation.rerank.modelsDir,
 			this.modelId,
 			relPath,
 		);
-		if (existsSync(localPath)) return localPath;
+		const expected = PINNED_MODELS[this.modelId]?.sha256[relPath];
+		const cached = await readFile(localPath).catch(() => null);
+		if (
+			cached &&
+			(!expected ||
+				createHash("sha256").update(cached).digest("hex") === expected)
+		) {
+			return cached;
+		}
+		if (cached) {
+			logger.warn(
+				`[rerank] Cached ${relPath} does not match its pinned checksum — re-downloading.`,
+			);
+			await rm(localPath, { force: true });
+		}
+		return this.download(relPath, localPath);
+	}
 
-		const url = `https://huggingface.co/${this.modelId}/resolve/main/${relPath}`;
+	private async download(relPath: string, localPath: string): Promise<Buffer> {
+		const pin = PINNED_MODELS[this.modelId];
+		const revision = pin?.revision ?? "main";
+		const url = `https://huggingface.co/${this.modelId}/resolve/${revision}/${relPath}`;
 		logger.log(`[rerank] Downloading ${relPath}: ${url}`);
-		const response = await fetch(url, { redirect: "follow" });
+		const response = await fetch(url, {
+			redirect: "follow",
+			signal: AbortSignal.timeout(this.downloadTimeoutMs),
+		});
 		if (!response.ok) {
 			throw new Error(
 				`model artifact download failed: ${response.status} ${response.statusText} (${url})`,
 			);
 		}
+		const bytes = Buffer.from(await response.arrayBuffer());
+		const expected = pin?.sha256[relPath];
+		if (
+			expected &&
+			createHash("sha256").update(bytes).digest("hex") !== expected
+		) {
+			throw new Error(
+				`checksum mismatch for ${relPath} at revision ${revision} — not cached`,
+			);
+		}
 		await mkdir(dirname(localPath), { recursive: true });
-		await writeFile(localPath, Buffer.from(await response.arrayBuffer()));
-		return localPath;
-	}
-
-	private ensureTokenizerFile(): Promise<string> {
-		return this.ensureModelArtifact("tokenizer.json");
-	}
-
-	private ensureOnnxFile(): Promise<string> {
-		return this.ensureModelArtifact("onnx/model_quantized.onnx");
+		// Write beside the target, then rename: a write cut short (disk full,
+		// killed process) never leaves a partial file at the cache path.
+		const tmpPath = `${localPath}.${randomUUID()}.tmp`;
+		try {
+			await writeFile(tmpPath, bytes);
+			await rename(tmpPath, localPath);
+		} catch (err) {
+			await rm(tmpPath, { force: true });
+			throw err;
+		}
+		return bytes;
 	}
 
 	/**
-	 * Score all (query, document) pairs in a single batched forward pass.
+	 * Score each (query, document) pair; returns one sigmoid score per document,
+	 * in input order.
 	 *
-	 * The model emits one logit per pair; sigmoid maps it to [0, 1].
+	 * Pairs run one at a time: batching gave no throughput on single-threaded
+	 * WASM and padded every pair to the longest one. The query is its last
+	 * `maxQueryTokens` tokens (the end of the prompt) and each document its
+	 * first `maxDocTokens` tokens, so no pair exceeds the model window.
 	 *
-	 * Throws on timeout (the underlying WASM inference keeps running but its
-	 * result is abandoned) and on any load/inference failure — callers are
+	 * The whole call is bounded by timeoutMs. Before each run the call checks
+	 * a cooperative deadline, and after each run it yields to the event loop,
+	 * so timers and other requests are served during scoring. A timer also
+	 * races the call, so a slow model download cannot outlast the timeout.
+	 *
+	 * On timeout the call rejects (no partial scores). Scores for scored and
+	 * unscored candidates are not on a comparable scale, so the caller falls
+	 * back to dense ordering for the whole batch.
+	 *
+	 * Throws on timeout and on any load/inference failure — callers are
 	 * expected to catch and fall back to dense-only ordering.
 	 */
 	async scoreBatch(query: string, documents: string[]): Promise<number[]> {
 		if (documents.length === 0) return [];
 
-		const work = (async () => {
-			const { tokenizer, session } = await this.load();
-			const queries = new Array(documents.length).fill(query);
-			const features = tokenizer.batchEncodePairs(queries, documents);
+		const deadline = performance.now() + this.timeoutMs;
+		const work = this.scorePairs(query, documents, deadline);
+		const { promise: expired, reject } = Promise.withResolvers<never>();
+		const timer = setTimeout(
+			() => reject(new Error(`rerank timeout after ${this.timeoutMs}ms`)),
+			this.timeoutMs,
+		);
+		try {
+			return await Promise.race([work, expired]);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
 
-			const ort = await import("onnxruntime-web");
+	private async scorePairs(
+		query: string,
+		documents: string[],
+		deadline: number,
+	): Promise<number[]> {
+		const { tokenizer, session } = await this.load();
+		const ort = await import("onnxruntime-web");
+		const { maxQueryTokens, maxDocTokens } = config.activation.rerank;
+		const queryIds = tokenizer.encodeTail(query, maxQueryTokens);
+
+		const scores: number[] = [];
+		for (const document of documents) {
+			if (performance.now() >= deadline) {
+				throw new Error(`rerank timeout after ${this.timeoutMs}ms`);
+			}
+			const features = tokenizer.batchFromIds(
+				[queryIds],
+				[tokenizer.encodeHead(document, maxDocTokens)],
+				MAX_SEQUENCE_LENGTH,
+			);
 			const inputs: Record<string, unknown> = {
 				input_ids: new ort.Tensor("int64", features.inputIds, features.dims),
 				attention_mask: new ort.Tensor(
@@ -249,26 +359,16 @@ export class LocalReranker implements RerankScorer {
 
 			// biome-ignore lint/suspicious/noExplicitAny: ort run signature with our tensor map
 			const out = await session.run(inputs as any);
-			const logits = out.logits.data as Float32Array;
-			return Array.from(logits, (x) => 1 / (1 + Math.exp(-x)));
-		})();
+			const logit = (out.logits.data as Float32Array)[0];
+			scores.push(1 / (1 + Math.exp(-logit)));
 
-		return await new Promise<number[]>((resolve, reject) => {
-			const timer = setTimeout(
-				() => reject(new Error(`rerank timeout after ${this.timeoutMs}ms`)),
-				this.timeoutMs,
-			);
-			work.then(
-				(scores) => {
-					clearTimeout(timer);
-					resolve(scores);
-				},
-				(err) => {
-					clearTimeout(timer);
-					reject(err);
-				},
-			);
-		});
+			// Macrotask yield: timers and other requests run between pairs.
+			const { promise: yielded, resolve: yieldDone } =
+				Promise.withResolvers<void>();
+			setImmediate(yieldDone);
+			await yielded;
+		}
+		return scores;
 	}
 }
 
@@ -281,12 +381,17 @@ export class LocalReranker implements RerankScorer {
  * is not blocked by the first-download case.
  */
 export function createRerankerFromConfig(): LocalReranker | null {
-	if (!config.activation.rerank.enabled) {
+	const rerank = config.activation.rerank;
+	if (!rerank.enabled) {
 		logger.log(
 			"[rerank] Disabled (RERANK_ENABLED=false) — dense-only ordering.",
 		);
 		return null;
 	}
+	const pin = PINNED_MODELS[rerank.model];
+	logger.log(
+		`[rerank] Enabled: model "${rerank.model}" (${pin ? `pinned to ${pin.revision.slice(0, 12)}` : "unpinned, revision main"}${rerank.model === DEFAULT_RERANK_MODEL ? ", English-only" : ""}); mode: WASM, one pair per run, timeout ${rerank.timeoutMs}ms; candidates ${rerank.candidates}, query ≤${rerank.maxQueryTokens} tokens, document ≤${rerank.maxDocTokens} tokens.`,
+	);
 	const reranker = new LocalReranker();
 	reranker.preload();
 	return reranker;

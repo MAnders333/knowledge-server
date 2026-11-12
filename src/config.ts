@@ -460,7 +460,7 @@ export const config = {
 			// Default on. RERANK_ENABLED=false restores pure dense ordering.
 			enabled: process.env.RERANK_ENABLED !== "false",
 			// Hugging Face model ID. Default is the classic English MS MARCO
-			// cross-encoder (int8 ONNX, ~23MB, ~2ms/pair on Apple Silicon).
+			// cross-encoder (int8 ONNX, ~23MB, ~40ms/pair on Apple Silicon WASM).
 			// For multilingual knowledge bases use a multilingual ONNX
 			// cross-encoder instead (e.g. a jina/bge multilingual reranker export).
 			model: process.env.RERANK_MODEL || "Xenova/ms-marco-MiniLM-L-6-v2",
@@ -474,6 +474,13 @@ export const config = {
 			// Hard timeout per rerank call; on expiry the result is abandoned
 			// and dense-only ordering is used.
 			timeoutMs: parseIntEnv(process.env.RERANK_TIMEOUT_MS, 2_000, 100),
+			// Query side of each pair: the last N tokens of the prompt. The
+			// rerank query is capped so a long prompt cannot squeeze documents
+			// out of the model window.
+			maxQueryTokens: parseIntEnv(process.env.RERANK_MAX_QUERY_TOKENS, 64, 1),
+			// Document side of each pair: the first N tokens of the candidate.
+			// 128 keeps a 40-pair batch near 1.5 s on one WASM thread.
+			maxDocTokens: parseIntEnv(process.env.RERANK_MAX_DOC_TOKENS, 128, 1),
 		},
 	},
 } as const;
