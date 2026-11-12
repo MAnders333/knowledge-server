@@ -19,9 +19,10 @@ import { errCode } from "../utils.js";
  *   Use when: connecting to a new or existing store for the first time.
  *
  * --reset-state
- *   Also wipes consolidated_episode and resets consolidation_state counters.
+ *   Also wipes consolidated_episode and resets consolidation_state counters, and
+ *   deletes this user's pending episodes (user_id = resolved user). Other users'
+ *   pending episodes on a shared state DB are kept.
  *   Episodes re-upload AND re-consolidate under the current domain config.
- *   Safe for shared stores (session IDs are per-machine by nature).
  *   Use when: retroactively rerouting knowledge after adding a new domain.
  *
  * --reset-store
@@ -204,9 +205,9 @@ export async function runReinitialize(args: string[]): Promise<void> {
 			);
 
 			if (resetState) {
-				await serverStateDb.reinitialize();
+				await serverStateDb.reinitialize(registry.userId);
 				console.log(
-					"  ✓ Wiped consolidated_episode and reset consolidation state",
+					`  ✓ Deleted pending episodes for user "${registry.userId}", wiped consolidated_episode and reset consolidation state`,
 				);
 			}
 

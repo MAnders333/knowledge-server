@@ -504,9 +504,11 @@ The `reinitialize` command resets varying amounts of state depending on which fl
 # Use when: connecting to a new or existing store for the first time.
 knowledge-server reinitialize --confirm
 
-# --reset-state — also wipe consolidated_episode and reset consolidation state.
+# --reset-state — also wipe consolidated_episode, reset consolidation state, and
+# delete THIS user's pending episodes (user_id). Other users' pending episodes on a
+# shared state DB are kept. The consolidation log and counters are shared, so they
+# are reset for everyone.
 # Episodes re-upload AND re-consolidate under the current domain config.
-# Safe for shared stores (session IDs are per-machine by nature).
 # Use when: retroactively rerouting knowledge after adding a new domain.
 knowledge-server reinitialize --reset-state --confirm
 
