@@ -39,8 +39,11 @@ That's it. The server auto-starts the episode collector alongside itself — not
 **To update:**
 
 ```bash
-knowledge-server update
+knowledge-server update                              # latest release
+knowledge-server update --version v3.10.2 --force    # older release (downgrades need --force)
 ```
+
+Every downloaded file is checked against the release's `SHA256SUMS` before anything is replaced. The new binaries must also pass a smoke test. The previous binaries are kept as `*.prev`, and a failed post-install check restores them.
 
 ### From source
 
@@ -617,7 +620,16 @@ You work across multiple machines and want a single knowledge base that spans al
 
 **Prompt injection** — Session content is sent to an LLM for extraction. Adversarial text in your sessions (code you pasted, web content you discussed) could influence what gets consolidated. The extraction prompt is hardened, and any injected entry must still pass similarity checks. The extraction bar (most sessions → nothing) significantly limits attack surface.
 
-**Binary integrity** — Binaries are SHA-256 verified before install. The installer decompresses and verifies before moving files into place. `knowledge-server update` does the same.
+**Binary integrity** — The installer and `knowledge-server update` download the binaries, plugin, and slash-command files, then compare each one with the release's `SHA256SUMS-<platform>`. They abort, without installing anything, if a file has no manifest entry, if a hash does not match, or if neither `sha256sum` nor `shasum` is available. Set `KNOWLEDGE_REQUIRE_ATTESTATION=1` to make the installer also require a GitHub artifact attestation (this needs the `gh` CLI).
+
+**Verifying a release** — Release binaries and `SHA256SUMS` files carry GitHub build-provenance attestations, created by this repository's release workflow. To check a binary, decompress the `.gz` first: attestations cover the uncompressed files.
+
+```bash
+gh attestation verify ~/.local/share/knowledge-server/libexec/knowledge-server --repo MAnders333/knowledge-server
+gh attestation verify SHA256SUMS-linux-x64 --repo MAnders333/knowledge-server
+```
+
+An attestation shows that the file was built from this repository by its release workflow. It does not protect against a compromised maintainer account.
 
 ## Development
 
