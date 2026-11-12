@@ -30,6 +30,7 @@ import {
 	PostgresKnowledgeDB,
 	buildAnnSimilarEntriesSql,
 } from "../src/db/postgres/index";
+import { PG_MIGRATIONS } from "../src/db/postgres/migrations";
 import { SCHEMA_VERSION } from "../src/db/postgres/schema";
 import { ServerStateDB } from "../src/db/state/index";
 import { PostgresServerStateDB } from "../src/db/state/postgres";
@@ -1470,6 +1471,107 @@ describe.skipIf(!PG_URI)("PostgresServerStateDB", () => {
 				DROP OWNED BY ${role};
 				DROP ROLE IF EXISTS ${role};
 			`);
+		}
+	});
+});
+
+// ── Schema version guard: refuse newer stores, never drop, name missing versions ──
+
+describe.skipIf(!PG_URI)("schema version guard", () => {
+	const uri = PG_URI as string;
+	let admin: ReturnType<typeof postgres>;
+
+	async function setVersion(version: number): Promise<void> {
+		await admin`DELETE FROM schema_version`;
+		await admin`INSERT INTO schema_version (version, applied_at) VALUES (${version}, ${Date.now()})`;
+	}
+
+	async function tableExists(name: string): Promise<boolean> {
+		const rows = await admin`SELECT to_regclass(${name}) AS t`;
+		return rows[0].t !== null;
+	}
+
+	beforeAll(async () => {
+		admin = postgres(uri, { max: 1 });
+		const seed = new PostgresKnowledgeDB(uri);
+		await seed.initialize();
+		await seed.close();
+	});
+
+	afterAll(async () => {
+		await setVersion(SCHEMA_VERSION);
+		await admin.end();
+	});
+
+	it("refuses a knowledge store newer than this build and keeps its tables", async () => {
+		await setVersion(SCHEMA_VERSION + 1);
+		const store = new PostgresKnowledgeDB(uri);
+		try {
+			await expect(store.initialize()).rejects.toThrow(/newer than this build/);
+		} finally {
+			await store.close();
+		}
+		expect(await tableExists("knowledge_entry")).toBe(true);
+		await setVersion(SCHEMA_VERSION);
+	});
+
+	it("refuses a knowledge store with a missing migration, naming the version", async () => {
+		const missing = PG_MIGRATIONS[0].version - 1;
+		await setVersion(missing - 1);
+		const store = new PostgresKnowledgeDB(uri);
+		try {
+			await expect(store.initialize()).rejects.toThrow(
+				new RegExp(`no migration for v${missing}`),
+			);
+		} finally {
+			await store.close();
+		}
+		expect(await tableExists("knowledge_entry")).toBe(true);
+		await setVersion(SCHEMA_VERSION);
+	});
+
+	it("refuses a Postgres state DB newer than this build and keeps its tables", async () => {
+		await admin`DELETE FROM state_schema_version`;
+		await admin`INSERT INTO state_schema_version (version, applied_at) VALUES (99, 0)`;
+		const state = new PostgresServerStateDB(uri);
+		try {
+			await expect(state.initialize()).rejects.toThrow(/newer than this build/);
+		} finally {
+			await state.close();
+			await admin`DELETE FROM state_schema_version WHERE version = 99`;
+		}
+		expect(await tableExists("pending_episodes")).toBe(true);
+	});
+
+	it("insertPendingEpisode stores the same episode range once (Postgres)", async () => {
+		const state = new PostgresServerStateDB(uri);
+		const base = {
+			userId: "alice",
+			source: "opencode",
+			sessionId: "dup-session",
+			startMessageId: "m0",
+			endMessageId: "m9",
+			sessionTitle: "t",
+			projectName: "p",
+			directory: "/tmp",
+			content: "c",
+			contentType: "messages" as const,
+			timeCreated: 1,
+			maxMessageTime: 2,
+			approxTokens: 3,
+			uploadedAt: 4,
+		};
+		try {
+			await admin`DELETE FROM pending_episodes WHERE session_id = 'dup-session'`;
+			await state.insertPendingEpisode({ ...base, id: "dup-a" });
+			await state.insertPendingEpisode({ ...base, id: "dup-b" });
+			const rows = (await state.getPendingEpisodes(0)).filter(
+				(r) => r.sessionId === "dup-session",
+			);
+			expect(rows.map((r) => r.id)).toEqual(["dup-a"]);
+		} finally {
+			await admin`DELETE FROM pending_episodes WHERE session_id = 'dup-session'`;
+			await state.close();
 		}
 	});
 });

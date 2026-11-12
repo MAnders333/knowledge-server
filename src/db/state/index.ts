@@ -13,7 +13,12 @@ import {
 	type IServerStateDB,
 	PENDING_EPISODE_MAX_ATTEMPTS,
 } from "../interface.js";
+import {
+	assertNotNewerThanCode,
+	pendingMigrations,
+} from "../migration-registry.js";
 import { runStateMigrations } from "./migrations.js";
+import { SERVER_LOCAL_MIGRATIONS } from "./schema.js";
 import {
 	SERVER_LOCAL_CREATE_TABLES,
 	SERVER_LOCAL_SCHEMA_VERSION,
@@ -84,6 +89,22 @@ export class ServerStateDB implements IServerStateDB {
 					.get() as { version: number } | null
 			)?.version ?? 0;
 
+		assertNotNewerThanCode(
+			currentVersion,
+			SERVER_LOCAL_SCHEMA_VERSION,
+			"state.db",
+		);
+		if (currentVersion > 0) {
+			// Every version after the stored one must be registered. The state tables
+			// themselves are created idempotently below.
+			pendingMigrations(
+				SERVER_LOCAL_MIGRATIONS,
+				currentVersion,
+				SERVER_LOCAL_SCHEMA_VERSION,
+				"state.db",
+			);
+		}
+
 		// Always ensure applied_migrations exists — it was added in v1 but may be
 		// absent from existing v1 DBs created before this table was introduced.
 		this.db.exec(`
@@ -120,13 +141,19 @@ export class ServerStateDB implements IServerStateDB {
 	// ── Pending Episodes ──────────────────────────────────────────────────────
 
 	async insertPendingEpisode(episode: PendingEpisode): Promise<void> {
+		// Skip a range already staged, e.g. two daemons uploading the same session.
+		// Plain SQL: no unique index or table ownership needed.
 		this.db
 			.prepare(
 				`INSERT OR IGNORE INTO pending_episodes
          (id, user_id, source, session_id, start_message_id, end_message_id,
           session_title, project_name, directory, content, content_type,
           session_timestamp, max_message_time, approx_tokens, uploaded_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+         WHERE NOT EXISTS (
+           SELECT 1 FROM pending_episodes
+           WHERE user_id = ? AND source = ? AND session_id = ? AND start_message_id = ? AND end_message_id = ?
+         )`,
 			)
 			.run(
 				episode.id,
@@ -144,6 +171,11 @@ export class ServerStateDB implements IServerStateDB {
 				episode.maxMessageTime,
 				episode.approxTokens,
 				episode.uploadedAt,
+				episode.userId,
+				episode.source,
+				episode.sessionId,
+				episode.startMessageId,
+				episode.endMessageId,
 			);
 	}
 

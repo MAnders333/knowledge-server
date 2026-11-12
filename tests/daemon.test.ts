@@ -113,10 +113,18 @@ describe("pending_episodes DB operations", () => {
 	it("filters by afterMaxMessageTime", async () => {
 		const now = Date.now();
 		await db.insertPendingEpisode(
-			makePendingEpisode({ id: "old", maxMessageTime: now - 10000 }),
+			makePendingEpisode({
+				id: "old",
+				startMessageId: "msg-old",
+				maxMessageTime: now - 10000,
+			}),
 		);
 		await db.insertPendingEpisode(
-			makePendingEpisode({ id: "new", maxMessageTime: now }),
+			makePendingEpisode({
+				id: "new",
+				startMessageId: "msg-new",
+				maxMessageTime: now,
+			}),
 		);
 
 		const rows = await db.getPendingEpisodes(now - 5000);
@@ -134,8 +142,12 @@ describe("pending_episodes DB operations", () => {
 	});
 
 	it("deletes episodes by id", async () => {
-		await db.insertPendingEpisode(makePendingEpisode({ id: "ep-1" }));
-		await db.insertPendingEpisode(makePendingEpisode({ id: "ep-2" }));
+		await db.insertPendingEpisode(
+			makePendingEpisode({ id: "ep-1", startMessageId: "msg-ep-1" }),
+		);
+		await db.insertPendingEpisode(
+			makePendingEpisode({ id: "ep-2", startMessageId: "msg-ep-2" }),
+		);
 
 		await db.deletePendingEpisodes(["ep-1"]);
 

@@ -9,6 +9,10 @@ import type {
 } from "../../types.js";
 import type { IKnowledgeStore } from "../interface.js";
 import {
+	assertNotNewerThanCode,
+	pendingMigrations,
+} from "../migration-registry.js";
+import {
 	bufferToFloats,
 	floatsToBuffer,
 	floatsToVectorLiteral,
@@ -280,72 +284,29 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			return;
 		}
 
-		// PG_MIGRATIONS is imported from ./migrations.ts — see that file for history.
-		//
-		// Gap-safe: migrations are filtered to version > currentVersion and applied
-		// in ascending order.  If the DB is at v10 and migrations v11–v16 all exist,
-		// every one of them runs in sequence even though intermediate versions (e.g.
-		// v12, v13) were never individually stamped on this database.  Each migration
-		// stamps its own version row, so a crash mid-sequence leaves the DB at the
-		// last successfully committed version and restarts cleanly from there.
-		if (currentVersion < SCHEMA_VERSION) {
-			const pending = PG_MIGRATIONS.filter(
-				(m) => m.version > currentVersion,
-			).sort((a, b) => a.version - b.version);
+		// A database written by a newer build must not be opened. Refuse it, untouched.
+		assertNotNewerThanCode(currentVersion, SCHEMA_VERSION, "knowledge store");
 
-			if (pending.length > 0) {
-				logger.log(
-					`[pg-db] Schema at v${currentVersion}, target v${SCHEMA_VERSION}. Applying ${pending.length} migration(s): ${pending.map((m) => `v${m.version} (${m.label})`).join(", ")}.`,
-				);
-			}
-
-			let migratedTo = currentVersion;
-			for (const migration of pending) {
-				logger.log(
-					`[pg-db] Applying migration v${migration.version}: ${migration.label}.`,
-				);
-				await this.sql.begin(async (sql: TxSql) => {
-					await migration.up(sql);
-					await sql`
-						INSERT INTO schema_version (version, applied_at)
-						VALUES (${migration.version}, ${Date.now()})
-					`;
-				});
-				migratedTo = migration.version;
-				logger.log(`[pg-db] Migration v${migration.version} complete.`);
-			}
-
-			// Safety net: if migrations still didn't reach SCHEMA_VERSION (e.g.
-			// a future migration requires destructive changes), fall back to
-			// drop+recreate. migratedTo > 0 is always true here (we already
-			// handled 0 above), so we always warn before the destructive reset.
-			if (migratedTo < SCHEMA_VERSION) {
-				logger.warn(
-					`[pg-db] Schema still at v${migratedTo} after migrations, code expects v${SCHEMA_VERSION}. Dropping and recreating all tables. All existing knowledge data has been cleared.`,
-				);
-				// Wrap the entire drop+recreate in a transaction so a crash mid-way
-				// leaves the DB at the last committed migration version (re-runnable
-				// on restart) rather than with a partially-dropped schema.
-				await this.sql.begin(async (sql: TxSql) => {
-					await sql`DROP TABLE IF EXISTS knowledge_cluster_member CASCADE`;
-					await sql`DROP TABLE IF EXISTS knowledge_cluster CASCADE`;
-					await sql`DROP TABLE IF EXISTS knowledge_relation CASCADE`;
-					await sql`DROP TABLE IF EXISTS knowledge_entry CASCADE`;
-					await sql`DROP TABLE IF EXISTS embedding_metadata CASCADE`;
-					// Drop staging tables that may exist from pre-v14 Postgres schemas.
-					// These now live in state.db (ServerStateDB) — safe to drop here
-					// since migrateFromKnowledgeDb() would have already copied them.
-					await sql`DROP TABLE IF EXISTS pending_episodes CASCADE`;
-					await sql`DROP TABLE IF EXISTS consolidated_episode CASCADE`;
-					await sql`DROP TABLE IF EXISTS consolidation_state CASCADE`;
-					await sql`DROP TABLE IF EXISTS schema_version CASCADE`;
-					await sql.unsafe(PG_CREATE_TABLES);
-					await sql`
-						INSERT INTO schema_version (version, applied_at)
-						VALUES (${SCHEMA_VERSION}, ${Date.now()})
-					`;
-				});
-			}
+		// Apply exactly the migrations the store is missing, in order. A gap with no
+		// registered migration is a hard error; nothing is dropped.
+		const pending = pendingMigrations(
+			PG_MIGRATIONS,
+			currentVersion,
+			SCHEMA_VERSION,
+			"Postgres knowledge store",
+		);
+		for (const migration of pending) {
+			logger.log(
+				`[pg-db] Applying migration v${migration.version}: ${migration.label}.`,
+			);
+			await this.sql.begin(async (sql: TxSql) => {
+				await migration.up(sql);
+				await sql`
+					INSERT INTO schema_version (version, applied_at)
+					VALUES (${migration.version}, ${Date.now()})
+				`;
+			});
+			logger.log(`[pg-db] Migration v${migration.version} complete.`);
 		}
 
 		// ── pgvector: ensure embedding_vec column + HNSW index ───────────────────

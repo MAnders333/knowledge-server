@@ -17,7 +17,16 @@
  *   the staging tables are copied from knowledge.db to state.db automatically.
  */
 
-export const SERVER_LOCAL_SCHEMA_VERSION = 2;
+import { latestVersion } from "../migration-registry.js";
+
+export const SERVER_LOCAL_MIGRATIONS = [
+	{ version: 1, label: "baseline state schema" },
+	{ version: 2, label: "pending_episode_attempts table" },
+] as const;
+
+export const SERVER_LOCAL_SCHEMA_VERSION = latestVersion(
+	SERVER_LOCAL_MIGRATIONS,
+);
 
 // Schema is always additive (CREATE TABLE IF NOT EXISTS), so column-manifest
 // drift detection is not used for state.db. See KnowledgeDB (knowledge.db)

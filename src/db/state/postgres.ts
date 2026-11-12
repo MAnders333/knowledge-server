@@ -7,11 +7,35 @@ import type {
 } from "../../types.js";
 import { PENDING_EPISODE_MAX_ATTEMPTS } from "../interface.js";
 import type { IServerStateDB } from "../interface.js";
+import {
+	assertNotNewerThanCode,
+	latestVersion,
+	pendingMigrations,
+} from "../migration-registry.js";
 
 // biome-ignore lint: TS limitation with Omit stripping call signatures
 type TxSql = any;
 
-const STATE_SCHEMA_VERSION = 2;
+/**
+ * Versioned migrations for the Postgres state DB. Version 1 is the baseline
+ * created by PG_CREATE_STATE_TABLES; each later entry runs once, in order.
+ */
+const PG_STATE_MIGRATIONS: Array<{
+	version: number;
+	label: string;
+	up?: (tx: TxSql) => Promise<void>;
+}> = [
+	{ version: 1, label: "baseline state schema" },
+	{
+		version: 2,
+		label:
+			"pending_episode_attempts table (attempt counts kept out of pending_episodes)",
+		up: async (tx: TxSql) => {
+			await tx.unsafe(PG_ATTEMPTS_TABLE);
+		},
+	},
+];
+const STATE_SCHEMA_VERSION = latestVersion(PG_STATE_MIGRATIONS);
 
 const PG_ATTEMPTS_TABLE = `
   CREATE TABLE IF NOT EXISTS pending_episode_attempts (
@@ -157,6 +181,7 @@ export class PostgresServerStateDB implements IServerStateDB {
 		} else if (v < STATE_SCHEMA_VERSION) {
 			await this.upgradeSchema();
 		} else {
+			assertNotNewerThanCode(v, STATE_SCHEMA_VERSION, "Postgres state DB");
 			logger.log(`[pg-state-db] Postgres state DB at schema v${v}.`);
 		}
 	}
@@ -173,16 +198,22 @@ export class PostgresServerStateDB implements IServerStateDB {
 			const rows = await tx`SELECT MAX(version) AS v FROM state_schema_version`;
 			const versionRow = rows[0] as { v: number | null } | undefined;
 			const current = Number(versionRow?.v ?? 0);
-			if (current >= STATE_SCHEMA_VERSION) return;
-			await tx.unsafe(PG_ATTEMPTS_TABLE);
-			await tx`
-				INSERT INTO state_schema_version (version, applied_at)
-				VALUES (${STATE_SCHEMA_VERSION}, ${Date.now()})
-				ON CONFLICT DO NOTHING
-			`;
-			logger.log(
-				`[pg-state-db] Upgraded Postgres state DB to schema v${STATE_SCHEMA_VERSION}.`,
-			);
+			for (const migration of pendingMigrations(
+				PG_STATE_MIGRATIONS,
+				current,
+				STATE_SCHEMA_VERSION,
+				"Postgres state DB",
+			)) {
+				if (migration.up) await migration.up(tx);
+				await tx`
+					INSERT INTO state_schema_version (version, applied_at)
+					VALUES (${migration.version}, ${Date.now()})
+					ON CONFLICT DO NOTHING
+				`;
+				logger.log(
+					`[pg-state-db] Applied state migration v${migration.version}: ${migration.label}.`,
+				);
+			}
 		});
 	}
 
@@ -190,19 +221,25 @@ export class PostgresServerStateDB implements IServerStateDB {
 
 	async insertPendingEpisode(episode: PendingEpisode): Promise<void> {
 		await this.initialize();
+		// Skip a range already staged (see the SQLite implementation). Plain SQL: no
+		// unique index or table ownership needed.
 		await this.sql`
 			INSERT INTO pending_episodes
 			(id, user_id, source, session_id, start_message_id, end_message_id,
 			 session_title, project_name, directory, content, content_type,
 			 session_timestamp, max_message_time, approx_tokens, uploaded_at)
-			VALUES (
-				${episode.id}, ${episode.userId}, ${episode.source},
+			SELECT ${episode.id}, ${episode.userId}, ${episode.source},
 				${episode.sessionId}, ${episode.startMessageId}, ${episode.endMessageId},
 				${episode.sessionTitle ?? ""}, ${episode.projectName ?? ""},
 				${episode.directory ?? ""}, ${episode.content},
-				${episode.contentType}, ${episode.timeCreated ?? 0},
-				${episode.maxMessageTime}, ${episode.approxTokens ?? 0},
-				${episode.uploadedAt}
+				${episode.contentType}, ${episode.timeCreated ?? 0}::bigint,
+				${episode.maxMessageTime}::bigint, ${episode.approxTokens ?? 0}::integer,
+				${episode.uploadedAt}::bigint
+			WHERE NOT EXISTS (
+				SELECT 1 FROM pending_episodes
+				WHERE user_id = ${episode.userId} AND source = ${episode.source} AND session_id = ${episode.sessionId}
+				  AND start_message_id = ${episode.startMessageId}
+				  AND end_message_id = ${episode.endMessageId}
 			)
 			ON CONFLICT (id) DO NOTHING
 		`;

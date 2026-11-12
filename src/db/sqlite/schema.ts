@@ -90,7 +90,10 @@
  *   present but unpopulated and/or missing ANN indexes (legacy rollout edge case).
  * - v17 applies the repair migration on Postgres; SQLite remains a no-op.
  */
-export const SCHEMA_VERSION = 17;
+import { latestVersion } from "../migration-registry.js";
+import { MIGRATIONS } from "./migrations.js";
+
+export const SCHEMA_VERSION = latestVersion(MIGRATIONS);
 
 /**
  * Expected columns for each table, derived from the DDL below.
