@@ -6,7 +6,10 @@ import { resolveDataDir } from "../config-file.js";
 import { restartDaemonAfterUpdate } from "./daemon-restart.js";
 import {
 	EXTENSION_ASSETS,
+	type ExtensionTarget,
+	findLegacyExtensionCopies,
 	readExtensionTargets,
+	recordExtensionTarget,
 	refreshExtensionTargets,
 } from "./extension-targets.js";
 import {
@@ -431,6 +434,21 @@ export async function runUpdate(
 	// made in a tool's config dir is registered and refreshed too, so registered
 	// assets are fetched even when they are not yet on disk.
 	const targets = readExtensionTargets(inferredInstallDir);
+	// Copies made by releases before the registry (v3.10.3 and earlier) are not
+	// registered. Adopt the ones whose bytes match a known release; the registry
+	// entry is written only after the verified refresh below.
+	const adopted: ExtensionTarget[] = [];
+	for (const copy of findLegacyExtensionCopies(homedir())) {
+		if (targets.some((t) => t.dst === copy.target.dst)) continue;
+		if (!copy.adoptable) {
+			console.log(
+				`  · Left ${copy.target.dst} unchanged: it is not a known knowledge-server release file. Run \`knowledge-server setup-tool <tool>\` to replace it.`,
+			);
+			continue;
+		}
+		adopted.push(copy.target);
+		targets.push(copy.target);
+	}
 	const refresh = new Set<string>(targets.map((t) => t.asset));
 	for (const name of EXTENSION_ASSETS) {
 		if (existsSync(join(inferredInstallDir, name))) refresh.add(name);
@@ -471,6 +489,15 @@ export async function runUpdate(
 	for (const outcome of refreshExtensionTargets(inferredInstallDir, targets)) {
 		if (outcome.status === "refreshed") {
 			console.log(`  ✓ Refreshed ${outcome.target.dst}`);
+			if (adopted.some((t) => t.dst === outcome.target.dst)) {
+				try {
+					recordExtensionTarget(inferredInstallDir, outcome.target);
+				} catch (err) {
+					console.warn(
+						`  ⚠ Could not register ${outcome.target.dst} for future updates: ${err instanceof Error ? err.message : err}`,
+					);
+				}
+			}
 		} else {
 			console.warn(
 				`  ⚠ Not refreshed ${outcome.target.dst}: ${outcome.reason}`,
