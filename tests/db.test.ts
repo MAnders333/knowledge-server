@@ -129,7 +129,8 @@ describe("KnowledgeDB", () => {
 			)
 			.get() as { injection_count: number };
 		raw.close();
-		expect(row.injection_count).toBe(4);
+		// Each id counts once per batch: 1 + 1 (duplicate id in one batch) + 1.
+		expect(row.injection_count).toBe(3);
 	});
 
 	it("recordInjections is a no-op for an empty batch", async () => {

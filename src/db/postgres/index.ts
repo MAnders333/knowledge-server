@@ -962,7 +962,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			SET injection_count = injection_count + 1,
 			    last_accessed_at = CASE WHEN last_accessed_at <= ${now - LAST_ACCESS_TOUCH_INTERVAL_MS}
 			                       THEN ${now} ELSE last_accessed_at END
-			WHERE id = ANY(${ids}::text[])
+			WHERE id = ANY(${[...new Set(ids)]}::text[])
 		`;
 	}
 

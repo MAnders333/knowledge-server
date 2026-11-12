@@ -472,7 +472,7 @@ export class KnowledgeDB implements IKnowledgeStore {
          WHERE id = ?`,
 		);
 		this.db.transaction(() => {
-			for (const id of ids) stmt.run(cutoff, now, id);
+			for (const id of new Set(ids)) stmt.run(cutoff, now, id);
 		})();
 	}
 

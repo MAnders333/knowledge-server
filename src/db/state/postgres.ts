@@ -47,15 +47,28 @@ const PG_STATE_MIGRATIONS: Array<{
 		version: 4,
 		label: "activation_event gate and budget counts (precision gate)",
 		up: async (tx: TxSql) => {
+			// Only add what is missing: a non-owner role cannot ALTER a table another
+			// role created, and fresh installs already have the columns (v3 DDL).
+			// pg_attribute, not information_schema: the latter hides columns from roles
+			// without privileges on the table, which would look like "missing".
+			const present = new Set(
+				(
+					await tx`SELECT a.attname FROM pg_attribute a
+					         WHERE a.attrelid = to_regclass('activation_event')
+					           AND a.attnum > 0 AND NOT a.attisdropped`
+				).map((r: { attname: string }) => r.attname),
+			);
 			for (const column of [
 				"gate_dropped",
 				"budget_dropped",
 				"deduped",
 				"injected_tokens",
 			]) {
-				await tx.unsafe(
-					`ALTER TABLE activation_event ADD COLUMN IF NOT EXISTS ${column} INTEGER NOT NULL DEFAULT 0`,
-				);
+				if (!present.has(column)) {
+					await tx.unsafe(
+						`ALTER TABLE activation_event ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`,
+					);
+				}
 			}
 		},
 	},
