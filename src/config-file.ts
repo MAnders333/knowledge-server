@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 /**
  * Store configuration — one entry per knowledge database.
@@ -159,6 +159,21 @@ export const DEFAULT_SQLITE_PATH = join(
 	"knowledge-server",
 	"knowledge.db",
 );
+
+/**
+ * Directory that holds state.db, the default knowledge.db, the lockfiles
+ * (daemon.lock, consolidate.lock), the daemon status file and daemon.log.
+ * Follows `stateDb.path` from config.jsonc, else the default location.
+ */
+export function resolveDataDir(configPath = DEFAULT_CONFIG_PATH): string {
+	let stateDbPath: string | undefined;
+	try {
+		stateDbPath = loadConfigFile(configPath)?.stateDb.path;
+	} catch {
+		// A malformed config is reported by the component that needs it.
+	}
+	return dirname(stateDbPath ?? DEFAULT_SQLITE_PATH);
+}
 
 /** Expand a leading `~` (alone or as `~/…`) to the home directory. */
 export function expandHome(p: string): string {

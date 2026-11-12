@@ -2,6 +2,8 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { hasOAuthTokens } from "./auth/claude-oauth.js";
+import { envFileCandidates, preferredEnvFile } from "./env-file.js";
+import { DEFAULT_LOG_MAX_BYTES } from "./logger.js";
 
 /**
  * Parse an integer environment variable with a fallback default and optional
@@ -160,6 +162,9 @@ export const config = {
 	logPath:
 		process.env.KNOWLEDGE_LOG_PATH ??
 		join(homedir(), ".local", "share", "knowledge-server", "server.log"),
+	// Size at which the active log rotates (server.log.1 … .3 are kept).
+	// LOG_MAX_BYTES=0 disables rotation.
+	logMaxBytes: parseIntEnv(process.env.LOG_MAX_BYTES, DEFAULT_LOG_MAX_BYTES, 0),
 
 	// PID file — written on startup, deleted on clean shutdown.
 	// Used by `knowledge-server stop` to signal the running server.
@@ -587,30 +592,8 @@ export function resolveEnvFilePath(): string {
 		return "the .env file in the project root";
 	}
 
-	// Priority-ordered candidate list for binary installs.
-	const candidates: string[] = [];
-
-	// 1. Explicit override
-	if (process.env.KNOWLEDGE_CONFIG_HOME) {
-		candidates.push(join(process.env.KNOWLEDGE_CONFIG_HOME, ".env"));
-	}
-
-	// 2 & 3. XDG_CONFIG_HOME (falls back to ~/.config per XDG spec)
-	const xdgConfigHome =
-		process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
-	candidates.push(join(xdgConfigHome, "knowledge-server", ".env"));
-
-	// 4. Legacy location — backwards compat for existing installs
-	candidates.push(
-		join(homedir(), ".local", "share", "knowledge-server", ".env"),
-	);
-
-	for (const candidate of candidates) {
-		if (existsSync(candidate)) return candidate;
-	}
-
-	// Nothing found — return the preferred new location as the hint
-	return join(xdgConfigHome, "knowledge-server", ".env");
+	// Nothing found — return the preferred new location as the hint.
+	return envFileCandidates().find((p) => existsSync(p)) ?? preferredEnvFile();
 }
 
 // Placeholder values shipped in the .env template — used to detect unconfigured installs.

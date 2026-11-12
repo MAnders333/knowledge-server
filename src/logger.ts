@@ -1,9 +1,10 @@
 import {
-	appendFileSync,
 	closeSync,
+	existsSync,
 	fstatSync,
 	mkdirSync,
 	openSync,
+	renameSync,
 	statSync,
 	writeSync,
 } from "node:fs";
@@ -17,12 +18,16 @@ import { ensurePrivateFile } from "./utils.js";
  * - One file descriptor, opened once and reused for every line (no open/close per
  *   line). Writes are synchronous so ordering is exact.
  * - Never double-write: launchd points stdout and stderr at the same server.log.
- *   When a stream is already the log file (same device + inode), the line goes to
- *   that stream only. Writing it again to the file was the source of the duplicated
- *   lines in the log.
+ *   When a stream is already the log file (same device + inode), lines are written
+ *   through the logger's own descriptor and skipped on that stream. The file gets
+ *   exactly one copy per line, and rotation (which renames the file) never leaves
+ *   a stdout redirect writing into a rotated copy.
+ * - Size-based rotation: when the next line would push the active file past
+ *   `maxBytes` (default 20 MB), server.log → server.log.1 → … → server.log.3 and the
+ *   oldest copy is dropped. `maxBytes` 0 disables rotation (LOG_MAX_BYTES).
  * - ISO timestamp + [LEVEL] prefix on every persisted line — makes grep/tail
- *   immediately useful. raw() writes a timestamped line to the file (and to stdout
- *   when stdout is the file) but a plain line to a terminal, so the banner looks clean.
+ *   immediately useful. raw() writes a timestamped line to the file but a plain
+ *   line to a terminal, so the banner looks clean.
  * - LOG_LEVEL (debug | info | warn | error, default info). Prompt and entry text is
  *   only logged at debug; info lines carry lengths, ids and scores, not content.
  * - Same .log/.warn/.error API as console.* so call sites are a mechanical replace.
@@ -39,6 +44,11 @@ import { ensurePrivateFile } from "./utils.js";
 
 export type LogLevelName = "debug" | "info" | "warn" | "error";
 type LineLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
+
+/** Rotated copies kept beside the active log: `<log>.1` … `<log>.3`. */
+export const LOG_KEEP_FILES = 3;
+/** Size at which the active log rotates when LOG_MAX_BYTES is unset. */
+export const DEFAULT_LOG_MAX_BYTES = 20 * 1024 * 1024;
 
 const RANK: Record<LogLevelName, number> = {
 	debug: 0,
@@ -92,16 +102,21 @@ function isSameFile(fd: number, path: string): boolean {
 export interface LoggerOptions {
 	/** Mirror to stdout/stderr. Tests turn this off to keep output quiet. */
 	mirror?: boolean;
+	/** Rotate the active file before it would exceed this size. 0 disables rotation. */
+	maxBytes?: number;
 }
 
 export class Logger {
 	private readonly logPath: string;
 	private readonly level: LogLevelName;
 	private readonly mirror: boolean;
+	private readonly maxBytes: number;
 	private fd: number | null = null;
+	/** Bytes in the active file as far as this process knows (set on open, grown per write). */
+	private bytes = 0;
 	private readonly stdoutIsLog: boolean;
 	private readonly stderrIsLog: boolean;
-	/** Number of times the log file was opened. Stays at 1 for a process lifetime. */
+	/** Number of times the log file was opened. Grows by one per rotation. */
 	fileOpens = 0;
 
 	constructor(
@@ -111,6 +126,7 @@ export class Logger {
 	) {
 		this.level = level;
 		this.mirror = options?.mirror ?? true;
+		this.maxBytes = options?.maxBytes ?? DEFAULT_LOG_MAX_BYTES;
 		this.logPath = logPath;
 		if (logPath) {
 			// Ensure the log directory exists before the first write.
@@ -135,14 +151,43 @@ export class Logger {
 		return RANK[level] >= RANK[this.level];
 	}
 
+	/** Open the active file through the reused descriptor (append, owner-only). */
+	private openFile(): number {
+		const fd = openSync(this.logPath, "a", 0o600);
+		this.fd = fd;
+		this.fileOpens++;
+		this.bytes = fstatSync(fd).size;
+		return fd;
+	}
+
+	/**
+	 * Shift server.log → .1 → … → .N (the oldest copy is overwritten) and start a
+	 * fresh active file. The descriptor is closed first so the rename is clean.
+	 */
+	private rotate(): void {
+		this.close();
+		for (let i = LOG_KEEP_FILES; i >= 1; i--) {
+			const from = i === 1 ? this.logPath : `${this.logPath}.${i - 1}`;
+			if (existsSync(from)) renameSync(from, `${this.logPath}.${i}`);
+		}
+	}
+
 	/** Append one line to the log file through the reused descriptor. */
 	private appendLine(line: string): void {
 		try {
-			if (this.fd === null) {
-				this.fd = openSync(this.logPath, "a", 0o600);
-				this.fileOpens++;
+			const data = `${line}\n`;
+			const len = Buffer.byteLength(data);
+			let fd = this.fd ?? this.openFile();
+			if (
+				this.maxBytes > 0 &&
+				this.bytes > 0 &&
+				this.bytes + len > this.maxBytes
+			) {
+				this.rotate();
+				fd = this.openFile();
 			}
-			writeSync(this.fd, `${line}\n`);
+			writeSync(fd, data);
+			this.bytes += len;
 		} catch {
 			// If the file write fails, don't crash the server — stdout is still intact.
 			// Avoid recursively calling logger here; use process.stderr directly.
@@ -151,14 +196,15 @@ export class Logger {
 	}
 
 	/**
-	 * Send one persisted line to the stream it belongs on. The file gets it only
-	 * when that stream is not already the log file (avoids the double write).
+	 * Send one persisted line to the stream it belongs on. The file always gets it
+	 * through the logger's descriptor; the stream gets a copy only when it is not
+	 * already the log file.
 	 */
 	private emit(toStderr: boolean, line: string): void {
-		const stream = toStderr ? process.stderr : process.stdout;
-		if (this.mirror) stream.write(`${line}\n`);
-		if (this.logPath && !(toStderr ? this.stderrIsLog : this.stdoutIsLog)) {
-			this.appendLine(line);
+		if (this.logPath) this.appendLine(line);
+		const streamIsLog = toStderr ? this.stderrIsLog : this.stdoutIsLog;
+		if (this.mirror && !streamIsLog) {
+			(toStderr ? process.stderr : process.stdout).write(`${line}\n`);
 		}
 	}
 
@@ -201,21 +247,14 @@ export class Logger {
 
 	raw(...args: unknown[]): void {
 		if (!this.isEnabled("info")) return;
+		const persisted = `${new Date().toISOString()} [INFO] ${args.map(serialize).join(" ")}`;
 		if (this.stdoutIsLog) {
 			// stdout is the log file: the timestamped form is the only copy written.
-			this.emit(
-				false,
-				`${new Date().toISOString()} [INFO] ${args.map(serialize).join(" ")}`,
-			);
+			this.emit(false, persisted);
 			return;
 		}
 		if (this.mirror) process.stdout.write(`${this.toDisplay(args)}\n`);
-		if (this.logPath) {
-			// file: use serialize() so Errors and circular objects are represented faithfully
-			this.appendLine(
-				`${new Date().toISOString()} [INFO] ${args.map(serialize).join(" ")}`,
-			);
-		}
+		if (this.logPath) this.appendLine(persisted);
 	}
 
 	/**
@@ -233,11 +272,11 @@ export class Logger {
 	 * double-stamping in the log file.
 	 */
 	passthrough(line: string): void {
-		if (this.mirror) process.stdout.write(`${line}\n`);
-		if (this.logPath && !this.stdoutIsLog) this.appendLine(line);
+		if (this.logPath) this.appendLine(line);
+		if (this.mirror && !this.stdoutIsLog) process.stdout.write(`${line}\n`);
 	}
 
-	/** Close the file descriptor. Only for shutdown and tests. */
+	/** Close the file descriptor. Only for shutdown, rotation and tests. */
 	close(): void {
 		if (this.fd !== null) {
 			closeSync(this.fd);
@@ -247,15 +286,19 @@ export class Logger {
 }
 
 // Singleton — initialized lazily on first import of logger.ts.
-// index.ts calls logger.init(config.logPath, config.logLevel) as the very first
-// action in main(), before KnowledgeDB and other modules are instantiated, so all
-// subsequent operational messages (including DB schema warnings) reach the log file.
+// index.ts calls logger.init(config.logPath, level, config.logMaxBytes) as the very
+// first action in main(), before KnowledgeDB and other modules are instantiated, so
+// all subsequent operational messages (including DB schema warnings) reach the log file.
 // Until init() is called, logPath is "" (stdout-only — safe for tests).
 let _logger = new Logger("");
 
 export const logger = {
-	init(logPath: string, level: LogLevelName = "info"): void {
-		_logger = new Logger(logPath, level);
+	init(
+		logPath: string,
+		level: LogLevelName = "info",
+		maxBytes: number = DEFAULT_LOG_MAX_BYTES,
+	): void {
+		_logger = new Logger(logPath, level, { maxBytes });
 	},
 	/** True when the given level would be written. Use to skip building costly debug text. */
 	isEnabled: (level: LogLevelName) => _logger.isEnabled(level),
