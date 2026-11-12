@@ -6,45 +6,43 @@ on:
     types: [completed]
     branches: [main]
 
-permissions:
-  contents: write
-  pull-requests: write
+# No default token scope. Each job grants only what it needs below.
+permissions: {}
 
 jobs:
   release-please:
-    # Only run if CI passed
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    # Only for CI runs of a direct push to this repository (not PR runs, not forks).
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
+      sha: ${{ steps.release.outputs.sha }}
     steps:
-      - uses: googleapis/release-please-action@v4
+      # release-please-config.json sets "draft": true, so this creates a draft
+      # release (with its tag, via force-tag-creation). Nothing is installable
+      # until the publish job below promotes it.
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
         id: release
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           release-type: node
 
-      # Upload non-binary assets (platform-independent) when a release is created
-      - uses: actions/checkout@v4
-        if: ${{ steps.release.outputs.release_created == 'true' }}
-
-      - name: Upload non-binary release assets
-        if: ${{ steps.release.outputs.release_created == 'true' }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload "${{ steps.release.outputs.tag_name }}" \
-            plugin/knowledge.ts \
-            plugin/pi-knowledge.ts \
-            commands/consolidate.md \
-            commands/knowledge-review.md \
-            scripts/install.sh
-
   build-binaries:
-    name: Build binaries (${{ matrix.os }})
+    name: Build binaries (${{ matrix.suffix }})
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      contents: read
+      # Required by actions/attest-build-provenance (Sigstore OIDC identity).
+      id-token: write
+      attestations: write
     strategy:
       matrix:
         include:
@@ -54,17 +52,23 @@ jobs:
             suffix: darwin-arm64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Build the commit release-please tagged, not whatever main points at now.
+          ref: ${{ needs.release-please.outputs.sha }}
+          persist-credentials: false
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           # Pin Bun for reproducible binaries. Newer Bun releases have produced
           # darwin-arm64 artifacts that fail macOS exec/signature validation on
-          # some machines (SIGKILL before process startup).
+          # some machines (SIGKILL before process startup). Keep in sync with ci.yml.
           bun-version: 1.3.9
 
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
+      - name: Install production dependencies
+        # The shipped binaries bundle only runtime dependencies (no src/ file
+        # imports a devDependency). Skip devDependencies and lifecycle scripts.
+        run: bun install --frozen-lockfile --production --ignore-scripts
 
       - name: Build binaries
         run: |
@@ -80,39 +84,132 @@ jobs:
           # verification/execution and avoids publishing unusable artifacts.
           codesign --force --sign - dist/knowledge-server-${{ matrix.suffix }}
           codesign --force --sign - dist/knowledge-daemon-${{ matrix.suffix }}
-
-      - name: Verify macOS binaries are executable
-        if: ${{ matrix.suffix == 'darwin-arm64' }}
-        run: |
-          # Ensure Mach-O signature/load commands are acceptable to macOS
-          # before publishing the release assets.
           codesign --verify --verbose dist/knowledge-server-${{ matrix.suffix }}
           codesign --verify --verbose dist/knowledge-daemon-${{ matrix.suffix }}
-          # Smoke-test startup path. This catches pre-runtime SIGKILL failures.
-          ./dist/knowledge-server-${{ matrix.suffix }} --help > /dev/null
 
-      - name: Generate checksums and compress
+      - name: Smoke test binaries
+        # Side-effect-free entry points only: both exit 0 before touching any
+        # database or network. This catches pre-runtime SIGKILL failures too.
+        run: |
+          ./dist/knowledge-server-${{ matrix.suffix }} --help > /dev/null
+          ./dist/knowledge-daemon-${{ matrix.suffix }} --version > /dev/null
+
+      - name: Assemble release files
+        run: |
+          cp plugin/knowledge.ts dist/knowledge.ts
+          cp plugin/pi-knowledge.ts dist/pi-knowledge.ts
+          cp commands/consolidate.md dist/consolidate.md
+          cp commands/knowledge-review.md dist/knowledge-review.md
+          cp scripts/install.sh dist/install.sh
+          cd dist
+          for bin in knowledge-server-${{ matrix.suffix }} knowledge-daemon-${{ matrix.suffix }}; do
+            gzip -c "$bin" > "$bin.gz"
+          done
+
+      - name: Generate SHA256SUMS
+        # One manifest per platform. It covers the binaries and every
+        # platform-independent file that install.sh, update and setup-tool
+        # download, so none of them can be fetched unverified.
         run: |
           cd dist
-          # Checksum the uncompressed binaries — update.ts verifies after gunzip
+          files=(
+            knowledge-server-${{ matrix.suffix }}
+            knowledge-daemon-${{ matrix.suffix }}
+            knowledge.ts
+            pi-knowledge.ts
+            consolidate.md
+            knowledge-review.md
+          )
           if command -v sha256sum &>/dev/null; then
-            sha256sum knowledge-server-${{ matrix.suffix }} > SHA256SUMS-${{ matrix.suffix }}
-            sha256sum knowledge-daemon-${{ matrix.suffix }} >> SHA256SUMS-${{ matrix.suffix }}
+            sha256sum "${files[@]}" > SHA256SUMS-${{ matrix.suffix }}
           else
-            shasum -a 256 knowledge-server-${{ matrix.suffix }} > SHA256SUMS-${{ matrix.suffix }}
-            shasum -a 256 knowledge-daemon-${{ matrix.suffix }} >> SHA256SUMS-${{ matrix.suffix }}
+            shasum -a 256 "${files[@]}" > SHA256SUMS-${{ matrix.suffix }}
           fi
-          # Compress for distribution
-          gzip -k knowledge-server-${{ matrix.suffix }}
-          gzip -k knowledge-daemon-${{ matrix.suffix }}
+          cat SHA256SUMS-${{ matrix.suffix }}
 
-      - name: Upload binaries and checksums
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload "${{ needs.release-please.outputs.tag_name }}" \
-            dist/knowledge-server-${{ matrix.suffix }} \
-            dist/knowledge-server-${{ matrix.suffix }}.gz \
-            dist/knowledge-daemon-${{ matrix.suffix }} \
-            dist/knowledge-daemon-${{ matrix.suffix }}.gz \
+      - name: Attest binaries and checksums
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/knowledge-server-${{ matrix.suffix }}
+            dist/knowledge-daemon-${{ matrix.suffix }}
             dist/SHA256SUMS-${{ matrix.suffix }}
+
+      - name: Attest installer
+        if: ${{ matrix.suffix == 'linux-x64' }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/install.sh
+
+      - name: Stage release files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.suffix }}
+          if-no-files-found: error
+          retention-days: 1
+          path: |
+            dist/knowledge-server-${{ matrix.suffix }}
+            dist/knowledge-server-${{ matrix.suffix }}.gz
+            dist/knowledge-daemon-${{ matrix.suffix }}
+            dist/knowledge-daemon-${{ matrix.suffix }}.gz
+            dist/SHA256SUMS-${{ matrix.suffix }}
+            dist/knowledge.ts
+            dist/pi-knowledge.ts
+            dist/consolidate.md
+            dist/knowledge-review.md
+            dist/install.sh
+
+  publish:
+    # Runs only when every build leg succeeded. Until this job promotes the
+    # draft, /releases/latest (used by install.sh and update) does not see it.
+    name: Publish release
+    needs: [release-please, build-binaries]
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.release-please.outputs.tag_name }}
+    steps:
+      - name: Download staged files
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: artifacts
+
+      - name: Upload assets to the draft release
+        run: |
+          cd artifacts
+          gh release upload "$TAG" \
+            release-linux-x64/knowledge-server-linux-x64 \
+            release-linux-x64/knowledge-server-linux-x64.gz \
+            release-linux-x64/knowledge-daemon-linux-x64 \
+            release-linux-x64/knowledge-daemon-linux-x64.gz \
+            release-linux-x64/SHA256SUMS-linux-x64 \
+            release-darwin-arm64/knowledge-server-darwin-arm64 \
+            release-darwin-arm64/knowledge-server-darwin-arm64.gz \
+            release-darwin-arm64/knowledge-daemon-darwin-arm64 \
+            release-darwin-arm64/knowledge-daemon-darwin-arm64.gz \
+            release-darwin-arm64/SHA256SUMS-darwin-arm64 \
+            release-linux-x64/knowledge.ts \
+            release-linux-x64/pi-knowledge.ts \
+            release-linux-x64/consolidate.md \
+            release-linux-x64/knowledge-review.md \
+            release-linux-x64/install.sh
+
+      - name: Verify every expected asset is present
+        run: |
+          expected="knowledge-server-linux-x64 knowledge-server-linux-x64.gz knowledge-daemon-linux-x64 knowledge-daemon-linux-x64.gz SHA256SUMS-linux-x64 knowledge-server-darwin-arm64 knowledge-server-darwin-arm64.gz knowledge-daemon-darwin-arm64 knowledge-daemon-darwin-arm64.gz SHA256SUMS-darwin-arm64 knowledge.ts pi-knowledge.ts consolidate.md knowledge-review.md install.sh"
+          present="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          missing=0
+          for name in $expected; do
+            if ! grep -qxF "$name" <<< "$present"; then
+              echo "::error::missing release asset: $name"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Publish release
+        run: gh release edit "$TAG" --draft=false
