@@ -217,20 +217,15 @@ describe("DomainRouter.resolve", () => {
 	});
 });
 
-describe("DomainRouter.resolveStore", () => {
+describe("DomainRouter.resolveEntryDomain", () => {
 	let tempDir: string;
 	let personalDb: KnowledgeDB;
 	let workDb: KnowledgeDB;
-	let stores: Map<string, KnowledgeDB>;
 
 	beforeEach(() => {
 		tempDir = mkdtempSync(join(tmpdir(), "ks-domain-store-test-"));
 		personalDb = new KnowledgeDB(join(tempDir, "personal.db"));
 		workDb = new KnowledgeDB(join(tempDir, "work.db"));
-		stores = new Map([
-			["personal", personalDb],
-			["work", workDb],
-		]);
 	});
 
 	afterEach(async () => {
@@ -239,34 +234,54 @@ describe("DomainRouter.resolveStore", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	it("returns the correct store for a known domain id", () => {
+	it("returns the store for a configured, available domain", () => {
 		const router = new DomainRouter(
 			makeConfig(),
-			stores as Map<string, import("../src/db/interface").IKnowledgeStore>,
+			new Map<string, import("../src/db/interface").IKnowledgeStore>([
+				["personal", personalDb],
+				["work", workDb],
+			]),
 			personalDb,
 		);
 
-		expect(router.resolveStore("personal")).toBe(personalDb);
-		expect(router.resolveStore("work")).toBe(workDb);
+		expect(router.resolveEntryDomain("personal")).toEqual({
+			status: "ok",
+			store: personalDb,
+		});
+		expect(router.resolveEntryDomain("work")).toEqual({
+			status: "ok",
+			store: workDb,
+		});
 	});
 
-	it("returns undefined for unknown domain id", () => {
+	it("treats an unknown domain id as the path-based default", () => {
 		const router = new DomainRouter(
 			makeConfig(),
-			stores as Map<string, import("../src/db/interface").IKnowledgeStore>,
+			new Map<string, import("../src/db/interface").IKnowledgeStore>([
+				["personal", personalDb],
+				["work", workDb],
+			]),
 			personalDb,
 		);
 
-		expect(router.resolveStore("nonexistent")).toBeUndefined();
+		expect(router.resolveEntryDomain("nonexistent")).toEqual({
+			status: "default",
+		});
+		expect(router.resolveEntryDomain(undefined)).toEqual({ status: "default" });
 	});
 
-	it("returns undefined for undefined input", () => {
+	it("reports a configured domain whose store is missing as unavailable, never as a fallback", () => {
 		const router = new DomainRouter(
 			makeConfig(),
-			stores as Map<string, import("../src/db/interface").IKnowledgeStore>,
-			personalDb,
+			new Map<string, import("../src/db/interface").IKnowledgeStore>([
+				["work", workDb],
+			]),
+			workDb,
 		);
 
-		expect(router.resolveStore(undefined)).toBeUndefined();
+		expect(router.resolveEntryDomain("personal")).toEqual({
+			status: "unavailable",
+			domainId: "personal",
+		});
 	});
 });

@@ -180,17 +180,30 @@ export class DomainRouter {
 	}
 
 	/**
-	 * Resolve the store for a specific domain id.
-	 * Used for per-entry routing when the LLM assigns a domain to an extracted entry.
+	 * Resolve the store for a domain id the LLM chose for one extracted entry.
 	 *
-	 * Returns undefined when domainId is undefined or not found —
-	 * callers fall back to the chunk's default resolved store.
+	 * - "default": no id, or an id that is not configured. The model's choice is
+	 *   only honoured for configured domains, so the caller uses the chunk's
+	 *   path-based default.
+	 * - "ok": a configured domain whose store is available.
+	 * - "unavailable": a configured domain whose store is down. Callers must not
+	 *   substitute another store; the chunk has to wait for a later run.
 	 */
-	resolveStore(domainId: string | undefined): IKnowledgeStore | undefined {
-		if (!domainId) return undefined;
-		const domain = this.domains.find((d) => d.id === domainId);
-		if (!domain) return undefined;
-		return this.stores.get(domain.store);
+	resolveEntryDomain(
+		domainId: string | undefined,
+	):
+		| { status: "default" }
+		| { status: "ok"; store: IKnowledgeStore }
+		| { status: "unavailable"; domainId: string } {
+		const domain = domainId
+			? this.domains.find((d) => d.id === domainId)
+			: undefined;
+		if (!domain) return { status: "default" };
+		const store = this.stores.get(domain.store);
+		if (!store || this.unavailableStoreIds.has(domain.store)) {
+			return { status: "unavailable", domainId: domain.id };
+		}
+		return { status: "ok", store };
 	}
 
 	/**
