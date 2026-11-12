@@ -21,6 +21,13 @@ const CONTENT_DISPLAY_MAX = 200;
  *   e  edit    — edit content inline (re-embeds automatically)
  *   q  quit    — stop reviewing, keep remaining entries untouched
  */
+const WRITE_ANSWERS = new Set(["d", "delete", "a", "archive", "e", "edit"]);
+
+/** True when a review answer would change an entry that lives in a read-only store. */
+export function isBlockedWrite(readOnly: boolean, answer: string): boolean {
+	return readOnly && WRITE_ANSWERS.has(answer);
+}
+
 export async function runReview(args: string[]): Promise<void> {
 	const filterIdx = args.indexOf("--filter");
 
@@ -53,6 +60,8 @@ export async function runReview(args: string[]): Promise<void> {
 	const serviceByStore = new Map(
 		readDbs.map((s) => [s, new KnowledgeService(s, embedder)]),
 	);
+	// Entries from read-only stores are shown for review but never changed here.
+	const writableSet = new Set(registry.writableStores());
 
 	// Hoisted outside try so finally can always call rl?.close() — even on the
 	// early-return path (toReview.length === 0) where rl is never assigned.
@@ -130,10 +139,21 @@ export async function runReview(args: string[]): Promise<void> {
 			}
 
 			printEntry(entry, reason, i + 1, toReview.length);
+			const readOnly = !writableSet.has(entryStore);
+			if (readOnly) {
+				console.log("  Read-only store: view only (k to keep, q to quit).\n");
+			}
 
 			let handled = false;
 			while (!handled) {
 				const answer = (await prompt("  > ")).trim().toLowerCase();
+
+				if (isBlockedWrite(readOnly, answer)) {
+					console.log(
+						"  This entry is in a read-only store and cannot be changed.\n",
+					);
+					continue;
+				}
 
 				switch (answer) {
 					case "k":
