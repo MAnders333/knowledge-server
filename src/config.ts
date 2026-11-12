@@ -241,14 +241,36 @@ export const config = {
 			process.env.LLM_SYNTHESIS_MODEL ||
 			process.env.LLM_EXTRACTION_MODEL ||
 			"anthropic/claude-sonnet-4-6",
-		// Per-call timeout in milliseconds. Applied per attempt (not across all retries).
-		// Default: 5 minutes. Large contradiction batches (50+ candidates) can take
-		// 2–3 minutes for a complex Sonnet response; 5 minutes gives headroom while
-		// still bounding a true hang (network stall, rate-limit loop, etc.).
-		// Minimum 1 ms enforced — set a high value rather than 0 to effectively disable.
-		timeoutMs: parseIntEnv(process.env.LLM_TIMEOUT_MS, 5 * 60 * 1000, 1),
-		// Per-call retry budget. On timeout or transient error, complete() retries up
-		// to this many additional times before throwing to the caller.
+		// Per-call-type timeouts in ms: total wall-clock budget for one attempt
+		// (not across retries). A timed-out attempt is not retried. Defaults suit
+		// hosted models; slow local models (Ollama) should raise the value for the
+		// affected call types. Precedence per type: LLM_TIMEOUT_<TYPE>_MS >
+		// LLM_TIMEOUT_MS > default. Minimum 1 ms enforced.
+		timeoutsMs: {
+			contradiction: parseIntEnv(
+				process.env.LLM_TIMEOUT_CONTRADICTION_MS,
+				parseIntEnv(process.env.LLM_TIMEOUT_MS, 60_000, 1),
+				1,
+			),
+			merge: parseIntEnv(
+				process.env.LLM_TIMEOUT_MERGE_MS,
+				parseIntEnv(process.env.LLM_TIMEOUT_MS, 90_000, 1),
+				1,
+			),
+			extraction: parseIntEnv(
+				process.env.LLM_TIMEOUT_EXTRACTION_MS,
+				parseIntEnv(process.env.LLM_TIMEOUT_MS, 300_000, 1),
+				1,
+			),
+			synthesis: parseIntEnv(
+				process.env.LLM_TIMEOUT_SYNTHESIS_MS,
+				parseIntEnv(process.env.LLM_TIMEOUT_MS, 300_000, 1),
+				1,
+			),
+		},
+		// Per-call retry budget. On transient error, complete() retries up to this many
+		// additional times before throwing to the caller. A timed-out attempt is never
+		// retried (its budget is treated as a hang).
 		// Retries use exponential backoff starting at retryBaseDelayMs (capped at 60s).
 		// Set to 0 to disable retries entirely.
 		maxRetries: parseIntEnv(process.env.LLM_MAX_RETRIES, 2, 0),

@@ -349,8 +349,12 @@ Provider-specific credentials take precedence over the unified endpoint.
 | `LLM_MERGE_MODEL` | `anthropic/claude-haiku-4-5` | Near-duplicate merge decisions (cheaper) |
 | `LLM_CONTRADICTION_MODEL` | `anthropic/claude-haiku-4-5` | Contradiction detection and resolution |
 | `LLM_SYNTHESIS_MODEL` | *(inherits `LLM_EXTRACTION_MODEL`)* | Cross-session principle synthesis |
-| `LLM_TIMEOUT_MS` | `300000` | Per-call LLM timeout in ms |
-| `LLM_MAX_RETRIES` | `2` | Retry attempts on timeout/error |
+| `LLM_TIMEOUT_CONTRADICTION_MS` | `60000` | Per-attempt timeout for contradiction detection. Raise for slow local models |
+| `LLM_TIMEOUT_MERGE_MS` | `90000` | Per-attempt timeout for merge decisions |
+| `LLM_TIMEOUT_EXTRACTION_MS` | `300000` | Per-attempt timeout for knowledge extraction |
+| `LLM_TIMEOUT_SYNTHESIS_MS` | `300000` | Per-attempt timeout for principle synthesis |
+| `LLM_TIMEOUT_MS` | *(per-type defaults)* | Fallback per-attempt timeout in ms for any call type without its own `LLM_TIMEOUT_<TYPE>_MS` |
+| `LLM_MAX_RETRIES` | `2` | Retry attempts on transient errors (a timed-out call is not retried) |
 | `OPENAI_MAX_TOKENS_PARAM` | `max_tokens` | Token-limit parameter sent on OpenAI-compatible calls. Set to `max_completion_tokens` for newer OpenAI models (gpt-5.x, o-series) that reject `max_tokens` |
 | `OPENAI_DROP_PARAMS` | *(none)* | Comma-separated request parameters to omit from OpenAI-compatible calls (e.g. `temperature` for gpt-5.x/o-series models that only accept the default value) |
 
