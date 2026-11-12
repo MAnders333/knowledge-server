@@ -1246,6 +1246,9 @@ function registerPiExtension(
  *     retries — standard service behaviour for infrastructure dependencies.
  */
 function maybeSetupDaemon(): void {
+	// Test runs set this (tests/preload.ts) so they never register a launchd or
+	// systemd service that runs from the checkout.
+	if (process.env.KNOWLEDGE_SKIP_DAEMON_REGISTRATION === "1") return;
 	const platform = process.platform;
 	const home = homedir();
 

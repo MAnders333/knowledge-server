@@ -16,7 +16,7 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	setupCodex,
@@ -308,5 +308,47 @@ describe("setupCodex", () => {
 		expect(content).toContain('name = "o4-mini"');
 		// New section appended
 		expect(content).toContain("[mcp_servers.knowledge]");
+	});
+});
+
+// ── Test isolation ─────────────────────────────────────────────────────────────
+
+describe("setupCursor / setupCodex test isolation", () => {
+	let tmpDir: string;
+
+	beforeEach(() => {
+		tmpDir = mkdtempSync(join(tmpdir(), "setup-isolation-test-"));
+		process.env.CURSOR_HOME = join(tmpDir, "cursor");
+		process.env.CODEX_HOME = join(tmpDir, "codex");
+	});
+
+	afterEach(() => {
+		rmSync(tmpDir, { recursive: true, force: true });
+		Reflect.deleteProperty(process.env, "CURSOR_HOME");
+		Reflect.deleteProperty(process.env, "CODEX_HOME");
+	});
+
+	// Setup runs must never register the launchd/systemd daemon from the test
+	// checkout. Compare against the real service files: a run must not add one.
+	it("does not register a background daemon in the real home", () => {
+		const launchAgent = join(
+			homedir(),
+			"Library",
+			"LaunchAgents",
+			"com.knowledge-server.daemon.plist",
+		);
+		const systemdUnit = join(
+			homedir(),
+			".config",
+			"systemd",
+			"user",
+			"knowledge-daemon.service",
+		);
+		const before = [existsSync(launchAgent), existsSync(systemdUnit)];
+
+		setupCursor();
+		setupCodex();
+
+		expect([existsSync(launchAgent), existsSync(systemdUnit)]).toEqual(before);
 	});
 });

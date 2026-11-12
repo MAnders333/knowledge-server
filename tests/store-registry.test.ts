@@ -4,6 +4,7 @@ import { type AddressInfo, type Socket, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ActivationEngine } from "../src/activation/activate";
+import { DEFAULT_CONFIG } from "../src/config-file";
 import { KnowledgeDB } from "../src/db/sqlite/index";
 import { StoreRegistry } from "../src/db/store-registry";
 import * as loggerModule from "../src/logger";
@@ -22,17 +23,12 @@ describe("StoreRegistry", () => {
 
 	// ── No config file (default) ───────────────────────────────────────────────
 
-	it("creates a single default SQLite store when no config file exists", async () => {
-		const registry = await StoreRegistry.create(
-			join(tempDir, "nonexistent.jsonc"),
-		);
-		try {
-			expect(registry.writableStore()).toBeDefined();
-			expect(registry.readStores()).toHaveLength(1);
-			expect(registry.readStores()[0]).toBe(registry.writableStore());
-		} finally {
-			await registry.close();
-		}
+	it("defaults to a single writable SQLite store when no config file exists", () => {
+		// StoreRegistry.create() on a missing config would open the real default
+		// knowledge.db and state.db under the user's home, so assert the default shape.
+		expect(DEFAULT_CONFIG.stores).toEqual([
+			{ id: "default", kind: "sqlite", writable: true },
+		]);
 	});
 
 	// ── Single SQLite store ────────────────────────────────────────────────────
@@ -43,6 +39,7 @@ describe("StoreRegistry", () => {
 		writeFileSync(
 			configPath,
 			JSON.stringify({
+				stateDb: { kind: "sqlite", path: join(tempDir, "state.db") },
 				stores: [{ id: "main", kind: "sqlite", path: dbPath, writable: true }],
 			}),
 		);
@@ -67,6 +64,7 @@ describe("StoreRegistry", () => {
 		writeFileSync(
 			configPath,
 			JSON.stringify({
+				stateDb: { kind: "sqlite", path: join(tempDir, "state.db") },
 				stores: [
 					{ id: "primary", kind: "sqlite", path: db1Path, writable: true },
 					{ id: "secondary", kind: "sqlite", path: db2Path, writable: false },
@@ -93,6 +91,7 @@ describe("StoreRegistry", () => {
 		writeFileSync(
 			configPath,
 			JSON.stringify({
+				stateDb: { kind: "sqlite", path: join(tempDir, "state.db") },
 				stores: [
 					{ id: "a", kind: "sqlite", path: db1Path, writable: true },
 					{ id: "b", kind: "sqlite", path: db2Path, writable: false },
@@ -148,6 +147,7 @@ describe("StoreRegistry", () => {
 		writeFileSync(
 			configPath,
 			JSON.stringify({
+				stateDb: { kind: "sqlite", path: join(tempDir, "state.db") },
 				stores: [
 					{
 						id: "tunnel",
@@ -195,6 +195,7 @@ describe("StoreRegistry", () => {
 		writeFileSync(
 			configPath,
 			JSON.stringify({
+				stateDb: { kind: "sqlite", path: join(tempDir, "state.db") },
 				stores: [
 					{
 						id: "only",
