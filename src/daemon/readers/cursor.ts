@@ -12,10 +12,9 @@ import type {
 } from "../../types.js";
 import {
 	MAX_MESSAGE_CHARS,
-	MAX_TOKENS_PER_EPISODE,
-	approxTokens,
-	chunkByTokenBudget,
-	formatMessages,
+	dropProcessed,
+	episodesFromMessages,
+	recordSkip,
 } from "./shared.js";
 
 // ── Cursor storage schema ──────────────────────────────────────────────────────
@@ -93,9 +92,9 @@ interface CursorComposerData {
 	isAgentic?: boolean;
 	tokenCount?: number;
 	// Format A: full inline turns
-	conversation?: CursorTurn[];
+	conversation?: Array<CursorTurn | null>;
 	// Format B: ordered stubs; full content in separate bubbleId: KV entries
-	fullConversationHeadersOnly?: CursorConversationHeader[];
+	fullConversationHeadersOnly?: Array<CursorConversationHeader | null>;
 	latestConversationSummary?: { title?: string; tldr?: string };
 	unifiedMode?: string;
 	forceMode?: string;
@@ -107,14 +106,46 @@ interface ParsedSession {
 	createdAt: number;
 	lastUpdatedAt: number;
 	/** Format A only — turns with inline text. Empty for Format B. */
-	inlineTurns: CursorTurn[];
+	inlineTurns: Array<CursorTurn | null>;
 	/** Format B only — ordered bubble stubs. Empty for Format A. */
-	headers: CursorConversationHeader[];
+	headers: Array<CursorConversationHeader | null>;
 	isAgentic: boolean;
 	/** Resolved workspace root directory (e.g. "/Users/x/Documents/projectX"). Empty if unresolvable. */
 	directory: string;
 	/** Human-readable project name — last segment of directory (e.g. "projectX"). Empty if unresolvable. */
 	projectName: string;
+}
+
+/** Message text of a turn or bubble: undefined when absent or null, null when present but not a string. */
+function textField(value: unknown): string | null | undefined {
+	if (value === undefined || value === null) return undefined;
+	return typeof value === "string" ? value : null;
+}
+
+/** An array field: [] when absent; a present non-array value is recorded as a skip. */
+function arrayField<T>(
+	source: string,
+	item: string,
+	field: string,
+	value: unknown,
+): T[] {
+	if (value === undefined || value === null) return [];
+	if (Array.isArray(value)) return value as T[];
+	recordSkip(source, item, `non-array ${field}`);
+	return [];
+}
+
+/** Percent-decode a path token. A bare `%` that is not an escape keeps the raw token. */
+function decodeToken(token: string): string {
+	try {
+		return decodeURIComponent(token);
+	} catch {
+		return token;
+	}
+}
+
+function errorMessage(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
 }
 
 // ── CursorEpisodeReader ───────────────────────────────────────────────────────
@@ -201,7 +232,11 @@ export class CursorEpisodeReader implements IEpisodeReader {
 			const session = this._sessionCache.get(sessionId);
 			if (!session) continue;
 			const sessionProcessed = processedRanges.get(sessionId) ?? [];
-			episodes.push(...this.segmentSession(session, sessionProcessed));
+			try {
+				episodes.push(...this.segmentSession(session, sessionProcessed));
+			} catch (err) {
+				recordSkip(this.source, sessionId, `unreadable: ${errorMessage(err)}`);
+			}
 		}
 		return episodes;
 	}
@@ -238,7 +273,8 @@ export class CursorEpisodeReader implements IEpisodeReader {
 		let db: Database;
 		try {
 			db = this.getDb();
-		} catch {
+		} catch (err) {
+			recordSkip(this.source, this.dbPath, `unreadable: ${errorMessage(err)}`);
 			return [];
 		}
 
@@ -250,7 +286,12 @@ export class CursorEpisodeReader implements IEpisodeReader {
 					"SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'",
 				)
 				.all();
-		} catch {
+		} catch (err) {
+			recordSkip(
+				this.source,
+				this.dbPath,
+				`unreadable composerData rows: ${errorMessage(err)}`,
+			);
 			return [];
 		}
 
@@ -270,7 +311,8 @@ export class CursorEpisodeReader implements IEpisodeReader {
 		let db: Database;
 		try {
 			db = this.getDb();
-		} catch {
+		} catch (err) {
+			recordSkip(this.source, this.dbPath, `unreadable: ${errorMessage(err)}`);
 			return result;
 		}
 
@@ -282,7 +324,8 @@ export class CursorEpisodeReader implements IEpisodeReader {
 						"SELECT value FROM cursorDiskKV WHERE key = ?",
 					)
 					.get(`composerData:${id}`);
-			} catch {
+			} catch (err) {
+				recordSkip(this.source, id, `unreadable: ${errorMessage(err)}`);
 				continue;
 			}
 			if (!row) continue;
@@ -302,25 +345,45 @@ export class CursorEpisodeReader implements IEpisodeReader {
 		let data: CursorComposerData;
 		try {
 			const parsed: unknown = JSON.parse(raw);
-			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+				recordSkip(this.source, sessionId, "not a JSON object");
 				return null;
+			}
 			data = parsed as CursorComposerData;
-		} catch {
+		} catch (err) {
+			recordSkip(this.source, sessionId, `unreadable: ${errorMessage(err)}`);
 			return null;
 		}
 
 		const createdAt = data.createdAt ?? 0;
 		const lastUpdatedAt = data.lastUpdatedAt ?? createdAt;
 		if (lastUpdatedAt === 0) return null;
+		if (!Number.isFinite(createdAt) || !Number.isFinite(lastUpdatedAt)) {
+			recordSkip(this.source, sessionId, "non-numeric timestamp");
+			return null;
+		}
 
+		const summaryTitle = data.latestConversationSummary?.title;
 		const title =
-			data.name || data.latestConversationSummary?.title || sessionId;
+			(typeof data.name === "string" && data.name) ||
+			(typeof summaryTitle === "string" && summaryTitle) ||
+			sessionId;
 
 		// Format A: inline conversation array
-		const inlineTurns = data.conversation ?? [];
+		const inlineTurns = arrayField<CursorTurn | null>(
+			this.source,
+			sessionId,
+			"conversation",
+			data.conversation,
+		);
 
 		// Format B: ordered bubble header stubs
-		const headers = data.fullConversationHeadersOnly ?? [];
+		const headers = arrayField<CursorConversationHeader | null>(
+			this.source,
+			sessionId,
+			"fullConversationHeadersOnly",
+			data.fullConversationHeadersOnly,
+		);
 
 		// Skip sessions with no conversation data at all
 		if (inlineTurns.length === 0 && headers.length === 0) return null;
@@ -349,40 +412,19 @@ export class CursorEpisodeReader implements IEpisodeReader {
 		session: ParsedSession,
 		processedRanges: ProcessedRange[],
 	): Episode[] {
-		const messages = this.extractMessages(session);
-		if (messages.length < config.consolidation.minSessionMessages) return [];
-
-		const chunks = chunkByTokenBudget(messages, MAX_TOKENS_PER_EPISODE);
-		const processedSet = new Set(
-			processedRanges.map((r) => `${r.startMessageId}::${r.endMessageId}`),
-		);
-		const episodes: Episode[] = [];
-
-		for (const chunk of chunks) {
-			const startId = chunk[0].messageId;
-			const endId = chunk[chunk.length - 1].messageId;
-			if (processedSet.has(`${startId}::${endId}`)) continue;
-
-			const content = formatMessages(chunk);
-			if (!content.trim()) continue;
-
-			episodes.push({
+		const episodes = episodesFromMessages(
+			{
 				source: this.source,
 				sessionId: session.sessionId,
-				startMessageId: startId,
-				endMessageId: endId,
 				sessionTitle: session.title || "Untitled",
 				projectName: session.projectName,
 				directory: session.directory,
 				timeCreated: session.createdAt,
-				maxMessageTime: chunk[chunk.length - 1].timestamp,
-				content,
-				contentType: "messages",
-				approxTokens: approxTokens(content),
-			});
-		}
-
-		return episodes;
+			},
+			this.extractMessages(session),
+			{ processedRanges },
+		);
+		return dropProcessed(episodes, processedRanges);
 	}
 
 	/**
@@ -410,11 +452,24 @@ export class CursorEpisodeReader implements IEpisodeReader {
 		const messages: EpisodeMessage[] = [];
 		const n = turns.length;
 		const timeSpan = lastUpdatedAt - createdAt;
+		let malformed = 0;
 
 		for (let i = 0; i < n; i++) {
 			const turn = turns[i];
+			if (!turn || typeof turn !== "object") {
+				malformed++;
+				continue;
+			}
 			if (turn.type !== 1 && turn.type !== 2) continue;
-			const text = (turn.text ?? "").trim();
+			const rawText = textField(turn.text);
+			if (
+				rawText === null ||
+				(turn.bubbleId != null && typeof turn.bubbleId !== "string")
+			) {
+				malformed++;
+				continue;
+			}
+			const text = (rawText ?? "").trim();
 			if (!text) continue;
 			if (containsInjectedKnowledge(text)) continue;
 
@@ -435,6 +490,9 @@ export class CursorEpisodeReader implements IEpisodeReader {
 			});
 		}
 
+		if (malformed > 0) {
+			recordSkip(this.source, sessionId, "malformed turn(s)", malformed);
+		}
 		return messages;
 	}
 
@@ -449,22 +507,37 @@ export class CursorEpisodeReader implements IEpisodeReader {
 		const { headers, sessionId, createdAt, lastUpdatedAt } = session;
 		if (headers.length === 0) return [];
 
+		let malformed = 0;
+		const usableHeaders: CursorConversationHeader[] = [];
+		for (const header of headers) {
+			if (
+				header &&
+				typeof header === "object" &&
+				typeof header.bubbleId === "string"
+			) {
+				usableHeaders.push(header);
+			} else {
+				malformed++;
+			}
+		}
+
 		let db: Database;
 		try {
 			db = this.getDb();
-		} catch {
+		} catch (err) {
+			recordSkip(this.source, sessionId, `unreadable: ${errorMessage(err)}`);
 			return [];
 		}
 
 		// Build the full set of DB keys we need.
-		const bubbleKeys = headers.map(
+		const bubbleKeys = usableHeaders.map(
 			(h) => `bubbleId:${sessionId}:${h.bubbleId}`,
 		);
 
 		// Batch fetch in chunks of SQLITE_BATCH_SIZE to stay below SQLite's
 		// SQLITE_LIMIT_VARIABLE_NUMBER (default 999). Very long agentic sessions
 		// can have hundreds of bubbles; without batching, sessions with ≥1000
-		// turns would silently produce no messages (the query throws and we return []).
+		// turns would fail the query and produce no messages.
 		const SQLITE_BATCH_SIZE = 500;
 		const allRows: Array<{ key: string; value: string }> = [];
 		try {
@@ -478,7 +551,12 @@ export class CursorEpisodeReader implements IEpisodeReader {
 					.all(...batch);
 				allRows.push(...batchRows);
 			}
-		} catch {
+		} catch (err) {
+			recordSkip(
+				this.source,
+				sessionId,
+				`unreadable bubbles: ${errorMessage(err)}`,
+			);
 			return [];
 		}
 
@@ -497,26 +575,33 @@ export class CursorEpisodeReader implements IEpisodeReader {
 				const parsed: unknown = JSON.parse(row.value);
 				if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
 					bubbleMap.set(bId, parsed as CursorBubble);
+				} else {
+					malformed++;
 				}
 			} catch {
-				// skip malformed entries
+				malformed++;
 			}
 		}
 
 		// Reconstruct messages in header order
 		const messages: EpisodeMessage[] = [];
-		const n = headers.length;
+		const n = usableHeaders.length;
 		const timeSpan = lastUpdatedAt - createdAt;
 
 		for (let i = 0; i < n; i++) {
-			const header = headers[i];
+			const header = usableHeaders[i];
 			const bubble = bubbleMap.get(header.bubbleId);
 			// Use the type from the header (always present) as ground truth
 			const type = header.type;
 			if (type !== 1 && type !== 2) continue;
 
 			// Text may live on the bubble or be absent (e.g. tool-only turns)
-			const text = (bubble?.text ?? "").trim();
+			const rawText = textField(bubble?.text);
+			if (rawText === null) {
+				malformed++;
+				continue;
+			}
+			const text = (rawText ?? "").trim();
 			if (!text) continue;
 			if (containsInjectedKnowledge(text)) continue;
 
@@ -536,6 +621,14 @@ export class CursorEpisodeReader implements IEpisodeReader {
 			});
 		}
 
+		if (malformed > 0) {
+			recordSkip(
+				this.source,
+				sessionId,
+				"malformed bubble record(s)",
+				malformed,
+			);
+		}
 		return messages;
 	}
 
@@ -561,7 +654,8 @@ export class CursorEpisodeReader implements IEpisodeReader {
 		let db: Database;
 		try {
 			db = this.getDb();
-		} catch {
+		} catch (err) {
+			recordSkip(this.source, sessionId, `unreadable: ${errorMessage(err)}`);
 			return "";
 		}
 
@@ -582,8 +676,12 @@ export class CursorEpisodeReader implements IEpisodeReader {
 					collectFilePathsFromString(row.value, filePaths);
 					if (filePaths.length >= 2) break; // enough for a meaningful prefix
 				}
-			} catch {
-				// ignore — try next source
+			} catch (err) {
+				recordSkip(
+					this.source,
+					sessionId,
+					`unreadable workspace context: ${errorMessage(err)}`,
+				);
 			}
 		}
 
@@ -599,8 +697,12 @@ export class CursorEpisodeReader implements IEpisodeReader {
 					collectFilePathsFromString(row.value, filePaths);
 					if (filePaths.length >= 2) break;
 				}
-			} catch {
-				// ignore — try next source
+			} catch (err) {
+				recordSkip(
+					this.source,
+					sessionId,
+					`unreadable workspace context: ${errorMessage(err)}`,
+				);
 			}
 		}
 
@@ -616,8 +718,12 @@ export class CursorEpisodeReader implements IEpisodeReader {
 					collectFilePathsFromString(row.value, filePaths);
 					if (filePaths.length >= 2) break;
 				}
-			} catch {
-				// ignore
+			} catch (err) {
+				recordSkip(
+					this.source,
+					sessionId,
+					`unreadable workspace context: ${errorMessage(err)}`,
+				);
 			}
 		}
 
@@ -639,7 +745,7 @@ export function collectFilePathsFromString(str: string, out: string[]): void {
 	const re = /file:\/\/\/([\w/._@+%-]+)/g;
 	for (const match of str.matchAll(re)) {
 		// Reconstruct the absolute path (the URI strips the leading /)
-		const decoded = decodeURIComponent(match[1]);
+		const decoded = decodeToken(match[1]);
 		out.push(`/${decoded}`);
 	}
 }

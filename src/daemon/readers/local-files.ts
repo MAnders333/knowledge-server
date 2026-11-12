@@ -1,10 +1,16 @@
 import { createHash } from "node:crypto";
-import { type Dirent, readFileSync, readdirSync, statSync } from "node:fs";
+import {
+	type Dirent,
+	existsSync,
+	readFileSync,
+	readdirSync,
+	statSync,
+} from "node:fs";
 import { basename, extname, join } from "node:path";
 import { config } from "../../config.js";
 import { logger } from "../../logger.js";
 import type { Episode, IEpisodeReader, ProcessedRange } from "../../types.js";
-import { MAX_TOKENS_PER_EPISODE, approxTokens } from "./shared.js";
+import { MAX_TOKENS_PER_EPISODE, approxTokens, recordSkip } from "./shared.js";
 
 /**
  * Reads Markdown files from a local directory as knowledge episodes.
@@ -103,8 +109,15 @@ export class LocalFilesEpisodeReader implements IEpisodeReader {
 				// max_message_time. Postgres rejects fractional bigints with
 				// "invalid input syntax for type bigint: \"…\".\"…\"".
 				mtimeMs = Math.floor(statSync(filePath).mtimeMs);
-			} catch {
-				// File disappeared between scan and read — skip silently.
+			} catch (err) {
+				// Gone between scan and read is normal and not logged. Any other failure
+				// is an unreadable file: count it and move on.
+				if (!existsSync(filePath)) continue;
+				recordSkip(
+					this.source,
+					filePath,
+					`unreadable: ${(err as Error).message}`,
+				);
 				continue;
 			}
 

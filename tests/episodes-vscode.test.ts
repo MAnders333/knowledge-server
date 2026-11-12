@@ -22,6 +22,7 @@
  *   - getNewEpisodes — ordering by lastMessageDate ASC
  *   - getNewEpisodes — limit parameter
  *   - Malformed JSON session files skipped gracefully
+ *   - ARC-07: tail-only growth, hold-back, poison pills
  *   - resolveVSCodeDataDir() — env var branch
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
@@ -29,11 +30,13 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { config } from "../src/config";
+import { takeSkipCount } from "../src/daemon/readers/shared";
 import {
 	VSCodeEpisodeReader,
 	resolveVSCodeDataDir,
 	resolveWorkspaceFolder,
 } from "../src/daemon/readers/vscode";
+import type { ProcessedRange } from "../src/types";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -991,5 +994,283 @@ describe("VSCodeEpisodeReader — injected knowledge guard", () => {
 		expect(episodes).toHaveLength(1);
 		expect(episodes[0].content).toContain("user: question zero");
 		expect(episodes[0].content).toContain("assistant: reply zero");
+	});
+});
+
+// ── ARC-07: growth, hold-back, and poison pills ───────────────────────────────
+
+type Req = {
+	requestId: string;
+	messageText: string;
+	timestamp: number;
+	response: Array<{ value: string }>;
+};
+
+/** Request `i` in the shape makeSession accepts; its text is unique and assertable. */
+function req(i: number, timestamp: number = BASE + i * 1000): Req {
+	return {
+		requestId: `req-${i}`,
+		messageText: `Q${i}tok`,
+		timestamp,
+		response: [{ value: `A${i}tok` }],
+	};
+}
+
+/** Request `i` in the on-disk shape (`message.text`), for hand-written files. */
+function rawReq(i: number) {
+	return {
+		requestId: `req-${i}`,
+		timestamp: BASE + i * 1000,
+		message: { text: `Q${i}tok` },
+		response: [{ value: `A${i}tok` }],
+	};
+}
+
+/** Indexes in [from, to). */
+function indexes(from: number, to: number): number[] {
+	return Array.from({ length: to - from }, (_, j) => from + j);
+}
+
+/** Fresh reader over `dataDir`; episodes for every candidate session. */
+function episodesNow(
+	dataDir: string,
+	processed = new Map<string, ProcessedRange[]>(),
+) {
+	const reader = new VSCodeEpisodeReader(dataDir);
+	try {
+		const ids = reader.getCandidateSessions(0).map((c) => c.id);
+		return reader.getNewEpisodes(ids, processed);
+	} finally {
+		reader.close();
+	}
+}
+
+function rangesOf(
+	episodes: Array<{ startMessageId: string; endMessageId: string }>,
+): ProcessedRange[] {
+	return episodes.map((e) => ({
+		source: "vscode",
+		startMessageId: e.startMessageId,
+		endMessageId: e.endMessageId,
+	}));
+}
+
+/** Number of occurrences of `needle` across the episodes' content. */
+function occurrences(
+	episodes: Array<{ content: string }>,
+	needle: string,
+): number {
+	return episodes.reduce((n, e) => n + (e.content.split(needle).length - 1), 0);
+}
+
+describe("VSCodeEpisodeReader — growth re-emits only the new tail", () => {
+	let tmpDir: string;
+	let dataDir: string;
+	let chatDir: string;
+
+	beforeEach(() => {
+		({ tmpDir, dataDir, chatDir } = setupDataDir());
+	});
+
+	afterEach(() => {
+		rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	it("emits exactly the new messages once, then nothing", () => {
+		const min = config.consolidation.minSessionMessages;
+		const n = Math.ceil(min / 2); // two messages per request
+		const k = Math.ceil(min / 2);
+		writeSession(
+			chatDir,
+			"s1.json",
+			makeSession({
+				sessionId: "session-grow",
+				lastMessageDate: BASE + 10_000,
+				requests: indexes(0, n).map((i) => req(i)),
+			}),
+		);
+		const first = episodesNow(dataDir);
+		expect(first).toHaveLength(1);
+		expect(first[0].endMessageId).toBe(`req-${n - 1}-response`);
+
+		writeSession(
+			chatDir,
+			"s1.json",
+			makeSession({
+				sessionId: "session-grow",
+				lastMessageDate: BASE + 20_000,
+				requests: indexes(0, n + k).map((i) => req(i)),
+			}),
+		);
+		const second = episodesNow(
+			dataDir,
+			new Map([["session-grow", rangesOf(first)]]),
+		);
+		expect(second).toHaveLength(1);
+		expect(second[0].startMessageId).toBe(`req-${n}`);
+		expect(second[0].endMessageId).toBe(`req-${n + k - 1}-response`);
+		for (const i of indexes(n, n + k)) {
+			expect(occurrences(second, `Q${i}tok`)).toBe(1);
+			expect(occurrences(second, `A${i}tok`)).toBe(1);
+		}
+		for (const i of indexes(0, n)) {
+			expect(occurrences(second, `Q${i}tok`)).toBe(0);
+		}
+
+		const all = [...rangesOf(first), ...rangesOf(second)];
+		expect(episodesNow(dataDir, new Map([["session-grow", all]]))).toHaveLength(
+			0,
+		);
+	});
+
+	it("holds back a tail below minSessionMessages while the session is active", () => {
+		const min = config.consolidation.minSessionMessages;
+		expect(min).toBeGreaterThan(2);
+		const n = Math.ceil(min / 2);
+		const now = Date.now();
+		const processed = new Map([
+			[
+				"session-live",
+				[
+					{
+						source: "vscode",
+						startMessageId: "req-0",
+						endMessageId: `req-${n - 1}-response`,
+					},
+				],
+			],
+		]);
+		writeSession(
+			chatDir,
+			"s1.json",
+			makeSession({
+				sessionId: "session-live",
+				lastMessageDate: now - 1000,
+				requests: indexes(0, n + 1).map((i) => req(i, now - 1000)),
+			}),
+		);
+		expect(episodesNow(dataDir, processed)).toHaveLength(0);
+	});
+
+	it("flushes the same tail once the session is idle", () => {
+		const min = config.consolidation.minSessionMessages;
+		const n = Math.ceil(min / 2);
+		const processed = new Map([
+			[
+				"session-live",
+				[
+					{
+						source: "vscode",
+						startMessageId: "req-0",
+						endMessageId: `req-${n - 1}-response`,
+					},
+				],
+			],
+		]);
+		writeSession(
+			chatDir,
+			"s1.json",
+			makeSession({
+				sessionId: "session-live",
+				lastMessageDate: BASE + 10_000,
+				requests: indexes(0, n + 1).map((i) => req(i)),
+			}),
+		);
+		const flushed = episodesNow(dataDir, processed);
+		expect(flushed).toHaveLength(1);
+		expect(flushed[0].startMessageId).toBe(`req-${n}`);
+		expect(flushed[0].endMessageId).toBe(`req-${n}-response`);
+	});
+});
+
+describe("VSCodeEpisodeReader — poison pills (ARC-07)", () => {
+	let tmpDir: string;
+	let dataDir: string;
+	let chatDir: string;
+
+	beforeEach(() => {
+		({ tmpDir, dataDir, chatDir } = setupDataDir());
+	});
+
+	afterEach(() => {
+		rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	it("skips null, non-object, and malformed session files without throwing", () => {
+		writeFileSync(join(chatDir, "null.json"), "null");
+		writeFileSync(join(chatDir, "array.json"), "[1,2]");
+		writeFileSync(join(chatDir, "broken.json"), "{not valid json");
+		writeFileSync(
+			join(chatDir, "requests-object.json"),
+			JSON.stringify({
+				sessionId: "session-obj",
+				creationDate: BASE,
+				lastMessageDate: BASE + 10_000,
+				requests: { 0: rawReq(0) },
+			}),
+		);
+		writeFileSync(
+			join(chatDir, "poison.json"),
+			JSON.stringify({
+				sessionId: "session-poison",
+				creationDate: BASE,
+				lastMessageDate: BASE + 10_000,
+				requests: [
+					null,
+					7,
+					{ requestId: "req-bad", message: { text: 42 }, response: [] },
+					rawReq(0),
+					rawReq(1),
+				],
+			}),
+		);
+		writeSession(
+			chatDir,
+			"good.json",
+			makeSession({ sessionId: "session-good", requests: [req(0), req(1)] }),
+		);
+
+		takeSkipCount("vscode");
+		const reader = new VSCodeEpisodeReader(dataDir);
+		const ids = reader
+			.getCandidateSessions(0)
+			.map((c) => c.id)
+			.sort();
+		reader.close();
+		expect(ids).toEqual(["session-good", "session-poison"]);
+
+		const episodes = episodesNow(dataDir);
+		expect(episodes.some((e) => e.sessionId === "session-good")).toBe(true);
+		const poison = episodes.filter((e) => e.sessionId === "session-poison");
+		expect(poison).toHaveLength(1);
+		expect(occurrences(poison, "Q0tok")).toBe(1);
+		expect(occurrences(poison, "Q1tok")).toBe(1);
+		expect(takeSkipCount("vscode")).toBeGreaterThan(0);
+	});
+
+	it("skips an unreadable session file and still produces episodes for the others", () => {
+		// A directory named *.json: readFileSync throws EISDIR.
+		mkdirSync(join(chatDir, "unreadable.json"));
+		writeSession(
+			chatDir,
+			"good.json",
+			makeSession({ sessionId: "session-good", requests: [req(0), req(1)] }),
+		);
+
+		takeSkipCount("vscode");
+		const episodes = episodesNow(dataDir);
+		expect(episodes.map((e) => e.sessionId)).toEqual(["session-good"]);
+		expect(takeSkipCount("vscode")).toBeGreaterThan(0);
+	});
+});
+
+describe("resolveWorkspaceFolder — bare % (ARC-07)", () => {
+	it("keeps a bare % in a file:// folder instead of throwing", () => {
+		expect(() =>
+			resolveWorkspaceFolder("file:///Users/x/100%/project"),
+		).not.toThrow();
+		expect(resolveWorkspaceFolder("file:///Users/x/100%/project")).toBe(
+			"/Users/x/100%/project",
+		);
 	});
 });

@@ -9,11 +9,13 @@ import type {
 	ProcessedRange,
 } from "../../types.js";
 import {
+	type EpisodeBase,
 	MAX_MESSAGE_CHARS,
-	MAX_TOKENS_PER_EPISODE,
-	approxTokens,
-	chunkByTokenBudget,
-	formatMessages,
+	dropProcessed,
+	episodeFrom,
+	episodesFromMessages,
+	isJsonObject,
+	recordSkip,
 } from "./shared.js";
 
 // ── pi session JSONL entry types ──────────────────────────────────────────────
@@ -92,6 +94,15 @@ interface ParsedSession {
 	maxTimestampMs: number; // latest entry timestamp
 }
 
+/** Unix ms of an ISO timestamp field; NaN when absent or not a parseable string. */
+function parseTimestamp(value: unknown): number {
+	return typeof value === "string" ? Date.parse(value) : Number.NaN;
+}
+
+function messageOf(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
+
 /**
  * Reads episodes from pi's JSONL session files.
  *
@@ -133,8 +144,11 @@ interface ParsedSession {
  *
  * Incremental processing:
  * - Files are pre-filtered by mtime: only files modified after the cursor are parsed.
- * - Episode idempotency uses the same (startMessageId, endMessageId) key scheme,
- *   where message IDs are the pi entry `id` (8-char hex, unique within a session).
+ * - Message IDs are the pi entry `id` (8-char hex, unique within a session).
+ *   Messages up to the session's processed watermark are dropped before
+ *   chunking (episodesFromMessages), so only the new tail is segmented.
+ * - Compaction / branch summaries are keyed by their entry id and deduplicated
+ *   by exact (startMessageId, endMessageId) match (dropProcessed).
  */
 export class PiEpisodeReader implements IEpisodeReader {
 	readonly source: string;
@@ -208,9 +222,17 @@ export class PiEpisodeReader implements IEpisodeReader {
 			const session = this._sessionCache.get(sessionId);
 			if (!session) continue;
 
-			const sessionProcessed = processedRanges.get(sessionId) ?? [];
-			const sessionEpisodes = this.segmentSession(session, sessionProcessed);
-			episodes.push(...sessionEpisodes);
+			try {
+				episodes.push(
+					...this.segmentSession(session, processedRanges.get(sessionId) ?? []),
+				);
+			} catch (err) {
+				recordSkip(
+					this.source,
+					sessionId,
+					`segmentation failed: ${messageOf(err)}`,
+				);
+			}
 		}
 
 		return episodes;
@@ -265,7 +287,8 @@ export class PiEpisodeReader implements IEpisodeReader {
 					let mtimeMs: number;
 					try {
 						mtimeMs = statSync(filePath).mtimeMs;
-					} catch {
+					} catch (err) {
+						recordSkip(this.source, filePath, `unreadable: ${messageOf(err)}`);
 						continue;
 					}
 					if (mtimeMs <= afterMessageTimeCreated) continue;
@@ -284,7 +307,8 @@ export class PiEpisodeReader implements IEpisodeReader {
 			return readdirSync(sessionsDir, { withFileTypes: true })
 				.filter((d) => d.isDirectory())
 				.map((d) => d.name);
-		} catch {
+		} catch (err) {
+			recordSkip(this.source, sessionsDir, `unreadable: ${messageOf(err)}`);
 			return [];
 		}
 	}
@@ -292,7 +316,8 @@ export class PiEpisodeReader implements IEpisodeReader {
 	private listJsonlFiles(projectPath: string): string[] {
 		try {
 			return readdirSync(projectPath).filter((f) => f.endsWith(".jsonl"));
-		} catch {
+		} catch (err) {
+			recordSkip(this.source, projectPath, `unreadable: ${messageOf(err)}`);
 			return [];
 		}
 	}
@@ -311,13 +336,15 @@ export class PiEpisodeReader implements IEpisodeReader {
 	/**
 	 * Parse a single JSONL session file.
 	 * Returns null if the file is empty, unreadable, has no session header,
-	 * or contains no timestamped entries.
+	 * or contains no timestamped entries. Unreadable files and malformed lines
+	 * are counted as skips; malformed or non-object lines are dropped individually.
 	 */
 	private parseSessionFile(filePath: string): ParsedSession | null {
 		let content: string;
 		try {
 			content = readFileSync(filePath, "utf8");
-		} catch {
+		} catch (err) {
+			recordSkip(this.source, filePath, `unreadable: ${messageOf(err)}`);
 			return null;
 		}
 
@@ -328,33 +355,42 @@ export class PiEpisodeReader implements IEpisodeReader {
 		let sessionId = "";
 		let cwd = "";
 		let infoName = "";
-		let firstUserText = "";
 		let minTimestampMs = Number.MAX_SAFE_INTEGER;
 		let maxTimestampMs = 0;
+		let malformedLines = 0;
 
 		for (const line of lines) {
-			let record: PiRecord;
+			let parsed: unknown;
 			try {
-				record = JSON.parse(line) as PiRecord;
+				parsed = JSON.parse(line);
 			} catch {
-				continue; // skip malformed lines
+				malformedLines += 1;
+				continue;
 			}
+			// `null`, scalars and arrays are not entries; skip without dereferencing.
+			if (!isJsonObject(parsed)) {
+				malformedLines += 1;
+				continue;
+			}
+			const record = parsed as PiRecord;
 
 			records.push(record);
 
 			if (record.type === "session") {
-				if (record.id) sessionId = record.id;
-				if (record.cwd) cwd = record.cwd;
-			} else if (record.type === "session_info" && record.name) {
+				if (typeof record.id === "string" && record.id) sessionId = record.id;
+				if (typeof record.cwd === "string" && record.cwd) cwd = record.cwd;
+			} else if (
+				record.type === "session_info" &&
+				typeof record.name === "string" &&
+				record.name
+			) {
 				infoName = record.name;
 			}
 
-			if (record.timestamp) {
-				const ts = Date.parse(record.timestamp);
-				if (!Number.isNaN(ts)) {
-					if (ts < minTimestampMs) minTimestampMs = ts;
-					if (ts > maxTimestampMs) maxTimestampMs = ts;
-				}
+			const ts = parseTimestamp(record.timestamp);
+			if (!Number.isNaN(ts)) {
+				if (ts < minTimestampMs) minTimestampMs = ts;
+				if (ts > maxTimestampMs) maxTimestampMs = ts;
 			}
 		}
 
@@ -367,9 +403,19 @@ export class PiEpisodeReader implements IEpisodeReader {
 			}
 		}
 
+		if (malformedLines > 0) {
+			recordSkip(
+				this.source,
+				sessionId || filePath,
+				"malformed JSONL line(s)",
+				malformedLines,
+			);
+		}
+
 		if (records.length === 0 || !sessionId || maxTimestampMs === 0) return null;
 
 		// Title fallback chain: /name → first user message preview → sessionId.
+		let firstUserText = "";
 		for (const rec of records) {
 			if (rec.type !== "message" || rec.message?.role !== "user") continue;
 			const text = this.extractTextParts(rec.message.content);
@@ -406,32 +452,38 @@ export class PiEpisodeReader implements IEpisodeReader {
 	 * 1. Find compaction + branch_summary entries (both carry an inline `summary`)
 	 * 2. If any exist:
 	 *    - Each summary → one episode (rich, pre-condensed)
-	 *    - Messages after the last summary entry → final episode(s)
+	 *    - Messages after the last summary entry → tail episode(s)
 	 * 3. If none exist:
-	 *    - All messages → one or more episodes chunked by token budget
-	 * 4. Filter out already-processed (startMessageId, endMessageId) ranges.
+	 *    - All messages → tail episode(s), chunked by token budget
+	 *    Both message paths go through episodesFromMessages, which drops the
+	 *    already-uploaded prefix before chunking.
+	 * 4. Drop exact (startMessageId, endMessageId) matches already processed.
 	 */
 	private segmentSession(
 		session: ParsedSession,
 		processedRanges: ProcessedRange[],
 	): Episode[] {
 		const summaryPoints = this.getSummaryPoints(session);
+		const base: EpisodeBase = {
+			source: this.source,
+			sessionId: session.sessionId,
+			sessionTitle: session.title,
+			projectName: session.projectName,
+			directory: session.directory,
+			timeCreated: session.minTimestampMs,
+		};
 
-		let episodes: Episode[];
-		if (summaryPoints.length > 0) {
-			episodes = this.segmentWithSummaries(session, summaryPoints);
-		} else {
-			episodes = this.segmentWithoutSummaries(session);
-		}
+		const episodes =
+			summaryPoints.length > 0
+				? this.segmentWithSummaries(
+						base,
+						session,
+						summaryPoints,
+						processedRanges,
+					)
+				: this.segmentWithoutSummaries(base, session, processedRanges);
 
-		if (processedRanges.length === 0) return episodes;
-
-		const processedSet = new Set(
-			processedRanges.map((r) => `${r.startMessageId}::${r.endMessageId}`),
-		);
-		return episodes.filter(
-			(ep) => !processedSet.has(`${ep.startMessageId}::${ep.endMessageId}`),
-		);
+		return dropProcessed(episodes, processedRanges);
 	}
 
 	/**
@@ -452,11 +504,13 @@ export class PiEpisodeReader implements IEpisodeReader {
 
 		for (const rec of session.records) {
 			if (rec.type !== "compaction" && rec.type !== "branch_summary") continue;
-			if (!rec.id || !rec.summary?.trim()) continue;
+			if (typeof rec.id !== "string" || !rec.id) continue;
+			if (typeof rec.summary !== "string" || !rec.summary.trim()) continue;
+			const ts = parseTimestamp(rec.timestamp);
 			points.push({
 				entryId: rec.id,
 				summaryText: rec.summary,
-				timestampMs: rec.timestamp ? Date.parse(rec.timestamp) : 0,
+				timestampMs: Number.isNaN(ts) ? 0 : ts,
 			});
 		}
 
@@ -464,59 +518,36 @@ export class PiEpisodeReader implements IEpisodeReader {
 	}
 
 	private segmentWithSummaries(
+		base: EpisodeBase,
 		session: ParsedSession,
 		summaryPoints: Array<{
 			entryId: string;
 			summaryText: string;
 			timestampMs: number;
 		}>,
+		processedRanges: ProcessedRange[],
 	): Episode[] {
 		const episodes: Episode[] = [];
 
 		for (const point of summaryPoints) {
-			episodes.push({
-				source: this.source,
-				sessionId: session.sessionId,
-				startMessageId: point.entryId,
-				endMessageId: point.entryId,
-				sessionTitle: session.title,
-				projectName: session.projectName,
-				directory: session.directory,
-				timeCreated: session.minTimestampMs,
-				maxMessageTime: point.timestampMs,
-				content: point.summaryText,
-				contentType: "compaction_summary",
-				approxTokens: approxTokens(point.summaryText),
-			});
+			episodes.push(
+				episodeFrom(base, {
+					startMessageId: point.entryId,
+					endMessageId: point.entryId,
+					maxMessageTime: point.timestampMs,
+					content: point.summaryText,
+					contentType: "compaction_summary",
+				}),
+			);
 		}
 
 		// Messages after the last summary entry (in file order) → tail episode(s).
 		// Pre-summary messages are covered by the summary itself.
 		const lastSummaryId = summaryPoints[summaryPoints.length - 1].entryId;
 		const tailMessages = this.getMessagesAfterEntry(session, lastSummaryId);
-
-		if (tailMessages.length >= config.consolidation.minSessionMessages) {
-			const chunks = chunkByTokenBudget(tailMessages, MAX_TOKENS_PER_EPISODE);
-			for (const chunk of chunks) {
-				const content = formatMessages(chunk);
-				if (content.trim()) {
-					episodes.push({
-						source: this.source,
-						sessionId: session.sessionId,
-						startMessageId: chunk[0].messageId,
-						endMessageId: chunk[chunk.length - 1].messageId,
-						sessionTitle: session.title,
-						projectName: session.projectName,
-						directory: session.directory,
-						timeCreated: session.minTimestampMs,
-						maxMessageTime: chunk[chunk.length - 1].timestamp,
-						content,
-						contentType: "messages",
-						approxTokens: approxTokens(content),
-					});
-				}
-			}
-		}
+		episodes.push(
+			...episodesFromMessages(base, tailMessages, { processedRanges }),
+		);
 
 		return episodes;
 	}
@@ -538,51 +569,33 @@ export class PiEpisodeReader implements IEpisodeReader {
 			}
 			if (!pastEntry) continue;
 
-			const msg = this.extractMessage(rec);
+			const msg = this.extractMessage(rec, session.sessionId);
 			if (msg) messages.push(msg);
 		}
 
 		return messages;
 	}
 
-	private segmentWithoutSummaries(session: ParsedSession): Episode[] {
+	private segmentWithoutSummaries(
+		base: EpisodeBase,
+		session: ParsedSession,
+		processedRanges: ProcessedRange[],
+	): Episode[] {
 		const messages: EpisodeMessage[] = [];
 		for (const rec of session.records) {
-			const msg = this.extractMessage(rec);
+			const msg = this.extractMessage(rec, session.sessionId);
 			if (msg) messages.push(msg);
 		}
 
-		if (messages.length < config.consolidation.minSessionMessages) return [];
-
-		const chunks = chunkByTokenBudget(messages, MAX_TOKENS_PER_EPISODE);
-		const episodes: Episode[] = [];
-
-		for (const chunk of chunks) {
-			const content = formatMessages(chunk);
-			if (content.trim()) {
-				episodes.push({
-					source: this.source,
-					sessionId: session.sessionId,
-					startMessageId: chunk[0].messageId,
-					endMessageId: chunk[chunk.length - 1].messageId,
-					sessionTitle: session.title,
-					projectName: session.projectName,
-					directory: session.directory,
-					timeCreated: session.minTimestampMs,
-					maxMessageTime: chunk[chunk.length - 1].timestamp,
-					content,
-					contentType: "messages",
-					approxTokens: approxTokens(content),
-				});
-			}
-		}
-
-		return episodes;
+		return episodesFromMessages(base, messages, {
+			processedRanges,
+		});
 	}
 
 	/**
 	 * Extract a single EpisodeMessage from a `message` entry.
 	 * Returns null for non-message entries and messages with no extractable content.
+	 * Malformed message payloads are counted as skips and dropped individually.
 	 *
 	 * Role mapping (EpisodeMessage allows "user" | "assistant" | "tool"):
 	 * - user → user
@@ -592,11 +605,40 @@ export class PiEpisodeReader implements IEpisodeReader {
 	 * - bashExecution → tool, as `[tool: bash]` ($ command + output),
 	 *   allowlist-filtered; skipped when excludeFromContext (`!!`)
 	 */
-	private extractMessage(rec: PiRecord): EpisodeMessage | null {
-		if (rec.type !== "message" || !rec.message || !rec.id) return null;
+	private extractMessage(
+		rec: PiRecord,
+		sessionId: string,
+	): EpisodeMessage | null {
+		if (rec.type !== "message" || typeof rec.id !== "string" || !rec.id) {
+			return null;
+		}
 
 		const msg = rec.message;
-		const timestampMs = rec.timestamp ? Date.parse(rec.timestamp) : 0;
+		if (!isJsonObject(msg)) {
+			recordSkip(
+				this.source,
+				sessionId,
+				"message entry without an object payload",
+			);
+			return null;
+		}
+		if (
+			msg.content !== undefined &&
+			typeof msg.content !== "string" &&
+			!Array.isArray(msg.content)
+		) {
+			recordSkip(this.source, sessionId, "non-array message content");
+			return null;
+		}
+
+		let timestampMs = 0;
+		if (rec.timestamp) {
+			timestampMs = parseTimestamp(rec.timestamp);
+			if (Number.isNaN(timestampMs)) {
+				recordSkip(this.source, sessionId, "unparseable message timestamp");
+				return null;
+			}
+		}
 		const includeToolOutputs = config.consolidation.includeToolOutputs;
 
 		let role: EpisodeMessage["role"];
@@ -610,7 +652,7 @@ export class PiEpisodeReader implements IEpisodeReader {
 			content = this.extractAssistantText(msg.content).trim();
 		} else if (msg.role === "toolResult") {
 			role = "tool";
-			const toolName = msg.toolName ?? "";
+			const toolName = typeof msg.toolName === "string" ? msg.toolName : "";
 			if (!toolName || !includeToolOutputs.includes(toolName)) return null;
 			const text = this.extractTextParts(msg.content).trim();
 			if (!text) return null;
@@ -619,8 +661,8 @@ export class PiEpisodeReader implements IEpisodeReader {
 			role = "tool";
 			if (msg.excludeFromContext) return null; // `!!` — model never saw it
 			if (!includeToolOutputs.includes("bash")) return null;
-			const command = (msg.command ?? "").trim();
-			const output = (msg.output ?? "").trim();
+			const command = typeof msg.command === "string" ? msg.command.trim() : "";
+			const output = typeof msg.output === "string" ? msg.output.trim() : "";
 			if (!command && !output) return null;
 			content = `[tool: bash]\n$ ${command}\n${output}`.trim();
 		} else {
@@ -647,7 +689,7 @@ export class PiEpisodeReader implements IEpisodeReader {
 		if (typeof content === "string") return content;
 		if (!Array.isArray(content)) return "";
 		return content
-			.filter((p) => p.type === "text" && p.text)
+			.filter((p) => isJsonObject(p) && p.type === "text" && p.text)
 			.map((p) => p.text ?? "")
 			.join("\n");
 	}
@@ -659,8 +701,9 @@ export class PiEpisodeReader implements IEpisodeReader {
 		return content
 			.filter(
 				(p) =>
-					(p.type === "text" && p.text) ||
-					(p.type === "thinking" && p.thinking),
+					isJsonObject(p) &&
+					((p.type === "text" && p.text) ||
+						(p.type === "thinking" && p.thinking)),
 			)
 			.map((p) => (p.type === "thinking" ? (p.thinking ?? "") : (p.text ?? "")))
 			.join("\n");

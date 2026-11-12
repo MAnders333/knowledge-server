@@ -20,7 +20,12 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { config } from "../src/config";
 import { OpenCodeEpisodeReader } from "../src/daemon/readers/opencode";
+import {
+	SESSION_IDLE_FLUSH_MS,
+	takeSkipCount,
+} from "../src/daemon/readers/shared";
 
 // ── Schema helpers ─────────────────────────────────────────────────────────────
 
@@ -644,5 +649,145 @@ describe("EpisodeReader — injected knowledge guard", () => {
 		expect(episodes.length).toBe(1);
 		expect(episodes[0].content).toContain("  user: plain first message");
 		expect(episodes[0].content).toContain("  assistant: answer one");
+	});
+});
+
+// ── ARC-07: chunk growth, tail hold-back, poison pills ───────────────────────
+
+/** Seed `count` numbered messages (text "turn N") starting at turn `first`. */
+function seedTurns(
+	db: Database,
+	sessionId: string,
+	first: number,
+	count: number,
+	baseTime: number,
+): string[] {
+	const ids: string[] = [];
+	for (let i = 0; i < count; i++) {
+		const n = first + i;
+		const msgId = seedMessage(db, {
+			sessionId,
+			role: n % 2 === 0 ? "user" : "assistant",
+			timeCreated: baseTime + i,
+		});
+		seedTextPart(db, {
+			messageId: msgId,
+			text: `turn ${n}`,
+			timeCreated: baseTime + i,
+		});
+		ids.push(msgId);
+	}
+	return ids;
+}
+
+/** processedRanges for one session, one range per episode already produced. */
+function watermarkOf(
+	sessionId: string,
+	episodes: Array<{ startMessageId: string; endMessageId: string }>,
+) {
+	return new Map([
+		[
+			sessionId,
+			episodes.map((ep) => ({
+				startMessageId: ep.startMessageId,
+				endMessageId: ep.endMessageId,
+			})),
+		],
+	]);
+}
+
+describe("EpisodeReader — chunk growth (ARC-07)", () => {
+	beforeEach(() => seedProject(openCodeDb));
+
+	it("emits only the appended tail, and nothing when unchanged", () => {
+		const k = config.consolidation.minSessionMessages;
+		const now = Date.now();
+		const sid = seedSession(openCodeDb, { timeCreated: now - 10_000 });
+		seedTurns(openCodeDb, sid, 0, 4, now - 10_000);
+
+		const first = reader.getNewEpisodes([sid], new Map());
+		expect(first).toHaveLength(1);
+
+		const added = seedTurns(openCodeDb, sid, 4, k, now);
+		const second = reader.getNewEpisodes([sid], watermarkOf(sid, first));
+		expect(second).toHaveLength(1);
+		expect(second[0].startMessageId).toBe(added[0]);
+		expect(second[0].endMessageId).toBe(added[k - 1]);
+		expect(second[0].content.split("turn ").length - 1).toBe(k);
+		expect(second[0].content).not.toContain("turn 0");
+
+		expect(
+			reader.getNewEpisodes([sid], watermarkOf(sid, [...first, ...second])),
+		).toEqual([]);
+	});
+});
+
+describe("EpisodeReader — tail hold-back (ARC-07)", () => {
+	beforeEach(() => seedProject(openCodeDb));
+
+	it("holds back a small tail while the session is active", () => {
+		const now = Date.now();
+		const sid = seedSession(openCodeDb, { timeCreated: now - 7_200_000 });
+		seedTurns(openCodeDb, sid, 0, 4, now - 7_200_000);
+		const first = reader.getNewEpisodes([sid], new Map());
+		expect(first).toHaveLength(1);
+
+		seedTurns(openCodeDb, sid, 4, 2, now - 1_000);
+		expect(reader.getNewEpisodes([sid], watermarkOf(sid, first))).toEqual([]);
+	});
+
+	it("flushes a small tail once the session is idle", () => {
+		const now = Date.now();
+		const sid = seedSession(openCodeDb, { timeCreated: now - 7_200_000 });
+		seedTurns(openCodeDb, sid, 0, 4, now - 7_200_000);
+		const first = reader.getNewEpisodes([sid], new Map());
+
+		seedTurns(openCodeDb, sid, 4, 2, now - SESSION_IDLE_FLUSH_MS - 60_000);
+		const flushed = reader.getNewEpisodes([sid], watermarkOf(sid, first));
+		expect(flushed).toHaveLength(1);
+		expect(flushed[0].content).toContain("turn 5");
+	});
+});
+
+describe("EpisodeReader — poison pills (ARC-07)", () => {
+	beforeEach(() => seedProject(openCodeDb));
+
+	it("skips a session with a malformed part row without dropping the others", () => {
+		takeSkipCount("opencode");
+		const now = Date.now();
+		const healthy = seedSession(openCodeDb);
+		seedMinMessages(openCodeDb, healthy, now);
+
+		const broken = seedSession(openCodeDb);
+		const brokenMsg = seedMessage(openCodeDb, {
+			sessionId: broken,
+			role: "user",
+			timeCreated: now,
+		});
+		openCodeDb.run(
+			"INSERT INTO part (id, message_id, time_created, data) VALUES (?, ?, ?, ?)",
+			["bad-part", brokenMsg, now, "{not json"],
+		);
+
+		const episodes = reader.getNewEpisodes([broken, healthy], new Map());
+		expect(episodes.map((ep) => ep.sessionId)).toEqual([healthy]);
+		expect(takeSkipCount("opencode")).toBeGreaterThan(0);
+	});
+
+	it("counts an unreadable session (malformed message row) and keeps going", () => {
+		takeSkipCount("opencode");
+		const now = Date.now();
+		const healthy = seedSession(openCodeDb);
+		seedMinMessages(openCodeDb, healthy, now);
+
+		const broken = seedSession(openCodeDb);
+		openCodeDb.run(
+			"INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
+			["bad-msg", broken, now, "{{"],
+		);
+
+		const episodes = reader.getNewEpisodes([broken, healthy], new Map());
+		expect(episodes.map((ep) => ep.sessionId)).toEqual([healthy]);
+		expect(takeSkipCount("opencode")).toBeGreaterThan(0);
 	});
 });

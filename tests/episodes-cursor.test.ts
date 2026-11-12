@@ -13,6 +13,7 @@
  *   - Sessions with no text in any turn (skipped)
  *   - minSessionMessages filter
  *   - processedRanges exclusion
+ *   - ARC-07: tail-only growth, hold-back, poison pills
  *   - Ordering by lastUpdatedAt ASC
  *   - Limit parameter
  *   - Missing/invalid JSON values (edge cases)
@@ -23,12 +24,15 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { config } from "../src/config";
 import {
 	CursorEpisodeReader,
 	collectFilePathsFromString,
 	longestCommonDirectoryPrefix,
 	resolveCursorDbPath,
 } from "../src/daemon/readers/cursor";
+import { takeSkipCount } from "../src/daemon/readers/shared";
+import type { ProcessedRange } from "../src/types";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -1165,3 +1169,332 @@ for (const [format, extract] of CURSOR_FORMATS) {
 		});
 	});
 }
+
+// ── ARC-07: growth, hold-back, and poison pills ───────────────────────────────
+
+type Turn = { bubbleId: string; type: 1 | 2; text: string };
+
+/** Turns with indexes in [from, to), each with a unique, assertable text. */
+function turnsRange(from: number, to: number): Turn[] {
+	const turns: Turn[] = [];
+	for (let i = from; i < to; i++) {
+		turns.push({
+			bubbleId: `b${i}`,
+			type: i % 2 === 0 ? 1 : 2,
+			text: `payload-${i}-end`,
+		});
+	}
+	return turns;
+}
+
+/** Overwrite the composer row (and bubble rows for Format B) of an existing file. */
+function writeComposer(
+	path: string,
+	format: "A" | "B",
+	turns: Turn[],
+	lastUpdatedAt: number,
+	createdAt = BASE,
+): void {
+	const base = {
+		composerId: COMPOSER_A,
+		name: "Growing",
+		createdAt,
+		lastUpdatedAt,
+		isAgentic: false,
+	};
+	const data =
+		format === "A"
+			? { ...base, conversation: turns }
+			: {
+					...base,
+					fullConversationHeadersOnly: turns.map((t) => ({
+						bubbleId: t.bubbleId,
+						type: t.type,
+					})),
+					conversationMap: {},
+				};
+	const db = new Database(path);
+	try {
+		db.run("INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?, ?)", [
+			`composerData:${COMPOSER_A}`,
+			JSON.stringify(data),
+		]);
+		if (format === "B") {
+			for (const t of turns) {
+				db.run(
+					"INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?, ?)",
+					[
+						`bubbleId:${COMPOSER_A}:${t.bubbleId}`,
+						JSON.stringify({
+							type: t.type,
+							bubbleId: t.bubbleId,
+							text: t.text,
+						}),
+					],
+				);
+			}
+		}
+	} finally {
+		db.close();
+	}
+}
+
+/** Fresh reader over `path`; episodes for every candidate session. */
+function episodesWith(path: string, processed: ProcessedRange[] = []) {
+	const reader = new CursorEpisodeReader(path);
+	try {
+		const ids = reader.getCandidateSessions(0).map((c) => c.id);
+		return reader.getNewEpisodes(ids, new Map([[COMPOSER_A, processed]]));
+	} finally {
+		reader.close();
+	}
+}
+
+function rangesOf(
+	episodes: Array<{ startMessageId: string; endMessageId: string }>,
+): ProcessedRange[] {
+	return episodes.map((e) => ({
+		source: "cursor",
+		startMessageId: e.startMessageId,
+		endMessageId: e.endMessageId,
+	}));
+}
+
+/** Number of occurrences of `needle` across the episodes' content. */
+function occurrences(
+	episodes: Array<{ content: string }>,
+	needle: string,
+): number {
+	return episodes.reduce((n, e) => n + (e.content.split(needle).length - 1), 0);
+}
+
+for (const format of ["A", "B"] as const) {
+	describe(`CursorEpisodeReader — growth and hold-back, Format ${format}`, () => {
+		it("emits only the new tail once the session grows, each message exactly once", () => {
+			const n = config.consolidation.minSessionMessages;
+			const { path, cleanup } = dbToFile(createDb());
+			try {
+				writeComposer(path, format, turnsRange(0, n), BASE + 10_000);
+				const first = episodesWith(path);
+				expect(first).toHaveLength(1);
+
+				writeComposer(path, format, turnsRange(0, 2 * n), BASE + 20_000);
+				const second = episodesWith(path, rangesOf(first));
+				expect(second).toHaveLength(1);
+				expect(second[0].startMessageId).toBe(`b${n}`);
+				expect(second[0].endMessageId).toBe(`b${2 * n - 1}`);
+				for (let i = n; i < 2 * n; i++) {
+					expect(occurrences(second, `payload-${i}-end`)).toBe(1);
+				}
+				for (let i = 0; i < n; i++) {
+					expect(occurrences(second, `payload-${i}-end`)).toBe(0);
+				}
+
+				const all = [...rangesOf(first), ...rangesOf(second)];
+				expect(episodesWith(path, all)).toHaveLength(0);
+			} finally {
+				cleanup();
+			}
+		});
+
+		it("holds back a tail below minSessionMessages while the session is active", () => {
+			const n = config.consolidation.minSessionMessages;
+			expect(n).toBeGreaterThan(1);
+			const now = Date.now();
+			const { path, cleanup } = dbToFile(createDb());
+			try {
+				const processed = [
+					{ source: "cursor", startMessageId: "b0", endMessageId: `b${n - 1}` },
+				];
+				writeComposer(
+					path,
+					format,
+					turnsRange(0, n + 1),
+					now - 1000,
+					now - 60_000,
+				);
+				expect(episodesWith(path, processed)).toHaveLength(0);
+			} finally {
+				cleanup();
+			}
+		});
+
+		it("flushes the same tail once the session is idle", () => {
+			const n = config.consolidation.minSessionMessages;
+			const { path, cleanup } = dbToFile(createDb());
+			try {
+				writeComposer(path, format, turnsRange(0, n + 1), BASE + 10_000);
+				const processed = [
+					{ source: "cursor", startMessageId: "b0", endMessageId: `b${n - 1}` },
+				];
+				const episodes = episodesWith(path, processed);
+				expect(episodes).toHaveLength(1);
+				expect(episodes[0].startMessageId).toBe(`b${n}`);
+				expect(episodes[0].endMessageId).toBe(`b${n}`);
+				expect(occurrences(episodes, `payload-${n}-end`)).toBe(1);
+			} finally {
+				cleanup();
+			}
+		});
+	});
+}
+
+describe("CursorEpisodeReader — poison pills (ARC-07)", () => {
+	const POISON_NULL = "dddddddd-0000-0000-0000-000000000004";
+	const POISON_MALFORMED = "dddddddd-0000-0000-0000-000000000005";
+	const MIXED = "dddddddd-0000-0000-0000-000000000006";
+	const UNREADABLE = "dddddddd-0000-0000-0000-000000000007";
+
+	it("skips null and malformed composer rows without throwing; healthy sessions still produce episodes", () => {
+		const db = createDb();
+		insertFormatA(db, COMPOSER_A, { turns: withBubbleIds(PLAIN_TURNS) });
+		db.run("INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)", [
+			`composerData:${POISON_NULL}`,
+			"null",
+		]);
+		db.run("INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)", [
+			`composerData:${POISON_MALFORMED}`,
+			"{not valid json",
+		]);
+		db.run("INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)", [
+			`composerData:${MIXED}`,
+			JSON.stringify({
+				composerId: MIXED,
+				createdAt: BASE,
+				lastUpdatedAt: BASE + 10_000,
+				conversation: [
+					null,
+					{ type: 1, bubbleId: "m1", text: "alpha" },
+					{ type: 2, bubbleId: "m2", text: "beta" },
+					{ type: 1, bubbleId: "m3", text: "gamma" },
+					{ type: 2, bubbleId: "m4", text: "delta" },
+				],
+			}),
+		]);
+		const { path, cleanup } = dbToFile(db);
+		try {
+			takeSkipCount("cursor");
+			const reader = new CursorEpisodeReader(path);
+			const ids = reader
+				.getCandidateSessions(0)
+				.map((c) => c.id)
+				.sort();
+			expect(ids).toEqual([COMPOSER_A, MIXED].sort());
+			const episodes = reader.getNewEpisodes(ids, new Map());
+			reader.close();
+
+			expect(episodes.filter((e) => e.sessionId === COMPOSER_A)).toHaveLength(
+				1,
+			);
+			const mixed = episodes.filter((e) => e.sessionId === MIXED);
+			expect(mixed).toHaveLength(1);
+			expect(mixed[0].content).toContain("delta");
+			expect(mixed[0].content).toContain("alpha");
+			expect(takeSkipCount("cursor")).toBeGreaterThan(0);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("skips a session whose conversation is not an array and keeps the others", () => {
+		const db = createDb();
+		insertFormatA(db, COMPOSER_A, { turns: withBubbleIds(PLAIN_TURNS) });
+		db.run("INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)", [
+			`composerData:${UNREADABLE}`,
+			JSON.stringify({
+				composerId: UNREADABLE,
+				createdAt: BASE,
+				lastUpdatedAt: BASE + 10_000,
+				conversation: "not-an-array",
+			}),
+		]);
+		const { path, cleanup } = dbToFile(db);
+		try {
+			takeSkipCount("cursor");
+			const episodes = episodesWith(path);
+			expect(episodes.map((e) => e.sessionId)).toEqual([COMPOSER_A]);
+			expect(takeSkipCount("cursor")).toBeGreaterThan(0);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("skips malformed and non-object bubble rows and keeps the rest of a Format B session", () => {
+		const db = createDb();
+		insertFormatB(db, COMPOSER_A, {
+			turns: [
+				{ bubbleId: "p0", type: 1, text: "one" },
+				{ bubbleId: "p1", type: 2, text: "two" },
+				{ bubbleId: "p2", type: 1, text: "three" },
+				{ bubbleId: "p3", type: 2, text: "four" },
+				{ bubbleId: "p4", type: 1, text: "five" },
+				{ bubbleId: "p5", type: 2, text: "six" },
+			],
+		});
+		db.run("UPDATE cursorDiskKV SET value = ? WHERE key = ?", [
+			"{not valid json",
+			`bubbleId:${COMPOSER_A}:p1`,
+		]);
+		db.run("UPDATE cursorDiskKV SET value = ? WHERE key = ?", [
+			"[1,2]",
+			`bubbleId:${COMPOSER_A}:p2`,
+		]);
+		takeSkipCount("cursor");
+		const episodes = runCursor(db);
+		expect(episodes).toHaveLength(1);
+		expect(episodes[0].startMessageId).toBe("p0");
+		expect(episodes[0].endMessageId).toBe("p5");
+		expect(episodes[0].content).toContain("four");
+		expect(episodes[0].content).not.toContain("two");
+		expect(episodes[0].content).not.toContain("three");
+		expect(takeSkipCount("cursor")).toBeGreaterThan(0);
+	});
+
+	it("returns no sessions for a database file that cannot be read, without throwing", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ks-cursor-garbage-"));
+		const path = join(dir, "state.vscdb");
+		writeFileSync(path, "this is not a sqlite database");
+		try {
+			takeSkipCount("cursor");
+			const reader = new CursorEpisodeReader(path);
+			expect(reader.getCandidateSessions(0)).toHaveLength(0);
+			expect(takeSkipCount("cursor")).toBeGreaterThan(0);
+			reader.close();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("CursorEpisodeReader — bare % in file URIs (ARC-07)", () => {
+	it("keeps the raw token instead of throwing on an invalid escape", () => {
+		const out: string[] = [];
+		expect(() =>
+			collectFilePathsFromString('"file:///Users/x/100%/src/a.ts"', out),
+		).not.toThrow();
+		expect(out).toEqual(["/Users/x/100%/src/a.ts"]);
+	});
+
+	it("resolves a workspace root whose path contains a bare %", () => {
+		const db = createDb();
+		db.run("INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)", [
+			`composerData:${COMPOSER_A}`,
+			JSON.stringify({
+				composerId: COMPOSER_A,
+				name: "Bare percent",
+				createdAt: BASE,
+				lastUpdatedAt: BASE + 10_000,
+				conversation: withBubbleIds(PLAIN_TURNS),
+				context: {
+					fileSelections: [
+						{ uri: { external: "file:///Users/x/100%/src/a.ts" } },
+						{ uri: { external: "file:///Users/x/100%/src/b.ts" } },
+					],
+				},
+			}),
+		]);
+		const episodes = runCursor(db);
+		expect(episodes).toHaveLength(1);
+		expect(episodes[0].directory).toBe("/Users/x/100%/src");
+	});
+});

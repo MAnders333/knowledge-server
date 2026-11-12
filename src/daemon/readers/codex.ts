@@ -11,10 +11,10 @@ import type {
 } from "../../types.js";
 import {
 	MAX_MESSAGE_CHARS,
-	MAX_TOKENS_PER_EPISODE,
-	approxTokens,
-	chunkByTokenBudget,
-	formatMessages,
+	dropProcessed,
+	episodesFromMessages,
+	isJsonObject,
+	recordSkip,
 } from "./shared.js";
 
 // ── Codex CLI JSONL record types ──────────────────────────────────────────────
@@ -147,8 +147,9 @@ export function resolveCodexSessionsDir(): string {
  *   This is the value stored in the source_cursor table and advanced per cycle.
  *
  * Incremental processing:
- *   Files are pre-filtered by mtime (cheap). Within a file the
- *   (startMessageId, endMessageId) pair provides episode-level idempotency.
+ *   Files are pre-filtered by mtime (cheap). Within a file, already-uploaded
+ *   messages are skipped by the processed-range watermark; only the unuploaded
+ *   tail is chunked (see `episodesFromMessages`).
  */
 export class CodexEpisodeReader implements IEpisodeReader {
 	readonly source = "codex";
@@ -216,9 +217,17 @@ export class CodexEpisodeReader implements IEpisodeReader {
 			const session = this._sessionCache.get(sessionId);
 			if (!session) continue;
 
-			const sessionProcessed = processedRanges.get(sessionId) ?? [];
-			const sessionEpisodes = this.segmentSession(session, sessionProcessed);
-			episodes.push(...sessionEpisodes);
+			// A failing session must not stall the others: count it and move on.
+			try {
+				const sessionProcessed = processedRanges.get(sessionId) ?? [];
+				episodes.push(...this.segmentSession(session, sessionProcessed));
+			} catch (err) {
+				recordSkip(
+					this.source,
+					sessionId,
+					`segmentation failed: ${String(err)}`,
+				);
+			}
 		}
 
 		return episodes;
@@ -372,6 +381,10 @@ export class CodexEpisodeReader implements IEpisodeReader {
 	/**
 	 * Parse a single Codex JSONL rollout file.
 	 *
+	 * Every line is parsed once. Unusable lines (malformed JSON, non-object records,
+	 * non-object payloads or content parts) are skipped and counted per session;
+	 * they never abort the file. Line positions are kept so message IDs stay stable.
+	 *
 	 * Two-pass approach:
 	 * 1. Pass 1 — resolve sessionId (from session_meta or filename fallback), cwd,
 	 *    and sessionStartMs. session_meta is always the first record in practice, but
@@ -388,14 +401,16 @@ export class CodexEpisodeReader implements IEpisodeReader {
 		let mtimeMs: number;
 		try {
 			mtimeMs = statSync(filePath).mtimeMs;
-		} catch {
+		} catch (err) {
+			recordSkip(this.source, filePath, `unreadable: ${String(err)}`);
 			return null;
 		}
 
 		let content: string;
 		try {
 			content = readFileSync(filePath, "utf8");
-		} catch {
+		} catch (err) {
+			recordSkip(this.source, filePath, `unreadable: ${String(err)}`);
 			return null;
 		}
 
@@ -416,23 +431,35 @@ export class CodexEpisodeReader implements IEpisodeReader {
 		let cwd = "";
 		let sessionStartMs = 0;
 
-		// ── Pass 1: resolve sessionId, cwd, sessionStartMs ─────────────────────
-		for (const line of lines) {
-			let record: CodexRecord;
+		// Parse every line once. Entry i is the record for lines[i]; unusable lines
+		// are null so they never shift the line indices used for message IDs.
+		let malformed = 0;
+		const records: Array<CodexRecord | null> = lines.map((line) => {
+			let parsed: unknown;
 			try {
-				record = JSON.parse(line) as CodexRecord;
+				parsed = JSON.parse(line);
 			} catch {
-				continue;
+				malformed++;
+				return null;
 			}
-			if (record.type !== "session_meta") continue;
-			const meta = record.payload as CodexSessionMeta;
-			if (meta.id) sessionId = meta.id;
-			if (meta.cwd) cwd = meta.cwd;
-			if (meta.timestamp) {
-				const t = Date.parse(meta.timestamp);
+			if (!isJsonObject(parsed)) {
+				malformed++;
+				return null;
+			}
+			return parsed as CodexRecord;
+		});
+
+		// ── Pass 1: resolve sessionId, cwd, sessionStartMs ─────────────────────
+		// session_meta appears once at the top of the file; use the first one.
+		const meta = records.find((r) => r?.type === "session_meta")?.payload;
+		if (isJsonObject(meta)) {
+			const m = meta as Partial<CodexSessionMeta>;
+			if (typeof m.id === "string" && m.id) sessionId = m.id;
+			if (typeof m.cwd === "string" && m.cwd) cwd = m.cwd;
+			if (typeof m.timestamp === "string") {
+				const t = Date.parse(m.timestamp);
 				if (!Number.isNaN(t)) sessionStartMs = t;
 			}
-			break; // session_meta appears once at the top — stop scanning
 		}
 
 		// ── Pass 2: extract messages with the final sessionId ──────────────────
@@ -440,16 +467,14 @@ export class CodexEpisodeReader implements IEpisodeReader {
 		let minTimestampMs = Number.MAX_SAFE_INTEGER;
 		let maxTimestampMs = 0;
 
-		for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
-			let record: CodexRecord;
-			try {
-				record = JSON.parse(lines[lineIndex]) as CodexRecord;
-			} catch {
+		for (let lineIndex = 0; lineIndex < records.length; lineIndex++) {
+			const record = records[lineIndex];
+			if (record?.type !== "response_item") continue;
+
+			if (!isJsonObject(record.payload)) {
+				malformed++;
 				continue;
 			}
-
-			if (record.type !== "response_item") continue;
-
 			const item = record.payload as CodexResponseItem;
 			if (item.type !== "message") continue;
 			if (item.role !== "user" && item.role !== "assistant") continue;
@@ -458,14 +483,22 @@ export class CodexEpisodeReader implements IEpisodeReader {
 			// Extract text from content parts.
 			// User turns use "input_text", assistant turns use "output_text".
 			// We accept both to be robust against format variations.
-			const text = item.content
-				.filter(
-					(p) =>
-						(p.type === "input_text" || p.type === "output_text") && p.text,
-				)
-				.map((p) => p.text ?? "")
-				.join("\n")
-				.trim();
+			const texts: string[] = [];
+			for (const part of item.content as unknown[]) {
+				if (!isJsonObject(part)) {
+					malformed++;
+					continue;
+				}
+				const p = part as CodexContentPart;
+				if (
+					(p.type === "input_text" || p.type === "output_text") &&
+					typeof p.text === "string" &&
+					p.text
+				) {
+					texts.push(p.text);
+				}
+			}
+			const text = texts.join("\n").trim();
 
 			if (!text) continue;
 
@@ -488,7 +521,10 @@ export class CodexEpisodeReader implements IEpisodeReader {
 				truncated = `${truncated.slice(0, MAX_MESSAGE_CHARS)}\n[...truncated]`;
 			}
 
-			const recordTs = Date.parse(record.timestamp);
+			const recordTs =
+				typeof record.timestamp === "string"
+					? Date.parse(record.timestamp)
+					: Number.NaN;
 			const ts = Number.isNaN(recordTs) ? 0 : recordTs;
 
 			// Synthetic message ID: "<sessionId>:<lineIndex>" — stable because
@@ -506,6 +542,10 @@ export class CodexEpisodeReader implements IEpisodeReader {
 				if (ts < minTimestampMs) minTimestampMs = ts;
 				if (ts > maxTimestampMs) maxTimestampMs = ts;
 			}
+		}
+
+		if (malformed > 0) {
+			recordSkip(this.source, sessionId, "malformed JSONL line(s)", malformed);
 		}
 
 		if (messages.length === 0) return null;
@@ -539,51 +579,28 @@ export class CodexEpisodeReader implements IEpisodeReader {
 	}
 
 	/**
-	 * Segment a parsed session into episodes, skipping already-processed ranges.
+	 * Segment a parsed session into episodes, skipping already-uploaded messages.
 	 *
-	 * Codex has no compaction mechanism — all messages are treated as a flat
-	 * sequence and chunked by token budget.
+	 * Codex has no compaction mechanism — all messages are treated as one flat
+	 * sequence. `episodesFromMessages` chunks only the part after the watermark;
+	 * `dropProcessed` then removes any exact-key match.
 	 */
 	private segmentSession(
 		session: ParsedSession,
 		processedRanges: ProcessedRange[],
 	): Episode[] {
-		const { messages } = session;
-
-		if (messages.length < config.consolidation.minSessionMessages) return [];
-
-		const chunks = chunkByTokenBudget(messages, MAX_TOKENS_PER_EPISODE);
-		const episodes: Episode[] = [];
-
-		const processedSet = new Set(
-			processedRanges.map((r) => `${r.startMessageId}::${r.endMessageId}`),
-		);
-
-		for (const chunk of chunks) {
-			const startMessageId = chunk[0].messageId;
-			const endMessageId = chunk[chunk.length - 1].messageId;
-
-			if (processedSet.has(`${startMessageId}::${endMessageId}`)) continue;
-
-			const content = formatMessages(chunk);
-			if (!content.trim()) continue;
-
-			episodes.push({
+		const episodes = episodesFromMessages(
+			{
 				source: this.source,
 				sessionId: session.sessionId,
-				startMessageId,
-				endMessageId,
 				sessionTitle: session.sessionTitle,
 				projectName: session.projectName,
 				directory: session.directory,
 				timeCreated: session.minTimestampMs,
-				maxMessageTime: chunk[chunk.length - 1].timestamp,
-				content,
-				contentType: "messages",
-				approxTokens: approxTokens(content),
-			});
-		}
-
-		return episodes;
+			},
+			session.messages,
+			{ processedRanges },
+		);
+		return dropProcessed(episodes, processedRanges);
 	}
 }

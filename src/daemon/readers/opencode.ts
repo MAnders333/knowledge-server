@@ -9,12 +9,17 @@ import type {
 	ProcessedRange,
 } from "../../types.js";
 import {
+	type EpisodeBase,
 	MAX_MESSAGE_CHARS,
-	MAX_TOKENS_PER_EPISODE,
-	approxTokens,
-	chunkByTokenBudget,
-	formatMessages,
+	dropProcessed,
+	episodeFrom,
+	episodesFromMessages,
+	recordSkip,
 } from "./shared.js";
+
+function messageOf(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
 
 /**
  * Extract readable text from a tool output value.
@@ -88,8 +93,10 @@ function extractToolText(raw: string): string {
  * - Episodes are keyed by (sessionId, startMessageId, endMessageId).
  * - Message IDs are stable UUIDs from OpenCode — they never shift when new
  *   messages are appended, unlike a segment_index approach.
- * - On each consolidation run, already-processed (start, end) ranges are
- *   excluded, so only the new tail of a session is re-processed.
+ * - On each consolidation run, messages up to the session's processed watermark
+ *   are dropped before chunking (episodesFromMessages), so only the new tail is
+ *   segmented. Compaction summaries are excluded by exact (start, end) key
+ *   (dropProcessed).
  */
 
 export class OpenCodeEpisodeReader implements IEpisodeReader {
@@ -213,6 +220,9 @@ export class OpenCodeEpisodeReader implements IEpisodeReader {
 	 * and the processed ranges (via KnowledgeDB.getProcessedEpisodeRanges). This avoids
 	 * a redundant DB query and lets the caller use the full session list for cursor advancement.
 	 *
+	 * A session that cannot be segmented (e.g. a malformed row) is counted as a skip
+	 * and the remaining sessions are still produced.
+	 *
 	 * @param candidateSessionIds - session IDs to segment (already fetched by caller)
 	 * @param processedRanges     - per-session map of already-processed message ID ranges
 	 */
@@ -243,9 +253,16 @@ export class OpenCodeEpisodeReader implements IEpisodeReader {
 		const episodes: Episode[] = [];
 
 		for (const session of sessions) {
-			const sessionProcessed = processedRanges.get(session.id) ?? [];
-			const sessionEpisodes = this.segmentSession(session, sessionProcessed);
-			episodes.push(...sessionEpisodes);
+			try {
+				episodes.push(
+					...this.segmentSession(
+						session,
+						processedRanges.get(session.id) ?? [],
+					),
+				);
+			} catch (err) {
+				recordSkip(this.source, session.id, `unreadable: ${messageOf(err)}`);
+			}
 		}
 
 		return episodes;
@@ -258,9 +275,11 @@ export class OpenCodeEpisodeReader implements IEpisodeReader {
 	 * 1. Find all compaction points in the session
 	 * 2. If compactions exist:
 	 *    - Each compaction summary becomes one episode (already condensed)
-	 *    - Messages after the last compaction become the final episode
+	 *    - Messages after the last compaction become the final episode(s)
 	 * 3. If no compactions:
 	 *    - Extract all messages, chunk if they exceed token budget
+	 *    Both message paths go through episodesFromMessages, which drops the
+	 *    already-uploaded prefix before chunking.
 	 * 4. Filter out any episodes whose (startMessageId, endMessageId) range
 	 *    is already recorded in consolidated_episode.
 	 */
@@ -274,25 +293,28 @@ export class OpenCodeEpisodeReader implements IEpisodeReader {
 		},
 		processedRanges: ProcessedRange[],
 	): Episode[] {
+		const base: EpisodeBase = {
+			source: this.source,
+			sessionId: session.id,
+			sessionTitle: session.title || "Untitled",
+			projectName: session.project_name,
+			directory: session.directory,
+			timeCreated: session.time_created,
+		};
+
 		const compactionPoints = this.getCompactionPoints(session.id);
 
-		let episodes: Episode[];
-		if (compactionPoints.length > 0) {
-			episodes = this.segmentWithCompactions(session, compactionPoints);
-		} else {
-			episodes = this.segmentWithoutCompactions(session);
-		}
+		const episodes =
+			compactionPoints.length > 0
+				? this.segmentWithCompactions(
+						base,
+						session.id,
+						compactionPoints,
+						processedRanges,
+					)
+				: this.segmentWithoutCompactions(base, session.id, processedRanges);
 
-		// Filter out already-processed episodes by (startMessageId, endMessageId)
-		if (processedRanges.length === 0) return episodes;
-
-		const processedSet = new Set(
-			processedRanges.map((r) => `${r.startMessageId}::${r.endMessageId}`),
-		);
-
-		return episodes.filter(
-			(ep) => !processedSet.has(`${ep.startMessageId}::${ep.endMessageId}`),
-		);
+		return dropProcessed(episodes, processedRanges);
 	}
 
 	/**
@@ -311,8 +333,8 @@ export class OpenCodeEpisodeReader implements IEpisodeReader {
 				`SELECT m.time_created
          FROM part p
          JOIN message m ON m.id = p.message_id
-         WHERE json_extract(p.data, '$.type') = 'compaction'
-           AND m.session_id = ?
+         WHERE p.message_id IN (SELECT id FROM message WHERE session_id = ?)
+           AND json_extract(p.data, '$.type') = 'compaction'
          ORDER BY m.time_created ASC`,
 			)
 			.all(sessionId) as Array<{ time_created: number }>;
@@ -364,22 +386,18 @@ export class OpenCodeEpisodeReader implements IEpisodeReader {
 	 *
 	 * Each compaction summary is a pre-condensed episode with a stable
 	 * (startMessageId = endMessageId = summaryMessageId) key.
-	 * Messages after the last compaction become the final episode.
+	 * Messages after the last compaction become the final episode(s).
 	 */
 	private segmentWithCompactions(
-		session: {
-			id: string;
-			title: string;
-			directory: string;
-			time_created: number;
-			project_name: string;
-		},
+		base: EpisodeBase,
+		sessionId: string,
 		compactionPoints: Array<{
 			compactionTime: number;
 			summaryText: string;
 			summaryMessageId: string;
 			summaryMessageTime: number;
 		}>,
+		processedRanges: ProcessedRange[],
 	): Episode[] {
 		const episodes: Episode[] = [];
 
@@ -387,21 +405,15 @@ export class OpenCodeEpisodeReader implements IEpisodeReader {
 		// maxMessageTime uses the summary message's time_created (not the compaction marker's)
 		// so the cursor advances to the actual message that was processed.
 		for (const point of compactionPoints) {
-			const tokens = approxTokens(point.summaryText);
-			episodes.push({
-				source: this.source,
-				sessionId: session.id,
-				startMessageId: point.summaryMessageId,
-				endMessageId: point.summaryMessageId,
-				sessionTitle: session.title || "Untitled",
-				projectName: session.project_name,
-				directory: session.directory,
-				timeCreated: session.time_created,
-				maxMessageTime: point.summaryMessageTime,
-				content: point.summaryText,
-				contentType: "compaction_summary",
-				approxTokens: tokens,
-			});
+			episodes.push(
+				episodeFrom(base, {
+					startMessageId: point.summaryMessageId,
+					endMessageId: point.summaryMessageId,
+					maxMessageTime: point.summaryMessageTime,
+					content: point.summaryText,
+					contentType: "compaction_summary",
+				}),
+			);
 		}
 
 		// Messages after the last compaction become the final episode(s)
@@ -409,32 +421,13 @@ export class OpenCodeEpisodeReader implements IEpisodeReader {
 			compactionPoints[compactionPoints.length - 1].compactionTime;
 
 		const tailMessages = this.getMessagesAfterCompaction(
-			session.id,
+			sessionId,
 			lastCompactionTime,
 		);
 
-		if (tailMessages.length >= config.consolidation.minSessionMessages) {
-			const chunks = chunkByTokenBudget(tailMessages, MAX_TOKENS_PER_EPISODE);
-			for (const chunk of chunks) {
-				const content = formatMessages(chunk);
-				if (content.trim()) {
-					episodes.push({
-						source: this.source,
-						sessionId: session.id,
-						startMessageId: chunk[0].messageId,
-						endMessageId: chunk[chunk.length - 1].messageId,
-						sessionTitle: session.title || "Untitled",
-						projectName: session.project_name,
-						directory: session.directory,
-						timeCreated: session.time_created,
-						maxMessageTime: chunk[chunk.length - 1].timestamp,
-						content,
-						contentType: "messages",
-						approxTokens: approxTokens(content),
-					});
-				}
-			}
-		}
+		episodes.push(
+			...episodesFromMessages(base, tailMessages, { processedRanges }),
+		);
 
 		return episodes;
 	}
@@ -481,46 +474,16 @@ export class OpenCodeEpisodeReader implements IEpisodeReader {
 
 	/**
 	 * Segment a session without compactions.
-	 * The whole session is one or more episodes, chunked by token budget.
+	 * Only the unprocessed tail is chunked by token budget.
 	 */
-	private segmentWithoutCompactions(session: {
-		id: string;
-		title: string;
-		directory: string;
-		time_created: number;
-		project_name: string;
-	}): Episode[] {
-		const messages = this.getSessionMessages(session.id);
-
-		// Skip sessions with too few messages
-		if (messages.length < config.consolidation.minSessionMessages) {
-			return [];
-		}
-
-		const chunks = chunkByTokenBudget(messages, MAX_TOKENS_PER_EPISODE);
-		const episodes: Episode[] = [];
-
-		for (const chunk of chunks) {
-			const content = formatMessages(chunk);
-			if (content.trim()) {
-				episodes.push({
-					source: this.source,
-					sessionId: session.id,
-					startMessageId: chunk[0].messageId,
-					endMessageId: chunk[chunk.length - 1].messageId,
-					sessionTitle: session.title || "Untitled",
-					projectName: session.project_name,
-					directory: session.directory,
-					timeCreated: session.time_created,
-					maxMessageTime: chunk[chunk.length - 1].timestamp,
-					content,
-					contentType: "messages",
-					approxTokens: approxTokens(content),
-				});
-			}
-		}
-
-		return episodes;
+	private segmentWithoutCompactions(
+		base: EpisodeBase,
+		sessionId: string,
+		processedRanges: ProcessedRange[],
+	): Episode[] {
+		return episodesFromMessages(base, this.getSessionMessages(sessionId), {
+			processedRanges,
+		});
 	}
 
 	/**

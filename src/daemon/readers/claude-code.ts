@@ -9,11 +9,13 @@ import type {
 	ProcessedRange,
 } from "../../types.js";
 import {
+	type EpisodeBase,
 	MAX_MESSAGE_CHARS,
-	MAX_TOKENS_PER_EPISODE,
-	approxTokens,
-	chunkByTokenBudget,
-	formatMessages,
+	dropProcessed,
+	episodeFrom,
+	episodesFromMessages,
+	isJsonObject,
+	recordSkip,
 } from "./shared.js";
 
 // ── Claude Code JSONL record types ────────────────────────────────────────────
@@ -73,6 +75,28 @@ interface ParsedSession {
 }
 
 /**
+ * Remove non-object entries from a content-part array (recursing into
+ * tool_result content) so no later read dereferences a null part.
+ * Returns the number of entries removed.
+ */
+function pruneContentParts(parts: unknown[]): number {
+	let removed = 0;
+	for (let i = parts.length - 1; i >= 0; i--) {
+		const part = parts[i];
+		if (!isJsonObject(part)) {
+			parts.splice(i, 1);
+			removed++;
+			continue;
+		}
+		const nested = (part as { content?: unknown }).content;
+		if (Array.isArray(nested)) {
+			removed += pruneContentParts(nested);
+		}
+	}
+	return removed;
+}
+
+/**
  * Reads episodes from Claude Code's JSONL session files.
  *
  * Storage layout (confirmed by direct inspection):
@@ -94,8 +118,9 @@ interface ParsedSession {
  *
  * Incremental processing:
  * - Files are pre-filtered by mtime: only files modified after the cursor are fully parsed.
- * - Episode idempotency uses the same (startMessageId, endMessageId) key scheme,
- *   where message IDs are the record's `uuid` field.
+ * - Already-uploaded messages are skipped by the processed-range watermark; only the
+ *   unuploaded tail is chunked (see `episodesFromMessages`). Compaction summaries are
+ *   keyed by their summary message id and removed by `dropProcessed`.
  */
 export class ClaudeCodeEpisodeReader implements IEpisodeReader {
 	readonly source = "claude-code";
@@ -174,9 +199,17 @@ export class ClaudeCodeEpisodeReader implements IEpisodeReader {
 			const session = this._sessionCache.get(sessionId);
 			if (!session) continue;
 
-			const sessionProcessed = processedRanges.get(sessionId) ?? [];
-			const sessionEpisodes = this.segmentSession(session, sessionProcessed);
-			episodes.push(...sessionEpisodes);
+			// A failing session must not stall the others: count it and move on.
+			try {
+				const sessionProcessed = processedRanges.get(sessionId) ?? [];
+				episodes.push(...this.segmentSession(session, sessionProcessed));
+			} catch (err) {
+				recordSkip(
+					this.source,
+					sessionId,
+					`segmentation failed: ${String(err)}`,
+				);
+			}
 		}
 
 		return episodes;
@@ -292,6 +325,7 @@ export class ClaudeCodeEpisodeReader implements IEpisodeReader {
 	/**
 	 * Parse a single JSONL session file.
 	 * Returns null if the file is empty, unreadable, or has no message records.
+	 * Unusable lines are skipped and counted; they never abort the file.
 	 */
 	private parseSessionFile(
 		filePath: string,
@@ -300,7 +334,8 @@ export class ClaudeCodeEpisodeReader implements IEpisodeReader {
 		let content: string;
 		try {
 			content = readFileSync(filePath, "utf8");
-		} catch {
+		} catch (err) {
+			recordSkip(this.source, sessionId, `unreadable: ${String(err)}`);
 			return null;
 		}
 
@@ -312,24 +347,38 @@ export class ClaudeCodeEpisodeReader implements IEpisodeReader {
 		let cwd = "";
 		let minTimestampMs = Number.MAX_SAFE_INTEGER;
 		let maxTimestampMs = 0;
+		let malformed = 0;
 
 		for (const line of lines) {
-			let record: CCRecord;
+			let parsed: unknown;
 			try {
-				record = JSON.parse(line) as CCRecord;
+				parsed = JSON.parse(line);
 			} catch {
-				continue; // skip malformed lines
+				malformed++;
+				continue;
+			}
+			if (!isJsonObject(parsed)) {
+				malformed++;
+				continue;
+			}
+			const record = parsed as CCRecord;
+
+			// Drop null / non-object content parts once, here, so later reads can
+			// assume every part is an object.
+			const parts = record.message?.content;
+			if (Array.isArray(parts)) {
+				malformed += pruneContentParts(parts);
 			}
 
 			records.push(record);
 
 			// Extract slug and cwd from any record that has them
-			if (record.slug) slug = record.slug;
-			if (record.cwd) cwd = record.cwd;
+			if (typeof record.slug === "string" && record.slug) slug = record.slug;
+			if (typeof record.cwd === "string" && record.cwd) cwd = record.cwd;
 
 			// Track timestamp range (only message records have timestamps)
 			if (
-				record.timestamp &&
+				typeof record.timestamp === "string" &&
 				(record.type === "user" || record.type === "assistant")
 			) {
 				const ts = Date.parse(record.timestamp);
@@ -338,6 +387,10 @@ export class ClaudeCodeEpisodeReader implements IEpisodeReader {
 					if (ts > maxTimestampMs) maxTimestampMs = ts;
 				}
 			}
+		}
+
+		if (malformed > 0) {
+			recordSkip(this.source, sessionId, "malformed JSONL line(s)", malformed);
 		}
 
 		if (records.length === 0 || maxTimestampMs === 0) return null;
@@ -370,17 +423,26 @@ export class ClaudeCodeEpisodeReader implements IEpisodeReader {
 		};
 	}
 
+	/** Identity fields shared by every episode produced from one session. */
+	private episodeBase(session: ParsedSession): EpisodeBase {
+		return {
+			source: this.source,
+			sessionId: session.sessionId,
+			sessionTitle: session.slug,
+			projectName: session.projectName,
+			directory: session.directory,
+			timeCreated: session.minTimestampMs,
+		};
+	}
+
 	/**
 	 * Segment a single parsed session into episodes, skipping already-processed ranges.
 	 *
-	 * Strategy (mirrors OpenCodeEpisodeReader):
 	 * 1. Find compaction points (system records with subtype === "compact_boundary")
-	 * 2. If compactions exist:
-	 *    - The next user record after each compaction is the summary → one episode
-	 *    - Messages after the last compaction → final episode(s)
-	 * 3. If no compactions:
-	 *    - All messages → one or more episodes chunked by token budget
-	 * 4. Filter out already-processed (startMessageId, endMessageId) ranges.
+	 * 2. If compactions exist: one episode per compaction summary; the messages after
+	 *    the last compaction are chunked by `episodesFromMessages`.
+	 * 3. Otherwise: all messages are chunked by `episodesFromMessages`.
+	 * 4. `dropProcessed` removes any compaction episode already uploaded.
 	 */
 	private segmentSession(
 		session: ParsedSession,
@@ -391,25 +453,17 @@ export class ClaudeCodeEpisodeReader implements IEpisodeReader {
 		const toolNameMap = this.buildToolNameMap(session.records);
 		const compactionPoints = this.getCompactionPoints(session);
 
-		let episodes: Episode[];
-		if (compactionPoints.length > 0) {
-			episodes = this.segmentWithCompactions(
-				session,
-				compactionPoints,
-				toolNameMap,
-			);
-		} else {
-			episodes = this.segmentWithoutCompactions(session, toolNameMap);
-		}
+		const episodes =
+			compactionPoints.length > 0
+				? this.segmentWithCompactions(
+						session,
+						compactionPoints,
+						toolNameMap,
+						processedRanges,
+					)
+				: this.segmentWithoutCompactions(session, toolNameMap, processedRanges);
 
-		if (processedRanges.length === 0) return episodes;
-
-		const processedSet = new Set(
-			processedRanges.map((r) => `${r.startMessageId}::${r.endMessageId}`),
-		);
-		return episodes.filter(
-			(ep) => !processedSet.has(`${ep.startMessageId}::${ep.endMessageId}`),
-		);
+		return dropProcessed(episodes, processedRanges);
 	}
 
 	/**
@@ -490,25 +544,21 @@ export class ClaudeCodeEpisodeReader implements IEpisodeReader {
 			summaryTimestampMs: number;
 		}>,
 		toolNameMap: Map<string, string>,
+		processedRanges: ProcessedRange[],
 	): Episode[] {
+		const base = this.episodeBase(session);
 		const episodes: Episode[] = [];
 
 		for (const point of compactionPoints) {
-			const tokens = approxTokens(point.summaryText);
-			episodes.push({
-				source: this.source,
-				sessionId: session.sessionId,
-				startMessageId: point.summaryUuid,
-				endMessageId: point.summaryUuid,
-				sessionTitle: session.slug,
-				projectName: session.projectName,
-				directory: session.directory,
-				timeCreated: session.minTimestampMs,
-				maxMessageTime: point.summaryTimestampMs,
-				content: point.summaryText,
-				contentType: "compaction_summary",
-				approxTokens: tokens,
-			});
+			episodes.push(
+				episodeFrom(base, {
+					startMessageId: point.summaryUuid,
+					endMessageId: point.summaryUuid,
+					maxMessageTime: point.summaryTimestampMs,
+					content: point.summaryText,
+					contentType: "compaction_summary",
+				}),
+			);
 		}
 
 		// Messages after the last compaction → final episode(s)
@@ -518,29 +568,9 @@ export class ClaudeCodeEpisodeReader implements IEpisodeReader {
 			lastCompaction.summaryUuid,
 			toolNameMap,
 		);
-
-		if (tailMessages.length >= config.consolidation.minSessionMessages) {
-			const chunks = chunkByTokenBudget(tailMessages, MAX_TOKENS_PER_EPISODE);
-			for (const chunk of chunks) {
-				const content = formatMessages(chunk);
-				if (content.trim()) {
-					episodes.push({
-						source: this.source,
-						sessionId: session.sessionId,
-						startMessageId: chunk[0].messageId,
-						endMessageId: chunk[chunk.length - 1].messageId,
-						sessionTitle: session.slug,
-						projectName: session.projectName,
-						directory: session.directory,
-						timeCreated: session.minTimestampMs,
-						maxMessageTime: chunk[chunk.length - 1].timestamp,
-						content,
-						contentType: "messages",
-						approxTokens: approxTokens(content),
-					});
-				}
-			}
-		}
+		episodes.push(
+			...episodesFromMessages(base, tailMessages, { processedRanges }),
+		);
 
 		return episodes;
 	}
@@ -582,35 +612,13 @@ export class ClaudeCodeEpisodeReader implements IEpisodeReader {
 	private segmentWithoutCompactions(
 		session: ParsedSession,
 		toolNameMap: Map<string, string>,
+		processedRanges: ProcessedRange[],
 	): Episode[] {
-		const messages = this.extractAllMessages(session, toolNameMap);
-
-		if (messages.length < config.consolidation.minSessionMessages) return [];
-
-		const chunks = chunkByTokenBudget(messages, MAX_TOKENS_PER_EPISODE);
-		const episodes: Episode[] = [];
-
-		for (const chunk of chunks) {
-			const content = formatMessages(chunk);
-			if (content.trim()) {
-				episodes.push({
-					source: this.source,
-					sessionId: session.sessionId,
-					startMessageId: chunk[0].messageId,
-					endMessageId: chunk[chunk.length - 1].messageId,
-					sessionTitle: session.slug,
-					projectName: session.projectName,
-					directory: session.directory,
-					timeCreated: session.minTimestampMs,
-					maxMessageTime: chunk[chunk.length - 1].timestamp,
-					content,
-					contentType: "messages",
-					approxTokens: approxTokens(content),
-				});
-			}
-		}
-
-		return episodes;
+		return episodesFromMessages(
+			this.episodeBase(session),
+			this.extractAllMessages(session, toolNameMap),
+			{ processedRanges },
+		);
 	}
 
 	/**
@@ -669,7 +677,10 @@ export class ClaudeCodeEpisodeReader implements IEpisodeReader {
 		if (!rec.message || !rec.uuid) return null;
 		if (rec.type !== "user" && rec.type !== "assistant") return null;
 
-		const timestampMs = rec.timestamp ? Date.parse(rec.timestamp) : 0;
+		// An unparseable timestamp becomes 0 (same as the Codex reader) so it cannot
+		// leave NaN in the cursor or the idle-flush check.
+		const parsedTs = rec.timestamp ? Date.parse(rec.timestamp) : 0;
+		const timestampMs = Number.isNaN(parsedTs) ? 0 : parsedTs;
 		const includeToolOutputs = config.consolidation.includeToolOutputs;
 
 		let textContent = "";
