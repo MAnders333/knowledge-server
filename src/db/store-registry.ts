@@ -12,6 +12,7 @@ import { DomainRouter } from "../consolidation/domain-router.js";
 import { logger } from "../logger.js";
 import type { IKnowledgeStore, IServerStateDB } from "./interface.js";
 import { PostgresKnowledgeDB } from "./postgres/index.js";
+import { isNonLocalPostgresUri } from "./postgres/tls.js";
 import { KnowledgeDB } from "./sqlite/index.js";
 import { ServerStateDB } from "./state/index.js";
 import { PostgresServerStateDB } from "./state/postgres.js";
@@ -363,15 +364,7 @@ function warnIfMixedTopology(config: KnowledgeServerConfig): void {
 		} catch {
 			return false; // URI not configured — not remote
 		}
-		try {
-			const url = new URL(uri);
-			const host = url.hostname;
-			// Unix socket connections have an empty or path-like hostname.
-			if (!host || host.startsWith("/")) return false;
-			return host !== "localhost" && host !== "127.0.0.1" && host !== "::1";
-		} catch {
-			return false;
-		}
+		return isNonLocalPostgresUri(uri);
 	});
 
 	if (hasRemotePostgres) {
@@ -392,6 +385,6 @@ function redactUri(uri: string): string {
 		if (url.password) url.password = "***";
 		return url.toString();
 	} catch {
-		return uri.replace(/:([^@/]+)@/, ":***@");
+		return uri.replace(/(\/\/[^:/@]*):[^@]*@/, "$1:***@");
 	}
 }
