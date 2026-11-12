@@ -161,6 +161,7 @@ export async function main() {
 					url.searchParams.set("threshold", String(threshold));
 
 				const response = await fetch(url, {
+					headers: { "x-knowledge-client": "mcp" },
 					signal: AbortSignal.timeout(15_000),
 				});
 

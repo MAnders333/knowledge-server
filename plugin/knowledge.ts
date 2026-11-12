@@ -197,7 +197,10 @@ export const KnowledgePlugin: Plugin = async (ctx) => {
 
 				const response = await fetch(
 					`${KNOWLEDGE_SERVER_URL}/activate?${params.toString()}`,
-					{ signal: AbortSignal.timeout(5000) },
+					{
+						headers: { "x-knowledge-client": "opencode" },
+						signal: AbortSignal.timeout(5000),
+					},
 				);
 
 				if (!response.ok) {

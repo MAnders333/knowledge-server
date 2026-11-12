@@ -7,6 +7,7 @@ import { serve } from "bun";
 // @ts-ignore — Bun supports JSON imports natively
 import pkg from "../package.json" with { type: "json" };
 import { ActivationEngine } from "./activation/activate.js";
+import { ActivationEventRecorder } from "./activation/events.js";
 import { createRerankerFromConfig } from "./activation/rerank.js";
 import { createApp } from "./api/server.js";
 import { runActivate } from "./commands/activate.js";
@@ -26,7 +27,7 @@ import { ConsolidationEngine } from "./consolidation/consolidate.js";
 import { runPollTick } from "./consolidation/poll.js";
 import { PendingEpisodesReader } from "./consolidation/readers/pending.js";
 import { StoreRegistry } from "./db/store-registry.js";
-import { logger } from "./logger.js";
+import { logger, parseLogLevel } from "./logger.js";
 import { main as mcpMain } from "./mcp/index.js";
 import { tightenOwnedPrivatePaths } from "./private-files.js";
 import { errCode } from "./utils.js";
@@ -236,7 +237,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	}
 
 	// Initialize logger first so all subsequent output (including config errors) is captured.
-	logger.init(config.logPath);
+	logger.init(config.logPath, parseLogLevel(process.env.LOG_LEVEL));
 	// Upgraded installs may have group/other-readable logs, DBs or .env (server.log can hold an old admin token).
 	tightenOwnedPrivatePaths();
 
@@ -365,6 +366,10 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		}
 	}
 
+	// Content-free activation telemetry: pruned at startup and daily, flushed on shutdown.
+	const activationEvents = new ActivationEventRecorder(serverStateDb);
+	activationEvents.start();
+
 	// Create HTTP app
 	const app = createApp(
 		db,
@@ -377,6 +382,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		registry.readStores(),
 		registry.writableStores(),
 		registry.port,
+		activationEvents,
 	);
 
 	// port/host/daemonAutoSpawn come from the registry (config.jsonc with env var override)
@@ -768,6 +774,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 			}
 		}
 		consolidation.close();
+		await activationEvents.stop();
 		await registry.close();
 		removeOwnPidFile(config.pidPath);
 		process.exit(0);
