@@ -442,6 +442,22 @@ All sources are auto-detected. Override paths or disable sources via environment
 | `ACTIVATION_MAX_RESULTS` | `10` | Max entries returned per activation |
 | `ACTIVATION_SIMILARITY_THRESHOLD` | `0.42` | Minimum cosine similarity to activate |
 
+### Reranking (local cross-encoder)
+
+Dense retrieval overfetches `RERANK_CANDIDATES` entries and a local cross-encoder re-scores them. It runs offline after a one-time model download (~23MB). The default model is pinned to a Hugging Face revision and checksum. If reranking fails or times out, activation uses dense ordering.
+
+| Variable | Default | Description |
+|---|---|---|
+| `RERANK_ENABLED` | `true` | `false` restores dense-only ordering |
+| `RERANK_MODEL` | `Xenova/ms-marco-MiniLM-L-6-v2` | Hugging Face ONNX cross-encoder. **The default is English-only.** For other languages use a multilingual ONNX export with a WordPiece `tokenizer.json`. Other models are fetched from `main` without a checksum |
+| `RERANK_MODELS_DIR` | `~/.local/share/knowledge-server/models` | Model cache |
+| `RERANK_CANDIDATES` | `40` | Dense candidates scored per activation |
+| `RERANK_TIMEOUT_MS` | `2000` | Budget for one rerank call. On expiry the whole batch falls back to dense ordering (no partial scores) |
+| `RERANK_MAX_QUERY_TOKENS` | `64` | Last N tokens of the prompt used as the rerank query |
+| `RERANK_MAX_DOC_TOKENS` | `128` | First N tokens of each candidate that is scored |
+
+Pairs are scored one at a time and the event loop is yielded between them, so one long candidate no longer stalls other requests. Size `RERANK_CANDIDATES` so that candidates × ~40 ms (Apple Silicon) fits within `RERANK_TIMEOUT_MS`; on slower CPUs lower the count or raise the timeout.
+
 ## Usage
 
 ### Start the server
