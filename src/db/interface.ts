@@ -310,6 +310,8 @@ export interface IKnowledgeStore {
 			lastMembershipChangedAt: number;
 			createdAt: number;
 			memberIds: string[];
+			/** entry id → ms when the entry first joined this cluster (kept across passes). */
+			memberJoinedAt: Map<string, number>;
 		}>
 	>;
 

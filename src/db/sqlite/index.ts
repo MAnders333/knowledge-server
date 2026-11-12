@@ -1035,6 +1035,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 			lastMembershipChangedAt: number;
 			createdAt: number;
 			memberIds: string[];
+			memberJoinedAt: Map<string, number>;
 		}>
 	> {
 		const clusterRows = this.db
@@ -1052,19 +1053,25 @@ export class KnowledgeDB implements IKnowledgeStore {
 
 		const memberRows = this.db
 			.prepare(
-				`SELECT cluster_id, entry_id FROM knowledge_cluster_member
+				`SELECT cluster_id, entry_id, joined_at FROM knowledge_cluster_member
          WHERE cluster_id IN (SELECT value FROM json_each(?))`,
 			)
 			.all(JSON.stringify(clusterRows.map((r) => r.id))) as Array<{
 			cluster_id: string;
 			entry_id: string;
+			joined_at: number;
 		}>;
 
 		const membersByCluster = new Map<string, string[]>();
+		const joinedByCluster = new Map<string, Map<string, number>>();
 		for (const m of memberRows) {
 			const arr = membersByCluster.get(m.cluster_id);
 			if (arr) arr.push(m.entry_id);
 			else membersByCluster.set(m.cluster_id, [m.entry_id]);
+			const joined = joinedByCluster.get(m.cluster_id);
+			if (joined) joined.set(m.entry_id, m.joined_at);
+			else
+				joinedByCluster.set(m.cluster_id, new Map([[m.entry_id, m.joined_at]]));
 		}
 
 		return clusterRows.map((r) => ({
@@ -1075,6 +1082,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 			lastMembershipChangedAt: r.last_membership_changed_at,
 			createdAt: r.created_at,
 			memberIds: membersByCluster.get(r.id) ?? [],
+			memberJoinedAt: joinedByCluster.get(r.id) ?? new Map(),
 		}));
 	}
 
@@ -1151,10 +1159,16 @@ export class KnowledgeDB implements IKnowledgeStore {
 					}
 				}
 
-				// Replace membership: delete existing rows, insert new set.
+				// Sync membership: drop members that left, keep joined_at for members that
+				// stayed (synthesis ripeness counts members who joined since the last
+				// synthesis), and add new members with joined_at = now.
 				this.db
-					.prepare("DELETE FROM knowledge_cluster_member WHERE cluster_id = ?")
-					.run(cluster.id);
+					.prepare(
+						`DELETE FROM knowledge_cluster_member
+               WHERE cluster_id = ?
+                 AND entry_id NOT IN (SELECT value FROM json_each(?))`,
+					)
+					.run(cluster.id, JSON.stringify(cluster.memberIds));
 
 				for (const entryId of cluster.memberIds) {
 					this.db

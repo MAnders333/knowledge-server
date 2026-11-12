@@ -1359,6 +1359,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			lastMembershipChangedAt: number;
 			createdAt: number;
 			memberIds: string[];
+			memberJoinedAt: Map<string, number>;
 		}>
 	> {
 		const clusterRows = await this.sql`
@@ -1369,16 +1370,22 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 
 		const clusterIds = clusterRows.map((r) => r.id as string);
 		const memberRows = await this.sql`
-			SELECT cluster_id, entry_id FROM knowledge_cluster_member
+			SELECT cluster_id, entry_id, joined_at FROM knowledge_cluster_member
 			WHERE cluster_id = ANY(${clusterIds}::text[])
 		`;
 
 		const membersByCluster = new Map<string, string[]>();
+		const joinedByCluster = new Map<string, Map<string, number>>();
 		for (const m of memberRows) {
 			const cid = m.cluster_id as string;
 			const arr = membersByCluster.get(cid);
 			if (arr) arr.push(m.entry_id as string);
 			else membersByCluster.set(cid, [m.entry_id as string]);
+			const joined = joinedByCluster.get(cid);
+			const joinedAt = toNum(m.joined_at as number | string);
+			if (joined) joined.set(m.entry_id as string, joinedAt);
+			else
+				joinedByCluster.set(cid, new Map([[m.entry_id as string, joinedAt]]));
 		}
 
 		return clusterRows.map((r) => ({
@@ -1394,6 +1401,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			),
 			createdAt: toNum(r.created_at as number | string),
 			memberIds: membersByCluster.get(r.id as string) ?? [],
+			memberJoinedAt: joinedByCluster.get(r.id as string) ?? new Map(),
 		}));
 	}
 
@@ -1415,6 +1423,10 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			newClusterIds.size > 0
 				? this.sql.array([...newClusterIds]) // postgres.js infers text (OID 25) for string[]
 				: null;
+		// Member-id arrays are built outside the transaction for the same reason.
+		const memberArrays = new Map(
+			clusters.map((c) => [c.id, this.sql.array(c.memberIds, 25)]),
+		);
 
 		await this.sql.begin(async (sql: TxSql) => {
 			// Remove stale clusters in a single DELETE rather than N round-trips.
@@ -1453,8 +1465,13 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 					`;
 				}
 
-				// Replace membership
-				await sql`DELETE FROM knowledge_cluster_member WHERE cluster_id = ${cluster.id}`;
+				// Sync membership: drop members that left; members that stayed keep their
+				// joined_at (ON CONFLICT DO NOTHING below), new members get joined_at = now.
+				await sql`
+					DELETE FROM knowledge_cluster_member
+					WHERE cluster_id = ${cluster.id}
+					  AND NOT (entry_id = ANY(${memberArrays.get(cluster.id) ?? this.sql.array([], 25)}))
+				`;
 				for (const entryId of cluster.memberIds) {
 					await sql`
 						INSERT INTO knowledge_cluster_member (cluster_id, entry_id, joined_at)

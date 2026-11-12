@@ -659,6 +659,55 @@ describe("KnowledgeDB — cluster CRUD", () => {
 		expect(after.centroid[0]).toBeCloseTo(0.6); // centroid updated
 	});
 
+	it("persistClusters keeps joined_at for members that stay and stamps new members", async () => {
+		const centroid = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+		await insertEntry("e1", centroid);
+		await insertEntry("e2", centroid);
+
+		await db.persistClusters([
+			{
+				id: "c1",
+				centroid,
+				memberIds: ["e1"],
+				isNew: true,
+				membershipChanged: true,
+			},
+		]);
+		const first = (await db.getClustersWithMembers())[0].memberJoinedAt.get(
+			"e1",
+		);
+		expect(first).toBeNumber();
+
+		await Bun.sleep(10);
+		await db.persistClusters([
+			{
+				id: "c1",
+				centroid,
+				memberIds: ["e1", "e2"],
+				isNew: false,
+				membershipChanged: true,
+			},
+		]);
+		const joined = (await db.getClustersWithMembers())[0].memberJoinedAt;
+		expect(joined.get("e1")).toBe(first as number);
+		expect(joined.get("e2") as number).toBeGreaterThan(first as number);
+
+		// Members that left are removed; the remaining member keeps its timestamp.
+		await db.persistClusters([
+			{
+				id: "c1",
+				centroid,
+				memberIds: ["e2"],
+				isNew: false,
+				membershipChanged: true,
+			},
+		]);
+		const after = (await db.getClustersWithMembers())[0];
+		expect(after.memberIds).toEqual(["e2"]);
+		expect(after.memberJoinedAt.has("e1")).toBe(false);
+		expect(after.memberJoinedAt.get("e2")).toBe(joined.get("e2") as number);
+	});
+
 	it("persistClusters deletes stale clusters not in the new set", async () => {
 		const centroid = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 		await insertEntry("e1", centroid);
