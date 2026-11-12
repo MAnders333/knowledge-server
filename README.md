@@ -569,7 +569,7 @@ You work across multiple machines and want a single knowledge base that spans al
 
 ## Security
 
-**Admin token** — Mutation endpoints require an admin token. A random token is generated at startup and printed to stdout. Set `KNOWLEDGE_ADMIN_TOKEN` in `.env` (≥16 chars) for a stable token across restarts.
+**Admin token** — Mutation endpoints require an admin token. A random token is generated at startup. It is printed only when the server's stdout is a terminal; under launchd, systemd or redirected output it is not printed and never written to `server.log`. For service or scripted use, set `KNOWLEDGE_ADMIN_TOKEN` in `.env` (≥16 chars) for a stable token across restarts.
 
 **Localhost only** — The server binds to `127.0.0.1` by default and refuses to start if `KNOWLEDGE_HOST` is set to a non-loopback address. No TLS — not designed for network exposure.
 
