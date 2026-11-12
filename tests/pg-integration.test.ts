@@ -1494,6 +1494,52 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		);
 	});
 
+	it("interrupted re-embed keeps the old metadata, leaves ANN off, and resumes on the next run", async () => {
+		const pg = db as PostgresKnowledgeDB;
+		const OLD = unitVec(4, 0);
+		const NEW = unitVec(6, 3);
+		await pg.setEmbeddingMetadata("old-model", OLD.length);
+		for (let i = 0; i < 150; i++) {
+			await pg.insertEntry(
+				makeEntry(`resume-${String(i).padStart(3, "0")}`, { embedding: OLD }),
+			);
+		}
+
+		const savedModel = config.embedding.model;
+		config.embedding.model = "new-model";
+		try {
+			const activation = new ActivationEngine(pg);
+			let calls = 0;
+			const spy = spyOn(activation.embeddings, "embedBatch").mockImplementation(
+				async (texts: string[]) => {
+					calls++;
+					if (calls === 2) throw new Error("rate limit exceeded");
+					return texts.map(() => NEW);
+				},
+			);
+
+			await expect(activation.checkAndReEmbed()).rejects.toThrow(
+				"rate limit exceeded",
+			);
+			expect((await pg.getEmbeddingMetadata())?.model).toBe("old-model");
+			expect(await pg.isVectorSearchReady()).toBe(false);
+
+			spy.mockImplementation(async (texts: string[]) => texts.map(() => NEW));
+			expect(await activation.checkAndReEmbed()).toBe(true);
+		} finally {
+			config.embedding.model = savedModel;
+		}
+
+		expect((await pg.getEmbeddingMetadata())?.model).toBe("new-model");
+		expect(await pg.isVectorSearchReady()).toBe(true);
+		const stale = await truncSql`
+			SELECT COUNT(*)::int AS n FROM knowledge_entry
+			WHERE embedding_vec IS NULL OR octet_length(embedding) <> ${NEW.length * 4}
+		`;
+		expect(Number((stale[0] as { n: number }).n)).toBe(0);
+		expect((await pg.findSimilarEntries(NEW, 500, 0.5)).length).toBe(150);
+	});
+
 	it("reinitialize followed by a new dimension restores ANN without restart (H2)", async () => {
 		const pg = db as PostgresKnowledgeDB;
 		await pg.setEmbeddingMetadata("text-embedding-3-large", 3072);
