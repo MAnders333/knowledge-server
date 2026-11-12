@@ -10,6 +10,11 @@
  * entries of KNOWLEDGE_ALLOWED_HOSTS. An entry without a port matches any port
  * (so reverse proxies on default ports work); an entry with `:port` matches
  * only that port.
+ *
+ * Loopback names also match on any port, not only the listening one, by design:
+ * a container or port forward that maps this server to another host port sends
+ * that host-side port in Host. The rebinding defence does not depend on the port:
+ * the name must still be a loopback name. Origin is checked against the same list.
  */
 
 export interface HostAllowlist {

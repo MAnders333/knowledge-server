@@ -38,7 +38,6 @@ const TOKEN = "stable-admin-token-0123456789";
  * `keepalive: false` gives each oversized request its own socket.
  */
 const OVERSIZED_REQUEST = { keepalive: false } as RequestInit;
-
 const MCP_HEADERS = {
 	"Content-Type": "application/json",
 	Accept: "application/json, text/event-stream",
@@ -273,6 +272,77 @@ describe("HTTP API boundary", () => {
 			});
 			expect(res.status).toBe(403);
 		});
+	});
+
+	describe("Fetch metadata", () => {
+		it("refuses a cross-site or same-site request, which a no-cors GET can send without Origin", async () => {
+			for (const site of ["cross-site", "same-site"]) {
+				const res = await fetch(`${base}/status`, {
+					headers: { "Sec-Fetch-Site": site },
+				});
+				expect({ site, status: res.status }).toEqual({ site, status: 403 });
+			}
+		});
+
+		it("allows same-origin, user-initiated (none) and absent Sec-Fetch-Site", async () => {
+			for (const site of ["same-origin", "none"]) {
+				const res = await fetch(`${base}/status`, {
+					headers: { "Sec-Fetch-Site": site },
+				});
+				expect({ site, status: res.status }).toEqual({ site, status: 200 });
+			}
+			expect((await fetch(`${base}/status`)).status).toBe(200);
+		});
+	});
+
+	describe("admin routes with non-object JSON bodies", () => {
+		const adminHeaders = {
+			"Content-Type": "application/json",
+			Authorization: `Bearer ${TOKEN}`,
+		};
+
+		for (const body of ["null", '"text"', "[1,2]", "42"]) {
+			it(`answers ${body} with 400 on PATCH, flag and resolve`, async () => {
+				await db.insertEntry(entryFixture("json-active", "active entry"));
+				await db.insertEntry({
+					...entryFixture("json-conflicted", "conflicted entry"),
+					status: "conflicted",
+				});
+
+				const patch = await fetch(`${base}/entries/json-active`, {
+					method: "PATCH",
+					headers: adminHeaders,
+					body,
+				});
+				expect({ body, route: "PATCH", status: patch.status }).toEqual({
+					body,
+					route: "PATCH",
+					status: 400,
+				});
+
+				const flag = await fetch(`${base}/entries/json-active/flag`, {
+					method: "POST",
+					headers: adminHeaders,
+					body,
+				});
+				expect({ body, route: "flag", status: flag.status }).toEqual({
+					body,
+					route: "flag",
+					status: 400,
+				});
+
+				const resolve = await fetch(`${base}/entries/json-conflicted/resolve`, {
+					method: "POST",
+					headers: adminHeaders,
+					body,
+				});
+				expect({ body, route: "resolve", status: resolve.status }).toEqual({
+					body,
+					route: "resolve",
+					status: 400,
+				});
+			});
+		}
 	});
 
 	describe("KNOWLEDGE_ALLOWED_HOSTS entries", () => {
