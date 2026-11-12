@@ -131,10 +131,10 @@ export const DEFAULT_CONTRADICTION_MIN_SIMILARITY = 0.4;
 export const DEFAULT_CONTRADICTION_MAX_CANDIDATES = Number.POSITIVE_INFINITY;
 /** Minimum raw cosine similarity to activate an entry. */
 export const DEFAULT_ACTIVATION_SIMILARITY_THRESHOLD = 0.42;
-/** Precision gate defaults, calibrated on replay (see gate.ts and the PR evaluation). */
-export const DEFAULT_RERANK_REL_FRAC = 0.5;
-export const DEFAULT_DENSE_MARGIN = 0.03;
-export const DEFAULT_TOKEN_BUDGET = 1500;
+// Precision gate defaults. Conservative and NOT replay-calibrated (see gate.ts).
+export const DEFAULT_RERANK_REL_FRAC = 0.35;
+export const DEFAULT_DENSE_MARGIN = 0;
+export const DEFAULT_TOKEN_BUDGET = 2000;
 /**
  * Cosine similarity threshold for assigning an entry to an existing cluster
  * during greedy clustering. Below this threshold a new cluster is started.

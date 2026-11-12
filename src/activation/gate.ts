@@ -20,15 +20,11 @@
 import type { RerankIdentity } from "./rerank.js";
 
 /**
- * Absolute rerank-score floor per scorer, keyed by `${provider}/${model}`.
- * Calibrated on the owner's replay (see the evaluation in the PR notes). A
- * scorer without an entry uses the relative rule only, unless RERANK_FLOOR sets
- * one. A sigmoid floor does not carry across models, so each model needs its
- * own calibration.
+ * Absolute rerank-score floor per scorer, keyed by `${provider}/${model}`. Empty:
+ * no model has a calibrated floor yet, so the relative rule applies alone unless
+ * RERANK_FLOOR sets one. Add an entry only after a replay on that model.
  */
-export const RERANK_ABS_FLOOR_BY_MODEL: Readonly<Record<string, number>> = {
-	"local/Xenova/ms-marco-MiniLM-L-6-v2": 0.1,
-};
+export const RERANK_ABS_FLOOR_BY_MODEL: Readonly<Record<string, number>> = {};
 
 /** Scorer identity as a table key. */
 export function scorerKey(identity: RerankIdentity): string {

@@ -39,8 +39,7 @@ afterEach(() => {
 	Object.assign(gate, saved);
 });
 
-const UNKNOWN_MODEL = { provider: "local" as const, model: "some/other-model" };
-const KNOWN_MODEL = {
+const UNKNOWN_MODEL = {
 	provider: "local" as const,
 	model: "Xenova/ms-marco-MiniLM-L-6-v2",
 };
@@ -134,22 +133,20 @@ describe("gate arithmetic", () => {
 	it("uses the larger of the absolute floor and the relative fraction", () => {
 		expect(
 			rerankFloor({
-				identity: KNOWN_MODEL,
-				floorOverride: null,
-				relFrac: 0.5,
-				topScore: 0.9,
-			}),
-		).toBe(
-			Math.max(RERANK_ABS_FLOOR_BY_MODEL[`local/${KNOWN_MODEL.model}`], 0.45),
-		);
-		expect(
-			rerankFloor({
-				identity: KNOWN_MODEL,
+				identity: UNKNOWN_MODEL,
 				floorOverride: 0.6,
 				relFrac: 0.5,
 				topScore: 0.9,
 			}),
 		).toBe(0.6);
+		expect(
+			rerankFloor({
+				identity: UNKNOWN_MODEL,
+				floorOverride: 0.1,
+				relFrac: 0.5,
+				topScore: 0.9,
+			}),
+		).toBe(0.45);
 	});
 
 	it("uses only the relative rule for a model without an absolute floor", () => {
@@ -220,10 +217,11 @@ describe("precision gate in the engine", () => {
 		expect(result.telemetry?.gateDropped).toBe(2);
 	});
 
-	it("applies the absolute floor for a known model, even to the top entry", async () => {
+	it("applies the RERANK_FLOOR absolute floor, even to the top entry", async () => {
+		gate.rerankFloor = 0.1;
 		const engine = engineFor(
 			fx,
-			rerankerWith(KNOWN_MODEL, {
+			rerankerWith(UNKNOWN_MODEL, {
 				"alpha knowledge": 0.05,
 				"beta knowledge": 0.04,
 				"gamma knowledge": 0.03,
@@ -271,7 +269,7 @@ describe("precision gate in the engine", () => {
 		gate.enabled = false;
 		const engine = engineFor(
 			fx,
-			rerankerWith(KNOWN_MODEL, {
+			rerankerWith(UNKNOWN_MODEL, {
 				"alpha knowledge": 0.05,
 				"beta knowledge": 0.04,
 				"gamma knowledge": 0.03,
