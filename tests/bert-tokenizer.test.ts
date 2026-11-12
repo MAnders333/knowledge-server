@@ -121,6 +121,34 @@ describe("BertWordPieceTokenizer (synthetic vocab)", () => {
 	});
 });
 
+describe("BertWordPieceTokenizer truncation and id-level pairs", () => {
+	it("C3: an overlong query leaves the document its share of the budget", () => {
+		const tok = makeTokenizer();
+		const { ids } = tok.encodePair("hello ".repeat(600), "world", 512);
+		expect(ids.length).toBeLessThanOrEqual(512);
+		expect(ids.slice(-2)).toEqual([11, 3]); // "world" and the final [SEP] survive
+	});
+
+	it("encodeTail keeps the last tokens and drops a leading continuation piece", () => {
+		const tok = makeTokenizer();
+		expect(tok.encodeTail("hello world hello world", 2)).toEqual([10, 11]);
+		// "unaffable" = un ##aff ##able; the cut lands on ##able, which is dropped
+		expect(tok.encodeTail("unaffable hello", 2)).toEqual([10]);
+	});
+
+	it("encodeHead keeps the first tokens", () => {
+		const tok = makeTokenizer();
+		expect(tok.encodeHead("hello world", 1)).toEqual([10]);
+		expect(tok.encodeHead("hello", 5)).toEqual([10]);
+	});
+
+	it("batchFromIds pads id-level pairs like batchEncodePairs", () => {
+		const tok = makeTokenizer();
+		const enc = tok.batchFromIds([[10]], [[11, 11]]);
+		expect(enc.dims).toEqual([1, 6]); // [CLS] hello [SEP] world world [SEP]
+	});
+});
+
 // ── Parity with the reference implementation (skipped without local model) ───
 
 const MODEL_DIR = join(
