@@ -5,8 +5,10 @@
  * Validation is lenient per item: an item that fails its schema is dropped with
  * a warning and its siblings are kept. Values are normalised rather than
  * rejected where a safe default exists (confidence is clamped to [0, 1], topics
- * are filtered to short strings). A response that is not a JSON array at all is
- * malformed and throws MalformedLlmOutputError. That is a SyntaxError, so the
+ * are filtered to short strings). A response with the wrong top-level shape (not
+ * a JSON array, or for contradiction not the {checked, conflicts} object, or a
+ * `checked` count that differs from the batch size) is malformed and throws
+ * MalformedLlmOutputError. That is a SyntaxError, so the
  * chunk-level error classifier treats it as a deterministic failure.
  */
 import { z } from "zod";
@@ -21,10 +23,10 @@ export const MAX_TOPICS = 10;
 /** Longest single topic kept. Longer topics are dropped, not truncated. */
 export const MAX_TOPIC_CHARS = 100;
 
-/** Thrown when a model response is not the JSON array we asked for. */
+/** Thrown when a model response does not have the shape we asked for. */
 export class MalformedLlmOutputError extends SyntaxError {
-	constructor(label: string) {
-		super(`[llm] ${label}: response is not a JSON array`);
+	constructor(label: string, detail = "response is not a JSON array") {
+		super(`[llm] ${label}: ${detail}`);
 		this.name = "MalformedLlmOutputError";
 	}
 }
@@ -146,25 +148,119 @@ export const synthesisItemSchema = z.object({
 	),
 });
 
-// ── Contradiction ────────────────────────────────────────────────────────────
+// ── Contradiction (one batch per call, conflicts only) ───────────────────────
 
-export const contradictionItemSchema = z.object({
-	candidateId: z.string().min(1),
-	resolution: z.enum([
-		"no_conflict",
-		"supersede_old",
-		"supersede_new",
-		"merge",
-		"irresolvable",
-	]),
-	reason: z.preprocess(
-		(v) => (typeof v === "string" ? scrubUntrusted(v).trim() : ""),
-		z.string(),
-	),
-	// Merge fields are only needed for "merge". A malformed value there must not
-	// invalidate a supersede or irresolvable verdict, so each one falls back to undefined.
-	mergedContent: storedText.optional().catch(undefined),
-	mergedType: knowledgeType.optional().catch(undefined),
-	mergedTopics: topicsField,
-	mergedConfidence: confidenceOr(0.7),
+export const CONTRADICTION_TYPES = [
+	"supersede_old",
+	"supersede_new",
+	"merge",
+	"irresolvable",
+] as const;
+
+export type ContradictionType = (typeof CONTRADICTION_TYPES)[number];
+
+/** One validated conflict from a contradiction reply. `index` is 1-based. */
+export interface ContradictionConflict {
+	index: number;
+	resolution: ContradictionType;
+	reason: string;
+	mergedContent?: string;
+	mergedType?: string;
+	mergedTopics: string[];
+	mergedConfidence: number;
+}
+
+/**
+ * Candidate reference: the 1-based number shown in the prompt. Cheap models
+ * sometimes write "[3]" or "3" as a string, so both forms are accepted.
+ */
+const candidateNumber = z.preprocess((v) => {
+	if (typeof v === "string") {
+		const m = /^\s*\[?\s*(\d+)\s*\]?\s*$/.exec(v);
+		return m ? Number(m[1]) : v;
+	}
+	return toNumber(v) ?? v;
+}, z.number().int());
+
+/** Items are checked against the batch size so an out-of-range index is dropped. */
+const contradictionConflictSchema = (batchSize: number) =>
+	z.preprocess(
+		// Accept `resolution` as an alias of `type`.
+		(raw) =>
+			raw && typeof raw === "object" && !("type" in raw) && "resolution" in raw
+				? { ...raw, type: (raw as { resolution: unknown }).resolution }
+				: raw,
+		z.object({
+			candidate: candidateNumber.pipe(z.number().min(1).max(batchSize)),
+			type: z.enum(CONTRADICTION_TYPES),
+			reason: z.preprocess(
+				(v) => (typeof v === "string" ? scrubUntrusted(v).trim() : ""),
+				z.string(),
+			),
+			// Merge fields are only needed for "merge". A malformed value there must not
+			// invalidate a supersede or irresolvable verdict, so each one falls back to undefined.
+			mergedContent: storedText.optional().catch(undefined),
+			mergedType: knowledgeType.optional().catch(undefined),
+			mergedTopics: topicsField,
+			mergedConfidence: confidenceOr(0.7),
+		}),
+	);
+
+/** The reply is a wrapper object so a truncated or confused reply cannot pass as "no conflicts". */
+const contradictionReplySchema = z.object({
+	checked: z.preprocess(toNumber, z.number().int()),
+	conflicts: z.array(z.unknown()),
 });
+
+/**
+ * Validate a contradiction reply for a batch of `batchSize` candidates.
+ *
+ * Throws MalformedLlmOutputError when the reply is not the wrapper object, or
+ * when `checked` is not exactly `batchSize` (the model did not review the whole
+ * batch). Individual conflicts are validated leniently: an item with an invalid
+ * candidate number, an unknown type, or an extra duplicate is dropped.
+ */
+export function parseContradictionReply(
+	raw: unknown,
+	batchSize: number,
+): ContradictionConflict[] {
+	const wrapper = contradictionReplySchema.safeParse(raw);
+	if (!wrapper.success) {
+		throw new MalformedLlmOutputError(
+			"contradiction",
+			"reply is not {checked, conflicts}",
+		);
+	}
+	if (wrapper.data.checked !== batchSize) {
+		throw new MalformedLlmOutputError(
+			"contradiction",
+			`checked ${wrapper.data.checked} of ${batchSize} candidates`,
+		);
+	}
+
+	const seen = new Set<number>();
+	const out: ContradictionConflict[] = [];
+	for (const item of parseItems(
+		wrapper.data.conflicts,
+		contradictionConflictSchema(batchSize),
+		"contradiction",
+	)) {
+		if (seen.has(item.candidate)) {
+			logger.warn(
+				`[llm] contradiction: duplicate conflict for candidate ${item.candidate} — kept the first`,
+			);
+			continue;
+		}
+		seen.add(item.candidate);
+		out.push({
+			index: item.candidate,
+			resolution: item.type,
+			reason: item.reason,
+			mergedContent: item.mergedContent,
+			mergedType: item.mergedType,
+			mergedTopics: item.mergedTopics,
+			mergedConfidence: item.mergedConfidence,
+		});
+	}
+	return out;
+}

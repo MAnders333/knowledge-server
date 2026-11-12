@@ -162,7 +162,7 @@ describe("prompt boundaries", () => {
 	});
 
 	it("topics with newlines are JSON-encoded inside their tag", async () => {
-		respond("[]");
+		respond('{"checked":1,"conflicts":[]}');
 		await new ConsolidationLLM().detectAndResolveContradiction(
 			{ id: "new", ...extracted, createdAt: 0 },
 			[
@@ -350,36 +350,39 @@ describe("output validation: contradiction", () => {
 			confidence: 0.9,
 			createdAt: 0,
 		},
+		{
+			id: "old-2",
+			content: "b",
+			type: "fact",
+			topics: [],
+			confidence: 0.9,
+			createdAt: 0,
+		},
 	];
 
-	it("clamps mergedConfidence and drops merges without usable content", async () => {
+	it("clamps mergedConfidence, drops merges without usable content, keeps verdicts that are valid", async () => {
 		respond(
-			JSON.stringify([
-				{
-					candidateId: "old-1",
-					resolution: "merge",
-					reason: "r",
-					mergedContent: "Port is 9090.",
-					mergedType: "fact",
-					mergedTopics: ["server"],
-					mergedConfidence: 85,
-				},
-				{
-					candidateId: "old-2",
-					resolution: "merge",
-					reason: "r",
-					mergedContent: "",
-					mergedType: "fact",
-				},
-				{
-					candidateId: "old-3",
-					resolution: "supersede_old",
-					reason: "r",
-					mergedType: 42,
-				},
-				{ candidateId: "old-4", resolution: "bogus", reason: "r" },
-				{ candidateId: "old-5", resolution: "no_conflict", reason: "r" },
-			]),
+			JSON.stringify({
+				checked: 2,
+				conflicts: [
+					{
+						candidate: 1,
+						type: "merge",
+						reason: "r",
+						mergedContent: "Port is 9090.",
+						mergedType: "fact",
+						mergedTopics: ["server"],
+						mergedConfidence: 85,
+					},
+					{
+						candidate: 2,
+						type: "merge",
+						reason: "r",
+						mergedContent: "",
+						mergedType: "fact",
+					},
+				],
+			}),
 		);
 		const results = await new ConsolidationLLM().detectAndResolveContradiction(
 			newEntry,
@@ -387,10 +390,18 @@ describe("output validation: contradiction", () => {
 		);
 		expect(results.map((r) => [r.candidateId, r.resolution])).toEqual([
 			["old-1", "merge"],
-			["old-3", "supersede_old"],
 		]);
 		expect(results[0].mergedConfidence).toBe(1);
-		expect(results[1].mergedType).toBeUndefined();
+	});
+
+	it("rejects a reply whose checked count is not the batch size", async () => {
+		respond(JSON.stringify({ checked: 1, conflicts: [] }));
+		await expect(
+			new ConsolidationLLM().detectAndResolveContradiction(
+				newEntry,
+				candidates,
+			),
+		).rejects.toBeInstanceOf(SyntaxError);
 	});
 });
 

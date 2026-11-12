@@ -363,20 +363,14 @@ describe("ConsolidationLLM.detectAndResolveContradiction", () => {
 		expect(spy).not.toHaveBeenCalled();
 	});
 
-	it("filters out no_conflict results", async () => {
+	it("maps candidate numbers to ids and returns only the listed conflicts", async () => {
 		mockGenerateText(
-			JSON.stringify([
-				{
-					candidateId: "old-1",
-					resolution: "supersede_old",
-					reason: "newer port",
-				},
-				{
-					candidateId: "old-2",
-					resolution: "no_conflict",
-					reason: "different aspect",
-				},
-			]),
+			JSON.stringify({
+				checked: 2,
+				conflicts: [
+					{ candidate: 1, type: "supersede_old", reason: "newer port" },
+				],
+			}),
 		);
 		const result = await llm.detectAndResolveContradiction(
 			newEntry,
@@ -387,6 +381,24 @@ describe("ConsolidationLLM.detectAndResolveContradiction", () => {
 		expect(result[0].resolution).toBe("supersede_old");
 	});
 
+	it("accepts a bracketed string index and a resolution alias", async () => {
+		mockGenerateText(
+			JSON.stringify({
+				checked: 2,
+				conflicts: [
+					{ candidate: "[2]", resolution: "irresolvable", reason: "tie" },
+				],
+			}),
+		);
+		const result = await llm.detectAndResolveContradiction(
+			newEntry,
+			candidates,
+		);
+		expect(result.map((r) => [r.candidateId, r.resolution])).toEqual([
+			["old-2", "irresolvable"],
+		]);
+	});
+
 	it("throws a SyntaxError when the response is unparseable", async () => {
 		mockGenerateText("Sorry, cannot process this.");
 		await expect(
@@ -394,19 +406,43 @@ describe("ConsolidationLLM.detectAndResolveContradiction", () => {
 		).rejects.toBeInstanceOf(SyntaxError);
 	});
 
-	it("includes merge fields when resolution is 'merge'", async () => {
+	it("throws when the reply is a bare array (old format)", async () => {
 		mockGenerateText(
-			JSON.stringify([
-				{
-					candidateId: "old-1",
-					resolution: "merge",
-					reason: "both partially correct",
-					mergedContent: "Port was 8080, changed to 9090.",
-					mergedType: "fact",
-					mergedTopics: ["server"],
-					mergedConfidence: 0.88,
-				},
-			]),
+			JSON.stringify([{ candidateId: "old-1", resolution: "supersede_old" }]),
+		);
+		await expect(
+			llm.detectAndResolveContradiction(newEntry, candidates),
+		).rejects.toBeInstanceOf(SyntaxError);
+	});
+
+	it("throws when checked does not match the batch size", async () => {
+		mockGenerateText(
+			JSON.stringify({
+				checked: 1,
+				conflicts: [{ candidate: 1, type: "supersede_old", reason: "x" }],
+			}),
+		);
+		await expect(
+			llm.detectAndResolveContradiction(newEntry, candidates),
+		).rejects.toBeInstanceOf(SyntaxError);
+	});
+
+	it("includes merge fields when type is 'merge'", async () => {
+		mockGenerateText(
+			JSON.stringify({
+				checked: 2,
+				conflicts: [
+					{
+						candidate: 1,
+						type: "merge",
+						reason: "both partially correct",
+						mergedContent: "Port was 8080, changed to 9090.",
+						mergedType: "fact",
+						mergedTopics: ["server"],
+						mergedConfidence: 0.88,
+					},
+				],
+			}),
 		);
 		const result = await llm.detectAndResolveContradiction(
 			newEntry,
@@ -417,34 +453,13 @@ describe("ConsolidationLLM.detectAndResolveContradiction", () => {
 		expect(result[0].mergedContent).toContain("9090");
 	});
 
-	it("handles irresolvable resolution", async () => {
+	it("rejects a truncated wrapper rather than salvaging part of it", async () => {
 		mockGenerateText(
-			JSON.stringify([
-				{
-					candidateId: "old-1",
-					resolution: "irresolvable",
-					reason: "equal evidence both ways",
-				},
-			]),
+			`{"checked": 2, "conflicts": [{"candidate": 1, "type": "supersede_old", "reason": "newer"}, {"candidate": 2, "type": "no_con`,
 		);
-		const result = await llm.detectAndResolveContradiction(
-			newEntry,
-			candidates,
-		);
-		expect(result.length).toBe(1);
-		expect(result[0].resolution).toBe("irresolvable");
-	});
-
-	it("uses partial-array recovery when response is truncated", async () => {
-		// One complete object, second truncated
-		const partial = `[{"candidateId":"old-1","resolution":"supersede_old","reason":"newer"},{"candidateId":"old-2","resolution":"no_con`;
-		mockGenerateText(partial);
-		const result = await llm.detectAndResolveContradiction(
-			newEntry,
-			candidates,
-		);
-		// Should recover old-1 (supersede_old is not no_conflict so it passes the filter)
-		expect(result.some((r) => r.candidateId === "old-1")).toBe(true);
+		await expect(
+			llm.detectAndResolveContradiction(newEntry, candidates),
+		).rejects.toBeInstanceOf(SyntaxError);
 	});
 });
 
