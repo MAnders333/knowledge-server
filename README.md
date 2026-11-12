@@ -362,6 +362,8 @@ Provider-specific credentials take precedence over the unified endpoint.
 | `EMBEDDING_DIMENSIONS` | *(model default)* | Truncated output dimensions (only valid for `text-embedding-3-*`) |
 | `EMBEDDING_BASE_URL` | *(see below)* | Dedicated embedding endpoint. Priority: `EMBEDDING_BASE_URL` → `OPENAI_BASE_URL` → `LLM_BASE_ENDPOINT/openai/v1` |
 | `EMBEDDING_API_KEY` | *(see below)* | Falls back to `OPENAI_API_KEY` then `LLM_API_KEY` |
+| `EMBEDDING_TIMEOUT_MS` | `20000` | Per-request embedding timeout in ms. Background re-embed and backfill use at least `60000` |
+| `EMBEDDING_MAX_RETRIES` | `2` | Retries per 100-text chunk on transient errors (timeouts, network errors, HTTP 408/429/5xx, truncated or malformed responses) during background re-embed and backfill. Interactive activation does not retry |
 
 For local embeddings via Ollama:
 ```bash

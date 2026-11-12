@@ -30,7 +30,9 @@ function serialize(a: unknown): string {
 	if (typeof a === "string") return a;
 	if (a instanceof Error) {
 		// a.stack already includes "Error: <message>" in most runtimes — don't double it.
-		return a.stack ?? a.message;
+		// Fetch-thrown DOMExceptions (e.g. AbortSignal.timeout's TimeoutError) have
+		// stack === "" in Bun, which previously rendered as nothing.
+		return a.stack || `${a.name}: ${a.message}`;
 	}
 	try {
 		return JSON.stringify(a, null, 2);
