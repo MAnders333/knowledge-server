@@ -7,3 +7,9 @@ dist/
 .env
 .env.local
 *_seed.sql
+.env.*
+!.env.template
+config.jsonc
+*.log
+*.pem
+*.key
