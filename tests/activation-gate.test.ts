@@ -351,7 +351,7 @@ describe("precision gate in the engine", () => {
 			},
 			failingReranker(),
 		);
-		const result = await engine.activate(CUE);
+		const result = await engine.activate(CUE, { threshold: 0.42 });
 		// Dense floor = 0.42 + 0.1 = 0.52: gamma (0.5) is dropped, the rest stay.
 		expect(result.telemetry?.gateMode).toBe("dense");
 		expect(ids(result)).toEqual(["alpha-entry", "beta-entry"]);
