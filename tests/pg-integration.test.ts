@@ -1397,7 +1397,7 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		}
 
 		for (const status of statuses) {
-			const entry = await pg.getEntry(status);
+			const entry = await pg.getEntryWithEmbedding(status);
 			if (status === "tombstoned") {
 				expect(entry?.embedding).toBeUndefined();
 			} else {
@@ -1605,7 +1605,9 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 			config.embedding.model = savedModel;
 		}
 
-		expect((await pg.getEntry("revive-me"))?.embedding).toEqual(NEW);
+		expect((await pg.getEntryWithEmbedding("revive-me"))?.embedding).toEqual(
+			NEW,
+		);
 		const hits = await pg.findSimilarEntries(NEW, 5, 0.5);
 		expect(hits.map((h) => h.entry.id)).toEqual(["revive-me"]);
 	});
@@ -1667,8 +1669,10 @@ describe.skipIf(!PG_URI)("PostgreSQL migrations v16/v17", () => {
 
 	it("a failing optional ANN index build does not abort the migration transaction", async () => {
 		await rewindToV15();
-		// Make the halfvec index build fail: an integer column has no cast to halfvec.
-		await admin`ALTER TABLE knowledge_entry ADD COLUMN embedding_vec integer`;
+		// Make the optional ANN DDL fail: DROP INDEX IF EXISTS errors on a relation
+		// that is not an index. The column is recreated by the dimension check, so an
+		// integer column no longer reaches the index build.
+		await admin`CREATE VIEW idx_entry_embedding_vec_hnsw AS SELECT 1 AS x`;
 
 		const store = new PostgresKnowledgeDB(uri);
 		try {
@@ -1677,6 +1681,7 @@ describe.skipIf(!PG_URI)("PostgreSQL migrations v16/v17", () => {
 			expect(store.isVectorSearchReady()).toBe(false);
 		} finally {
 			await store.close();
+			await admin`DROP VIEW IF EXISTS idx_entry_embedding_vec_hnsw`;
 		}
 		expect(await storeVersion()).toBe(SCHEMA_VERSION);
 	});

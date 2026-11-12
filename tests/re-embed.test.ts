@@ -386,7 +386,7 @@ describe("checkAndReEmbed", () => {
 		expect(texts.length).toBe(4);
 
 		for (const status of statuses) {
-			const entry = await db.getEntry(status);
+			const entry = await db.getEntryWithEmbedding(status);
 			if (status === "tombstoned") {
 				// Tombstoned vectors are cleared, not re-embedded.
 				expect(entry?.embedding).toBeUndefined();
@@ -423,7 +423,9 @@ describe("checkAndReEmbed", () => {
 			embedBatchSpy.mock.calls.map((c) => (c[0] as string[]).length),
 		).toEqual([100, 100, 50]);
 		for (let i = 0; i < 250; i++) {
-			const e = await db.getEntry(`b${String(i).padStart(3, "0")}`);
+			const e = await db.getEntryWithEmbedding(
+				`b${String(i).padStart(3, "0")}`,
+			);
 			expect(e?.embedding).toEqual(NEW);
 		}
 	});
@@ -460,7 +462,9 @@ describe("checkAndReEmbed", () => {
 		expect(await activation.checkAndReEmbed()).toBe(true);
 		expect((await db.getEmbeddingMetadata())?.model).toBe("new-model");
 		for (let i = 0; i < 150; i++) {
-			const e = await db.getEntry(`r${String(i).padStart(3, "0")}`);
+			const e = await db.getEntryWithEmbedding(
+				`r${String(i).padStart(3, "0")}`,
+			);
 			expect(e?.embedding).toEqual(NEW);
 		}
 	});

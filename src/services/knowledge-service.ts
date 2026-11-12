@@ -70,7 +70,7 @@ export class KnowledgeService {
 		}
 
 		// Fetch the current entry to fill in whichever semantic field isn't changing.
-		const current = await this.db.getEntry(id);
+		const current = await this.db.getEntryWithEmbedding(id);
 		if (!current) {
 			throw new Error(`KnowledgeService.updateEntry: entry not found: ${id}`);
 		}

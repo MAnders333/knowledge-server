@@ -185,7 +185,11 @@ export interface IKnowledgeStore {
 	 */
 	updateEntry(id: string, updates: Partial<KnowledgeEntry>): Promise<void>;
 
+	/** Plain entry without its vector; use getEntryWithEmbedding when the vector is needed. */
 	getEntry(id: string): Promise<KnowledgeEntry | null>;
+
+	/** Entry including its stored vector, or `embedding` undefined when none is stored. */
+	getEntryWithEmbedding(id: string): Promise<KnowledgeEntry | null>;
 
 	getActiveEntries(): Promise<KnowledgeEntry[]>;
 

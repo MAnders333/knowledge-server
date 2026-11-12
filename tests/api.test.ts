@@ -871,7 +871,7 @@ describe("HTTP API", () => {
 		});
 		expect(res.status).toBe(200);
 		expect(embedSpy).toHaveBeenCalledTimes(1);
-		const revived = await db.getEntry("patch-stale");
+		const revived = await db.getEntryWithEmbedding("patch-stale");
 		expect(revived?.status).toBe("active");
 		expect(revived?.embedding?.[0]).toBeCloseTo(0.11);
 		expect(revived?.embedding?.[2]).toBeCloseTo(0.33);
@@ -892,7 +892,9 @@ describe("HTTP API", () => {
 		});
 		expect(res.status).toBe(200);
 		expect(embedSpy).toHaveBeenCalledTimes(1);
-		expect((await db.getEntry("patch-null"))?.embedding?.[1]).toBeCloseTo(0.22);
+		expect(
+			(await db.getEntryWithEmbedding("patch-null"))?.embedding?.[1],
+		).toBeCloseTo(0.22);
 	});
 
 	it("PATCH /entries/:id status=active keeps a current embedding without calling the embedder", async () => {
@@ -912,6 +914,8 @@ describe("HTTP API", () => {
 		});
 		expect(res.status).toBe(200);
 		expect(embedSpy).not.toHaveBeenCalled();
-		expect((await db.getEntry("patch-fresh"))?.embedding?.[0]).toBeCloseTo(0.5);
+		expect(
+			(await db.getEntryWithEmbedding("patch-fresh"))?.embedding?.[0],
+		).toBeCloseTo(0.5);
 	});
 });

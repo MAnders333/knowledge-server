@@ -797,6 +797,15 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		return this.rowToEntry(rows[0] as unknown as RawEntryRow);
 	}
 
+	async getEntryWithEmbedding(id: string): Promise<KnowledgeEntry | null> {
+		const rows = await this.sql.unsafe(
+			`SELECT ${ENTRY_COLUMNS}, embedding FROM knowledge_entry WHERE id = $1`,
+			[id],
+		);
+		if (rows.length === 0) return null;
+		return this.rowToEntry(rows[0] as unknown as RawEntryRow);
+	}
+
 	async getActiveEntries(): Promise<KnowledgeEntry[]> {
 		const rows = await this.sql.unsafe(
 			`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE status = 'active' ORDER BY strength DESC`,

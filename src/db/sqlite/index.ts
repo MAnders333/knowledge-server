@@ -256,6 +256,16 @@ export class KnowledgeDB implements IKnowledgeStore {
 		return row ? this.rowToEntry(row) : null;
 	}
 
+	async getEntryWithEmbedding(id: string): Promise<KnowledgeEntry | null> {
+		const row = this.db
+			.prepare(
+				`SELECT ${ENTRY_COLUMNS}, embedding FROM knowledge_entry WHERE id = ?`,
+			)
+			.get(id) as RawEntryRow | null;
+
+		return row ? this.rowToEntry(row) : null;
+	}
+
 	async getActiveEntries(): Promise<KnowledgeEntry[]> {
 		const rows = this.db
 			.prepare(
