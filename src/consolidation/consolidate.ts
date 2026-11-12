@@ -13,10 +13,11 @@ import type {
 	IEpisodeReader,
 	KnowledgeEntry,
 } from "../types.js";
-import { clampKnowledgeType } from "../types.js";
+import { clampKnowledgeType, episodeKeyId } from "../types.js";
 import { ContradictionScanner } from "./contradiction.js";
 import { computeStrength } from "./decay.js";
 import type { DomainResolution, DomainRouter } from "./domain-router.js";
+import { isDeterministicFailure } from "./errors.js";
 import { ConsolidationLLM, formatEpisodes } from "./llm.js";
 import type { ExtractedKnowledge } from "./llm.js";
 import { Reconsolidator } from "./reconsolidate.js";
@@ -42,7 +43,7 @@ const MAX_CHUNK_TOKENS = 150_000;
  * - failed:    extraction or a store write threw. The episodes stay pending and
  *              their failed-attempt count is incremented.
  */
-type ChunkOutcome = "completed" | "deferred" | "failed";
+type ChunkOutcome = "completed" | "deferred" | "transient" | "failed";
 
 interface ChunkResult {
 	outcome: ChunkOutcome;
@@ -203,8 +204,10 @@ export class ConsolidationEngine {
 	 *   that the next synthesis pass will cluster and merge). The in-process lock
 	 *   (Layer 1) ensures synthesis and consolidation never overlap on the same instance.
 	 */
-	async consolidate(): Promise<ConsolidationResult> {
-		return await this._consolidate();
+	async consolidate(
+		options: { attempted?: Set<string> } = {},
+	): Promise<ConsolidationResult> {
+		return await this._consolidate(options.attempted ?? new Set());
 	}
 
 	/**
@@ -221,7 +224,9 @@ export class ConsolidationEngine {
 	 * 6. Apply decay to all active entries
 	 * 7. Generate embeddings for new/updated entries
 	 */
-	private async _consolidate(): Promise<ConsolidationResult> {
+	private async _consolidate(
+		attempted: Set<string>,
+	): Promise<ConsolidationResult> {
 		const startTime = Date.now();
 		const state = await this.serverStateDb.getConsolidationState();
 
@@ -241,7 +246,7 @@ export class ConsolidationEngine {
 
 		// Process each reader source independently with its own cursor.
 		for (const reader of this.readers) {
-			const sourceTotals = await this.consolidateSource(reader);
+			const sourceTotals = await this.consolidateSource(reader, attempted);
 			totalSessionsProcessed += sourceTotals.sessionsProcessed;
 			totalSegmentsProcessed += sourceTotals.segmentsProcessed;
 			totalCreated += sourceTotals.entriesCreated;
@@ -329,7 +334,10 @@ export class ConsolidationEngine {
 	 * Run consolidation for a single source reader.
 	 * Returns partial counts that the caller aggregates across all readers.
 	 */
-	private async consolidateSource(reader: IEpisodeReader): Promise<{
+	private async consolidateSource(
+		reader: IEpisodeReader,
+		attempted: Set<string>,
+	): Promise<{
 		sessionsProcessed: number;
 		segmentsProcessed: number;
 		entriesCreated: number;
@@ -347,7 +355,12 @@ export class ConsolidationEngine {
 		//    skips this source rather than aborting the entire consolidation run.
 		if (reader.prepare) {
 			try {
-				await reader.prepare(afterMessageTimeCreated);
+				await reader.prepare(
+					afterMessageTimeCreated,
+					(episode) =>
+						attempted.has(episodeKeyId(episode)) ||
+						this.isStoreUnavailable(episode.directory),
+				);
 			} catch (err) {
 				logger.error(
 					`[consolidation/${reader.source}] prepare() failed — skipping source this run:`,
@@ -494,6 +507,7 @@ export class ConsolidationEngine {
 				startMessageId: ep.startMessageId,
 				endMessageId: ep.endMessageId,
 			}));
+			for (const key of keys) attempted.add(episodeKeyId(key));
 			if (result.outcome === "completed") {
 				outcome.completed.push(...keys);
 				for (const ep of chunk) completedSessionIds.add(ep.sessionId);
@@ -596,11 +610,11 @@ export class ConsolidationEngine {
 			extracted = await this.extractFromChunk(source, chunk, domainResolution);
 		} catch (err) {
 			logger.error(
-				`[consolidation/${source}] Extraction failed for a chunk of ${chunk.length} episodes — episodes kept for retry (attempt counted):`,
+				`[consolidation/${source}] Extraction failed for a chunk of ${chunk.length} episodes — episodes kept for retry:`,
 				err,
 			);
 			return {
-				outcome: "failed",
+				outcome: isDeterministicFailure(err) ? "failed" : "transient",
 				error: `extraction failed: ${err instanceof Error ? err.message : String(err)}`,
 				...none,
 			};
@@ -650,6 +664,7 @@ export class ConsolidationEngine {
 		const touchedStores = new Set<IKnowledgeStore>();
 		let deferred = false;
 		let failure: string | undefined;
+		let transientFailure: string | undefined;
 
 		for (const result of settled) {
 			if (result.status === "fulfilled") {
@@ -666,9 +681,13 @@ export class ConsolidationEngine {
 					result.reason instanceof Error
 						? result.reason.message
 						: String(result.reason);
-				failure ??= `store write failed: ${reason}`;
+				if (isDeterministicFailure(result.reason)) {
+					failure ??= `store write failed: ${reason}`;
+				} else {
+					transientFailure ??= `store write failed (transient): ${reason}`;
+				}
 				logger.error(
-					`[consolidation/${source}] Store consolidation failed — episodes kept for retry (attempt counted):`,
+					`[consolidation/${source}] Store consolidation failed — episodes kept for retry:`,
 					result.reason,
 				);
 			}
@@ -676,6 +695,7 @@ export class ConsolidationEngine {
 
 		let outcome: ChunkOutcome = "completed";
 		if (failure !== undefined) outcome = "failed";
+		else if (transientFailure !== undefined) outcome = "transient";
 		else if (deferred) outcome = "deferred";
 
 		if (outcome === "completed") {
@@ -705,6 +725,11 @@ export class ConsolidationEngine {
 			conflictsResolved: chunkConflictsResolved,
 			touchedStores,
 		};
+	}
+
+	/** True when the episode's target store is unavailable; its rows wait for a later run. */
+	private isStoreUnavailable(directory: string): boolean {
+		return this.domainRouter?.resolve(directory).storeUnavailable ?? false;
 	}
 
 	/**

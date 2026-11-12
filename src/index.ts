@@ -116,7 +116,9 @@ async function main() {
 			for (const err of errors) console.error(`  ✗ ${err}`);
 			process.exit(1);
 		}
-		await runConsolidate();
+		await runConsolidate({
+			retryDead: subcommandArgs.includes("--retry-dead"),
+		});
 		process.exit(0);
 	}
 
@@ -194,7 +196,7 @@ Commands:
   (no command)              Start the HTTP server
   stop                      Stop the running HTTP server
   status                    Show server state and knowledge graph stats
-  consolidate               Run a manual consolidation cycle
+  consolidate [--retry-dead] Run a manual consolidation cycle (--retry-dead requeues dead-lettered episodes)
   process-inbox [dir]       Upload local files and run full pipeline (upload → consolidate → synthesize)
   claude-auth               Authenticate with a Claude Pro/Max subscription (optional)
   activate <query>          Test knowledge activation for a query
@@ -609,6 +611,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	 * Caller is responsible for acquiring/releasing the lock.
 	 */
 	async function runConsolidationDrain(label: string): Promise<void> {
+		const attempted = new Set<string>();
 		let batch = 1;
 		let consecutiveErrors = 0;
 		const MAX_CONSECUTIVE_ERRORS = 3;
@@ -624,7 +627,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 				logger.log(`[${label}] Batch ${batch}...`);
 				let result: Awaited<ReturnType<typeof consolidation.consolidate>>;
 				try {
-					result = await consolidation.consolidate();
+					result = await consolidation.consolidate({ attempted });
 				} finally {
 					consolidation.unlock();
 				}

@@ -493,6 +493,12 @@ curl http://127.0.0.1:3179/review
 
 Returns conflicted, stale, and team-relevant entries. OpenCode and Claude Code users also have a `/knowledge-review` slash command (installed by `setup-tool`).
 
+### Failed and deferred episodes
+
+A chunk that fails for a deterministic reason (malformed model output, or a rejected request such as an over-long prompt) counts one attempt against each of its episodes, at most once per drain. After 5 attempts (`PENDING_EPISODE_MAX_ATTEMPTS`) an episode is dead-lettered: it stays in `pending_episodes`, is no longer consolidated, and `knowledge-server status` shows the count. Requeue them with `knowledge-server consolidate --retry-dead`. Transient failures (rate limits, timeouts, dropped connections, expired credentials, provider outages) never count; those episodes are retried on a later run.
+
+Episodes whose target store is unavailable, or whose store lock is held by another process, are skipped without counting and are retried on a later run. They are excluded before the batch window, so they do not hold up other sessions. **Known gap:** the exclusion only sees the 2000 oldest pending rows per run, so a backlog for an unavailable store larger than that can still delay newer sessions.
+
 ### Reinitialize / reset state
 
 The `reinitialize` command resets varying amounts of state depending on which flags you pass. Flags are additive — each level includes everything below it.

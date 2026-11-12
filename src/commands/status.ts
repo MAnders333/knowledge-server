@@ -82,6 +82,10 @@ export async function runStatus(pidPath: string): Promise<void> {
 			`  Last consolidation: ${state.lastConsolidatedAt ? new Date(state.lastConsolidatedAt).toISOString() : "never"}`,
 		);
 		console.log(`  Pending sessions:   ${pendingSessions}`);
+		const deadLettered = await serverStateDb.countDeadLetteredEpisodes();
+		console.log(
+			`  Dead-lettered:      ${deadLettered} (requeue with: knowledge-server consolidate --retry-dead)`,
+		);
 		console.log(
 			`  Total processed:    ${state.totalSessionsProcessed} sessions, ${state.totalEntriesCreated} created, ${state.totalEntriesUpdated} updated`,
 		);

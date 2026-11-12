@@ -11,6 +11,7 @@ import type {
 	PendingEpisode,
 	ProcessedRange,
 } from "../../types.js";
+import { episodeKeyId } from "../../types.js";
 
 /**
  * PendingEpisodesReader — drains the `pending_episodes` staging table.
@@ -58,15 +59,17 @@ export class PendingEpisodesReader implements IEpisodeReader {
 	 * Pre-load all pending episodes from the staging table.
 	 * Called by ConsolidationEngine before getCandidateSessions.
 	 */
-	async prepare(afterMessageTimeCreated: number): Promise<void> {
+	async prepare(
+		afterMessageTimeCreated: number,
+		isBlocked?: (episode: EpisodeKey & { directory: string }) => boolean,
+	): Promise<void> {
 		this._cachedRows = [];
 		this._cachedCandidates = [];
 		this._prepared = false;
 
-		const rows = await this.db.getPendingEpisodes(
-			afterMessageTimeCreated,
-			2000,
-		);
+		const rows = (
+			await this.db.getPendingEpisodes(afterMessageTimeCreated, 2000)
+		).filter((row) => !isBlocked?.(row));
 
 		// Group by session_id, track max_message_time per session.
 		const sessionMap = new Map<string, number>();
@@ -182,14 +185,4 @@ export class PendingEpisodesReader implements IEpisodeReader {
 	private _prepared = false;
 	private _cachedRows: PendingEpisode[] = [];
 	private _cachedCandidates: Array<{ id: string; maxMessageTime: number }> = [];
-}
-
-/** Stable identity of an episode row, matching the consolidation key. */
-function episodeKeyId(key: EpisodeKey): string {
-	return JSON.stringify([
-		key.source,
-		key.sessionId,
-		key.startMessageId,
-		key.endMessageId,
-	]);
 }

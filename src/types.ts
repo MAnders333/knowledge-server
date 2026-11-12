@@ -239,7 +239,10 @@ export interface IEpisodeReader {
 	 * (e.g. PendingEpisodesReader fetches from the pending_episodes table).
 	 * Not called for readers that don't implement it (backwards-compatible).
 	 */
-	prepare?(afterMessageTimeCreated: number): Promise<void>;
+	prepare?(
+		afterMessageTimeCreated: number,
+		isBlocked?: (episode: EpisodeKey & { directory: string }) => boolean,
+	): Promise<void>;
 
 	/**
 	 * Optional post-consolidation hook called once per consolidation batch.
@@ -320,4 +323,14 @@ export interface ConsolidationResult {
 	conflictsDetected: number;
 	conflictsResolved: number;
 	duration: number; // ms
+}
+
+/** Stable identity of an episode, matching the consolidation key. */
+export function episodeKeyId(key: EpisodeKey): string {
+	return JSON.stringify([
+		key.source,
+		key.sessionId,
+		key.startMessageId,
+		key.endMessageId,
+	]);
 }

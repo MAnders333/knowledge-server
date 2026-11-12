@@ -81,6 +81,7 @@ export async function drainConsolidation(
 	lockTimeoutMs = 10_000,
 ): Promise<DrainResult> {
 	let batch = 1;
+	const attempted = new Set<string>();
 	let totalSessions = 0;
 	let totalCreated = 0;
 	let totalUpdated = 0;
@@ -95,7 +96,7 @@ export async function drainConsolidation(
 		}
 
 		try {
-			const result = await consolidation.consolidate();
+			const result = await consolidation.consolidate({ attempted });
 
 			if (result.sessionsProcessed === 0) break;
 

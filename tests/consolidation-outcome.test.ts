@@ -162,7 +162,7 @@ describe("store locked by another process", () => {
 });
 
 describe("store write failure", () => {
-	it("keeps the row, counts the attempt, and succeeds on retry", async () => {
+	it("keeps the row for a later run and succeeds on retry", async () => {
 		await state.insertPendingEpisode(
 			pendingRow({ id: "row-write", sessionId: "session-write" }),
 		);
@@ -178,7 +178,7 @@ describe("store write failure", () => {
 
 		const rows = await state.getPendingEpisodes(0);
 		expect(rows.map((r) => r.id)).toEqual(["row-write"]);
-		expect(rows[0].failedAttempts).toBe(1);
+		expect(rows[0].failedAttempts).toBe(0);
 		expect(failing).toHaveBeenCalledTimes(1);
 
 		await engine.consolidate();
@@ -210,7 +210,9 @@ describe("chunk whose extraction always fails", () => {
 			"extractKnowledge",
 		).mockImplementation(async (summary: string) => {
 			if (summary.includes("POISON")) {
-				throw new Error("context length exceeded");
+				throw Object.assign(new Error("context length exceeded"), {
+					statusCode: 400,
+				});
 			}
 			return [entry("The sky is blue.")];
 		});
@@ -304,7 +306,7 @@ describe("entries routed to another store", () => {
 });
 
 describe("state.db upgrade from schema v1", () => {
-	it("adds the attempt columns to an existing pending_episodes table", async () => {
+	it("creates the attempts table for an existing v1 state.db", async () => {
 		const path = join(tempDir, "v1-state.db");
 		const { Database } = await import("bun:sqlite");
 		const legacy = new Database(path);
@@ -338,6 +340,174 @@ describe("state.db upgrade from schema v1", () => {
 			expect(after.failedAttempts).toBe(1);
 		} finally {
 			await upgraded.close();
+		}
+	});
+});
+
+describe("failure classification and dead-letter retry", () => {
+	it("transient provider errors never count toward dead-lettering", async () => {
+		await state.insertPendingEpisode(
+			pendingRow({ id: "row-429", sessionId: "session-429" }),
+		);
+		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockRejectedValue(
+			Object.assign(new Error("Too Many Requests"), { statusCode: 429 }),
+		);
+
+		for (let i = 0; i < PENDING_EPISODE_MAX_ATTEMPTS + 2; i++) {
+			await drainConsolidation(engine);
+		}
+
+		const [row] = await state.getPendingEpisodes(0);
+		expect(row.failedAttempts).toBe(0);
+		expect(await state.countDeadLetteredEpisodes()).toBe(0);
+		expect(await state.countPendingSessions()).toBe(1);
+	});
+
+	it("a deterministic failure counts once per drain while healthy episodes still finish", async () => {
+		const savedMax = config.consolidation.maxSessionsPerRun;
+		config.consolidation.maxSessionsPerRun = 2;
+		try {
+			const now = Date.now();
+			await state.insertPendingEpisode(
+				pendingRow({
+					id: "row-poison",
+					sessionId: "session-poison",
+					content: "POISON: malformed",
+					maxMessageTime: now - 3000,
+				}),
+			);
+			await state.insertPendingEpisode(
+				pendingRow({
+					id: "row-good-1",
+					sessionId: "session-good-1",
+					maxMessageTime: now - 2000,
+				}),
+			);
+			await state.insertPendingEpisode(
+				pendingRow({
+					id: "row-good-2",
+					sessionId: "session-good-2",
+					maxMessageTime: now - 1000,
+				}),
+			);
+			spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockImplementation(
+				async (summary: string) => {
+					if (summary.includes("POISON")) {
+						throw new SyntaxError("Unexpected token in model output");
+					}
+					return [entry(`Fact ${Math.random()}`)];
+				},
+			);
+
+			// The poison chunk is attempted in the first batch only; the second batch
+			// must not retry it, so it is counted once for this drain.
+			await drainConsolidation(engine);
+
+			const rows = await state.getPendingEpisodes(0);
+			expect(rows.map((r) => r.id)).toEqual(["row-poison"]);
+			expect(rows[0].failedAttempts).toBe(1);
+		} finally {
+			config.consolidation.maxSessionsPerRun = savedMax;
+		}
+	});
+
+	it("retryDeadLetteredEpisodes requeues dead-lettered rows", async () => {
+		await state.insertPendingEpisode(
+			pendingRow({ id: "row-dead", sessionId: "session-dead" }),
+		);
+		for (let i = 0; i < PENDING_EPISODE_MAX_ATTEMPTS; i++) {
+			await state.recordPendingEpisodeFailures(["row-dead"], "boom");
+		}
+		expect(await state.countDeadLetteredEpisodes()).toBe(1);
+		expect(await state.countPendingSessions()).toBe(0);
+
+		expect(await state.retryDeadLetteredEpisodes()).toBe(1);
+
+		expect(await state.countPendingSessions()).toBe(1);
+		expect(await state.countDeadLetteredEpisodes()).toBe(0);
+	});
+});
+
+describe("unavailable store and the batch window", () => {
+	it("a healthy session is processed although the oldest sessions wait for an unavailable store", async () => {
+		const savedMax = config.consolidation.maxSessionsPerRun;
+		config.consolidation.maxSessionsPerRun = 2;
+		const workDb = new KnowledgeDB(join(tempDir, "work-window.db"));
+		try {
+			const homeDir = homedir();
+			const routedConfig = {
+				userId: "alice",
+				stores: [
+					{ id: "personal", kind: "sqlite", writable: true },
+					{ id: "work", kind: "sqlite", writable: true },
+				],
+				domains: [
+					{ id: "personal", description: "Personal", store: "personal" },
+					{ id: "work", description: "Work", store: "work" },
+				],
+				projects: [
+					{ path: `${homeDir}/work`, default_domain: "work" },
+					{ path: `${homeDir}/personal`, default_domain: "personal" },
+				],
+			} as unknown as KnowledgeServerConfig;
+			const stores = new Map<string, IKnowledgeStore>([
+				["personal", db],
+				["work", workDb],
+			]);
+			// The work store is unavailable (it failed at startup).
+			const router = new DomainRouter(
+				routedConfig,
+				stores,
+				db,
+				new Set(["work"]),
+			);
+			const activation = new ActivationEngine(db);
+			spyOn(activation.embeddings, "embed").mockImplementation(async (text) =>
+				uniqueEmbedding(seenEmbeddings, text),
+			);
+			const routed = new ConsolidationEngine(
+				db,
+				state,
+				activation,
+				[new PendingEpisodesReader(state)],
+				router,
+			);
+			const now = Date.now();
+			for (const i of [1, 2]) {
+				await state.insertPendingEpisode(
+					pendingRow({
+						id: `work-${i}`,
+						sessionId: `session-work-${i}`,
+						directory: `${homeDir}/work/app`,
+						maxMessageTime: now - 5000 + i,
+					}),
+				);
+			}
+			await state.insertPendingEpisode(
+				pendingRow({
+					id: "personal-1",
+					sessionId: "session-personal",
+					directory: `${homeDir}/personal/notes`,
+					maxMessageTime: now - 1000,
+				}),
+			);
+			spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockResolvedValue([
+				entry("Ship the release on Fridays."),
+			]);
+
+			await routed.consolidate();
+
+			expect(
+				(await state.getProcessedEpisodeRanges(["session-personal"])).get(
+					"session-personal",
+				),
+			).toHaveLength(1);
+			const waiting = await state.getPendingEpisodes(0);
+			expect(waiting.map((r) => r.id).sort()).toEqual(["work-1", "work-2"]);
+			expect(waiting.every((r) => r.failedAttempts === 0)).toBe(true);
+		} finally {
+			config.consolidation.maxSessionsPerRun = savedMax;
+			await workDb.close();
 		}
 	});
 });
