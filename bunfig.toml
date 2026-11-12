@@ -1,0 +1,3 @@
+[test]
+# Takes the real-home baseline before any test runs; see tests/support/real-home-guard-preload.ts.
+preload = ["./tests/support/real-home-guard-preload.ts"]
