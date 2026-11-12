@@ -67,7 +67,9 @@ const RULES: ReadonlyArray<RedactionRule> = [
 	},
 	{
 		kind: "url_credentials",
-		re: /(?<=[a-z][a-z0-9+.-]{0,64}:\/\/[^\s:/@]{1,256}:)[^\s@/]+(?=@)/gi,
+		// The user may be empty. The password runs to the LAST `@` before the host
+		// (the host ends at whitespace, `/`, `:` or end), so a password that itself contains `@` is kept whole.
+		re: /(?<=[a-z][a-z0-9+.-]{0,64}:\/\/[^\s:/@]{0,256}:)[^\s/]+(?=@[^\s@/]*(?:[\s/:]|$))/gi,
 	},
 	{
 		kind: "env_secret",

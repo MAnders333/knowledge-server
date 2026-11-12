@@ -159,6 +159,34 @@ describe("redactSecrets: per-kind replacement", () => {
 		);
 	});
 
+	it("url_credentials: redacts a password when the username is empty", () => {
+		expectRedacted(
+			"connect redis://:" + "s3cret" + "@host:6379 now",
+			"connect redis://:[REDACTED:url_credentials]@host:6379 now",
+			"url_credentials",
+		);
+	});
+
+	it("url_credentials: redacts a password that contains @", () => {
+		expectRedacted(
+			"postgres://admin:" + "P@ssw0rd" + "@db",
+			"postgres://admin:[REDACTED:url_credentials]@db",
+			"url_credentials",
+		);
+	});
+
+	it("url_credentials: leaves URLs without a password unchanged", () => {
+		for (const url of [
+			"https://example.com/a@b",
+			"postgres://host:5432/db",
+			"https://user@host",
+		]) {
+			const result = redactSecrets(`open ${url} now`);
+			expect(result.text).toBe(`open ${url} now`);
+			expect(result.counts).toEqual({});
+		}
+	});
+
 	it("keyed_entropy: redacts a long value after a secret-ish key name", () => {
 		expectRedacted(
 			`{"api_key": "${HEX_SECRET}"}`,
