@@ -12,6 +12,17 @@ function storeWith(entries: KnowledgeEntry[]) {
 	const store = {
 		id: "test-store",
 		getActiveEntriesWithEmbeddings: mock(() => Promise.resolve(entries)),
+		scanEmbeddings: mock(() =>
+			Promise.resolve(
+				entries.map((e) => ({
+					id: e.id,
+					embedding: new Float32Array(e.embedding ?? []),
+				})),
+			),
+		),
+		getEntriesByIds: mock((ids: string[]) =>
+			Promise.resolve(entries.filter((e) => ids.includes(e.id))),
+		),
 		getSupportSourcesForIds: mock(() => Promise.resolve(new Map())),
 		getContradictPairsForIds: mock(() => Promise.resolve(new Map())),
 		recordAccess,
