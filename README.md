@@ -172,7 +172,7 @@ Hono-based HTTP server. Binds to `127.0.0.1:3179` by default.
 
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
-| `/activate?q=...` | GET | — | Activate knowledge entries by query |
+| `/activate?q=...` | GET | — | Activate knowledge entries by query. Optional `client` query param or `x-knowledge-client` header (`opencode`, `claude-code`, `pi`, `omp`, `codex`, `mcp`, `cli`); missing or unknown values are recorded as `unknown`. |
 | `/consolidate` | POST | admin | Run a consolidation batch |
 | `/reinitialize?confirm=yes` | POST | admin | Wipe all entries and reset consolidation state |
 | `/status` | GET | — (config requires admin) | Health check and stats |
@@ -386,7 +386,8 @@ Credentials and paths stay in `.env`:
 | Variable | Default | Description |
 |---|---|---|
 | `KNOWLEDGE_ADMIN_TOKEN` | *(random per process)* | Fixed admin token for scripted use (≥16 chars) |
-| `KNOWLEDGE_LOG_PATH` | `~/.local/share/knowledge-server/server.log` | Log file. Set to `""` to disable. |
+| `KNOWLEDGE_LOG_PATH` | `~/.local/share/knowledge-server/server.log` | Log file. Set to `""` to disable. When stdout or stderr already points at this file (the launchd plist does this), each line is written once. |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. Only `debug` logs query and entry text; `info` logs lengths, ids and similarity scores. |
 
 ### Session sources
 
@@ -459,7 +460,11 @@ knowledge-server stop
 knowledge-server status
 ```
 
-Shows whether the server is running, entry counts, last consolidation time, and pending sessions.
+Shows whether the server is running, entry counts, last consolidation time, and pending sessions. For the last 7 days it also shows, per source, episodes captured versus activations injected, and warns when a source is captured but never injected.
+
+Activation telemetry is kept in the `activation_event` table of the server state DB. It holds ids, counts, scores, latency and a client tag, never prompt or entry text, and rows older than 90 days are pruned.
+
+To replay prompts from a local JSONL file without changing any store, run `bun run bench/replay-activation.ts prompts.jsonl`. Each line is `{"prompt": "..."}`. Keep the file outside the repo. The script prints cap-hit, zero-hit, hub-concentration and latency figures.
 
 ### Trigger consolidation manually
 
