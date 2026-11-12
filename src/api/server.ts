@@ -20,6 +20,7 @@ import {
 import {
 	contradictionTagBlock,
 	contradictionTagInline,
+	formatActivatedKnowledge,
 	staleTag,
 } from "../activation/format.js";
 import { DEFAULT_CONFIG } from "../config-file.js";
@@ -162,14 +163,7 @@ export function createApp(
 					};
 				}
 
-				const formatted = result.entries
-					.map(
-						(r, i) =>
-							`${i + 1}. [${r.entry.type}] ${r.entry.content}${staleTag(r.staleness)}${contradictionTagBlock(r.contradiction)}\n` +
-							`   Topics: ${r.entry.topics.join(", ")}\n` +
-							`   Confidence: ${r.entry.confidence} | Semantic match: ${r.rawSimilarity.toFixed(3)} | Score: ${r.similarity.toFixed(3)}`,
-					)
-					.join("\n\n");
+				const formatted = formatActivatedKnowledge(result.entries);
 
 				const conflictCount = result.entries.filter(
 					(r) => r.contradiction,
@@ -367,7 +361,12 @@ export function createApp(
 			});
 			// telemetry is internal (content-free measurement); not part of the response.
 			const { telemetry: _telemetry, ...body } = result;
-			return c.json(body);
+			// `context` is the ready-to-inject block. Plugins prefer it over their own
+			// formatting, so the escaping and labelling live in one place (format.ts).
+			return c.json({
+				...body,
+				context: formatActivatedKnowledge(result.entries),
+			});
 		} catch (e) {
 			logger.error("[activate] Error:", e);
 			return c.json({ error: "Internal server error" }, 500);
@@ -914,19 +913,7 @@ export function createApp(
 					return c.json({});
 				}
 
-				// Format activated entries using the same inline style as the passive plugin.
-				const lines = result.entries.map((r) => {
-					const stale = staleTag(r.staleness);
-					const contradiction = contradictionTagInline(r.contradiction);
-					return `- [${r.entry.type}] ${r.entry.content}${stale}${contradiction}`;
-				});
-
-				const additionalContext = [
-					"<addrl-activated-knowledge>",
-					"Relevant knowledge from your knowledge base:",
-					...lines,
-					"</addrl-activated-knowledge>",
-				].join("\n");
+				const additionalContext = formatActivatedKnowledge(result.entries);
 
 				return c.json({
 					hookSpecificOutput: {
