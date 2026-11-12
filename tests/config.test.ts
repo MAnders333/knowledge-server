@@ -22,6 +22,7 @@ const ENV_VARS = [
 	"DECAY_ARCHIVE_THRESHOLD",
 	"RECONSOLIDATION_SIMILARITY_THRESHOLD",
 	"CONTRADICTION_MIN_SIMILARITY",
+	"CONTRADICTION_CONFLICTS_ONLY",
 	"ACTIVATION_SIMILARITY_THRESHOLD",
 	"EMBEDDING_DIMENSIONS",
 	"OPENAI_MAX_TOKENS_PARAM",
@@ -56,6 +57,22 @@ function envErrors(): string[] {
 }
 
 // ── baseline ──────────────────────────────────────────────────────────────────
+
+describe("validateConfig — CONTRADICTION_CONFLICTS_ONLY", () => {
+	it("accepts true and false", () => {
+		for (const value of ["true", "false"]) {
+			process.env.CONTRADICTION_CONFLICTS_ONLY = value;
+			expect(envErrors()).toEqual([]);
+		}
+	});
+
+	it("rejects any other value", () => {
+		process.env.CONTRADICTION_CONFLICTS_ONLY = "yes";
+		expect(
+			envErrors().some((e) => e.includes("CONTRADICTION_CONFLICTS_ONLY")),
+		).toBe(true);
+	});
+});
 
 describe("validateConfig — float-range baseline (all optional vars unset)", () => {
 	it("produces no float-range errors when optional vars are unset", () => {

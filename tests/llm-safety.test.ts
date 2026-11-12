@@ -162,7 +162,9 @@ describe("prompt boundaries", () => {
 	});
 
 	it("topics with newlines are JSON-encoded inside their tag", async () => {
-		respond('{"checked":1,"conflicts":[]}');
+		respond(
+			'{"checked":1,"results":[{"candidate":1,"resolution":"no_conflict","reason":"r"}]}',
+		);
 		await new ConsolidationLLM().detectAndResolveContradiction(
 			{ id: "new", ...extracted, createdAt: 0 },
 			[
@@ -364,10 +366,10 @@ describe("output validation: contradiction", () => {
 		respond(
 			JSON.stringify({
 				checked: 2,
-				conflicts: [
+				results: [
 					{
 						candidate: 1,
-						type: "merge",
+						resolution: "merge",
 						reason: "r",
 						mergedContent: "Port is 9090.",
 						mergedType: "fact",
@@ -376,7 +378,7 @@ describe("output validation: contradiction", () => {
 					},
 					{
 						candidate: 2,
-						type: "merge",
+						resolution: "merge",
 						reason: "r",
 						mergedContent: "",
 						mergedType: "fact",
@@ -395,7 +397,7 @@ describe("output validation: contradiction", () => {
 	});
 
 	it("rejects a reply whose checked count is not the batch size", async () => {
-		respond(JSON.stringify({ checked: 1, conflicts: [] }));
+		respond(JSON.stringify({ checked: 1, results: [] }));
 		await expect(
 			new ConsolidationLLM().detectAndResolveContradiction(
 				newEntry,

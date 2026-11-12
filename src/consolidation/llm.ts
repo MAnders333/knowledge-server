@@ -14,6 +14,7 @@ import type { Episode, KnowledgeType } from "../types.js";
 import type { DomainContext } from "./domain-router.js";
 import {
 	type ContradictionConflict,
+	type ContradictionReplyFormat,
 	MalformedLlmOutputError,
 	extractedItemSchema,
 	mergeDecisionSchema,
@@ -891,10 +892,13 @@ If no meaningful synthesis is possible, return: []`;
 	/**
 	 * Post-extraction contradiction check for one batch of candidates.
 	 *
-	 * Candidates are shown as numbered entries ([1]..[n]) and the model answers
-	 * with a {checked, conflicts} object. `checked` must equal the batch size, and
-	 * `conflicts` lists only the candidates that contradict the new entry. A
-	 * candidate that is not listed is treated as no conflict.
+	 * Candidates are shown as numbered entries ([1]..[n]). The model replies with a
+	 * wrapper object whose `checked` must equal the batch size:
+	 * - default ("verdicts"): {"checked", "results"} with one verdict per candidate,
+	 *   including no_conflict. This is the prompt the scan was tuned on.
+	 * - CONTRADICTION_CONFLICTS_ONLY=true ("conflicts"): {"checked", "conflicts"}
+	 *   listing only contradicting candidates. Saves about 65% of output tokens per
+	 *   call but is not validated for recall; enable only after an online spot-check.
 	 *
 	 * Uses the contradiction model. Returns only genuine contradictions. Possible
 	 * resolutions in the returned array:
@@ -926,6 +930,11 @@ If no meaningful synthesis is possible, return: []`;
 	): Promise<ContradictionResult[]> {
 		if (candidates.length === 0) return [];
 
+		const format: ContradictionReplyFormat = config.consolidation
+			.contradictionConflictsOnly
+			? "conflicts"
+			: "verdicts";
+
 		// Entry fields are untrusted: each is escaped and wrapped in a data tag.
 		const candidateList = candidates
 			.map(
@@ -936,25 +945,6 @@ topics: ${untrustedList("candidate_topics", c.topics)}
 content: ${untrustedField("candidate_content", c.content)}`,
 			)
 			.join("\n\n");
-
-		const systemPrompt = `You check a NEW knowledge entry against numbered EXISTING candidates. Report only genuine contradictions.
-
-A contradiction means the two entries make mutually exclusive claims about the same subject.
-NOT a contradiction: two entries about different aspects of one topic; one entry more specific than the other; time-bound statements that do not overlap; the same fact worded differently.
-
-Types for a contradiction:
-- supersede_old: the new entry is more correct or more recent; the candidate should be superseded
-- supersede_new: the candidate is more correct; the new entry should be superseded
-- merge: both are partly right; give the unified truth as mergedContent (with mergedType, mergedTopics, mergedConfidence)
-- irresolvable: equal evidence and recency; needs human review
-
-${UNTRUSTED_DATA_RULE}
-
-Output ONLY one JSON object, nothing else:
-{"checked": <how many candidates you reviewed>, "conflicts": [{"candidate": <candidate number>, "type": "<type>", "reason": "<one sentence>", "mergedContent": "<merge only>", "mergedType": "<merge only>", "mergedTopics": [], "mergedConfidence": 0.0}]}
-- "checked" must equal the number of candidates shown.
-- List only candidates that contradict the new entry. Use "conflicts": [] when none do.
-- Do not list non-conflicts.`;
 
 		const userPrompt = `NEW ENTRY (just added):
 type: ${untrustedLine("new_entry_type", newEntry.type)} | confidence: ${newEntry.confidence} | created: ${new Date(newEntry.createdAt).toISOString().split("T")[0]}
@@ -970,7 +960,7 @@ Return the JSON object. "checked" must be ${candidates.length}.`;
 		const response = await complete(
 			"contradiction",
 			config.llm.contradictionModel,
-			systemPrompt,
+			contradictionSystemPrompt(format),
 			userPrompt,
 		);
 
@@ -979,6 +969,7 @@ Return the JSON object. "checked" must be ${candidates.length}.`;
 			conflicts = parseContradictionReply(
 				parseJSON(response, false),
 				candidates.length,
+				format,
 			);
 		} catch (err) {
 			logger.error(
@@ -1012,6 +1003,44 @@ Return the JSON object. "checked" must be ${candidates.length}.`;
 		}
 		return results;
 	}
+}
+
+/** System prompt for the contradiction check. The verdict and conflicts-only formats differ only in the reply shape. */
+function contradictionSystemPrompt(format: ContradictionReplyFormat): string {
+	const shared = `You are a knowledge integrity checker. You will be shown a NEWLY ADDED knowledge entry and numbered EXISTING candidates that share related topics.
+
+Your job is to check each candidate for genuine contradiction with the new entry, and if a contradiction exists, determine how to resolve it.
+
+CONTRADICTION means the two entries make mutually exclusive claims about the same subject. Examples:
+- "The server runs on port 8080" vs "The server port was changed to 9090" → contradiction
+- "Always pre-aggregate before joining" vs "Pre-aggregation caused wrong results in campaign analysis" → contradiction
+- "User prefers dark mode" vs "User prefers light mode" → contradiction
+
+NOT a contradiction:
+- Two entries about different aspects of the same topic
+- One entry being more specific than the other (that's refinement, not contradiction)
+- Temporal statements that don't overlap ("In Q1 we used X" vs "In Q3 we switched to Y")
+
+Resolutions:
+- "no_conflict"   — no genuine contradiction
+- "supersede_old" — new entry is more correct/recent; existing entry should be superseded
+- "supersede_new" — existing entry is more correct; new entry should be downgraded
+- "merge"         — apparent contradiction resolves into a unified truth; provide merged content
+- "irresolvable"  — genuine tie (equal evidence, equal recency); needs human review
+
+${UNTRUSTED_DATA_RULE}
+
+Output ONLY one JSON object, nothing else. "checked" must equal the number of candidates shown.`;
+
+	if (format === "conflicts") {
+		return `${shared}
+{"checked": <number of candidates reviewed>, "conflicts": [{"candidate": <candidate number>, "type": "<supersede_old|supersede_new|merge|irresolvable>", "reason": "<one sentence>", "mergedContent": "<merge only>", "mergedType": "<merge only>", "mergedTopics": [], "mergedConfidence": 0.0}]}
+- List only candidates that contradict the new entry. Use "conflicts": [] when none do.
+- Do not list non-conflicts.`;
+	}
+	return `${shared}
+{"checked": <number of candidates reviewed>, "results": [{"candidate": <candidate number>, "resolution": "<no_conflict|supersede_old|supersede_new|merge|irresolvable>", "reason": "<one sentence>", "mergedContent": "<merge only>", "mergedType": "<merge only>", "mergedTopics": [], "mergedConfidence": 0.0}]}
+- One entry in "results" for every candidate, in order. Use "no_conflict" for candidates that do not contradict the new entry.`;
 }
 
 export interface ExtractedKnowledge {

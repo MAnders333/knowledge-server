@@ -56,36 +56,35 @@ afterEach(() => {
 
 // ── parseContradictionReply ───────────────────────────────────────────────────
 
-describe("parseContradictionReply", () => {
+describe("parseContradictionReply: conflicts format", () => {
+	const parse = (raw: unknown, n: number) =>
+		parseContradictionReply(raw, n, "conflicts");
+
 	it("rejects a checked count that differs from the batch size", () => {
-		expect(() =>
-			parseContradictionReply({ checked: 9, conflicts: [] }, 10),
-		).toThrow(MalformedLlmOutputError);
-		expect(() =>
-			parseContradictionReply({ checked: 10, conflicts: [] }, 10),
-		).not.toThrow();
+		expect(() => parse({ checked: 9, conflicts: [] }, 10)).toThrow(
+			MalformedLlmOutputError,
+		);
+		expect(() => parse({ checked: 10, conflicts: [] }, 10)).not.toThrow();
 	});
 
 	it("rejects a reply without the wrapper object", () => {
-		expect(() => parseContradictionReply([], 1)).toThrow(
-			MalformedLlmOutputError,
-		);
-		expect(() => parseContradictionReply({ conflicts: [] }, 1)).toThrow(
-			MalformedLlmOutputError,
-		);
-		expect(() => parseContradictionReply(null, 1)).toThrow(
+		expect(() => parse([], 1)).toThrow(MalformedLlmOutputError);
+		expect(() => parse({ conflicts: [] }, 1)).toThrow(MalformedLlmOutputError);
+		expect(() => parse(null, 1)).toThrow(MalformedLlmOutputError);
+	});
+
+	it("rejects the verdicts list key", () => {
+		expect(() => parse({ checked: 1, results: [] }, 1)).toThrow(
 			MalformedLlmOutputError,
 		);
 	});
 
 	it("accepts checked as a numeric string", () => {
-		expect(parseContradictionReply({ checked: "2", conflicts: [] }, 2)).toEqual(
-			[],
-		);
+		expect(parse({ checked: "2", conflicts: [] }, 2)).toEqual([]);
 	});
 
 	it("drops out-of-range candidate numbers and keeps the valid siblings", () => {
-		const out = parseContradictionReply(
+		const out = parse(
 			{
 				checked: 2,
 				conflicts: [
@@ -103,7 +102,7 @@ describe("parseContradictionReply", () => {
 	});
 
 	it("keeps the first conflict when a candidate is listed twice", () => {
-		const out = parseContradictionReply(
+		const out = parse(
 			{
 				checked: 1,
 				conflicts: [
@@ -116,8 +115,8 @@ describe("parseContradictionReply", () => {
 		expect(out.map((c) => [c.index, c.reason])).toEqual([[1, "first"]]);
 	});
 
-	it("drops no_conflict and unknown types, since conflicts-only output has neither", () => {
-		const out = parseContradictionReply(
+	it("drops unknown types and no_conflict items", () => {
+		const out = parse(
 			{
 				checked: 2,
 				conflicts: [
@@ -128,6 +127,66 @@ describe("parseContradictionReply", () => {
 			2,
 		);
 		expect(out).toEqual([]);
+	});
+});
+
+describe("parseContradictionReply: verdicts format (default)", () => {
+	const parse = (raw: unknown, n: number) =>
+		parseContradictionReply(raw, n, "verdicts");
+
+	it("rejects a checked count that differs from the batch size", () => {
+		expect(() =>
+			parse(
+				{
+					checked: 1,
+					results: [{ candidate: 1, resolution: "no_conflict", reason: "r" }],
+				},
+				2,
+			),
+		).toThrow(MalformedLlmOutputError);
+	});
+
+	it("rejects the conflicts list key", () => {
+		expect(() => parse({ checked: 1, conflicts: [] }, 1)).toThrow(
+			MalformedLlmOutputError,
+		);
+	});
+
+	it("returns conflicts only, dropping no_conflict verdicts", () => {
+		const out = parse(
+			{
+				checked: 3,
+				results: [
+					{
+						candidate: 1,
+						resolution: "no_conflict",
+						reason: "different aspect",
+					},
+					{ candidate: 2, resolution: "supersede_old", reason: "newer" },
+					{ candidate: 3, resolution: "no_conflict", reason: "x" },
+				],
+			},
+			3,
+		);
+		expect(out.map((c) => [c.index, c.resolution])).toEqual([
+			[2, "supersede_old"],
+		]);
+	});
+
+	it("applies the index guard to verdicts", () => {
+		const out = parse(
+			{
+				checked: 2,
+				results: [
+					{ candidate: 5, resolution: "supersede_old", reason: "x" },
+					{ candidate: "[2]", resolution: "irresolvable", reason: "tie" },
+				],
+			},
+			2,
+		);
+		expect(out.map((c) => [c.index, c.resolution])).toEqual([
+			[2, "irresolvable"],
+		]);
 	});
 });
 

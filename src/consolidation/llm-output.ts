@@ -148,7 +148,7 @@ export const synthesisItemSchema = z.object({
 	),
 });
 
-// ── Contradiction (one batch per call, conflicts only) ───────────────────────
+// ── Contradiction (one batch per call, wrapper object) ──────────────────────
 
 export const CONTRADICTION_TYPES = [
 	"supersede_old",
@@ -158,6 +158,13 @@ export const CONTRADICTION_TYPES = [
 ] as const;
 
 export type ContradictionType = (typeof CONTRADICTION_TYPES)[number];
+
+/**
+ * Reply shape. "verdicts" (default): one result per candidate, `no_conflict`
+ * allowed, list key `results`. "conflicts": only the conflicting candidates, list
+ * key `conflicts`. Both carry `checked`, which must equal the batch size.
+ */
+export type ContradictionReplyFormat = "verdicts" | "conflicts";
 
 /** One validated conflict from a contradiction reply. `index` is 1-based. */
 export interface ContradictionConflict {
@@ -183,7 +190,7 @@ const candidateNumber = z.preprocess((v) => {
 }, z.number().int());
 
 /** Items are checked against the batch size so an out-of-range index is dropped. */
-const contradictionConflictSchema = (batchSize: number) =>
+const contradictionItemSchema = (batchSize: number) =>
 	z.preprocess(
 		// Accept `resolution` as an alias of `type`.
 		(raw) =>
@@ -192,7 +199,7 @@ const contradictionConflictSchema = (batchSize: number) =>
 				: raw,
 		z.object({
 			candidate: candidateNumber.pipe(z.number().min(1).max(batchSize)),
-			type: z.enum(CONTRADICTION_TYPES),
+			type: z.enum([...CONTRADICTION_TYPES, "no_conflict"]),
 			reason: z.preprocess(
 				(v) => (typeof v === "string" ? scrubUntrusted(v).trim() : ""),
 				z.string(),
@@ -206,29 +213,41 @@ const contradictionConflictSchema = (batchSize: number) =>
 		}),
 	);
 
-/** The reply is a wrapper object so a truncated or confused reply cannot pass as "no conflicts". */
+/** The wrapper object. Only `checked` and the list for the requested format are read. */
 const contradictionReplySchema = z.object({
 	checked: z.preprocess(toNumber, z.number().int()),
-	conflicts: z.array(z.unknown()),
+	conflicts: z.array(z.unknown()).optional(),
+	results: z.array(z.unknown()).optional(),
 });
 
 /**
  * Validate a contradiction reply for a batch of `batchSize` candidates.
  *
- * Throws MalformedLlmOutputError when the reply is not the wrapper object, or
- * when `checked` is not exactly `batchSize` (the model did not review the whole
- * batch). Individual conflicts are validated leniently: an item with an invalid
- * candidate number, an unknown type, or an extra duplicate is dropped.
+ * Throws MalformedLlmOutputError when the reply is not the wrapper object, when
+ * the list for `format` is missing, or when `checked` is not exactly `batchSize`
+ * (the model did not review the whole batch). Individual items are validated
+ * leniently: an item with an invalid candidate number, an unknown type, or a
+ * duplicate is dropped. Returns conflicts only; no_conflict verdicts are not
+ * returned.
  */
 export function parseContradictionReply(
 	raw: unknown,
 	batchSize: number,
+	format: ContradictionReplyFormat,
 ): ContradictionConflict[] {
 	const wrapper = contradictionReplySchema.safeParse(raw);
-	if (!wrapper.success) {
+	const items =
+		format === "verdicts"
+			? wrapper.success
+				? wrapper.data.results
+				: undefined
+			: wrapper.success
+				? wrapper.data.conflicts
+				: undefined;
+	if (!wrapper.success || items === undefined) {
 		throw new MalformedLlmOutputError(
 			"contradiction",
-			"reply is not {checked, conflicts}",
+			`reply is not {checked, ${format === "verdicts" ? "results" : "conflicts"}}`,
 		);
 	}
 	if (wrapper.data.checked !== batchSize) {
@@ -241,13 +260,14 @@ export function parseContradictionReply(
 	const seen = new Set<number>();
 	const out: ContradictionConflict[] = [];
 	for (const item of parseItems(
-		wrapper.data.conflicts,
-		contradictionConflictSchema(batchSize),
+		items,
+		contradictionItemSchema(batchSize),
 		"contradiction",
 	)) {
+		if (item.type === "no_conflict") continue;
 		if (seen.has(item.candidate)) {
 			logger.warn(
-				`[llm] contradiction: duplicate conflict for candidate ${item.candidate} — kept the first`,
+				`[llm] contradiction: duplicate verdict for candidate ${item.candidate} — kept the first`,
 			);
 			continue;
 		}

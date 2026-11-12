@@ -477,6 +477,12 @@ export const config = {
 			DEFAULT_CONTRADICTION_MAX_CANDIDATES,
 			1,
 		),
+		// Contradiction reply format. false (default): one verdict per candidate, the
+		// format the scan was tuned on. true: list conflicts only, which saves about
+		// 65% of output tokens per call but is not validated for recall; enable only
+		// after an online spot-check.
+		contradictionConflictsOnly:
+			process.env.CONTRADICTION_CONFLICTS_ONLY === "true",
 		// An entry whose best candidate is below this similarity is not scanned.
 		// 0 disables the floor (every in-band candidate is checked).
 		contradictionMinTopSimilarity: parseFloatEnv(
@@ -866,6 +872,15 @@ export function validateConfig(): string[] {
 		1,
 		"Leave unset for no cap.",
 	);
+	if (
+		process.env.CONTRADICTION_CONFLICTS_ONLY !== undefined &&
+		process.env.CONTRADICTION_CONFLICTS_ONLY !== "true" &&
+		process.env.CONTRADICTION_CONFLICTS_ONLY !== "false"
+	) {
+		errors.push(
+			`CONTRADICTION_CONFLICTS_ONLY must be "true" or "false" (got "${process.env.CONTRADICTION_CONFLICTS_ONLY}"). Default is false.`,
+		);
+	}
 	validateFloatRange(
 		process.env.CONTRADICTION_MIN_TOP_SIMILARITY,
 		"CONTRADICTION_MIN_TOP_SIMILARITY",
