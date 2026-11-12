@@ -76,6 +76,121 @@ export function splitIntoCues(prompt: string): string[] {
 	return normalizeCues([...segments, trimmed]);
 }
 
+/** Per-store admission state within one activate() call (see callStore). */
+interface StoreSlot {
+	inFlight: number;
+	/** The store has returned a result in this activation; the in-flight cap lifts. */
+	answered: boolean;
+	/** Callers parked until one of this store's in-flight calls settles. */
+	waiting: Array<() => void>;
+}
+
+interface BreakerState {
+	status: "closed" | "open" | "half-open";
+	/** Consecutive failures while closed. */
+	failures: number;
+	openedAt: number;
+}
+
+/**
+ * Per-store circuit breaker for the activation fan-out. State is keyed by store
+ * id and lives as long as the ActivationEngine (one per process), so it is shared
+ * across activations.
+ *
+ *   closed    — calls go through; `threshold` consecutive failures open it.
+ *   open      — calls are refused (no timeout wait, no pool slot) for `windowMs`.
+ *   half-open — after the window exactly one probe call is admitted. Success
+ *               closes the circuit; failure re-opens it for another window.
+ *
+ * Warns once per state change (open, probe succeeded, probe failed), never per call.
+ */
+export class StoreBreaker {
+	private readonly states = new Map<string, BreakerState>();
+	private readonly threshold: number;
+	private readonly windowMs: number;
+	private readonly now: () => number;
+
+	constructor(opts: {
+		threshold: number;
+		windowMs: number;
+		now?: () => number;
+	}) {
+		this.threshold = opts.threshold;
+		this.windowMs = opts.windowMs;
+		this.now = opts.now ?? Date.now;
+	}
+
+	private stateOf(id: string): BreakerState {
+		let s = this.states.get(id);
+		if (!s) {
+			s = { status: "closed", failures: 0, openedAt: 0 };
+			this.states.set(id, s);
+		}
+		return s;
+	}
+
+	/** True when a new activation should leave this store out. */
+	isBlocked(id: string): boolean {
+		const s = this.states.get(id);
+		if (!s || s.status === "closed") return false;
+		if (s.status === "half-open") return true;
+		return this.now() - s.openedAt < this.windowMs;
+	}
+
+	/** Max calls in flight for this store before it has answered in an activation. */
+	budget(id: string): number {
+		const s = this.stateOf(id);
+		return s.status === "closed" ? Math.max(1, this.threshold - s.failures) : 1;
+	}
+
+	/** Admit one call. After the window, the first caller becomes the probe. */
+	admit(id: string): boolean {
+		const s = this.stateOf(id);
+		if (s.status === "closed") return true;
+		if (s.status === "open" && this.now() - s.openedAt >= this.windowMs) {
+			s.status = "half-open";
+			return true;
+		}
+		return false;
+	}
+
+	/** Record the outcome of an admitted call. `detail` is used in the warning. */
+	record(id: string, ok: boolean, detail: string): void {
+		const s = this.stateOf(id);
+		const windowS = this.windowMs / 1000;
+		if (ok) {
+			if (s.status === "half-open") {
+				s.status = "closed";
+				s.failures = 0;
+				logger.warn(`[activation] Store "${id}" recovered — circuit closed.`);
+			} else if (s.status === "closed") {
+				s.failures = 0;
+			}
+			return;
+		}
+		if (s.status === "closed") {
+			s.failures++;
+			if (s.failures < this.threshold) return;
+			this.open(s);
+			logger.warn(
+				`[activation] Store "${id}" failed ${this.threshold} times in a row ` +
+					`(${detail}) — circuit open, skipping it for ${windowS}s.`,
+			);
+		} else if (s.status === "half-open") {
+			this.open(s);
+			logger.warn(
+				`[activation] Store "${id}" probe failed (${detail}) — ` +
+					`circuit re-opened for ${windowS}s.`,
+			);
+		}
+	}
+
+	private open(s: BreakerState): void {
+		s.status = "open";
+		s.openedAt = this.now();
+	}
+}
+
 /**
  * Activation engine — the core retrieval mechanism.
  *
@@ -113,13 +228,10 @@ export class ActivationEngine {
 	private readonly reranker: RerankScorer | null;
 
 	/**
-	 * Per-store timestamp (ms since epoch) of the last failure.
-	 * Stores in this map are excluded from fan-out until RETRY_INTERVAL_MS
-	 * elapses, after which they are retried. This prevents a dead store
-	 * (e.g. remote Postgres behind a VPN that went down) from blocking
-	 * every activation call with a TCP timeout.
+	 * Per-store circuit breaker (see StoreBreaker). A store that keeps failing is
+	 * skipped for STORE_RETRY_INTERVAL_MS instead of costing a timeout per cue.
 	 */
-	private unreachableSince: Map<string, number> = new Map();
+	private readonly breaker: StoreBreaker;
 
 	/**
 	 * Last logged ANN vs full-scan partition of reachable stores. Used to log the
@@ -130,7 +242,10 @@ export class ActivationEngine {
 	/** Per-store call timeout — a dead store is skipped after this duration. */
 	private static readonly STORE_TIMEOUT_MS = 5_000;
 
-	/** How long to skip a failed store before retrying it. */
+	/** Consecutive store failures that open the circuit. */
+	private static readonly STORE_FAILURE_THRESHOLD = 3;
+
+	/** How long an open circuit skips a store before one half-open probe. */
 	private static readonly STORE_RETRY_INTERVAL_MS = 60_000;
 
 	/**
@@ -153,77 +268,96 @@ export class ActivationEngine {
 		this.writableDbs = writableDbs ?? [writableDb];
 		this.embeddings = new EmbeddingClient();
 		this.reranker = reranker ?? null;
+		this.breaker = new StoreBreaker({
+			threshold: ActivationEngine.STORE_FAILURE_THRESHOLD,
+			windowMs: ActivationEngine.STORE_RETRY_INTERVAL_MS,
+		});
 	}
 
 	/**
-	 * Read stores that are either healthy or due for a retry.
-	 * Stores that failed within the last STORE_RETRY_INTERVAL_MS are excluded
-	 * so a dead store doesn't block every activation call. After the retry
-	 * interval elapses the store is included again — if it's still down it
-	 * will fail, be re-marked, and excluded for another interval.
+	 * Read stores that the circuit breaker does not block. A store is left out of
+	 * a new activation while its circuit is open (or its half-open probe is in
+	 * flight); once the window elapses it becomes eligible for one probe call.
 	 */
 	private reachableReadDbs(): IKnowledgeStore[] {
-		const now = Date.now();
-		return this.readDbs.filter((db) => {
-			const since = this.unreachableSince.get(db.id);
-			if (since === undefined) return true;
-			return now - since >= ActivationEngine.STORE_RETRY_INTERVAL_MS;
-		});
+		return this.readDbs.filter((db) => !this.breaker.isBlocked(db.id));
 	}
 
 	/**
 	 * Fan out a function across stores, tolerating per-store failures.
 	 *
-	 * Each store call is wrapped in a per-store timeout (STORE_TIMEOUT_MS).
-	 * Results are collected via Promise.allSettled so one dead store cannot
-	 * reject the entire operation — the remaining stores' results are returned.
-	 *
-	 * Failed stores are marked unreachable (see reachableReadDbs) so subsequent
-	 * activation calls skip them for STORE_RETRY_INTERVAL_MS, avoiding repeated
-	 * timeouts on every call.
+	 * Each store call is bounded by STORE_TIMEOUT_MS; the timer is cleared when the
+	 * call settles. One dead store cannot reject the operation: its result is
+	 * dropped and the remaining stores' results are returned.
 	 */
 	private async fanOutSafe<T>(
 		stores: IKnowledgeStore[],
 		fn: (db: IKnowledgeStore) => Promise<T>,
 		label: string,
+		slots: Map<string, StoreSlot>,
 	): Promise<T[]> {
 		if (stores.length === 0) return [];
+		const results = await Promise.all(
+			stores.map((db) => this.callStore(db, fn, label, slots)),
+		);
+		return results.flatMap((r) => (r.ok ? [r.value] : []));
+	}
 
-		const results = await Promise.allSettled(
-			stores.map((db) =>
-				Promise.race([
-					fn(db),
-					new Promise<never>((_, reject) =>
-						setTimeout(
-							() =>
-								reject(
-									new Error(
-										`timeout after ${ActivationEngine.STORE_TIMEOUT_MS / 1000}s`,
-									),
-								),
-							ActivationEngine.STORE_TIMEOUT_MS,
+	/**
+	 * One store call under the circuit breaker, within one activation.
+	 *
+	 * Until the store answers in this activation, at most breaker.budget() of its
+	 * calls are in flight, so a dead store receives at most STORE_FAILURE_THRESHOLD
+	 * calls however many cues fan out. Calls the breaker refuses return at once:
+	 * no timeout wait, no warning.
+	 */
+	private async callStore<T>(
+		db: IKnowledgeStore,
+		fn: (db: IKnowledgeStore) => Promise<T>,
+		label: string,
+		slots: Map<string, StoreSlot>,
+	): Promise<{ ok: true; value: T } | { ok: false }> {
+		const slot: StoreSlot = slots.get(db.id) ?? {
+			inFlight: 0,
+			answered: false,
+			waiting: [],
+		};
+		slots.set(db.id, slot);
+		while (!slot.answered && slot.inFlight >= this.breaker.budget(db.id)) {
+			await new Promise<void>((resolve) => slot.waiting.push(resolve));
+		}
+		if (!this.breaker.admit(db.id)) return { ok: false };
+
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timeout = new Promise<never>((_, reject) => {
+			timer = setTimeout(
+				() =>
+					reject(
+						new Error(
+							`timeout after ${ActivationEngine.STORE_TIMEOUT_MS / 1000}s`,
 						),
 					),
-				]),
-			),
-		);
-
-		const ok: T[] = [];
-		for (let i = 0; i < results.length; i++) {
-			const r = results[i];
-			if (r.status === "fulfilled") {
-				this.unreachableSince.delete(stores[i].id);
-				ok.push(r.value);
-			} else {
-				this.unreachableSince.set(stores[i].id, Date.now());
-				logger.warn(
-					`[activation] Store "${stores[i].id}" failed during ${label} — skipping. ` +
-						`Will retry in ${ActivationEngine.STORE_RETRY_INTERVAL_MS / 1000}s. ` +
-						`Reason: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`,
-				);
-			}
+				ActivationEngine.STORE_TIMEOUT_MS,
+			);
+		});
+		slot.inFlight++;
+		try {
+			const value = await Promise.race([fn(db), timeout]);
+			slot.answered = true;
+			this.breaker.record(db.id, true, label);
+			return { ok: true, value };
+		} catch (err) {
+			this.breaker.record(
+				db.id,
+				false,
+				`${label}: ${err instanceof Error ? err.message : String(err)}`,
+			);
+			return { ok: false };
+		} finally {
+			clearTimeout(timer);
+			slot.inFlight--;
+			for (const wake of slot.waiting.splice(0)) wake();
 		}
-		return ok;
 	}
 
 	/**
@@ -281,6 +415,8 @@ export class ActivationEngine {
 			? Math.max(config.activation.rerank.candidates, maxResults)
 			: maxResults;
 
+		const slots = new Map<string, StoreSlot>();
+
 		// Embed all queries in a single batched API call
 		const queryEmbeddings = await this.embeddings.embedBatch(queryList);
 
@@ -321,7 +457,7 @@ export class ActivationEngine {
 			};
 		}> = [];
 
-		// Split *reachable* read stores by retrieval path. Unreachable stores are
+		// Split non-blocked read stores by retrieval path. Circuit-open stores are
 		// already excluded by reachableReadDbs().
 		const reachable = this.reachableReadDbs();
 		const annDbs: IKnowledgeStore[] = [];
@@ -343,8 +479,8 @@ export class ActivationEngine {
 		}
 
 		// Run all retrieval work concurrently. fanOutSafe tolerates per-store
-		// failures (a dead store is skipped after STORE_TIMEOUT_MS and marked
-		// unreachable) and returns [] for an empty store list, so a topology
+		// failures (a failing store trips its circuit breaker and is skipped) and
+		// returns [] for an empty store list, so a topology
 		// without ANN or without scan stores makes no calls for that path.
 		// - ANN: one fan-out per query vector, fetchLimit per query vector per
 		//   store, flattened across stores so annResultsPerQuery is
@@ -362,6 +498,7 @@ export class ActivationEngine {
 									// biome-ignore lint/style/noNonNullAssertion: guarded by storeSupportsAnn
 									db.findSimilarEntries!(qEmb, fetchLimit, similarityThreshold),
 								"ANN search",
+								slots,
 							)
 						).flat(),
 					),
@@ -373,11 +510,13 @@ export class ActivationEngine {
 							? db.getActiveEntryCount()
 							: Promise.resolve(0),
 					"active entry count",
+					slots,
 				),
 				this.fanOutSafe(
 					scanDbs,
 					(db) => db.getActiveEntriesWithEmbeddings(),
 					"full-scan load",
+					slots,
 				),
 			]);
 
@@ -549,6 +688,7 @@ export class ActivationEngine {
 				this.reachableReadDbs(),
 				(db) => db.getSupportSourcesForIds(synthesizedIds),
 				"support sources lookup",
+				slots,
 			);
 			const sourcesMap = mergeMaps(sourceMaps);
 
@@ -616,6 +756,7 @@ export class ActivationEngine {
 			this.reachableReadDbs(),
 			(db) => db.getContradictPairsForIds(conflictedIds),
 			"contradict pairs lookup",
+			slots,
 		);
 		const contradictPairs = mergeMaps(contradictMaps);
 
