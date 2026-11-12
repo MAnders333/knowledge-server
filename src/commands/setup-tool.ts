@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import {
 	copyFileSync,
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	readFileSync,
 	readdirSync,
@@ -20,6 +21,7 @@ import {
 	loadConfigFile,
 } from "../config-file.js";
 import { config } from "../config.js";
+import { recordExtensionTarget } from "./extension-targets.js";
 import {
 	GITHUB_RELEASES,
 	detectPlatform,
@@ -64,6 +66,10 @@ const resolvedHost = fileConfig.host;
  *
  * cursor / codex:
  *   - Register MCP server in ~/.cursor/mcp.json / ~/.codex/config.toml
+ * codex:
+ *   - Also write a UserPromptSubmit hook to ~/.codex/hooks.json (Codex skips it until trusted in /hooks)
+ * pi / oh-my-pi:
+ *   - Place the extension file (no MCP: pi and oh-my-pi have none for this)
  *
  * There are two installation modes:
  *
@@ -403,6 +409,7 @@ function setupOpenCode(): void {
 				try {
 					// Copy rather than symlink — install dir is internal implementation detail.
 					copyFileSync(cached, dst);
+					recordExtensionTarget(installDir, { asset: name, dst });
 					console.log(`  ✓ ${label}: ${dst}`);
 					return true;
 				} catch (err) {
@@ -414,6 +421,7 @@ function setupOpenCode(): void {
 				process.stdout.write(`  Downloading ${name}... `);
 				try {
 					downloadAssetSync(name, dst);
+					recordExtensionTarget(installDir, { asset: name, dst });
 					console.log("done");
 					return true;
 				} catch (err) {
@@ -795,6 +803,108 @@ Setup complete!`);
 
 // ── Codex setup ─────────────────────────────────────────────────────────────────
 
+// Marks knowledge-server's UserPromptSubmit handler in ~/.codex/hooks.json. A re-run
+// finds it by this path, so a port change replaces the old handler instead of adding one.
+const CODEX_HOOK_PATH_MARKER = "/hooks/claude-code/user-prompt?client=codex";
+
+/**
+ * Shell command for Codex's UserPromptSubmit hook. Codex writes the hook input
+ * ({prompt, session_id, cwd}) to stdin and reads hookSpecificOutput from stdout,
+ * which is the same JSON the Claude Code endpoint returns. `--max-time` stays
+ * under the hook's 5 s timeout. `|| true` matters: a command hook that exits 2
+ * blocks the prompt, so a stopped or slow server must never fail the hook.
+ */
+function codexHookCommand(): string {
+	const url = `http://${resolvedHost}:${resolvedPort}${CODEX_HOOK_PATH_MARKER}`;
+	// POSIX single-quoting: host and port come from config, so the URL is always quoted.
+	const quoted = `'${url.replace(/'/g, "'\\''")}'`;
+	return `curl -s --max-time 4 --data-binary @- ${quoted} || true`;
+}
+
+/**
+ * Write the UserPromptSubmit hook into ~/.codex/hooks.json. Other hooks and
+ * groups in that file are kept. Groups that held only a previous knowledge-server
+ * handler are dropped, so the file never ends up with two handlers.
+ */
+function setupCodexHook(codexHome: string): void {
+	const hooksPath = join(codexHome, "hooks.json");
+	let file: Record<string, unknown> = {};
+	if (existsSync(hooksPath)) {
+		try {
+			file = JSON.parse(readFileSync(hooksPath, "utf8")) as Record<
+				string,
+				unknown
+			>;
+		} catch (e) {
+			console.error(`  ✗ Failed to parse ${hooksPath}: ${e}`);
+			console.error(
+				"    Fix the JSON syntax error and re-run setup-tool codex to add the hook.",
+			);
+			return;
+		}
+	}
+
+	const hooks = (file.hooks ?? {}) as Record<string, unknown>;
+	const groups = Array.isArray(hooks.UserPromptSubmit)
+		? (hooks.UserPromptSubmit as Array<Record<string, unknown>>)
+		: [];
+	const command = codexHookCommand();
+
+	let ourHandlers = 0;
+	let alreadyCurrent = false;
+	const kept: unknown[] = [];
+	for (const group of groups) {
+		if (!Array.isArray(group.hooks)) {
+			kept.push(group);
+			continue;
+		}
+		const handlers = group.hooks as Array<Record<string, unknown>>;
+		const rest = handlers.filter((h) => {
+			if (
+				typeof h.command !== "string" ||
+				!h.command.includes(CODEX_HOOK_PATH_MARKER)
+			) {
+				return true;
+			}
+			ourHandlers += 1;
+			if (h.command === command) alreadyCurrent = true;
+			return false;
+		});
+		if (rest.length === handlers.length) kept.push(group);
+		else if (rest.length > 0) kept.push({ ...group, hooks: rest });
+	}
+	if (alreadyCurrent && ourHandlers === 1) {
+		console.log("  ✓ UserPromptSubmit hook already configured (no change)");
+		return;
+	}
+	kept.push({ hooks: [{ type: "command", command, timeout: 5 }] });
+	hooks.UserPromptSubmit = kept;
+	file.hooks = hooks;
+
+	const tmpPath = `${hooksPath}.tmp`;
+	try {
+		writeFileSync(tmpPath, `${JSON.stringify(file, null, 2)}\n`, "utf8");
+		renameSync(tmpPath, hooksPath);
+	} catch (e) {
+		try {
+			unlinkSync(tmpPath);
+		} catch {
+			/* ignore */
+		}
+		throw e;
+	}
+	console.log(`  ✓ UserPromptSubmit hook written to ${hooksPath}`);
+	console.log(
+		"  ⚠ Codex does not run a new or changed hook until you trust it:",
+	);
+	console.log(
+		"    open Codex, run /hooks, and trust the knowledge-server UserPromptSubmit hook.",
+	);
+	console.log(
+		"    Trust is tied to the hook's contents, so re-run this after a port change and trust it again.",
+	);
+}
+
 /**
  * Merge the `[mcp_servers.knowledge]` entry into ~/.codex/config.toml.
  *
@@ -879,6 +989,8 @@ env = { KNOWLEDGE_HOST = "${resolvedHost}", KNOWLEDGE_PORT = "${resolvedPort}" }
 		console.log("  ✓ MCP server 'knowledge' added to ~/.codex/config.toml");
 		console.log(`  ✓ Wrote ${configPath}`);
 	}
+
+	setupCodexHook(codexHome);
 
 	const startHint = isSourceInstall()
 		? `bun run ${join(getProjectDir(), "src", "index.ts")}`
@@ -1084,6 +1196,10 @@ function setupPi(): void {
 		if (existsSync(cached)) {
 			try {
 				copyFileSync(cached, extDst);
+				recordExtensionTarget(getBinaryInstallDir(), {
+					asset: "pi-knowledge.ts",
+					dst: extDst,
+				});
 				console.log(`  ✓ Extension: ${extDst}`);
 			} catch (err) {
 				console.error(`  ✗ Failed to copy pi-knowledge.ts: ${err}`);
@@ -1093,6 +1209,10 @@ function setupPi(): void {
 			process.stdout.write("  Downloading pi-knowledge.ts... ");
 			try {
 				downloadAssetSync("pi-knowledge.ts", extDst);
+				recordExtensionTarget(getBinaryInstallDir(), {
+					asset: "pi-knowledge.ts",
+					dst: extDst,
+				});
 				console.log("done");
 			} catch (err) {
 				console.error(`failed: ${err instanceof Error ? err.message : err}`);
@@ -1162,6 +1282,121 @@ Start the knowledge server before using pi:
   ${startHint}
 
 Setup complete!${registered > 0 ? ` (${registered} layer settings updated)` : ""}`);
+}
+
+// ── oh-my-pi setup ───────────────────────────────────────────────────────────
+
+/**
+ * Agent layers of an oh-my-pi install: the shared `agent` dir plus every
+ * `profiles/<mode>/agent`, the same layers the oh-my-pi session reader scans.
+ * A layer without an agent dir is skipped.
+ */
+function ompAgentLayers(ompRoot: string): string[] {
+	const layers: string[] = [];
+	const shared = join(ompRoot, "agent");
+	if (existsSync(shared)) layers.push(shared);
+	let profiles: string[] = [];
+	try {
+		profiles = readdirSync(join(ompRoot, "profiles"), { withFileTypes: true })
+			.filter((d) => d.isDirectory())
+			.map((d) => d.name);
+	} catch {
+		// no profiles dir — the shared layer alone may be the install
+	}
+	for (const mode of profiles) {
+		const agent = join(ompRoot, "profiles", mode, "agent");
+		if (existsSync(agent)) layers.push(agent);
+	}
+	return layers;
+}
+
+/**
+ * `knowledge-server setup-tool oh-my-pi`
+ *
+ * oh-my-pi (`omp`, @oh-my-pi/pi-coding-agent) is a pi fork with its own extension
+ * API, so it gets its own file, plugin/omp-knowledge.ts. The extension hooks
+ * `before_agent_start` (once per prompt, before the model sees it) and queries
+ * GET /activate with client tag `omp`.
+ *
+ * oh-my-pi auto-discovers `<agent-dir>/extensions/*.ts`, so the file is placed as
+ * extensions/knowledge.ts in every agent layer and no settings entry is needed.
+ * Source installs symlink the repo file; binary installs copy it and register the
+ * copies so `knowledge-server update` refreshes them.
+ */
+export function setupOhMyPi(ompRoot: string = config.ompSessionsRoot): void {
+	console.log("Setting up oh-my-pi integration...\n");
+
+	const layers = ompAgentLayers(ompRoot);
+	if (layers.length === 0) {
+		console.error(
+			`  ✗ No oh-my-pi agent directory under ${ompRoot} — oh-my-pi does not appear to be installed (or has never run).`,
+		);
+		console.error(
+			"    Install oh-my-pi (bun add -g @oh-my-pi/pi-coding-agent), run it once, then re-run this setup.",
+		);
+		process.exit(1);
+	}
+
+	const sourceInstall = isSourceInstall();
+	const projectDir = sourceInstall ? getProjectDir() : "";
+	const extSrc = join(projectDir, "plugin", "omp-knowledge.ts");
+	if (sourceInstall && !existsSync(extSrc)) {
+		console.error(`  ✗ Extension source not found: ${extSrc}`);
+		console.error(
+			"    Make sure you are running from the knowledge-server project directory.",
+		);
+		process.exit(1);
+	}
+	const installDir = getBinaryInstallDir();
+
+	for (const layer of layers) {
+		const extDir = join(layer, "extensions");
+		const dst = join(extDir, "knowledge.ts");
+		mkdirSync(extDir, { recursive: true });
+
+		if (sourceInstall) {
+			forceSymlink(extSrc, dst);
+			console.log(`  ✓ Extension: ${dst}`);
+			console.log(`       → ${extSrc}`);
+			continue;
+		}
+
+		// Binary install: copy <install-dir>/omp-knowledge.ts when present,
+		// otherwise download the verified release asset. A leftover symlink from a
+		// source install is removed first so the copy never writes into the repo.
+		if (existsSync(dst) && lstatSync(dst).isSymbolicLink()) unlinkSync(dst);
+		const cached = join(installDir, "omp-knowledge.ts");
+		try {
+			if (existsSync(cached)) {
+				copyFileSync(cached, dst);
+				console.log(`  ✓ Extension: ${dst}`);
+			} else {
+				process.stdout.write("  Downloading omp-knowledge.ts... ");
+				downloadAssetSync("omp-knowledge.ts", dst);
+				console.log("done");
+			}
+		} catch (err) {
+			console.error(`failed: ${err instanceof Error ? err.message : err}`);
+			console.error(
+				"    Extension is required for oh-my-pi integration — aborting.",
+			);
+			process.exit(1);
+		}
+		recordExtensionTarget(installDir, { asset: "omp-knowledge.ts", dst });
+	}
+
+	maybeSetupDaemon();
+
+	const startHint = sourceInstall
+		? `bun run ${join(projectDir, "src", "index.ts")}`
+		: "knowledge-server";
+
+	console.log(`
+Start the knowledge server before using oh-my-pi:
+  ${startHint}
+
+Open a new oh-my-pi session to load the extension.
+Setup complete! (${layers.length} agent layer${layers.length === 1 ? "" : "s"} updated)`);
 }
 
 /**
@@ -1447,7 +1682,7 @@ export function runSetupTool(args: string[]): void {
 Available tools:
   opencode      Symlink plugin + commands; register MCP server in opencode.jsonc
   claude-code   Register MCP server + hook; symlink commands into ~/.claude/commands/
-  pi            Place extension; register it in pi layer settings (pi has no MCP)
+  oh-my-pi      Place extension in each oh-my-pi agent layer (no MCP)
   cursor        Register MCP server in ~/.cursor/mcp.json
   codex         Register MCP server in ~/.codex/config.toml
   vscode        Register MCP server via \`code --add-mcp\`
@@ -1466,6 +1701,9 @@ Available tools:
 		case "pi":
 			setupPi();
 			break;
+		case "oh-my-pi":
+			setupOhMyPi();
+			break;
 		case "cursor":
 			setupCursor();
 			break;
@@ -1481,7 +1719,7 @@ Available tools:
 		default:
 			console.error(`Unknown tool: ${tool}`);
 			console.error(
-				"Valid options: opencode, claude-code, pi, cursor, codex, vscode, daemon",
+				"Valid options: opencode, claude-code, pi, oh-my-pi, cursor, codex, vscode, daemon",
 			);
 			process.exit(1);
 	}

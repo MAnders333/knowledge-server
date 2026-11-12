@@ -13,7 +13,7 @@ import { join } from "node:path";
 const PLUGIN_DIR = join(import.meta.dir, "..", "plugin");
 /** Run a plugin's startup health probe in a child process and return the fetched URLs. */
 async function startupProbeUrls(
-	pluginFile: "knowledge.ts" | "pi-knowledge.ts",
+	pluginFile: "knowledge.ts" | "pi-knowledge.ts" | "omp-knowledge.ts",
 	configJsonc: string,
 ): Promise<string[]> {
 	const home = mkdtempSync(join(tmpdir(), "ks-plugin-home-"));
@@ -76,7 +76,7 @@ console.log(JSON.stringify(urls));
 	}
 }
 
-describe.each(["knowledge.ts", "pi-knowledge.ts"] as const)(
+describe.each(["knowledge.ts", "pi-knowledge.ts", "omp-knowledge.ts"] as const)(
 	"%s server URL",
 	(pluginFile) => {
 		it("uses the port from config.jsonc", async () => {

@@ -982,6 +982,64 @@ describe("CodexEpisodeReader — injected knowledge guard", () => {
 		expect(episodes[0].content).toContain("  user: plain first message");
 		expect(episodes[0].content).toContain("  assistant: answer one");
 	});
+
+	it("never re-learns hook-injected context, stored as developer or user text", () => {
+		// A UserPromptSubmit hook's additionalContext is added as developer context.
+		// The reader keeps only user and assistant messages, so the developer record
+		// is never extracted, and a user record carrying the block is dropped by the
+		// tag guard.
+		const developerRecord = JSON.stringify({
+			timestamp: ts(BASE_TS, 1000),
+			type: "response_item",
+			payload: {
+				type: "message",
+				role: "developer",
+				content: [{ type: "input_text", text: INJECTED_BLOCK }],
+			},
+		});
+		writeRollout(
+			SESSION_UUID,
+			[
+				metaRecord({ timestamp: ts(BASE_TS), id: SESSION_UUID }),
+				developerRecord,
+				msgRecord({
+					timestamp: ts(BASE_TS, 2000),
+					role: "user",
+					text: `hook context follows\n${INJECTED_BLOCK}`,
+				}),
+				msgRecord({
+					timestamp: ts(BASE_TS, 3000),
+					role: "user",
+					text: "question one",
+				}),
+				msgRecord({
+					timestamp: ts(BASE_TS, 4000),
+					role: "assistant",
+					text: "answer one",
+				}),
+				msgRecord({
+					timestamp: ts(BASE_TS, 5000),
+					role: "user",
+					text: "question two",
+				}),
+				msgRecord({
+					timestamp: ts(BASE_TS, 6000),
+					role: "assistant",
+					text: "answer two",
+				}),
+			],
+			BASE_TS + 7000,
+		);
+		reader.getCandidateSessions(BASE_TS - 1);
+		const episodes = reader.getNewEpisodes(
+			[SESSION_UUID],
+			new Map([[SESSION_UUID, []]]),
+		);
+		expect(episodes).toHaveLength(1);
+		expect(episodes[0].content).not.toContain("addrl-activated-knowledge");
+		expect(episodes[0].content).not.toContain("Deploys go out on Thursdays");
+		expect(episodes[0].content).toContain("question one");
+	});
 });
 
 // ── ARC-07: incremental growth, hold-back, poison pills ──────────────────────

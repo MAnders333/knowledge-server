@@ -38,6 +38,7 @@ type ActivateBody = Record<string, unknown>;
 
 interface Item {
 	entry: {
+		id: string;
 		type: string;
 		content: string;
 		topics: string[];
@@ -60,7 +61,13 @@ interface Item {
 
 function item(content: string, type = "fact"): Item {
 	return {
-		entry: { type, content, topics: [], confidence: 0.9 },
+		entry: {
+			id: "0f1e2d3c-4b5a-4968-8777-665544332211",
+			type,
+			content,
+			topics: [],
+			confidence: 0.9,
+		},
 		rawSimilarity: 0.8,
 		similarity: 0.8,
 		staleness: {
@@ -118,22 +125,25 @@ const openCodeDriver: Driver = {
 	},
 };
 
-const piDriver: Driver = {
-	async activate(body, prompt) {
-		activateBody = body;
-		const handlers = new Map<string, (...args: unknown[]) => unknown>();
-		piModule.default({
-			on: (event: string, handler: (...args: unknown[]) => unknown) => {
-				handlers.set(event, handler);
-			},
-		});
-		const result = (await handlers.get("before_agent_start")?.(
-			{ prompt },
-			{},
-		)) as { message?: { content?: string } } | undefined;
-		return result?.message?.content;
-	},
-};
+/** Drives a before_agent_start handler: the hook that pi and oh-my-pi both expose. */
+function beforeAgentStartDriver(extension: typeof piModule): Driver {
+	return {
+		async activate(body, prompt) {
+			activateBody = body;
+			const handlers = new Map<string, (...args: unknown[]) => unknown>();
+			extension.default({
+				on: (event: string, handler: (...args: unknown[]) => unknown) => {
+					handlers.set(event, handler);
+				},
+			});
+			const result = (await handlers.get("before_agent_start")?.(
+				{ prompt },
+				{},
+			)) as { message?: { content?: string } } | undefined;
+			return result?.message?.content;
+		},
+	};
+}
 
 async function injected(
 	driver: Driver,
@@ -145,9 +155,12 @@ async function injected(
 	return text;
 }
 
+const ompModule = await loadPlugin("omp-knowledge.ts");
+
 const drivers: Array<[string, Driver]> = [
 	["knowledge.ts", openCodeDriver],
-	["pi-knowledge.ts", piDriver],
+	["pi-knowledge.ts", beforeAgentStartDriver(piModule)],
+	["omp-knowledge.ts", beforeAgentStartDriver(ompModule)],
 ];
 
 describe.each(drivers)("%s activation context", (_name, driver) => {
@@ -189,7 +202,7 @@ describe.each(drivers)("%s activation context", (_name, driver) => {
 		const content = "ab\u200bc\u202ed\u2066e\ufefff\u00adg";
 		const block = await injected(driver, { entries: [item(content)] });
 
-		expect(block).toContain("- [fact] abcdefg\n");
+		expect(block).toContain("- [fact] (id 0f1e2d3c) abcdefg\n");
 		expect(block).not.toMatch(/[\u200b\u202e\u2066\ufeff\u00ad]/);
 	});
 
@@ -198,7 +211,7 @@ describe.each(drivers)("%s activation context", (_name, driver) => {
 			"Café déjà vu — naïve résumé, 日本語のテキスト, family 👨‍👩‍👧 ok";
 		const block = await injected(driver, { entries: [item(content)] });
 
-		expect(block).toContain(`- [fact] ${content}\n`);
+		expect(block).toContain(`- [fact] (id 0f1e2d3c) ${content}\n`);
 	});
 
 	it("caps a 5000-character content at 1000 characters", async () => {
@@ -207,7 +220,7 @@ describe.each(drivers)("%s activation context", (_name, driver) => {
 		});
 		const line = block.split("\n").find((l) => l.startsWith("- [fact] "));
 
-		expect(line).toBe(`- [fact] ${"a".repeat(999)}…`);
+		expect(line).toBe(`- [fact] (id 0f1e2d3c) ${"a".repeat(999)}…`);
 	});
 
 	it("matches formatActivatedKnowledge for the same entries", async () => {
@@ -240,5 +253,59 @@ describe.each(drivers)("%s activation context", (_name, driver) => {
 		expect(
 			block.split("\n").filter((l) => l.startsWith("- [")).length,
 		).toBeLessThan(items.length);
+	});
+});
+
+describe("omp-knowledge.ts before_agent_start", () => {
+	it("injects nothing when oh-my-pi revives a parked subagent", async () => {
+		activateBody = { entries: [item("Use port 4321.")] };
+		const handlers = new Map<string, (...args: unknown[]) => unknown>();
+		ompModule.default({
+			on: (event: string, handler: (...args: unknown[]) => unknown) => {
+				handlers.set(event, handler);
+			},
+		});
+		const result = await handlers.get("before_agent_start")?.(
+			{ reason: "revive", prompt: PROMPT },
+			{},
+		);
+		expect(result).toBeUndefined();
+	});
+
+	it("returns the block as an agent-attributed custom message", async () => {
+		activateBody = { entries: [item("Use port 4321.")] };
+		const handlers = new Map<string, (...args: unknown[]) => unknown>();
+		ompModule.default({
+			on: (event: string, handler: (...args: unknown[]) => unknown) => {
+				handlers.set(event, handler);
+			},
+		});
+		const result = (await handlers.get("before_agent_start")?.(
+			{ reason: "prompt", prompt: PROMPT },
+			{},
+		)) as { message: Record<string, unknown> };
+		expect(result.message).toMatchObject({
+			customType: "knowledge",
+			display: false,
+			attribution: "agent",
+		});
+	});
+
+	it("sends the omp client tag on activation", async () => {
+		const seen: string[] = [];
+		const realFetchLocal = globalThis.fetch;
+		globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
+			seen.push(JSON.stringify(init?.headers ?? {}));
+			return realFetchLocal(input, init);
+		}) as typeof fetch;
+		try {
+			activateBody = { entries: [item("Use port 4321.")] };
+			await beforeAgentStartDriver(ompModule).activate({}, PROMPT);
+		} finally {
+			globalThis.fetch = realFetchLocal;
+		}
+		expect(seen.some((h) => h.includes('"x-knowledge-client":"omp"'))).toBe(
+			true,
+		);
 	});
 });
