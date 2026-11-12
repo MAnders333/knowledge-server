@@ -25,6 +25,22 @@ import {
 } from "./schema.js";
 
 /**
+ * knowledge_entry columns read by rowToEntry(), without the embedding BLOB.
+ * Every read that does not score vectors uses this list, so a 3072-d float32
+ * vector (12 KB as a BLOB) is only materialised where cosine similarity needs it.
+ * Keep in sync with RawEntryRow.
+ */
+const ENTRY_COLUMNS =
+	"id, type, content, topics, confidence, source, status, strength, created_at, updated_at, last_accessed_at, access_count, observation_count, superseded_by, derived_from, is_synthesized";
+
+/** ENTRY_COLUMNS qualified with a table alias (for joins). */
+function qualifiedEntryColumns(alias: string): string {
+	return ENTRY_COLUMNS.split(", ")
+		.map((c) => `${alias}.${c}`)
+		.join(", ");
+}
+
+/**
  * SQLite database layer for the knowledge graph.
  *
  * Uses bun:sqlite (Bun's native SQLite binding) for all operations:
@@ -233,7 +249,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 
 	async getEntry(id: string): Promise<KnowledgeEntry | null> {
 		const row = this.db
-			.prepare("SELECT * FROM knowledge_entry WHERE id = ?")
+			.prepare(`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE id = ?`)
 			.get(id) as RawEntryRow | null;
 
 		return row ? this.rowToEntry(row) : null;
@@ -242,7 +258,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 	async getActiveEntries(): Promise<KnowledgeEntry[]> {
 		const rows = this.db
 			.prepare(
-				"SELECT * FROM knowledge_entry WHERE status = 'active' ORDER BY strength DESC",
+				`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE status = 'active' ORDER BY strength DESC`,
 			)
 			.all() as RawEntryRow[];
 
@@ -259,7 +275,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 	> {
 		const rows = this.db
 			.prepare(
-				"SELECT * FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL ORDER BY strength DESC",
+				`SELECT ${ENTRY_COLUMNS}, embedding FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL ORDER BY strength DESC`,
 			)
 			.all() as RawEntryRow[];
 
@@ -279,7 +295,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 	> {
 		const row = this.db
 			.prepare(
-				"SELECT * FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL LIMIT 1",
+				`SELECT ${ENTRY_COLUMNS}, embedding FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL LIMIT 1`,
 			)
 			.get() as RawEntryRow | undefined;
 
@@ -299,7 +315,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 	async getActiveAndConflictedEntries(): Promise<KnowledgeEntry[]> {
 		const rows = this.db
 			.prepare(
-				"SELECT * FROM knowledge_entry WHERE status IN ('active', 'conflicted') ORDER BY updated_at DESC",
+				`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE status IN ('active', 'conflicted') ORDER BY updated_at DESC`,
 			)
 			.all() as RawEntryRow[];
 		return rows.map((r) => this.rowToEntry(r));
@@ -311,7 +327,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 	async getEntriesMissingEmbeddings(): Promise<KnowledgeEntry[]> {
 		const rows = this.db
 			.prepare(
-				"SELECT * FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NULL ORDER BY updated_at DESC",
+				`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NULL ORDER BY updated_at DESC`,
 			)
 			.all() as RawEntryRow[];
 
@@ -324,7 +340,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 	async getEntriesByStatus(status: KnowledgeStatus): Promise<KnowledgeEntry[]> {
 		const rows = this.db
 			.prepare(
-				"SELECT * FROM knowledge_entry WHERE status = ? ORDER BY updated_at DESC",
+				`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE status = ? ORDER BY updated_at DESC`,
 			)
 			.all(status) as RawEntryRow[];
 
@@ -355,7 +371,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 			conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 		const rows = this.db
 			.prepare(
-				`SELECT * FROM knowledge_entry ${where} ORDER BY created_at DESC`,
+				`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry ${where} ORDER BY created_at DESC`,
 			)
 			.all(...values) as RawEntryRow[];
 
@@ -447,7 +463,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 
 		const rows = this.db
 			.prepare(
-				`SELECT DISTINCT ke.*
+				`SELECT DISTINCT ${qualifiedEntryColumns("ke")}, ke.embedding
          FROM knowledge_entry ke, json_each(ke.topics) t
          WHERE ke.status IN ('active', 'conflicted')
            AND t.value IN (SELECT value FROM json_each(?))
@@ -813,7 +829,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 		// `supports` relations: source_id = synthesized entry, target_id = source entry
 		const rows = this.db
 			.prepare(
-				`SELECT kr.source_id AS synth_id, ke.*
+				`SELECT kr.source_id AS synth_id, ${qualifiedEntryColumns("ke")}
          FROM knowledge_relation kr
          JOIN knowledge_entry ke ON ke.id = kr.target_id
          WHERE kr.type = 'supports'
@@ -1303,5 +1319,6 @@ interface RawEntryRow {
 	superseded_by: string | null;
 	derived_from: string;
 	is_synthesized: number;
-	embedding: Uint8Array | null;
+	/** Present only in queries that select the embedding column. */
+	embedding?: Uint8Array | null;
 }

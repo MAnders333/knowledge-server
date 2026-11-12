@@ -173,15 +173,52 @@ describe("KnowledgeDB", () => {
 			embedding,
 		});
 
-		const entry = await db.getEntry("test-emb");
-		expect(entry?.embedding).toBeDefined();
-		expect(entry?.embedding?.length).toBe(5);
+		// Plain reads never carry the embedding BLOB; scoring reads do.
+		expect((await db.getEntry("test-emb"))?.embedding).toBeUndefined();
+		const [scored] = (await db.getActiveEntriesWithEmbeddings()).filter(
+			(e) => e.id === "test-emb",
+		);
+		expect(scored?.embedding.length).toBe(5);
 		// Float32 precision — check approximate equality
 		for (let i = 0; i < embedding.length; i++) {
-			expect(Math.abs(entry?.embedding?.[i] - embedding[i])).toBeLessThan(
-				0.0001,
-			);
+			expect(Math.abs(scored.embedding[i] - embedding[i])).toBeLessThan(0.0001);
 		}
+	});
+
+	it("plain entry reads never carry the embedding", async () => {
+		const now = Date.now();
+		await db.insertEntry({
+			id: "plain-1",
+			type: "fact",
+			content: "Plain read",
+			topics: ["t"],
+			confidence: 0.5,
+			source: "test",
+			status: "active",
+			strength: 1.0,
+			createdAt: now,
+			updatedAt: now,
+			lastAccessedAt: now,
+			accessCount: 0,
+			observationCount: 1,
+			supersededBy: null,
+			derivedFrom: [],
+			embedding: [0.1, 0.2, 0.3],
+		});
+		const reads = [
+			await db.getEntry("plain-1"),
+			...(await db.getActiveEntries()),
+			...(await db.getActiveAndConflictedEntries()),
+			...(await db.getEntriesByStatus("active")),
+			...(await db.getEntries({ status: "active" })),
+		];
+		expect(reads.length).toBeGreaterThanOrEqual(5);
+		for (const entry of reads) {
+			expect(entry?.embedding).toBeUndefined();
+		}
+		expect(
+			(await db.getActiveEntriesWithEmbeddings()).map((e) => e.id),
+		).toEqual(["plain-1"]);
 	});
 
 	it("should manage consolidation state", async () => {
@@ -436,10 +473,23 @@ describe("KnowledgeDB", () => {
 		const cleared = await db.clearAllEmbeddings();
 		expect(cleared).toBe(2); // only active + conflicted
 
-		expect((await db.getEntry("e1"))?.embedding).toBeUndefined();
-		expect((await db.getEntry("e2"))?.embedding).toBeUndefined();
-		// Superseded entry should retain its embedding
-		expect((await db.getEntry("e3"))?.embedding).toBeDefined();
+		const embeddingBlobs = new Database(join(tempDir, "test.db"), {
+			readonly: true,
+		});
+		const hasBlob = (id: string) =>
+			(
+				embeddingBlobs
+					.prepare("SELECT embedding FROM knowledge_entry WHERE id = ?")
+					.get(id) as { embedding: Uint8Array | null }
+			).embedding !== null;
+		try {
+			expect(hasBlob("e1")).toBe(false);
+			expect(hasBlob("e2")).toBe(false);
+			// Superseded entry should retain its embedding
+			expect(hasBlob("e3")).toBe(true);
+		} finally {
+			embeddingBlobs.close();
+		}
 	});
 
 	it("clearAllEmbeddings returns 0 when no embeddings exist", async () => {

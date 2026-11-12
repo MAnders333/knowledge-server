@@ -35,6 +35,7 @@ import { SCHEMA_VERSION } from "../src/db/postgres/schema";
 import { ServerStateDB } from "../src/db/state/index";
 import { PostgresServerStateDB } from "../src/db/state/postgres";
 import { logger } from "../src/logger";
+import type { KnowledgeEntry } from "../src/types";
 
 const PG_URI = process.env.PG_TEST_URI;
 // Non-owner role password, built at runtime so no credential literal sits in source.
@@ -329,13 +330,14 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		const embedding = [0.1, 0.2, 0.3, 0.4, 0.5];
 		await db.insertEntry(makeEntry("emb-1", { embedding }));
 
-		const entry = await db.getEntry("emb-1");
-		expect(entry?.embedding).toBeDefined();
-		expect(entry?.embedding?.length).toBe(5);
+		// Plain reads never carry the embedding; scoring reads do.
+		expect((await db.getEntry("emb-1"))?.embedding).toBeUndefined();
+		const [scored] = (await db.getActiveEntriesWithEmbeddings()).filter(
+			(e) => e.id === "emb-1",
+		);
+		expect(scored?.embedding.length).toBe(5);
 		for (let i = 0; i < embedding.length; i++) {
-			expect(
-				Math.abs((entry?.embedding?.[i] ?? 0) - embedding[i]),
-			).toBeLessThan(0.0001);
+			expect(Math.abs(scored.embedding[i] - embedding[i])).toBeLessThan(0.0001);
 		}
 	});
 
@@ -390,9 +392,11 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		const cleared = await db.clearAllEmbeddings();
 		expect(cleared).toBe(2);
 
-		expect((await db.getEntry("e1"))?.embedding).toBeUndefined();
-		expect((await db.getEntry("e2"))?.embedding).toBeUndefined();
-		expect((await db.getEntry("e3"))?.embedding).toBeDefined();
+		const withBlob = await truncSql`
+			SELECT id FROM knowledge_entry WHERE id IN ('e1', 'e2', 'e3') AND embedding IS NOT NULL
+		`;
+		// Superseded entry should retain its embedding; active and conflicted ones lost theirs.
+		expect(withBlob.map((r) => r.id)).toEqual(["e3"]);
 	});
 
 	// ── Stats ──
@@ -711,9 +715,11 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 
 		const entry = await db.getEntry("merge-emb");
 		expect(entry?.content).toBe("Updated with embedding");
-		expect(entry?.embedding).toBeDefined();
-		expect(entry?.embedding?.length).toBe(3);
-		expect(entry?.embedding?.[0]).toBeCloseTo(0.9);
+		const [merged] = (await db.getActiveEntriesWithEmbeddings()).filter(
+			(e) => e.id === "merge-emb",
+		);
+		expect(merged?.embedding.length).toBe(3);
+		expect(merged?.embedding[0]).toBeCloseTo(0.9);
 	});
 
 	// ── Overlapping Topics ──
@@ -952,8 +958,13 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		expect(result).toHaveLength(1);
 		const expected = await pg.getEntry("parity-1");
 		expect(expected).not.toBeNull();
-		expect(result[0].entry).toEqual(expected);
-		expect(result[0].entry.embedding).toHaveLength(8);
+		// ANN rows carry the same plain fields as getEntry, and no embedding.
+		// Strength is computed on read against the clock, so compare it separately.
+		const { strength: annStrength, ...annPlain } = result[0].entry;
+		const { strength: plainStrength, ...plain } = expected as KnowledgeEntry;
+		expect(annPlain).toEqual(plain);
+		expect(annStrength).toBeCloseTo(plainStrength, 3);
+		expect(result[0].entry.embedding).toBeUndefined();
 	});
 
 	it("findContradictionCandidates returns every entry field including the embedding", async () => {
@@ -979,8 +990,12 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		expect(res).toHaveLength(1);
 		const expected = await pg.getEntry("contra-parity");
 		expect(expected).not.toBeNull();
-		expect(res[0]).toEqual(expected);
-		expect(res[0].embedding).toHaveLength(8);
+		const { embedding, strength, ...plain } = res[0];
+		const { strength: plainStrength, ...expectedPlain } =
+			expected as KnowledgeEntry;
+		expect(plain).toEqual(expectedPlain);
+		expect(strength).toBeCloseTo(plainStrength, 3);
+		expect(embedding).toHaveLength(8);
 	});
 
 	it("findSimilarEntries latches the ef_search fallback only for unsupported-setting errors", async () => {

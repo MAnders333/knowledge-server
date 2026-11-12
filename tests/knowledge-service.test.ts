@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -5,7 +6,21 @@ import { join } from "node:path";
 import { EmbeddingClient } from "../src/activation/embeddings";
 import { KnowledgeDB } from "../src/db/sqlite/index";
 import { KnowledgeService } from "../src/services/knowledge-service";
+import type { KnowledgeEntry } from "../src/types";
 import { makeEntry } from "./fixtures";
+
+/** Plain reads omit the embedding; attach it from the scoring read so assertions can see it. */
+async function getEntryWithEmbedding(
+	db: KnowledgeDB,
+	id: string,
+): Promise<(KnowledgeEntry & { embedding?: number[] }) | null> {
+	const entry = await db.getEntry(id);
+	if (!entry) return null;
+	const scored = (await db.getActiveEntriesWithEmbeddings()).find(
+		(e) => e.id === id,
+	);
+	return { ...entry, embedding: scored?.embedding };
+}
 
 describe("KnowledgeService.updateEntry", () => {
 	let db: KnowledgeDB;
@@ -35,9 +50,22 @@ describe("KnowledgeService.updateEntry", () => {
 		await service.updateEntry("e1", { status: "archived" });
 
 		expect(embedSpy).not.toHaveBeenCalled();
-		// Embedding should be unchanged
-		const entry = await db.getEntry("e1");
-		expect(entry?.embedding?.[0]).toBeCloseTo(0.9);
+		// Embedding should be unchanged. The entry is archived, so it is outside the
+		// scoring read; check the stored blob directly.
+		const raw = new Database(join(tempDir, "test.db"), { readonly: true });
+		try {
+			const row = raw
+				.prepare("SELECT embedding FROM knowledge_entry WHERE id = 'e1'")
+				.get() as { embedding: Uint8Array };
+			const stored = new Float32Array(
+				row.embedding.buffer,
+				row.embedding.byteOffset,
+				row.embedding.byteLength / 4,
+			);
+			expect(stored[0]).toBeCloseTo(0.9);
+		} finally {
+			raw.close();
+		}
 	});
 
 	it("re-embeds when content changes", async () => {
@@ -46,7 +74,7 @@ describe("KnowledgeService.updateEntry", () => {
 		await service.updateEntry("e2", { content: "Updated content" });
 
 		expect(embedSpy).toHaveBeenCalledTimes(1);
-		const entry = await db.getEntry("e2");
+		const entry = await getEntryWithEmbedding(db, "e2");
 		expect(entry?.content).toBe("Updated content");
 		expect(entry?.embedding?.[0]).toBeCloseTo(0.1);
 	});
@@ -57,7 +85,7 @@ describe("KnowledgeService.updateEntry", () => {
 		await service.updateEntry("e3", { topics: ["new-topic"] });
 
 		expect(embedSpy).toHaveBeenCalledTimes(1);
-		const entry = await db.getEntry("e3");
+		const entry = await getEntryWithEmbedding(db, "e3");
 		expect(entry?.topics).toEqual(["new-topic"]);
 		expect(entry?.embedding?.[0]).toBeCloseTo(0.1);
 	});
@@ -78,7 +106,7 @@ describe("KnowledgeService.updateEntry", () => {
 		});
 
 		expect(embedSpy).toHaveBeenCalledTimes(1);
-		const entry = await db.getEntry("e4");
+		const entry = await getEntryWithEmbedding(db, "e4");
 		expect(entry?.content).toBe("new content");
 		expect(entry?.topics).toEqual(["new-topic"]);
 		expect(entry?.embedding?.[0]).toBeCloseTo(0.1);
@@ -106,7 +134,7 @@ describe("KnowledgeService.updateEntry", () => {
 		).rejects.toThrow("API quota exceeded");
 
 		// DB should be unchanged — no partial write (content, topics, embedding all intact)
-		const entry = await db.getEntry("e5");
+		const entry = await getEntryWithEmbedding(db, "e5");
 		expect(entry?.content).toBe("original");
 		expect(entry?.topics).toEqual(["original-topic"]);
 		expect(entry?.embedding?.[0]).toBeCloseTo(0.9);

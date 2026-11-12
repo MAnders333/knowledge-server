@@ -383,7 +383,7 @@ export interface IKnowledgeStore {
 		statuses?: KnowledgeStatus[],
 	): Promise<
 		Array<{
-			entry: KnowledgeEntry & { embedding: number[] };
+			entry: KnowledgeEntry;
 			similarity: number;
 		}>
 	>;

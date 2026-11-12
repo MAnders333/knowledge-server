@@ -536,14 +536,11 @@ export class ActivationEngine {
 		const bestById = new Map<
 			string,
 			{
-				entry: KnowledgeEntry & { embedding: number[] };
+				entry: KnowledgeEntry;
 				rawSimilarity: number;
 			}
 		>();
-		const keepBest = (
-			entry: KnowledgeEntry & { embedding: number[] },
-			rawSimilarity: number,
-		) => {
+		const keepBest = (entry: KnowledgeEntry, rawSimilarity: number) => {
 			const existing = bestById.get(entry.id);
 			if (!existing || rawSimilarity > existing.rawSimilarity) {
 				bestById.set(entry.id, { entry, rawSimilarity });

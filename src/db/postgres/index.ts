@@ -56,13 +56,26 @@ interface RawEntryRow {
 const SCHEMA_LOCK_NAME = "knowledge-server:schema-migration";
 
 /**
- * knowledge_entry columns read by rowToEntry(), qualified with the `ke` alias
- * used by the ANN queries. Deliberately excludes `embedding_vec`: rowToEntry()
- * never reads it, and a vector(3072) is ~35 KB as text per returned row.
+ * knowledge_entry columns read by rowToEntry(), without the embedding. Reads
+ * that do not score vectors use this list. Never selects `embedding_vec`: it is
+ * a vector(N) that travels as ~35 KB of text per row, and only the ANN SQL uses it.
  * Keep in sync with RawEntryRow.
  */
-const KE_ENTRY_COLUMNS =
-	"ke.id, ke.type, ke.content, ke.topics, ke.confidence, ke.source, ke.status, ke.strength, ke.created_at, ke.updated_at, ke.last_accessed_at, ke.access_count, ke.observation_count, ke.superseded_by, ke.derived_from, ke.is_synthesized, ke.embedding";
+const ENTRY_COLUMNS =
+	"id, type, content, topics, confidence, source, status, strength, created_at, updated_at, last_accessed_at, access_count, observation_count, superseded_by, derived_from, is_synthesized";
+
+/** ENTRY_COLUMNS qualified with the `ke` alias used by the ANN and join queries. */
+const KE_ENTRY_COLUMNS = qualifyColumns(ENTRY_COLUMNS, "ke");
+
+/** KE_ENTRY_COLUMNS plus the bytea embedding, for reads that score vectors in JS. */
+const KE_ENTRY_COLUMNS_WITH_EMBEDDING = `${KE_ENTRY_COLUMNS}, ke.embedding`;
+
+function qualifyColumns(columns: string, alias: string): string {
+	return columns
+		.split(", ")
+		.map((c) => `${alias}.${c}`)
+		.join(", ");
+}
 
 /**
  * SQLSTATEs that mean the server refuses `SET hnsw.ef_search` for this
@@ -744,28 +757,29 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	}
 
 	async getEntry(id: string): Promise<KnowledgeEntry | null> {
-		const rows = await this.sql`
-			SELECT * FROM knowledge_entry WHERE id = ${id}
-		`;
+		const rows = await this.sql.unsafe(
+			`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE id = $1`,
+			[id],
+		);
 		if (rows.length === 0) return null;
 		return this.rowToEntry(rows[0] as unknown as RawEntryRow);
 	}
 
 	async getActiveEntries(): Promise<KnowledgeEntry[]> {
-		const rows = await this.sql`
-			SELECT * FROM knowledge_entry WHERE status = 'active' ORDER BY strength DESC
-		`;
+		const rows = await this.sql.unsafe(
+			`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE status = 'active' ORDER BY strength DESC`,
+		);
 		return (rows as unknown as RawEntryRow[]).map((r) => this.rowToEntry(r));
 	}
 
 	async getActiveEntriesWithEmbeddings(): Promise<
 		Array<KnowledgeEntry & { embedding: number[] }>
 	> {
-		const rows = await this.sql`
-			SELECT * FROM knowledge_entry
+		const rows = await this.sql.unsafe(
+			`SELECT ${ENTRY_COLUMNS}, embedding FROM knowledge_entry
 			WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL
-			ORDER BY strength DESC
-		`;
+			ORDER BY strength DESC`,
+		);
 		return (rows as unknown as RawEntryRow[])
 			.map((r) => this.rowToEntry(r))
 			.filter(
@@ -776,11 +790,11 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	async getOneEntryWithEmbedding(): Promise<
 		(KnowledgeEntry & { embedding: number[] }) | null
 	> {
-		const rows = await this.sql`
-			SELECT * FROM knowledge_entry
+		const rows = await this.sql.unsafe(
+			`SELECT ${ENTRY_COLUMNS}, embedding FROM knowledge_entry
 			WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL
-			LIMIT 1
-		`;
+			LIMIT 1`,
+		);
 		if (rows.length === 0) return null;
 		const entry = this.rowToEntry(rows[0] as unknown as RawEntryRow);
 		if (!entry.embedding) return null;
@@ -788,27 +802,28 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	}
 
 	async getActiveAndConflictedEntries(): Promise<KnowledgeEntry[]> {
-		const rows = await this.sql`
-			SELECT * FROM knowledge_entry
+		const rows = await this.sql.unsafe(
+			`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry
 			WHERE status IN ('active', 'conflicted')
-			ORDER BY updated_at DESC
-		`;
+			ORDER BY updated_at DESC`,
+		);
 		return (rows as unknown as RawEntryRow[]).map((r) => this.rowToEntry(r));
 	}
 
 	async getEntriesMissingEmbeddings(): Promise<KnowledgeEntry[]> {
-		const rows = await this.sql`
-			SELECT * FROM knowledge_entry
+		const rows = await this.sql.unsafe(
+			`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry
 			WHERE status IN ('active', 'conflicted') AND embedding IS NULL
-			ORDER BY updated_at DESC
-		`;
+			ORDER BY updated_at DESC`,
+		);
 		return (rows as unknown as RawEntryRow[]).map((r) => this.rowToEntry(r));
 	}
 
 	async getEntriesByStatus(status: KnowledgeStatus): Promise<KnowledgeEntry[]> {
-		const rows = await this.sql`
-			SELECT * FROM knowledge_entry WHERE status = ${status} ORDER BY updated_at DESC
-		`;
+		const rows = await this.sql.unsafe(
+			`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE status = $1 ORDER BY updated_at DESC`,
+			[status],
+		);
 		return (rows as unknown as RawEntryRow[]).map((r) => this.rowToEntry(r));
 	}
 
@@ -832,7 +847,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		const where =
 			conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 		const rows = await this.sql.unsafe(
-			`SELECT * FROM knowledge_entry ${where} ORDER BY created_at DESC`,
+			`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry ${where} ORDER BY created_at DESC`,
 			values as postgres.ParameterOrJSON<never>[],
 		);
 		return (rows as unknown as RawEntryRow[]).map((r) => this.rowToEntry(r));
@@ -884,15 +899,16 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 
 		// PostgreSQL equivalent of SQLite's json_each:
 		// Use jsonb_array_elements_text to unnest the topics JSONB array
-		const rows = await this.sql`
-			SELECT DISTINCT ke.*
+		const rows = await this.sql.unsafe(
+			`SELECT DISTINCT ${KE_ENTRY_COLUMNS_WITH_EMBEDDING}
 			FROM knowledge_entry ke,
 			     jsonb_array_elements_text(ke.topics) AS t(value)
 			WHERE ke.status IN ('active', 'conflicted')
-			  AND t.value = ANY(${topics}::text[])
-			  AND ke.id != ALL(${excludeIds}::text[])
-			ORDER BY ke.strength DESC
-		`;
+			  AND t.value = ANY($1::text[])
+			  AND ke.id != ALL($2::text[])
+			ORDER BY ke.strength DESC`,
+			[topics, excludeIds],
+		);
 
 		return (rows as unknown as RawEntryRow[])
 			.map((r) => this.rowToEntry(r))
@@ -1143,14 +1159,15 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		if (synthesizedIds.length === 0) return new Map();
 
 		// `supports` relations: source_id = synthesized entry, target_id = source entry
-		const rows = await this.sql`
-			SELECT kr.source_id AS synth_id, ke.*
+		const rows = await this.sql.unsafe(
+			`SELECT kr.source_id AS synth_id, ${KE_ENTRY_COLUMNS}
 			FROM knowledge_relation kr
 			JOIN knowledge_entry ke ON ke.id = kr.target_id
 			WHERE kr.type = 'supports'
-			  AND kr.source_id = ANY(${synthesizedIds}::text[])
-			  AND ke.status IN ('active', 'conflicted')
-		`;
+			  AND kr.source_id = ANY($1::text[])
+			  AND ke.status IN ('active', 'conflicted')`,
+			[synthesizedIds],
+		);
 
 		const result = new Map<string, KnowledgeEntry[]>();
 		for (const row of rows) {
@@ -1553,7 +1570,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		statuses: KnowledgeStatus[] = ["active", "conflicted"],
 	): Promise<
 		Array<{
-			entry: KnowledgeEntry & { embedding: number[] };
+			entry: KnowledgeEntry;
 			similarity: number;
 		}>
 	> {
@@ -1640,19 +1657,14 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			}
 		}
 
-		return (rows as unknown as (RawEntryRow & { similarity: number })[])
-			.map((r) => ({
-				entry: this.rowToEntry(r) as KnowledgeEntry & { embedding: number[] },
+		// The ANN SQL filters on embedding_vec IS NOT NULL, and the scoring path does
+		// not read the returned embedding, so rows carry no embedding bytea.
+		return (rows as unknown as (RawEntryRow & { similarity: number })[]).map(
+			(r) => ({
+				entry: this.rowToEntry(r),
 				similarity: Number(r.similarity),
-			}))
-			.filter(
-				(
-					r,
-				): r is {
-					entry: KnowledgeEntry & { embedding: number[] };
-					similarity: number;
-				} => !!r.entry.embedding,
-			);
+			}),
+		);
 	}
 
 	/**
@@ -1710,7 +1722,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			   ORDER BY (embedding_vec::halfvec(${this.embeddingDims}) <=> $3::halfvec(${this.embeddingDims}))
 			   LIMIT $6
 			 )
-			 SELECT ${KE_ENTRY_COLUMNS}
+			 SELECT ${KE_ENTRY_COLUMNS_WITH_EMBEDDING}
 			 FROM knowledge_entry ke
 			 JOIN candidate_ids c ON c.id = ke.id
 			 WHERE (ke.embedding_vec <=> $3::vector) >  $4

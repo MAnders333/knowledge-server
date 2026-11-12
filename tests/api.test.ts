@@ -10,9 +10,23 @@ import type { ConsolidationEngine } from "../src/consolidation/consolidate";
 import type { KnowledgeDB } from "../src/db/sqlite/index";
 import { KnowledgeDB as KnowledgeDBImpl } from "../src/db/sqlite/index";
 import { ServerStateDB } from "../src/db/state/index";
+import type { KnowledgeEntry } from "../src/types";
 
 // Intentionally static string — production uses a random token generated at startup.
 const TEST_ADMIN_TOKEN = "test-admin-token-abc123";
+
+/** Plain reads omit the embedding; attach it from the scoring read so assertions can see it. */
+async function getEntryWithEmbedding(
+	db: KnowledgeDB,
+	id: string,
+): Promise<(KnowledgeEntry & { embedding?: number[] }) | null> {
+	const entry = await db.getEntry(id);
+	if (!entry) return null;
+	const scored = (await db.getActiveEntriesWithEmbeddings()).find(
+		(e) => e.id === id,
+	);
+	return { ...entry, embedding: scored?.embedding };
+}
 
 describe("HTTP API", () => {
 	let db: KnowledgeDB;
@@ -364,9 +378,15 @@ describe("HTTP API", () => {
 		const data = await res.json();
 		expect(data.entry.content).toBe("Updated content");
 		expect(data.entry.confidence).toBe(0.95);
-		expect((await db.getEntry("patch-test"))?.embedding?.[0]).toBeCloseTo(0.11);
-		expect((await db.getEntry("patch-test"))?.embedding?.[1]).toBeCloseTo(0.22);
-		expect((await db.getEntry("patch-test"))?.embedding?.[2]).toBeCloseTo(0.33);
+		expect(
+			(await getEntryWithEmbedding(db, "patch-test"))?.embedding?.[0],
+		).toBeCloseTo(0.11);
+		expect(
+			(await getEntryWithEmbedding(db, "patch-test"))?.embedding?.[1],
+		).toBeCloseTo(0.22);
+		expect(
+			(await getEntryWithEmbedding(db, "patch-test"))?.embedding?.[2],
+		).toBeCloseTo(0.33);
 	});
 
 	it("PATCH /entries/:id should re-embed when only topics change", async () => {
@@ -401,9 +421,9 @@ describe("HTTP API", () => {
 		});
 		expect(res.status).toBe(200);
 		expect(embedSpy).toHaveBeenCalled();
-		expect((await db.getEntry("patch-topics"))?.embedding?.[0]).toBeCloseTo(
-			0.44,
-		);
+		expect(
+			(await getEntryWithEmbedding(db, "patch-topics"))?.embedding?.[0],
+		).toBeCloseTo(0.44);
 	});
 
 	it("PATCH /entries/:id should return 400 with no valid fields", async () => {
