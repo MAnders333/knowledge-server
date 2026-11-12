@@ -20,6 +20,15 @@ import {
 	loadConfigFile,
 } from "../config-file.js";
 import { config } from "../config.js";
+import {
+	GITHUB_RELEASES,
+	detectPlatform,
+	fetchBufferSync,
+	parseChecksums,
+	releaseAssetUrl,
+	requireExpectedSha,
+	sha256Hex,
+} from "./release-download.js";
 
 // Resolve port/host from config.jsonc (with env var override via KNOWLEDGE_PORT/KNOWLEDGE_HOST).
 // Falls back to the env-var-only config for installs that have no config.jsonc yet.
@@ -285,13 +294,12 @@ function getBinaryInstallDir(): string {
 	return resolve(dirname(process.execPath), "..");
 }
 
-const GITHUB_RELEASES =
-	"https://github.com/MAnders333/knowledge-server/releases/download";
-
 /**
- * Download a text asset from the current release and write it atomically to dst.
- * Used by binary installs to fetch plugin/command files that aren't bundled.
- * Uses curl (always available on macOS/Linux) to stay synchronous.
+ * Download a release asset and install it at dst, verified against the
+ * release's SHA256SUMS-<platform>. Used by binary installs to fetch plugin and
+ * command files that aren't bundled. Fails closed: a missing manifest entry or
+ * a hash mismatch throws and leaves dst untouched.
+ * Synchronous (curl via spawnSync) to match the setup flow's control flow.
  */
 function downloadAssetSync(name: string, dst: string): void {
 	// Strict allowlist: bare filename, letters/digits/dots/hyphens/underscores only.
@@ -303,42 +311,20 @@ function downloadAssetSync(name: string, dst: string): void {
 	if (!/^\d+\.\d+\.\d+$/.test(pkg.version)) {
 		throw new Error(`Unexpected version format: ${pkg.version}`);
 	}
-	const url = `${GITHUB_RELEASES}/v${pkg.version}/${name}`;
-	const tmp = `${dst}.tmp`;
-	const result = spawnSync(
-		"curl",
-		[
-			"-fsSL",
-			"--proto",
-			"=https",
-			"--tlsv1.2",
-			"--max-time",
-			"30",
-			"--output",
-			tmp,
-			url,
-		],
-		{ encoding: "utf8", timeout: 35_000 },
+	const version = `v${pkg.version}`;
+	const checksums = parseChecksums(
+		fetchBufferSync(
+			`${GITHUB_RELEASES}/${version}/SHA256SUMS-${detectPlatform()}`,
+		).toString("utf8"),
 	);
-	if (result.error) {
-		try {
-			unlinkSync(tmp);
-		} catch {
-			/* ignore */
-		}
-		throw new Error(`Failed to run curl: ${result.error.message}`);
+	const expected = requireExpectedSha(checksums, name);
+	const data = fetchBufferSync(releaseAssetUrl(version, name));
+	if (sha256Hex(data) !== expected) {
+		throw new Error(`Checksum mismatch for ${name} — refusing to install.`);
 	}
-	if (result.status !== 0) {
-		try {
-			unlinkSync(tmp);
-		} catch {
-			/* ignore */
-		}
-		throw new Error(
-			`curl failed for ${name}: ${result.stderr?.trim() || "unknown error"}`,
-		);
-	}
+	const tmp = `${dst}.tmp`;
 	try {
+		writeFileSync(tmp, data, { mode: 0o644 });
 		renameSync(tmp, dst);
 	} catch (err) {
 		try {
