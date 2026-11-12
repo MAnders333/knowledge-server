@@ -47,7 +47,7 @@ knowledge-server update                             # latest release
 knowledge-server update --version vX.Y.Z --force    # an older release (downgrades need --force)
 ```
 
-Every downloaded file is checked against the release's `SHA256SUMS` before anything is replaced. The new binaries must also pass a smoke test. The previous binaries are kept as `*.prev`, and a failed post-install check restores them. `update` also refreshes the copies that `setup-tool` placed in tool directories (the OpenCode plugin and commands, the pi and oh-my-pi extensions), so they stay on the installed version.
+Every downloaded file is checked against the release's `SHA256SUMS` before anything is replaced. The new binaries must also pass a smoke test. The previous binaries are kept as `*.prev`, and a failed post-install check restores them. `update` refreshes the copies that `setup-tool` placed in tool directories (the OpenCode plugin and commands, the pi and oh-my-pi extensions), so they stay on the installed version. Copies made by v3.10.3 or earlier are picked up only when they are byte-identical to a known release; an edited copy is left unchanged and `update` says so. The first `update` from v3.10.3 runs the old updater, so after upgrading re-run `knowledge-server setup-tool opencode`, `setup-tool pi` or `setup-tool oh-my-pi` once to register the copies you use.
 
 Releases published before plugin and command files were checksummed (their `SHA256SUMS` has no `knowledge.ts` entry) cannot be installed with `update --version` or `install.sh --version`; both stop with a message. To roll back an update, use the `*.prev` binaries it kept.
 
@@ -178,9 +178,9 @@ Cursor and VSCode are capture-only in practice. Cursor's session-start hook is n
 
 Codex: after `setup-tool codex`, open Codex, run `/hooks`, and trust the knowledge-server hook. Codex does not run a new or changed hook until it is trusted, so trust it again after a port change. Codex limits each hook's output to about 2,500 tokens and saves the rest to a file. The injected block is capped at 6,000 characters, which is usually under that limit.
 
-Each injected entry starts with a short id, for example `(id 1a2b3c4d)`. When an entry is wrong or outdated, the agent can call the `knowledge_flag` MCP tool with that id. The entry is queued for review (status `conflicted`) and is not deleted. The MCP process needs `KNOWLEDGE_ADMIN_TOKEN` in its environment for this.
+Each injected entry starts with a short id, for example `(id 1a2b3c4d)`. When an entry is wrong or outdated, the agent can call the `knowledge_flag` MCP tool with that id. The entry is queued for review (status `conflicted`), is no longer injected into sessions, and is not deleted. The flag reason is written to the server log (`[entries/flag]`), not stored on the entry. The MCP process needs `KNOWLEDGE_ADMIN_TOKEN` in its environment for this.
 
-`knowledge-server status` shows, per source, the episodes captured in the last 7 days next to the activations received, and warns when a source is captured but nothing was injected.
+`knowledge-server status` shows the server's health (`ok`, `degraded` or `down`, with reasons) when the server answers, and, per source, the episodes captured in the last 7 days next to the activations received. It warns when a source is captured but nothing was injected.
 
 ## Components
 
@@ -221,7 +221,7 @@ Hono-based HTTP server. Binds to `127.0.0.1:3179` by default.
 
 ### MCP server
 
-Exposes two tools. `activate` recalls knowledge mid-task. `knowledge_flag` reports an entry (by its id) as `wrong`, `outdated` or `irrelevant`; the entry is queued for review and kept, not deleted.
+Exposes two tools. `activate` recalls knowledge mid-task. `knowledge_flag` reports an entry (by its id) as `wrong`, `outdated` or `irrelevant`; the entry is queued for review, stops being injected, and is kept, not deleted.
 
 Two connection modes:
 
@@ -426,8 +426,8 @@ Credentials and paths stay in `.env`:
 | `KNOWLEDGE_ADMIN_TOKEN` | *(random per process)* | Fixed admin token for scripted use (≥16 chars; the template placeholder `your-stable-token-here` is rejected) |
 | `KNOWLEDGE_ALLOWED_HOSTS` | *(empty)* | Extra `Host` names the API accepts, comma-separated (`name` or `name:port`). `localhost`, `127.0.0.1`, `[::1]` and the bind host are always accepted. Needed when a reverse proxy forwards a different hostname. |
 | `REDACT_SECRETS` | `true` | Scrub credentials (private keys, cloud/SaaS/LLM API tokens, JWTs, `Authorization` headers, `*_SECRET`/`*_TOKEN`/`*_PASSWORD`/`*_API_KEY` values, URL passwords, long keyed secrets) from transcript text before it is staged, sent to an LLM or embedding API, or stored. Set `false` to disable. Counts are logged per run; values are never logged. |
-| `KNOWLEDGE_LOG_PATH` | `~/.local/share/knowledge-server/server.log` | Log file. Set to `""` to disable. When stdout or stderr already points at this file, each line is written once. |
-| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. Only `debug` logs query and entry text; `info` logs lengths, ids and similarity scores. |
+| `KNOWLEDGE_LOG_PATH` | `~/.local/share/knowledge-server/server.log` | Log file. Set to `""` to disable. When stdout or stderr already points at this file (the launchd plist does this), each line is written once. |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. `info` logs lengths, ids and similarity scores; consolidation and contradiction decisions at `info` include entry text. `warn` suppresses those lines. |
 | `LOG_MAX_BYTES` | `20971520` (20 MB) | Size at which the active log rotates. Rotation keeps `server.log.1` to `server.log.3` and drops the oldest, so the files total about four times this value. `0` disables rotation. Rotated copies can hold text written by earlier versions, including an old admin token; delete them once you no longer need them. |
 
 ### Session sources
@@ -507,7 +507,7 @@ Injected entries are counted in `injection_count`, and `last_accessed_at` moves 
 Dense retrieval overfetches `RERANK_CANDIDATES` entries and a second stage re-scores them. If reranking fails or times out, activation uses dense ordering. Two providers are available:
 
 - `local` (default): an in-process cross-encoder. It runs offline after a one-time model download (~23MB). The default model is pinned to a Hugging Face revision and checksum. Nothing leaves the machine.
-- `remote` (opt-in): one listwise call per activation to a decision model on the LLM gateway (`RERANK_REMOTE_MODEL`, default `clef`). It uses the gateway in `LLM_BASE_ENDPOINT` and `LLM_API_KEY`; per-provider keys are not used. It needs no local model memory and does not block the event loop. After 3 consecutive failures remote reranking pauses for 60 s, and dense ordering is used meanwhile.
+- `remote` (opt-in): one listwise call per activation to a decision model on the LLM gateway (`RERANK_REMOTE_MODEL`). The default `clef` is the model name on the maintainer's gateway; set the name your gateway offers. It uses the gateway in `LLM_BASE_ENDPOINT` and `LLM_API_KEY`; per-provider keys are not used. It needs no local model memory and does not block the event loop. After 3 consecutive failures remote reranking pauses for 60 s, and dense ordering is used meanwhile.
 
 > **Privacy: `RERANK_PROVIDER=remote` sends content off this machine.** On every activation the remote provider sends (1) the query tail, the last `RERANK_MAX_QUERY_TOKENS` tokens of the prompt, and (2) the text of each candidate entry, its first `RERANK_MAX_DOC_TOKENS` tokens with its type and topics. Only the candidates dense retrieval returned for that prompt are sent, never the whole store. The gateway forwards the request to the hosting provider of `RERANK_REMOTE_MODEL`. Retention and processing terms are those of the gateway and the model host, which this project does not control. Keep the default `local` provider unless you accept that.
 
@@ -521,7 +521,7 @@ Dense retrieval overfetches `RERANK_CANDIDATES` entries and a second stage re-sc
 | `RERANK_TIMEOUT_MS` | `3000` | Budget for one local rerank call. On expiry the whole batch falls back to dense ordering (no partial scores) |
 | `RERANK_MAX_QUERY_TOKENS` | `128` | Last N tokens of the prompt used as the rerank query (remote: N × 4 characters) |
 | `RERANK_MAX_DOC_TOKENS` | `256` | First N tokens of each candidate that is scored (remote: N × 4 characters). Shorter caps lowered quality on long documents |
-| `RERANK_REMOTE_MODEL` | `clef` | Gateway decision model for `RERANK_PROVIDER=remote`. Lower-tier models (for example `clef-flash`) scored below BM25 in our evaluation |
+| `RERANK_REMOTE_MODEL` | `clef` | Gateway decision model for `RERANK_PROVIDER=remote`. `clef` exists only on the maintainer's gateway: set the model name your gateway offers. Lower-tier models (for example `clef-flash`) scored below BM25 in the maintainer's evaluation |
 | `RERANK_REMOTE_TIMEOUT_MS` | `4000` | Budget for one gateway call. It sits inside the 5 s plugin budget; on expiry dense ordering is used |
 
 Remote mode needs both `LLM_BASE_ENDPOINT` and `LLM_API_KEY`. If either is missing (or still a template placeholder), the server logs a warning at startup and uses the local reranker.
