@@ -48,7 +48,7 @@ echo "  ✓ Created $OPENCODE_DATA_DIR"
 if [ ! -f "$PROJECT_DIR/.env" ]; then
   echo ""
   echo "Creating .env from template..."
-  cp "$PROJECT_DIR/.env.template" "$PROJECT_DIR/.env"
+  (umask 077 && cp "$PROJECT_DIR/.env.template" "$PROJECT_DIR/.env")
   echo "  ⚠ Created .env — edit it before starting the server:"
   echo "    $PROJECT_DIR/.env"
 else
