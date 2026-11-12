@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { readDaemonStatus } from "../daemon/status.js";
 import { isProcessAlive, lockHolder } from "../process-lock.js";
 import { daemonLockPath, daemonStatusPath } from "../runtime-files.js";
@@ -10,6 +10,8 @@ const SYSTEMD_UNIT = "knowledge-daemon";
 /** How long a stopped daemon may take to exit before it is reported as still running. */
 const STOP_WAIT_MS = 10_000;
 const STOP_POLL_MS = 100;
+/** Source installs run the daemon as `bun run <repo>/src/daemon/index.ts`. */
+const SOURCE_DAEMON_ENTRY = "/src/daemon/index.ts";
 
 export type DaemonRestartOutcome =
 	| "service-restarted"
@@ -27,6 +29,8 @@ export interface DaemonRestartEnv {
 	/** Sends a signal to a process. Throws when the process is gone. */
 	signal?: (pid: number, signal: NodeJS.Signals) => void;
 	alive?: (pid: number) => boolean;
+	/** Command line of a process, or null when it cannot be read. Used to verify identity. */
+	command?: (pid: number) => string | null;
 	sleep?: (ms: number) => Promise<void>;
 	log: (line: string) => void;
 	warn: (line: string) => void;
@@ -34,6 +38,29 @@ export interface DaemonRestartEnv {
 
 function defaultRun(cmd: string, args: string[]): number | null {
 	return spawnSync(cmd, args, { stdio: "ignore" }).status;
+}
+
+function defaultCommand(pid: number): string | null {
+	const result = spawnSync("ps", ["-p", String(pid), "-o", "command="], {
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "ignore"],
+	});
+	const out = result.status === 0 ? result.stdout.trim() : "";
+	return out === "" ? null : out;
+}
+
+/**
+ * True when a command line is a knowledge-daemon: the compiled `knowledge-daemon`
+ * binary, or a `bun ... src/daemon/index.ts` source run.
+ */
+function isDaemonCommand(command: string): boolean {
+	const tokens = command.trim().split(/\s+/);
+	const program = basename(tokens[0] ?? "");
+	if (program === SYSTEMD_UNIT) return true;
+	return (
+		program.startsWith("bun") &&
+		tokens.some((t) => t.endsWith(SOURCE_DAEMON_ENTRY))
+	);
 }
 
 /**
@@ -96,6 +123,13 @@ async function stopRunningDaemon(
 	env: DaemonRestartEnv,
 ): Promise<DaemonRestartOutcome> {
 	const alive = env.alive ?? isProcessAlive;
+	const command = env.command ?? defaultCommand;
+	// A PID is signalled only when it still runs a knowledge-daemon. Lock and status
+	// files outlive their daemon, and the OS reuses PIDs.
+	const isDaemon = (pid: number): boolean => {
+		const line = command(pid);
+		return line !== null && isDaemonCommand(line);
+	};
 	const holder = lockHolder(daemonLockPath(env.dataDir));
 	if (holder && holder.pid === 0) {
 		env.warn(
@@ -103,10 +137,13 @@ async function stopRunningDaemon(
 		);
 		return "failed";
 	}
-	let pid = holder?.pid ?? null;
+	let pid: number | null = null;
+	if (holder && holder.pid > 0 && isDaemon(holder.pid)) pid = holder.pid;
 	if (pid === null) {
 		const status = readDaemonStatus(daemonStatusPath(env.dataDir));
-		if (status && status.pid > 0 && alive(status.pid)) pid = status.pid;
+		if (status && status.pid > 0 && alive(status.pid) && isDaemon(status.pid)) {
+			pid = status.pid;
+		}
 	}
 	if (pid === null) {
 		env.log(

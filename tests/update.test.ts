@@ -438,12 +438,42 @@ describe("restartDaemonAfterUpdate", () => {
 					stopped = true;
 				},
 				alive: () => !stopped,
+				command: () => "/x/libexec/knowledge-daemon --interval=300",
 				sleep: noSleep,
 				log,
 				warn,
 			});
 			expect(outcome).toBe("daemon-stopped");
 			expect(signals).toEqual([[process.pid, "SIGTERM"]]);
+		} finally {
+			lock?.release();
+		}
+	});
+
+	it("does not signal a lock holder that is not a knowledge-daemon", async () => {
+		const lock = tryAcquireProcessLock(daemonLockPath(dataDir));
+		expect(lock).not.toBeNull();
+		const signals: Array<[number, string]> = [];
+		try {
+			const outcome = await restartDaemonAfterUpdate({
+				platform: "darwin",
+				home,
+				uid: 501,
+				dataDir,
+				run: () => {
+					throw new Error("no service registered");
+				},
+				command: () => "/usr/bin/some-other-tool --serve",
+				signal: (pid, sig) => {
+					signals.push([pid, sig]);
+				},
+				alive: () => true,
+				sleep: noSleep,
+				log,
+				warn,
+			});
+			expect(outcome).toBe("not-running");
+			expect(signals).toEqual([]);
 		} finally {
 			lock?.release();
 		}
