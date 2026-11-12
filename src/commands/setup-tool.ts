@@ -1683,6 +1683,7 @@ Available tools:
   opencode      Symlink plugin + commands; register MCP server in opencode.jsonc
   claude-code   Register MCP server + hook; symlink commands into ~/.claude/commands/
   oh-my-pi      Place extension in each oh-my-pi agent layer (no MCP)
+  pi            Place extension in ~/.pi/shared/extensions or ~/.pi/agent/extensions (no MCP)
   cursor        Register MCP server in ~/.cursor/mcp.json
   codex         Register MCP server in ~/.codex/config.toml
   vscode        Register MCP server via \`code --add-mcp\`

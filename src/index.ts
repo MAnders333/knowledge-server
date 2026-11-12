@@ -212,7 +212,8 @@ Commands:
   review [--filter <f>]     Interactively review entries (filter: conflicted|stale|all)
   calibrate                 Recommend similarity thresholds for the active embedding model
   reinitialize              Reset daemon cursor, state, or store entries (see --reset-state, --reset-store)
-  setup-tool <tool>         Set up integration (opencode|claude-code|cursor|codex|vscode)
+  setup-tool <tool>         Set up integration: opencode|claude-code|cursor|codex|vscode,
+                            pi|oh-my-pi (extensions), daemon (background service)
   update [--version v1.2.3] Update to the latest (or specified) release
   mcp                       Start the MCP stdio proxy (used by tool integrations)
 

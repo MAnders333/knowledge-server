@@ -18,8 +18,10 @@ Captures knowledge from [OpenCode](https://opencode.ai), [Claude Code](https://d
 Supports **Linux x64** and **macOS arm64** (Apple Silicon). No Bun or Node.js required.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MAnders333/knowledge-server/main/scripts/install.sh | bash
+curl -fsSL https://github.com/MAnders333/knowledge-server/releases/latest/download/install.sh | bash
 ```
+
+The installer is attached to the latest release, so it always matches that release's binaries and checksums.
 
 **After running:**
 
@@ -41,11 +43,13 @@ That's it. The server auto-starts the episode collector alongside itself — not
 **To update:**
 
 ```bash
-knowledge-server update                              # latest release
-knowledge-server update --version v3.10.2 --force    # older release (downgrades need --force)
+knowledge-server update                             # latest release
+knowledge-server update --version vX.Y.Z --force    # an older release (downgrades need --force)
 ```
 
 Every downloaded file is checked against the release's `SHA256SUMS` before anything is replaced. The new binaries must also pass a smoke test. The previous binaries are kept as `*.prev`, and a failed post-install check restores them. `update` also refreshes the copies that `setup-tool` placed in tool directories (the OpenCode plugin and commands, the pi and oh-my-pi extensions), so they stay on the installed version.
+
+Releases published before plugin and command files were checksummed (their `SHA256SUMS` has no `knowledge.ts` entry) cannot be installed with `update --version` or `install.sh --version`; both stop with a message. To roll back an update, use the `*.prev` binaries it kept.
 
 ### From source
 
@@ -204,7 +208,7 @@ Hono-based HTTP server. Binds to `127.0.0.1:3179` by default.
 | `/activate?q=...` | GET | — | Activate knowledge entries by query. Optional `client` query param or `x-knowledge-client` header (`opencode`, `claude-code`, `pi`, `omp`, `codex`, `mcp`, `cli`); missing or unknown values are recorded as `unknown`. |
 | `/consolidate` | POST | admin | Run a consolidation batch |
 | `/reinitialize?confirm=yes` | POST | admin | Wipe all entries and reset consolidation state |
-| `/status` | GET | — (config requires admin) | Health check and stats |
+| `/status` | GET | — (config requires admin) | Liveness and stats. `status` is `"ok"` whenever the server answers. `health` is the verdict: `ok`, `degraded` (with `reasons`: a store or provider failing, consolidation errors or dead-lettered episodes, more than 500 pending sessions, or the daemon not running when one is expected) or `down` (state DB unreachable, or every knowledge store unreachable). Config and diagnostics are admin-only. |
 | `/entries` | GET | — | List entries (filter by `status`, `type`, `scope`) |
 | `/entries/:id` | GET | — | Get a specific entry with relations |
 | `/entries/:id` | PATCH | admin | Update content, topics, confidence, status, scope |
@@ -228,7 +232,7 @@ Two connection modes:
 ### Consolidation engine (`src/consolidation/`)
 
 - `readers/pending.ts` — drains `pending_episodes` uploaded by the daemon
-- `consolidate.ts` — full cycle: read → extract → reconsolidate → contradiction scan → decay → embed → synthesis → delete processed rows
+- `consolidate.ts` — full cycle: read → extract → reconsolidate → contradiction scan → embed → synthesis → delete processed rows. Decay runs on its own timer (`DECAY_INTERVAL_MS`).
 - `llm.ts` — four LLM calls: `extractKnowledge` (extraction model), `decideMerge` (merge model), `detectAndResolveContradiction` (contradiction model), `synthesizePrinciple` (synthesis model, fires rarely on ripe clusters)
 - `decay.ts` — forgetting curve with type-specific half-lives
 
@@ -236,7 +240,7 @@ Two connection modes:
 
 Configuration is split across two files:
 
-**`~/.config/knowledge-server/.env`** — credentials and tuning parameters (API keys, model names, thresholds). Loaded by the launcher wrapper at startup.
+**`~/.config/knowledge-server/.env`** — credentials and tuning parameters (API keys, model names, thresholds). Read by the server binary at startup from `$KNOWLEDGE_CONFIG_HOME/.env` or `$XDG_CONFIG_HOME/knowledge-server/.env` (default `~/.config/knowledge-server/.env`; the legacy `~/.local/share/knowledge-server/.env` is used when neither exists). Compiled binaries never read a `.env` from the current directory.
 
 **`~/.config/knowledge-server/config.jsonc`** — store topology (which databases to use and where). Created automatically on first run (default: local SQLite). Edit this for Postgres or multi-store setups.
 
@@ -422,8 +426,9 @@ Credentials and paths stay in `.env`:
 | `KNOWLEDGE_ADMIN_TOKEN` | *(random per process)* | Fixed admin token for scripted use (≥16 chars; the template placeholder `your-stable-token-here` is rejected) |
 | `KNOWLEDGE_ALLOWED_HOSTS` | *(empty)* | Extra `Host` names the API accepts, comma-separated (`name` or `name:port`). `localhost`, `127.0.0.1`, `[::1]` and the bind host are always accepted. Needed when a reverse proxy forwards a different hostname. |
 | `REDACT_SECRETS` | `true` | Scrub credentials (private keys, cloud/SaaS/LLM API tokens, JWTs, `Authorization` headers, `*_SECRET`/`*_TOKEN`/`*_PASSWORD`/`*_API_KEY` values, URL passwords, long keyed secrets) from transcript text before it is staged, sent to an LLM or embedding API, or stored. Set `false` to disable. Counts are logged per run; values are never logged. |
-| `KNOWLEDGE_LOG_PATH` | `~/.local/share/knowledge-server/server.log` | Log file. Set to `""` to disable. When stdout or stderr already points at this file (the launchd plist does this), each line is written once. |
+| `KNOWLEDGE_LOG_PATH` | `~/.local/share/knowledge-server/server.log` | Log file. Set to `""` to disable. When stdout or stderr already points at this file, each line is written once. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. Only `debug` logs query and entry text; `info` logs lengths, ids and similarity scores. |
+| `LOG_MAX_BYTES` | `20971520` (20 MB) | Size at which the active log rotates. Rotation keeps `server.log.1` to `server.log.3` and drops the oldest, so the files total about four times this value. `0` disables rotation. Rotated copies can hold text written by earlier versions, including an old admin token; delete them once you no longer need them. |
 
 ### Session sources
 
@@ -685,8 +690,8 @@ You work across multiple machines and want a single knowledge base that spans al
 **Verifying a release** — Release binaries and `SHA256SUMS` files carry GitHub build-provenance attestations, created by this repository's release workflow. To check a binary, decompress the `.gz` first: attestations cover the uncompressed files.
 
 ```bash
-gh attestation verify ~/.local/share/knowledge-server/libexec/knowledge-server --repo MAnders333/knowledge-server
-gh attestation verify SHA256SUMS-linux-x64 --repo MAnders333/knowledge-server
+gh attestation verify ~/.local/share/knowledge-server/libexec/knowledge-server --repo MAnders333/knowledge-server --signer-workflow MAnders333/knowledge-server/.github/workflows/release-please.yml
+gh attestation verify SHA256SUMS-linux-x64 --repo MAnders333/knowledge-server --signer-workflow MAnders333/knowledge-server/.github/workflows/release-please.yml
 ```
 
 An attestation shows that the file was built from this repository by its release workflow. It does not protect against a compromised maintainer account.

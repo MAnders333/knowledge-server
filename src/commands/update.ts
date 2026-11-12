@@ -13,6 +13,7 @@ import {
 	fetchChecksums,
 	releaseAssetUrl,
 	requireExpectedSha,
+	requireManifestCoverage,
 } from "./release-download.js";
 
 const GITHUB_API = "https://api.github.com";
@@ -418,6 +419,17 @@ export async function runUpdate(
 			dest: join(inferredInstallDir, name),
 			gzip: false,
 		});
+	}
+
+	try {
+		requireManifestCoverage(
+			checksums,
+			targetVersion,
+			assets.filter((a) => !a.smokeArgs).map((a) => a.name),
+		);
+	} catch (err) {
+		console.error(`  ✗ ${err instanceof Error ? err.message : err}`);
+		process.exit(1);
 	}
 
 	process.stdout.write("  Verifying, staging and installing... ");
