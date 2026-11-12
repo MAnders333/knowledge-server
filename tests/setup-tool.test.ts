@@ -16,13 +16,17 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	setupCodex,
 	setupCursor,
 	stripJsoncComments,
 } from "../src/commands/setup-tool";
+import {
+	type SetupIsolation,
+	isolateSetupTool,
+} from "./support/setup-isolation";
 
 describe("stripJsoncComments", () => {
 	// ── Basic comment stripping ───────────────────────────────────────────────
@@ -313,42 +317,22 @@ describe("setupCodex", () => {
 
 // ── Test isolation ─────────────────────────────────────────────────────────────
 
-describe("setupCursor / setupCodex test isolation", () => {
-	let tmpDir: string;
+// Every test in this file runs with HOME and PATH isolated, independent of cwd.
+let isolation: SetupIsolation;
+beforeEach(() => {
+	isolation = isolateSetupTool();
+});
+afterEach(() => {
+	isolation.restore();
+});
 
-	beforeEach(() => {
-		tmpDir = mkdtempSync(join(tmpdir(), "setup-isolation-test-"));
-		process.env.CURSOR_HOME = join(tmpDir, "cursor");
-		process.env.CODEX_HOME = join(tmpDir, "codex");
-	});
-
-	afterEach(() => {
-		rmSync(tmpDir, { recursive: true, force: true });
-		Reflect.deleteProperty(process.env, "CURSOR_HOME");
-		Reflect.deleteProperty(process.env, "CODEX_HOME");
-	});
-
-	// Setup runs must never register the launchd/systemd daemon from the test
-	// checkout. Compare against the real service files: a run must not add one.
-	it("does not register a background daemon in the real home", () => {
-		const launchAgent = join(
-			homedir(),
-			"Library",
-			"LaunchAgents",
-			"com.knowledge-server.daemon.plist",
-		);
-		const systemdUnit = join(
-			homedir(),
-			".config",
-			"systemd",
-			"user",
-			"knowledge-daemon.service",
-		);
-		const before = [existsSync(launchAgent), existsSync(systemdUnit)];
-
+describe("setup runs never register a background service", () => {
+	it("calls no launchctl/systemctl and writes no service file under HOME", () => {
 		setupCursor();
 		setupCodex();
 
-		expect([existsSync(launchAgent), existsSync(systemdUnit)]).toEqual(before);
+		expect(existsSync(isolation.callsLog)).toBe(false);
+		expect(existsSync(join(isolation.home, "Library"))).toBe(false);
+		expect(existsSync(join(isolation.home, ".config", "systemd"))).toBe(false);
 	});
 });
