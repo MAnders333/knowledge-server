@@ -36,6 +36,7 @@ import { createServerStateDB } from "../db/state/factory.js";
 import { logger } from "../logger.js";
 import { tightenOwnedPrivatePaths } from "../private-files.js";
 import { currentUserId } from "../user-id.js";
+import { parseInitialLookbackDays } from "./lookback.js";
 import { createEpisodeReaders } from "./readers/index.js";
 import { EpisodeUploader } from "./uploader.js";
 
@@ -116,7 +117,11 @@ if (readers.length === 0) {
 	);
 }
 
-const uploader = new EpisodeUploader(readers, serverStateDb, daemonDb, userId);
+const uploader = new EpisodeUploader(readers, serverStateDb, daemonDb, userId, {
+	initialLookbackDays: parseInitialLookbackDays(
+		process.env.INITIAL_LOOKBACK_DAYS,
+	),
+});
 
 if (onceFlag) {
 	// One-shot mode: upload once and exit. Useful for cron / launchd OnDemand.

@@ -156,7 +156,7 @@ The local-files source is opt-in by directory presence: if `~/knowledge/` does n
 
 ### knowledge-daemon (`src/daemon/`)
 
-A lightweight background process (~250 KB binary) that reads local session files and uploads new episodes to the `pending_episodes` staging table. Keeps its own upload cursor in local SQLite (`daemon_cursor`), independent from consolidation progress.
+A lightweight background process that reads local session files and uploads new episodes to the `pending_episodes` staging table. Keeps its own upload cursor in local SQLite (`daemon_cursor`) and a per-session upload watermark (`daemon_session_cursor`), independent from consolidation progress.
 
 **Started automatically** alongside the server for single-machine setups (set `DAEMON_AUTO_SPAWN=false` to opt out). For multi-machine or remote setups, run it separately:
 
@@ -420,6 +420,17 @@ All sources are auto-detected. Override paths or disable sources via environment
 | `PI_ENABLED` | `true` | Set to `false` to disable |
 | `OMP_SESSIONS_ROOT` | `~/.omp` | oh-my-pi sessions root (scans shared + profile layers) |
 | `OMP_ENABLED` | `true` | Set to `false` to disable |
+
+#### Daemon upload behaviour
+
+| Variable | Default | Description |
+|---|---|---|
+| `INITIAL_LOOKBACK_DAYS` | `30` | First run of each source the daemon reads only ingests sessions (or local Markdown files, by modification time) with activity in the last N days. `0` ingests all history. A session in the window is ingested in full. The `process-inbox` command is not affected. |
+
+- **First run preview.** The daemon logs the episode count and a rough token estimate for each batch of the first run. No LLM cost is estimated, because no model price is configured. Review the count before a large history is consolidated.
+- **Only new content is uploaded.** A session that grows is uploaded from its last uploaded message onward. Earlier chunks are not re-sent.
+- **Small tails wait.** A new tail shorter than `CONSOLIDATION_MIN_MESSAGES` is held until the session grows or has been idle for 30 minutes, then uploaded.
+- **Skips are counted, not silent.** An unreadable session, a malformed JSONL line or a null record is skipped and logged once with its reason. The per-cycle summary counts skips. Other sessions and sources still upload. NUL bytes are stripped from text before staging, since Postgres rejects them.
 
 ### Consolidation
 
