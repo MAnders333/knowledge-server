@@ -206,6 +206,8 @@ export function createApp(
 						sessionId: null,
 						clientGaveUp: false,
 					});
+					// The agent receives these entries, so they count as injections.
+					activation.commitInjections(result.injection);
 
 					if (result.entries.length === 0) {
 						return {
@@ -416,10 +418,26 @@ export function createApp(
 				gateMode,
 				latencyMs,
 				clientDeadlineExceeded: clientGaveUp,
+				gateDropped: result.telemetry?.gateDropped ?? 0,
+				budgetDropped: result.telemetry?.budgetDropped ?? 0,
+				deduped: result.telemetry?.deduped ?? 0,
+				injectedTokens: result.telemetry?.injectedTokens ?? 0,
 			});
 		} catch {
 			// Measurement must never fail a request.
 		}
+	}
+
+	/**
+	 * Per-session dedupe key, scoped to the client. Undefined when the client sent
+	 * no session id: such requests are not deduplicated (see session-dedupe.ts).
+	 */
+	function sessionDedupeKey(
+		client: string,
+		sessionId: string | null | undefined,
+	): string | undefined {
+		const id = sessionId?.trim();
+		return id ? `${client}\u0000${id}` : undefined;
 	}
 
 	// -- Activation --
@@ -463,26 +481,30 @@ export function createApp(
 			const started = performance.now();
 			const result = await activation.activate(
 				queries.length === 1 ? queries[0] : queries,
-				{ limit, threshold },
+				{ limit, threshold, session: sessionDedupeKey(client, sessionId) },
 			);
 			const latencyMs = Math.round(performance.now() - started);
 			logActivation(client, queries.join(" | "), result.entries);
+			const clientGaveUp = c.req.raw.signal.aborted;
 			recordActivationEvent({
 				client,
 				promptChars: prompt.length,
 				result,
 				latencyMs,
 				sessionId,
-				clientGaveUp: c.req.raw.signal.aborted,
+				clientGaveUp,
 			});
-			// telemetry is internal (content-free measurement); not part of the response.
-			const { telemetry: _telemetry, ...body } = result;
+			// telemetry and injection are internal; neither is part of the response.
+			const { telemetry: _telemetry, injection: _injection, ...body } = result;
 			// `context` is the ready-to-inject block. Plugins prefer it over their own
 			// formatting, so the escaping and labelling live in one place (format.ts).
-			return c.json({
+			const response = c.json({
 				...body,
 				context: formatActivatedKnowledge(result.entries),
 			});
+			// Abandoned requests are not recorded as injections (client_deadline_exceeded).
+			if (!clientGaveUp) activation.commitInjections(result.injection);
+			return response;
 		} catch (e) {
 			logger.error("[activate] Error:", e);
 			return c.json({ error: "Internal server error" }, 500);
@@ -1153,33 +1175,40 @@ export function createApp(
 				// matching the same multi-cue strategy used by the OpenCode plugin.
 				const cues = boundCues(splitIntoCues(capText(prompt)));
 				const started = performance.now();
-				const result = await activation.activate(cues, { limit: 8 });
-				const latencyMs = Math.round(performance.now() - started);
 				const client = parseClientTag(
 					c.req.query("client") ?? c.req.header(CLIENT_HEADER) ?? "claude-code",
 				);
+				const sessionId =
+					typeof sessionIdBody === "string" ? sessionIdBody : null;
+				const result = await activation.activate(cues, {
+					limit: 8,
+					session: sessionDedupeKey(client, sessionId),
+				});
+				const latencyMs = Math.round(performance.now() - started);
 				logActivation(client, prompt, result.entries);
+				const clientGaveUp = c.req.raw.signal.aborted;
 				recordActivationEvent({
 					client,
 					promptChars: prompt.length,
 					result,
 					latencyMs,
-					sessionId: typeof sessionIdBody === "string" ? sessionIdBody : null,
-					clientGaveUp: c.req.raw.signal.aborted,
+					sessionId,
+					clientGaveUp,
 				});
 
-				if (result.entries.length === 0) {
-					return c.json({});
-				}
-
-				const additionalContext = formatActivatedKnowledge(result.entries);
-
-				return c.json({
-					hookSpecificOutput: {
-						hookEventName: "UserPromptSubmit",
-						additionalContext,
-					},
-				});
+				const response = c.json(
+					result.entries.length === 0
+						? {}
+						: {
+								hookSpecificOutput: {
+									hookEventName: "UserPromptSubmit",
+									additionalContext: formatActivatedKnowledge(result.entries),
+								},
+							},
+				);
+				// Abandoned requests are not recorded as injections (client_deadline_exceeded).
+				if (!clientGaveUp) activation.commitInjections(result.injection);
+				return response;
 			} catch (e) {
 				logger.error("[hooks/claude-code] Activation error:", e);
 				// Return {} so Claude Code continues without context (non-blocking)
