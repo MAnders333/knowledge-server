@@ -214,6 +214,17 @@ export interface IKnowledgeStore {
 
 	getEntriesMissingEmbeddings(): Promise<KnowledgeEntry[]>;
 
+	/**
+	 * One keyset-paginated page of entries to re-embed on an embedding model
+	 * change: every non-tombstoned entry that currently has an embedding, in any
+	 * status. Ordered by id; pass the last id of the previous page (null for the
+	 * first page). Carries only the fields the embedding text is built from.
+	 */
+	getEntriesForReEmbed(
+		afterId: string | null,
+		limit: number,
+	): Promise<Array<Pick<KnowledgeEntry, "id" | "type" | "content" | "topics">>>;
+
 	getEntriesByStatus(status: KnowledgeStatus): Promise<KnowledgeEntry[]>;
 
 	getEntries(filters: {
@@ -309,6 +320,23 @@ export interface IKnowledgeStore {
 	} | null>;
 
 	setEmbeddingMetadata(model: string, dimensions: number): Promise<void>;
+
+	/**
+	 * Start an embedding model change (called before any re-embed write, after
+	 * the new vector size is known). Discards vector-search structures sized for
+	 * the old model so new-size vectors never meet an old-size column. Does not
+	 * touch the recorded metadata: that is stamped by setEmbeddingMetadata() once
+	 * every entry holds a new-model vector.
+	 */
+	beginEmbeddingModelChange(dimensions: number): Promise<void>;
+
+	/**
+	 * NULL both embedding columns on tombstoned entries. Tombstoned entries are
+	 * not re-embedded on a model change; clearing them means a later revival
+	 * regenerates the vector (ensureEmbeddings) instead of reviving a stale one.
+	 * Returns the number of rows changed.
+	 */
+	clearTombstonedEmbeddings(): Promise<number>;
 
 	// ── Cluster Management ──
 

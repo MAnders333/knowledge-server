@@ -875,8 +875,8 @@ export class ActivationEngine {
 
 	/**
 	 * Check whether the configured embedding model differs from the model that
-	 * produced the stored embeddings. If it has changed, re-embed all active and
-	 * conflicted entries with the new model.
+	 * produced the stored embeddings. If it has changed, re-embed every entry
+	 * that has an embedding (any status except tombstoned) with the new model.
 	 *
 	 * Flow:
 	 * 1. Read stored embedding metadata (model + dimensions) from DB
@@ -887,10 +887,10 @@ export class ActivationEngine {
 	 * 3. If stored model matches configured model → no-op
 	 * 4. If stored model differs:
 	 *    a. Log the model change clearly
-	 *    b. Compute all new vectors (nothing is written if this fails)
-	 *    c. Overwrite each entry's embedding vector with the new-model vector,
-	 *       then write the metadata LAST (see inline comments on crash-recovery
-	 *       trade-offs below)
+	 *    b. Clear embeddings of tombstoned entries (regenerated only on revival)
+	 *    c. Re-embed the remaining entries in batches. The vector column is
+	 *       reshaped before the first write, and the metadata is written LAST
+	 *       (see inline comments below)
 	 *
 	 * Called at startup before consolidation so all vectors are consistent.
 	 * Fans out across all writable stores. Returns true if any store was re-embedded.
@@ -957,17 +957,66 @@ export class ActivationEngine {
 			return false;
 		}
 
-		// ── Model has changed — re-embed all entries in-place ──
-
-		const entriesWithEmbeddings = await db.getActiveEntriesWithEmbeddings();
-		const totalEntries = entriesWithEmbeddings.length;
-
+		// ── Model has changed — re-embed every stored vector in place ──
+		//
+		// Every entry with an embedding is re-embedded, whatever its status: a
+		// superseded, archived or conflicted row can be revived later (conflict
+		// resolution, PATCH) and must not come back with an old-model vector.
+		// Tombstoned rows are the exception: their vectors are cleared and
+		// regenerated only if they are ever revived.
+		//
+		// Failure modes:
+		// - embedBatch or a write throws: metadata is not stamped, so the next
+		//   startup sees the mismatch again and resumes. Rows already written hold
+		//   new-model vectors and are simply re-embedded on that run.
+		// - Metadata is stamped only after the last batch, so it never claims a
+		//   model that some rows do not yet match.
 		logger.log(
 			`[embedding] Model change detected: "${stored.model}" → "${configuredModel}".`,
 		);
 
-		if (totalEntries === 0) {
-			// No entries to re-embed — just update metadata.
+		const cleared = await db.clearTombstonedEmbeddings();
+		if (cleared > 0) {
+			logger.log(
+				`[embedding] Cleared ${cleared} tombstoned embedding(s); they regenerate if revived.`,
+			);
+		}
+
+		const reEmbedStart = Date.now();
+		let cursor: string | null = null;
+		let processed = 0;
+		let dimensions: number | null = null;
+
+		for (;;) {
+			const batch = await db.getEntriesForReEmbed(cursor, RE_EMBED_BATCH_SIZE);
+			if (batch.length === 0) break;
+
+			const vectors = await this.embeddings.embedBatch(
+				batch.map((e) => formatEmbeddingText(e.type, e.content, e.topics)),
+				bulkEmbedOptions(),
+			);
+
+			if (dimensions === null) {
+				// The new vector size is known only now. Reshape the vector column
+				// before the first write so a new-size vector never meets an old-size
+				// column.
+				dimensions = vectors[0].length;
+				await db.beginEmbeddingModelChange(dimensions);
+			}
+
+			for (let i = 0; i < batch.length; i++) {
+				await db.updateEntry(batch[i].id, { embedding: vectors[i] });
+			}
+
+			processed += batch.length;
+			cursor = batch[batch.length - 1].id;
+			logger.log(
+				`[embedding] Re-embedded ${processed} entries with "${configuredModel}"...`,
+			);
+		}
+
+		if (dimensions === null) {
+			// No entries with embeddings to re-embed — just update metadata.
 			logger.log(
 				"[embedding] No entries with embeddings to re-embed — updating metadata only.",
 			);
@@ -985,59 +1034,21 @@ export class ActivationEngine {
 			return false;
 		}
 
-		logger.log(
-			`[embedding] Re-embedding ${totalEntries} entries with new model "${configuredModel}"...`,
-		);
-
-		// Re-embed in-place: compute all new embeddings via a single batch call,
-		// then overwrite each entry's vector individually, then stamp the metadata.
-		//
-		// Failure modes:
-		// - embedBatch throws (after per-chunk retries for transient errors, or on a
-		//   response that fails validation): nothing is written → metadata still
-		//   points to the old model → next startup detects mismatch and retries in
-		//   full. Safe.
-		// - Response validation (count, vector shape) rejects truncated responses.
-		//   Distinct indices are sorted; duplicate indices fall back to array order
-		//   with a warning (#100).
-		// - Process crashes mid-loop: entries updated so far have new-model
-		//   embeddings; remaining entries still carry old-model embeddings (non-NULL).
-		//   Because metadata is written AFTER the loop, next startup sees
-		//   stored.model !== configuredModel and re-runs the full re-embed. The
-		//   already-updated entries will be re-embedded redundantly but correctly.
-		const reEmbedStart = Date.now();
-
-		const texts = entriesWithEmbeddings.map((e) =>
-			formatEmbeddingText(e.type, e.content, e.topics),
-		);
-		const newEmbeddings = await this.embeddings.embedBatch(
-			texts,
-			bulkEmbedOptions(),
-		);
-
-		const newDimensions =
-			newEmbeddings.length > 0 ? newEmbeddings[0].length : 0;
-
-		for (let i = 0; i < entriesWithEmbeddings.length; i++) {
-			await db.updateEntry(entriesWithEmbeddings[i].id, {
-				embedding: newEmbeddings[i],
-			});
-		}
-
-		// Write metadata AFTER the loop so a mid-loop crash does not leave the DB
-		// with mixed-dimension embeddings that look consistent to the next startup.
-		await db.setEmbeddingMetadata(configuredModel, newDimensions);
+		await db.setEmbeddingMetadata(configuredModel, dimensions);
 
 		const durationSec = ((Date.now() - reEmbedStart) / 1000).toFixed(1);
 
 		logger.log(
-			`[embedding] Re-embed complete: ${totalEntries} entries re-embedded in ${durationSec}s ` +
-				`(${stored.dimensions} → ${newDimensions} dimensions).`,
+			`[embedding] Re-embed complete: ${processed} entries re-embedded in ${durationSec}s ` +
+				`(${stored.dimensions} → ${dimensions} dimensions).`,
 		);
 
 		return true;
 	}
 }
+
+/** Entries per page when re-embedding after a model change. */
+const RE_EMBED_BATCH_SIZE = 100;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

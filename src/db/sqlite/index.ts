@@ -369,6 +369,34 @@ export class KnowledgeDB implements IKnowledgeStore {
 	}
 
 	/**
+	 * One keyset-paginated page of entries to re-embed on a model change — every
+	 * non-tombstoned entry with an embedding, any status. See IKnowledgeStore.
+	 */
+	async getEntriesForReEmbed(
+		afterId: string | null,
+		limit: number,
+	): Promise<
+		Array<Pick<KnowledgeEntry, "id" | "type" | "content" | "topics">>
+	> {
+		const rows = this.db
+			.prepare(
+				"SELECT id, type, content, topics FROM knowledge_entry WHERE status <> 'tombstoned' AND embedding IS NOT NULL AND id > ? ORDER BY id LIMIT ?",
+			)
+			.all(afterId ?? "", limit) as Array<{
+			id: string;
+			type: string;
+			content: string;
+			topics: string;
+		}>;
+		return rows.map((r) => ({
+			id: r.id,
+			type: r.type as KnowledgeEntry["type"],
+			content: r.content,
+			topics: JSON.parse(r.topics),
+		}));
+	}
+
+	/**
 	 * Get entries by status (for review, decay processing, etc.)
 	 */
 	async getEntriesByStatus(status: KnowledgeStatus): Promise<KnowledgeEntry[]> {
@@ -1062,6 +1090,20 @@ export class KnowledgeDB implements IKnowledgeStore {
 				"INSERT OR REPLACE INTO embedding_metadata (id, model, dimensions, recorded_at) VALUES (1, ?, ?, ?)",
 			)
 			.run(model, dimensions, Date.now());
+	}
+
+	/**
+	 * No-op: SQLite stores vectors as BLOBs with no typed column to resize.
+	 */
+	async beginEmbeddingModelChange(_dimensions: number): Promise<void> {}
+
+	async clearTombstonedEmbeddings(): Promise<number> {
+		const result = this.db
+			.prepare(
+				"UPDATE knowledge_entry SET embedding = NULL WHERE status = 'tombstoned' AND embedding IS NOT NULL",
+			)
+			.run();
+		return result.changes;
 	}
 
 	// ── Cluster Management ──

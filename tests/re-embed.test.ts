@@ -286,15 +286,13 @@ describe("checkAndReEmbed", () => {
 		expect(meta?.model).toBe("old-model");
 	});
 
-	it("does not re-embed superseded entries", async () => {
+	it("re-embeds superseded and archived entries too, not only active ones", async () => {
 		const oldEmb = fakeEmbedding("old");
 		const newEmb = fakeEmbedding("new");
 
-		// Active entry — should be re-embedded
 		await db.insertEntry(
 			makeEntry({ id: "e1", status: "active", embedding: oldEmb }),
 		);
-		// Superseded entry — should NOT be re-embedded
 		await db.insertEntry(
 			makeEntry({
 				id: "e2",
@@ -303,22 +301,23 @@ describe("checkAndReEmbed", () => {
 				embedding: oldEmb,
 			}),
 		);
+		await db.insertEntry(
+			makeEntry({ id: "e3", status: "archived", embedding: oldEmb }),
+		);
 
 		await db.setEmbeddingMetadata("old-model", oldEmb.length);
 		config.embedding.model = "new-model";
 
-		// Only 1 entry should be passed to embedBatch (the active one)
 		const embedBatchSpy = spyOn(
 			activation.embeddings,
 			"embedBatch",
-		).mockResolvedValue([newEmb]);
+		).mockResolvedValue([newEmb, newEmb, newEmb]);
 
 		await activation.checkAndReEmbed();
 
-		// embedBatch should only receive 1 text (for the active entry)
 		expect(embedBatchSpy).toHaveBeenCalledTimes(1);
 		const callArgs = embedBatchSpy.mock.calls[0][0] as string[];
-		expect(callArgs.length).toBe(1);
+		expect(callArgs.length).toBe(3);
 	});
 
 	it("re-embeds conflicted entries alongside active ones", async () => {
@@ -348,5 +347,121 @@ describe("checkAndReEmbed", () => {
 
 		const entries = await db.getActiveEntriesWithEmbeddings();
 		expect(entries.length).toBe(2);
+	});
+	// ── Issue #103: every stored vector follows the model ──
+
+	it("issue #103: after a model change every stored vector matches the new model", async () => {
+		const OLD = [1, 0, 0, 0];
+		const NEW = [0, 0, 1, 0, 0, 0]; // different dimension on purpose
+		const statuses = [
+			"active",
+			"conflicted",
+			"superseded",
+			"archived",
+			"tombstoned",
+		] as const;
+		for (const status of statuses) {
+			await db.insertEntry(
+				makeEntry({
+					id: status,
+					status,
+					content: `entry ${status}`,
+					supersededBy: status === "superseded" ? "active" : null,
+					embedding: OLD,
+				}),
+			);
+		}
+		await db.setEmbeddingMetadata("old-model", OLD.length);
+		config.embedding.model = "new-model";
+
+		const embedBatchSpy = spyOn(
+			activation.embeddings,
+			"embedBatch",
+		).mockImplementation(async (texts: string[]) => texts.map(() => NEW));
+
+		expect(await activation.checkAndReEmbed()).toBe(true);
+
+		// Every non-tombstoned entry is re-embedded, whatever its status.
+		const texts = embedBatchSpy.mock.calls.flatMap((c) => c[0] as string[]);
+		expect(texts.length).toBe(4);
+
+		for (const status of statuses) {
+			const entry = await db.getEntry(status);
+			if (status === "tombstoned") {
+				// Tombstoned vectors are cleared, not re-embedded.
+				expect(entry?.embedding).toBeUndefined();
+			} else {
+				expect(entry?.embedding).toEqual(NEW);
+			}
+		}
+
+		expect(await db.getEmbeddingMetadata()).toMatchObject({
+			model: "new-model",
+			dimensions: NEW.length,
+		});
+	});
+
+	it("re-embeds in batches of 100 with progress", async () => {
+		const OLD = [1, 0, 0, 0];
+		const NEW = [0, 1, 0, 0];
+		for (let i = 0; i < 250; i++) {
+			await db.insertEntry(
+				makeEntry({ id: `b${String(i).padStart(3, "0")}`, embedding: OLD }),
+			);
+		}
+		await db.setEmbeddingMetadata("old-model", OLD.length);
+		config.embedding.model = "new-model";
+
+		const embedBatchSpy = spyOn(
+			activation.embeddings,
+			"embedBatch",
+		).mockImplementation(async (texts: string[]) => texts.map(() => NEW));
+
+		await activation.checkAndReEmbed();
+
+		expect(
+			embedBatchSpy.mock.calls.map((c) => (c[0] as string[]).length),
+		).toEqual([100, 100, 50]);
+		for (let i = 0; i < 250; i++) {
+			const e = await db.getEntry(`b${String(i).padStart(3, "0")}`);
+			expect(e?.embedding).toEqual(NEW);
+		}
+	});
+
+	it("keeps metadata on the old model when a later batch fails, and resumes on the next run", async () => {
+		const OLD = [1, 0, 0, 0];
+		const NEW = [0, 1, 0, 0];
+		for (let i = 0; i < 150; i++) {
+			await db.insertEntry(
+				makeEntry({ id: `r${String(i).padStart(3, "0")}`, embedding: OLD }),
+			);
+		}
+		await db.setEmbeddingMetadata("old-model", OLD.length);
+		config.embedding.model = "new-model";
+
+		let calls = 0;
+		const embedBatchSpy = spyOn(
+			activation.embeddings,
+			"embedBatch",
+		).mockImplementation(async (texts: string[]) => {
+			calls++;
+			if (calls === 2) throw new Error("rate limit exceeded");
+			return texts.map(() => NEW);
+		});
+
+		await expect(activation.checkAndReEmbed()).rejects.toThrow(
+			"rate limit exceeded",
+		);
+		expect((await db.getEmbeddingMetadata())?.model).toBe("old-model");
+
+		embedBatchSpy.mockImplementation(async (texts: string[]) =>
+			texts.map(() => NEW),
+		);
+		expect(await activation.checkAndReEmbed()).toBe(true);
+		expect((await db.getEmbeddingMetadata())?.model).toBe("new-model");
+		for (let i = 0; i < 150; i++) {
+			const e = await db.getEntry(`r${String(i).padStart(3, "0")}`);
+			expect(e?.embedding).toEqual(NEW);
+		}
 	});
 });
