@@ -325,6 +325,10 @@ export const config = {
 	decay: {
 		archiveThreshold: parseFloatEnv(process.env.DECAY_ARCHIVE_THRESHOLD, 0.15),
 		tombstoneAfterDays: parseIntEnv(process.env.DECAY_TOMBSTONE_DAYS, 180, 1),
+		// Decay runs on its own schedule, independent of pending work, so an idle
+		// install still archives stale entries. Not run per consolidation batch.
+		// Set to 0 to disable.
+		intervalMs: parseIntEnv(process.env.DECAY_INTERVAL_MS, 86_400_000, 0),
 		// Type-specific decay rates (higher = slower decay)
 		typeHalfLife: {
 			fact: 30, // facts go stale in ~30 days

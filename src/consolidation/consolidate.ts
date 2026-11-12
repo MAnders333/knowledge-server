@@ -299,21 +299,6 @@ export class ConsolidationEngine {
 			logger.log("[consolidation] No new sessions to process.");
 		}
 
-		// Apply decay to ALL active entries across all configured stores.
-		// Fan out to domain stores via the router; always include this.db as primary.
-		// NOTE: decayStores is derived from domainRouter.allStores() (available stores
-		// registered with the router), while activation.writableDbs is derived from
-		// registry.writableStores() (all writable stores). Both exclude unavailable
-		// stores and should be equivalent in practice — but they are two independent
-		// derivation paths. If filtering logic changes in either, keep them in sync.
-		const decayStores = this.domainRouter
-			? new Set([this.db, ...this.domainRouter.allStores()])
-			: new Set([this.db]);
-		let archived = 0;
-		for (const store of decayStores) {
-			archived += await this.applyDecay(store);
-		}
-
 		// Generate embeddings for new entries across all writable stores.
 		// ensureEmbeddings() fans out internally to this.activation.writableDbs.
 		const embeddedCount = await this.activation.ensureEmbeddings();
@@ -322,12 +307,12 @@ export class ConsolidationEngine {
 		);
 
 		// Seed embedding metadata for any store that has no metadata record yet
-		// (e.g. first consolidation after a pre-v8 upgrade). Use decayStores as the
-		// scope — all writable stores — to cover stores that may have received writes
-		// in prior runs but never had metadata recorded.
+		// (e.g. first consolidation after a pre-v8 upgrade). Use every knowledge
+		// store — to cover stores that may have received writes in prior runs but
+		// never had metadata recorded.
 		// Only seeds when metadata is absent — the model-change path is handled
 		// exclusively by checkAndReEmbed() at startup.
-		for (const store of decayStores) {
+		for (const store of this.knowledgeStores()) {
 			if (!(await store.getEmbeddingMetadata())) {
 				const sample = await store.getOneEntryWithEmbedding();
 				if (sample) {
@@ -355,14 +340,13 @@ export class ConsolidationEngine {
 			segmentsProcessed: totalSegmentsProcessed,
 			entriesCreated: totalCreated,
 			entriesUpdated: totalUpdated,
-			entriesArchived: archived,
 			conflictsDetected: totalConflictsDetected,
 			conflictsResolved: totalConflictsResolved,
 			duration: Date.now() - startTime,
 		};
 
 		logger.log(
-			`[consolidation] Complete. ${result.sessionsProcessed} sessions (${result.segmentsProcessed} segments) -> ${result.entriesCreated} entries (${result.entriesArchived} archived, ${result.conflictsDetected} conflicts, ${result.conflictsResolved} resolved) in ${result.duration}ms`,
+			`[consolidation] Complete. ${result.sessionsProcessed} sessions (${result.segmentsProcessed} segments) -> ${result.entriesCreated} entries (${result.conflictsDetected} conflicts, ${result.conflictsResolved} resolved) in ${result.duration}ms`,
 		);
 
 		return result;
@@ -1172,10 +1156,40 @@ export class ConsolidationEngine {
 	}
 
 	/**
-	 * Apply decay to all active entries.
+	 * Every knowledge store consolidation writes to: the primary store plus the
+	 * domain stores known to the router.
+	 *
+	 * NOTE: derived from domainRouter.allStores() (available stores registered with
+	 * the router), while activation.writableDbs is derived from registry.writableStores()
+	 * (all writable stores). Both exclude unavailable stores and should be equivalent in
+	 * practice — but they are two independent derivation paths. If filtering logic
+	 * changes in either, keep them in sync.
+	 */
+	private knowledgeStores(): Set<IKnowledgeStore> {
+		return this.domainRouter
+			? new Set([this.db, ...this.domainRouter.allStores()])
+			: new Set([this.db]);
+	}
+
+	/**
+	 * Apply strength decay to every knowledge store: archive entries whose strength
+	 * fell below the threshold, and tombstone long-archived ones. Run on its own
+	 * schedule (daily, see runDecay callers in index.ts), not per consolidation batch.
 	 * Returns the number of entries that were archived.
 	 */
-	private async applyDecay(db: IKnowledgeStore = this.db): Promise<number> {
+	async runDecay(): Promise<number> {
+		let archived = 0;
+		for (const store of this.knowledgeStores()) {
+			archived += await this.applyDecay(store);
+		}
+		return archived;
+	}
+
+	/**
+	 * Apply decay to all active entries of one store.
+	 * Returns the number of entries that were archived.
+	 */
+	private async applyDecay(db: IKnowledgeStore): Promise<number> {
 		// Include conflicted entries — their strength must continue aging.
 		// A conflicted entry whose strength falls to zero is effectively forgotten
 		// regardless of the conflict, and should still be archived.

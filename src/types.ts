@@ -353,7 +353,6 @@ export interface ConsolidationResult {
 	segmentsProcessed: number;
 	entriesCreated: number;
 	entriesUpdated: number;
-	entriesArchived: number;
 	conflictsDetected: number;
 	conflictsResolved: number;
 	duration: number; // ms

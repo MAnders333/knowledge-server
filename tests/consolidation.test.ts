@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 /**
  * Integration tests for the consolidation engine.
  *
@@ -83,30 +84,61 @@ afterEach(async () => {
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
-describe("ConsolidationEngine.applyDecay (via consolidate early-return path)", () => {
-	it("archives entries below threshold even when no new sessions exist", async () => {
-		// Insert a very weak entry that should be archived
-		const weakEntry = makeEntry({
-			id: "weak-1",
+describe("ConsolidationEngine decay", () => {
+	function weakEntry(id: string) {
+		return makeEntry({
+			id,
 			content: "Weak entry",
 			strength: 0.05, // below default archiveThreshold of 0.15
 			lastAccessedAt: Date.now() - 365 * 24 * 60 * 60 * 1000, // 1 year ago
 			createdAt: Date.now() - 365 * 24 * 60 * 60 * 1000,
 			updatedAt: Date.now() - 365 * 24 * 60 * 60 * 1000,
 		});
-		await db.insertEntry(weakEntry);
+	}
 
+	it("consolidate() does not decay: decay runs on its own schedule", async () => {
+		await db.insertEntry(weakEntry("weak-batch"));
 		// Mock getCandidateSessions so consolidate() hits the early-return path
 		// without opening the real OpenCode DB (which may have sessions in CI).
 		mockReader._sessions = [];
-		// Mock ensureEmbeddings to avoid real embedding network calls
 		spyOn(activation, "ensureEmbeddings").mockResolvedValue(0);
 
-		const result = await engine.consolidate();
+		await engine.consolidate();
 
-		expect(result.sessionsProcessed).toBe(0);
-		// The key invariant: early-return still calls applyDecay
-		expect(result.entriesArchived).toBe(1);
+		expect((await db.getEntry("weak-batch"))?.status).toBe("active");
+	});
+
+	it("runDecay archives entries below threshold even when no sessions are pending", async () => {
+		await db.insertEntry(weakEntry("weak-1"));
+		expect(await engine.runDecay()).toBe(1);
+		expect((await db.getEntry("weak-1"))?.status).toBe("archived");
+	});
+
+	it("runDecay writes nothing for entries that stay above the threshold", async () => {
+		const now = Date.now();
+		// Decayed live (about 0.5) but still above the 0.15 archive threshold.
+		await db.insertEntry(
+			makeEntry({
+				id: "aging-1",
+				confidence: 0.9,
+				strength: 1.0, // stored value, never rewritten by decay
+				lastAccessedAt: now - 60 * 24 * 60 * 60 * 1000,
+				createdAt: now - 60 * 24 * 60 * 60 * 1000,
+				updatedAt: now - 60 * 24 * 60 * 60 * 1000,
+			}),
+		);
+		expect(await engine.runDecay()).toBe(0);
+		const raw = new Database(join(tempDir, "test.db"), { readonly: true });
+		try {
+			const row = raw
+				.prepare("SELECT strength, status FROM knowledge_entry WHERE id = ?")
+				.get("aging-1") as { strength: number; status: string };
+			expect(row).toEqual({ strength: 1.0, status: "active" });
+		} finally {
+			raw.close();
+		}
+		// The live value is still what reads report.
+		expect((await db.getEntry("aging-1"))?.strength).toBeLessThan(0.9);
 	});
 });
 

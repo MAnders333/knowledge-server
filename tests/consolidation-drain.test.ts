@@ -52,16 +52,30 @@ function makeConsolidation(
 		batches?: BatchSpec[];
 		lockHeld?: boolean;
 		throwOnBatch?: number;
+		/** Sessions pending before the first batch. Defaults to the sum of `batches`. */
+		pending?: number;
 	} = {},
-): ConsolidationEngine & { synthesisCalled: number } {
+): ConsolidationEngine & { synthesisCalled: number; consolidateCalls: number } {
 	const { batches = [], lockHeld = false, throwOnBatch } = opts;
 	let callCount = 0;
 	let locked = false;
 	let synthesisCalled = 0;
+	let pending =
+		opts.pending ?? batches.reduce((n, b) => n + b.sessionsProcessed, 0);
 
 	const engine = {
 		get synthesisCalled() {
 			return synthesisCalled;
+		},
+		get consolidateCalls() {
+			return callCount;
+		},
+
+		async checkPending(): Promise<{
+			pendingSessions: number;
+			lastConsolidatedAt: number;
+		}> {
+			return { pendingSessions: pending, lastConsolidatedAt: 0 };
 		},
 
 		tryLock(): boolean {
@@ -82,20 +96,23 @@ function makeConsolidation(
 			if (throwOnBatch !== undefined && callCount === throwOnBatch) {
 				throw new Error(`Batch ${throwOnBatch} failed`);
 			}
-			return (
-				batches[idx] ?? {
-					sessionsProcessed: 0,
-					entriesCreated: 0,
-					entriesUpdated: 0,
-				}
-			);
+			const result = batches[idx] ?? {
+				sessionsProcessed: 0,
+				entriesCreated: 0,
+				entriesUpdated: 0,
+			};
+			pending = Math.max(0, pending - result.sessionsProcessed);
+			return result;
 		},
 
 		async runSynthesis(): Promise<number> {
 			synthesisCalled++;
 			return 0;
 		},
-	} as unknown as ConsolidationEngine & { synthesisCalled: number };
+	} as unknown as ConsolidationEngine & {
+		synthesisCalled: number;
+		consolidateCalls: number;
+	};
 
 	return engine;
 }
@@ -174,6 +191,23 @@ describe("drainConsolidation", () => {
 		expect(result.totalUpdated).toBe(0);
 	});
 
+	it("never starts a batch when nothing is pending (no empty trailing batch)", async () => {
+		const engine = makeConsolidation({
+			pending: 0,
+			batches: [{ sessionsProcessed: 3, entriesCreated: 1, entriesUpdated: 0 }],
+		});
+		await drainConsolidation(engine);
+		expect(engine.consolidateCalls).toBe(0);
+	});
+
+	it("stops without an extra batch once the pending count reaches zero", async () => {
+		const engine = makeConsolidation({
+			batches: [{ sessionsProcessed: 2, entriesCreated: 1, entriesUpdated: 0 }],
+		});
+		await drainConsolidation(engine);
+		expect(engine.consolidateCalls).toBe(1);
+	});
+
 	it("accumulates totals across multiple batches", async () => {
 		const engine = makeConsolidation({
 			batches: [
@@ -215,6 +249,12 @@ describe("drainConsolidation", () => {
 		let locked = false;
 
 		const engine = {
+			async checkPending(): Promise<{
+				pendingSessions: number;
+				lastConsolidatedAt: number;
+			}> {
+				return { pendingSessions: 1, lastConsolidatedAt: 0 };
+			},
 			tryLock(): boolean {
 				if (locked) return false;
 				locked = true;

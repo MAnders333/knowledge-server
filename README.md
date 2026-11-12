@@ -433,6 +433,7 @@ All sources are auto-detected. Override paths or disable sources via environment
 |---|---|---|
 | `DECAY_ARCHIVE_THRESHOLD` | `0.15` | Strength below which an entry is archived |
 | `DECAY_TOMBSTONE_DAYS` | `180` | Days after archiving before permanent deletion |
+| `DECAY_INTERVAL_MS` | `86400000` (24h) | How often decay runs, independent of pending sessions. Set to `0` to disable. |
 
 ### Activation
 
