@@ -185,6 +185,43 @@ describe("KnowledgeDB", () => {
 		}
 	});
 
+	it("reports strength computed on read; the stored column is not rewritten", async () => {
+		const now = Date.now();
+		await db.insertEntry({
+			id: "live-strength",
+			type: "fact",
+			content: "Strength is live",
+			topics: [],
+			confidence: 0.9,
+			source: "test",
+			status: "active",
+			strength: 1.0,
+			createdAt: now - 400 * 86_400_000,
+			updatedAt: now,
+			lastAccessedAt: now - 400 * 86_400_000,
+			accessCount: 0,
+			observationCount: 1,
+			supersededBy: null,
+			derivedFrom: [],
+		});
+		const live = (await db.getEntry("live-strength"))?.strength ?? 1;
+		expect(live).toBeLessThan(0.05);
+		const raw = new Database(join(tempDir, "test.db"), { readonly: true });
+		try {
+			const row = raw
+				.prepare("SELECT strength FROM knowledge_entry WHERE id = ?")
+				.get("live-strength") as { strength: number };
+			expect(row.strength).toBe(1.0);
+		} finally {
+			raw.close();
+		}
+		// Ordering and the review stale filter use the live value.
+		const stale = (await db.getActiveEntries()).filter(
+			(e) => e.id === "live-strength",
+		);
+		expect(stale[0]?.strength).toBeLessThan(0.3);
+	});
+
 	it("plain entry reads never carry the embedding", async () => {
 		const now = Date.now();
 		await db.insertEntry({

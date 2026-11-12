@@ -212,8 +212,6 @@ export interface IKnowledgeStore {
 
 	reinforceObservation(id: string): Promise<void>;
 
-	updateStrength(id: string, strength: number): Promise<void>;
-
 	getStats(): Promise<Record<string, number>>;
 
 	// ── Contradiction detection ──

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import postgres from "postgres";
+import { computeStrength } from "../../consolidation/decay.js";
 import { logger } from "../../logger.js";
 import { clampKnowledgeType } from "../../types.js";
 import type {
@@ -595,7 +596,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				? JSON.parse(row.derived_from)
 				: row.derived_from;
 
-		return {
+		const entry: KnowledgeEntry = {
 			id: row.id,
 			type: row.type as KnowledgeEntry["type"],
 			content: row.content,
@@ -603,7 +604,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			confidence: toNum(row.confidence),
 			source: row.source,
 			status: row.status as KnowledgeEntry["status"],
-			strength: toNum(row.strength),
+			strength: 0,
 			createdAt: toNum(row.created_at),
 			updatedAt: toNum(row.updated_at),
 			lastAccessedAt: toNum(row.last_accessed_at),
@@ -614,6 +615,10 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			isSynthesized: toNum(row.is_synthesized) === 1,
 			embedding,
 		};
+		// Strength is computed on read (see computeStrength); the stored column is
+		// only written when an entry is archived.
+		entry.strength = computeStrength(entry);
+		return entry;
 	}
 
 	// ── Entry CRUD ──
@@ -868,12 +873,6 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			UPDATE knowledge_entry
 			SET observation_count = observation_count + 1, last_accessed_at = ${now}, updated_at = ${now}
 			WHERE id = ${id}
-		`;
-	}
-
-	async updateStrength(id: string, strength: number): Promise<void> {
-		await this.sql`
-			UPDATE knowledge_entry SET strength = ${strength}, updated_at = ${Date.now()} WHERE id = ${id}
 		`;
 	}
 

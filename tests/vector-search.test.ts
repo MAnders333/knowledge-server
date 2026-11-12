@@ -62,7 +62,6 @@ function makeStoreStub(
 		getEntries: mock(() => Promise.resolve([])),
 		recordAccess: mock(() => Promise.resolve()),
 		reinforceObservation: mock(() => Promise.resolve()),
-		updateStrength: mock(() => Promise.resolve()),
 		getStats: mock(() => Promise.resolve({})),
 		getEntriesWithOverlappingTopics: mock(() => Promise.resolve([])),
 		applyContradictionResolution: mock(() => Promise.resolve()),

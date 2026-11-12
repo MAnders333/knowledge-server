@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DEFAULT_SQLITE_PATH } from "../../config-file.js";
+import { computeStrength } from "../../consolidation/decay.js";
 import { logger } from "../../logger.js";
 import { clampKnowledgeType } from "../../types.js";
 import type {
@@ -406,17 +407,6 @@ export class KnowledgeDB implements IKnowledgeStore {
          WHERE id = ?`,
 			)
 			.run(Date.now(), Date.now(), id);
-	}
-
-	/**
-	 * Batch update strength scores (used during decay).
-	 */
-	async updateStrength(id: string, strength: number): Promise<void> {
-		this.db
-			.prepare(
-				"UPDATE knowledge_entry SET strength = ?, updated_at = ? WHERE id = ?",
-			)
-			.run(strength, Date.now(), id);
 	}
 
 	/**
@@ -898,7 +888,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 			embedding = Array.from(float32);
 		}
 
-		return {
+		const entry: KnowledgeEntry = {
 			id: row.id,
 			type: row.type as KnowledgeEntry["type"],
 			content: row.content,
@@ -906,7 +896,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 			confidence: row.confidence,
 			source: row.source,
 			status: row.status as KnowledgeEntry["status"],
-			strength: row.strength,
+			strength: 0,
 			createdAt: row.created_at,
 			updatedAt: row.updated_at,
 			lastAccessedAt: row.last_accessed_at,
@@ -917,6 +907,10 @@ export class KnowledgeDB implements IKnowledgeStore {
 			isSynthesized: row.is_synthesized === 1,
 			embedding,
 		};
+		// Strength is computed on read (see computeStrength). The stored column is
+		// only written when an entry is archived, so it is not a live value.
+		entry.strength = computeStrength(entry);
+		return entry;
 	}
 
 	/**

@@ -1186,6 +1186,8 @@ export class ConsolidationEngine {
 		for (const entry of entries) {
 			const newStrength = computeStrength(entry);
 
+			// Strength is computed on read, so only archival writes it back. Entries that
+			// stay above the threshold cost no write.
 			if (newStrength < config.decay.archiveThreshold) {
 				await db.updateEntry(entry.id, {
 					status: "archived",
@@ -1195,9 +1197,6 @@ export class ConsolidationEngine {
 				logger.log(
 					`[decay] Archived: ${JSON.stringify(entry.content)} (strength: ${newStrength.toFixed(3)})`,
 				);
-			} else if (Math.abs(newStrength - entry.strength) > 0.01) {
-				// Only update if strength changed meaningfully
-				await db.updateStrength(entry.id, newStrength);
 			}
 		}
 

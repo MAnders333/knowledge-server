@@ -526,4 +526,18 @@ export const PG_MIGRATIONS: Array<{
 				}
 			}),
 	},
+	{
+		version: 18,
+		label:
+			"drop strength and last_accessed_at indexes (HNSW churn on every update); fillfactor 85",
+		up: async (sql: TxSql) => {
+			// Strength is computed on read, so its index is unused. Both indexes were
+			// rewritten on each decay pass and access, which is a non-HOT update that
+			// also re-inserts the row into the embedding HNSW index. fillfactor leaves
+			// room on each page so counter updates can be HOT.
+			await sql`DROP INDEX IF EXISTS idx_entry_strength`;
+			await sql`DROP INDEX IF EXISTS idx_entry_accessed`;
+			await sql`ALTER TABLE knowledge_entry SET (fillfactor = 85)`;
+		},
+	},
 ];

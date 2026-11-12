@@ -254,13 +254,45 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		expect(entry?.lastAccessedAt).toBeGreaterThanOrEqual(now);
 	});
 
-	it("updates strength", async () => {
-		await db.insertEntry(makeEntry("test-strength", { strength: 1.0 }));
-
-		await db.updateStrength("test-strength", 0.42);
+	it("reports strength computed on read, not the stored column", async () => {
+		const now = Date.now();
+		await db.insertEntry(
+			makeEntry("test-strength", {
+				confidence: 0.9,
+				strength: 1.0,
+				lastAccessedAt: now - 400 * 86_400_000,
+			}),
+		);
 
 		const entry = await db.getEntry("test-strength");
-		expect(entry?.strength).toBeCloseTo(0.42);
+		expect(entry?.strength).toBeLessThan(0.05);
+		const [stored] = await truncSql`
+			SELECT strength FROM knowledge_entry WHERE id = 'test-strength'
+		`;
+		expect(Number(stored.strength)).toBe(1.0);
+	});
+
+	it("migration v18 drops the strength and last_accessed_at indexes", async () => {
+		const names = await truncSql`
+			SELECT indexname FROM pg_indexes
+			WHERE tablename = 'knowledge_entry'
+			  AND indexname IN ('idx_entry_strength', 'idx_entry_accessed')
+		`;
+		expect(names).toHaveLength(0);
+		const v18 = PG_MIGRATIONS.find((m) => m.version === 18);
+		expect(v18).toBeDefined();
+		// Recreate the legacy indexes, then run the migration step on them.
+		await truncSql`CREATE INDEX IF NOT EXISTS idx_entry_strength ON knowledge_entry(strength)`;
+		await truncSql`CREATE INDEX IF NOT EXISTS idx_entry_accessed ON knowledge_entry(last_accessed_at)`;
+		await truncSql.begin(async (tx) => {
+			await (v18 as (typeof PG_MIGRATIONS)[number]).up(tx as never);
+		});
+		const after = await truncSql`
+			SELECT indexname FROM pg_indexes
+			WHERE tablename = 'knowledge_entry'
+			  AND indexname IN ('idx_entry_strength', 'idx_entry_accessed')
+		`;
+		expect(after).toHaveLength(0);
 	});
 
 	it("filters entries by status", async () => {

@@ -113,6 +113,40 @@ describe("version guard on SQLite stores", () => {
 		}
 	}
 
+	it("v18 drops the strength and last_accessed_at indexes from an existing store", async () => {
+		const path = join(dir, "knowledge.db");
+		await new KnowledgeDB(path).close();
+		const indexExists = (name: string) => {
+			const raw = new Database(path, { readonly: true });
+			try {
+				return (
+					raw
+						.prepare(
+							"SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+						)
+						.get(name) !== null
+				);
+			} finally {
+				raw.close();
+			}
+		};
+		expect(indexExists("idx_entry_strength")).toBe(false);
+		expect(indexExists("idx_entry_accessed")).toBe(false);
+
+		const raw = new Database(path);
+		raw.exec("CREATE INDEX idx_entry_strength ON knowledge_entry(strength)");
+		raw.exec(
+			"CREATE INDEX idx_entry_accessed ON knowledge_entry(last_accessed_at)",
+		);
+		raw.close();
+		setVersion(path, 17);
+
+		await new KnowledgeDB(path).close();
+		expect(indexExists("idx_entry_strength")).toBe(false);
+		expect(indexExists("idx_entry_accessed")).toBe(false);
+		expect(indexExists("idx_entry_created")).toBe(true);
+	});
+
 	it("refuses a knowledge.db newer than this build, without dropping tables", async () => {
 		const path = join(dir, "knowledge.db");
 		await new KnowledgeDB(path).close();

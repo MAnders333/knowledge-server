@@ -54,15 +54,13 @@ export const PG_CREATE_TABLES = `
 
     -- Embedding (float32 array stored as bytea)
     embedding BYTEA
-  );
+  ) WITH (fillfactor = 85);
 
   -- Indices for common queries
   CREATE INDEX IF NOT EXISTS idx_entry_status ON knowledge_entry(status);
   CREATE INDEX IF NOT EXISTS idx_entry_type ON knowledge_entry(type);
 
-  CREATE INDEX IF NOT EXISTS idx_entry_strength ON knowledge_entry(strength);
   CREATE INDEX IF NOT EXISTS idx_entry_created ON knowledge_entry(created_at);
-  CREATE INDEX IF NOT EXISTS idx_entry_accessed ON knowledge_entry(last_accessed_at);
 
   -- Relationships between entries
   CREATE TABLE IF NOT EXISTS knowledge_relation (
