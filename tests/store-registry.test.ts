@@ -435,6 +435,7 @@ describe("ActivationEngine multi-store fan-out", () => {
 
 describe("StoreBreaker and activation fan-out", () => {
 	const WINDOW_MS = 60_000;
+	const ANN = "ANN search";
 	let clock = 0;
 	const newBreaker = () =>
 		new StoreBreaker({ threshold: 3, windowMs: WINDOW_MS, now: () => clock });
@@ -448,12 +449,11 @@ describe("StoreBreaker and activation fan-out", () => {
 			() => {},
 		);
 		const breaker = newBreaker();
-		breaker.record("s", false, "boom");
-		breaker.record("s", false, "boom");
-		expect(breaker.isBlocked("s")).toBe(false);
-		breaker.record("s", false, "boom");
-		expect(breaker.isBlocked("s")).toBe(true);
-		expect(breaker.admit("s")).toBe(false);
+		breaker.recordFailure("s", ANN, "boom");
+		breaker.recordFailure("s", ANN, "boom");
+		expect(breaker.admit("s", ANN)).toBe(true);
+		breaker.recordFailure("s", ANN, "boom");
+		expect(breaker.admit("s", ANN)).toBe(false);
 		expect(warn).toHaveBeenCalledTimes(1);
 	});
 
@@ -462,13 +462,27 @@ describe("StoreBreaker and activation fan-out", () => {
 			() => {},
 		);
 		const breaker = newBreaker();
-		breaker.record("s", false, "boom");
-		breaker.record("s", false, "boom");
-		breaker.record("s", true, "ok");
-		breaker.record("s", false, "boom");
-		breaker.record("s", false, "boom");
-		expect(breaker.isBlocked("s")).toBe(false);
+		breaker.recordFailure("s", ANN, "boom");
+		breaker.recordFailure("s", ANN, "boom");
+		breaker.recordSuccess("s", ANN);
+		breaker.recordFailure("s", ANN, "boom");
+		breaker.recordFailure("s", ANN, "boom");
+		expect(breaker.admit("s", ANN)).toBe(true);
 		expect(warn).not.toHaveBeenCalled();
+	});
+
+	it("a success of one operation does not reset another operation's failures", () => {
+		const warn = spyOn(loggerModule.logger, "warn").mockImplementation(
+			() => {},
+		);
+		const breaker = newBreaker();
+		breaker.recordFailure("s", ANN, "timeout");
+		breaker.recordFailure("s", ANN, "timeout");
+		breaker.recordSuccess("s", "active entry count");
+		breaker.recordFailure("s", ANN, "timeout");
+		expect(breaker.admit("s", ANN)).toBe(false);
+		expect(breaker.admit("s", "active entry count")).toBe(true);
+		expect(warn).toHaveBeenCalledTimes(1);
 	});
 
 	it("skips calls while open, allows one probe after the window, closes on success", () => {
@@ -477,20 +491,17 @@ describe("StoreBreaker and activation fan-out", () => {
 		);
 		clock = 1_000;
 		const breaker = newBreaker();
-		for (let i = 0; i < 3; i++) breaker.record("s", false, "boom");
+		for (let i = 0; i < 3; i++) breaker.recordFailure("s", ANN, "boom");
 
 		clock += WINDOW_MS - 1;
-		expect(breaker.admit("s")).toBe(false);
+		expect(breaker.admit("s", ANN)).toBe(false);
 
 		clock += 1;
-		expect(breaker.isBlocked("s")).toBe(false);
-		expect(breaker.admit("s")).toBe(true); // the probe
-		expect(breaker.isBlocked("s")).toBe(true);
-		expect(breaker.admit("s")).toBe(false); // no second call while probing
+		expect(breaker.admit("s", ANN)).toBe(true); // the probe
+		expect(breaker.admit("s", ANN)).toBe(false); // no second call while probing
 
-		breaker.record("s", true, "ok");
-		expect(breaker.isBlocked("s")).toBe(false);
-		expect(breaker.admit("s")).toBe(true);
+		breaker.recordSuccess("s", ANN);
+		expect(breaker.admit("s", ANN)).toBe(true);
 		// one warning for open, one for closed; nothing per refused call
 		expect(warn).toHaveBeenCalledTimes(2);
 	});
@@ -501,22 +512,22 @@ describe("StoreBreaker and activation fan-out", () => {
 		);
 		clock = 5_000;
 		const breaker = newBreaker();
-		for (let i = 0; i < 3; i++) breaker.record("s", false, "boom");
+		for (let i = 0; i < 3; i++) breaker.recordFailure("s", ANN, "boom");
 
 		clock += WINDOW_MS;
-		expect(breaker.admit("s")).toBe(true); // probe
-		breaker.record("s", false, "still down");
-		expect(breaker.admit("s")).toBe(false);
+		expect(breaker.admit("s", ANN)).toBe(true); // probe
+		breaker.recordFailure("s", ANN, "still down");
+		expect(breaker.admit("s", ANN)).toBe(false);
 
 		clock += WINDOW_MS - 1;
-		expect(breaker.admit("s")).toBe(false);
+		expect(breaker.admit("s", ANN)).toBe(false);
 		clock += 1;
-		expect(breaker.admit("s")).toBe(true); // next probe
+		expect(breaker.admit("s", ANN)).toBe(true); // next probe
 		// open, probe failed, next probe: exactly one warning per state change
 		expect(warn).toHaveBeenCalledTimes(2);
 	});
 
-	it("a dead store with 8 cues gets at most 3 calls, then none during the window", async () => {
+	it("a dead store: at most 3 ANN calls per circuit, none during its window; the count gets one call per activation until its own circuit opens", async () => {
 		const warn = spyOn(loggerModule.logger, "warn").mockImplementation(
 			() => {},
 		);
@@ -539,19 +550,58 @@ describe("StoreBreaker and activation fan-out", () => {
 			{ length: 8 },
 			(_, i) => `distinct cue number ${i}`,
 		);
-		const calls = () =>
-			findSimilarEntries.mock.calls.length +
-			getActiveEntryCount.mock.calls.length;
 
 		const started = Date.now();
 		await engine.activate(cues);
 		expect(Date.now() - started).toBeLessThan(1_000);
-		expect(calls()).toBeLessThanOrEqual(3);
+		// Activation 1: the ANN circuit opens on its third failure; the count is
+		// one fan-out call, so it has failed once.
+		expect(findSimilarEntries.mock.calls.length).toBe(3);
+		expect(getActiveEntryCount.mock.calls.length).toBe(1);
 		expect(warn).toHaveBeenCalledTimes(1);
 
-		const afterFirst = calls();
 		await engine.activate(cues);
-		expect(calls()).toBe(afterFirst);
+		expect(findSimilarEntries.mock.calls.length).toBe(3);
+		expect(getActiveEntryCount.mock.calls.length).toBe(2);
 		expect(warn).toHaveBeenCalledTimes(1);
+
+		// The count's third failure opens its own circuit.
+		await engine.activate(cues);
+		expect(findSimilarEntries.mock.calls.length).toBe(3);
+		expect(getActiveEntryCount.mock.calls.length).toBe(3);
+		expect(warn).toHaveBeenCalledTimes(2);
+
+		await engine.activate(cues);
+		expect(findSimilarEntries.mock.calls.length).toBe(3);
+		expect(getActiveEntryCount.mock.calls.length).toBe(3);
+		expect(warn).toHaveBeenCalledTimes(2);
+	});
+
+	it("an ANN timeout opens its own circuit while the count keeps answering: later activations do not wait", async () => {
+		const STORE_TIMEOUT_MS = 40;
+		spyOn(loggerModule.logger, "warn").mockImplementation(() => {});
+		spyOn(loggerModule.logger, "log").mockImplementation(() => {});
+		const findSimilarEntries = mock(() => new Promise<never>(() => {}));
+		const getActiveEntryCount = mock(() => Promise.resolve(2));
+		const slow = {
+			id: "slow",
+			findSimilarEntries,
+			getActiveEntryCount,
+		} as unknown as IKnowledgeStore;
+		const engine = new ActivationEngine(slow, undefined, undefined, null, {
+			storeTimeoutMs: STORE_TIMEOUT_MS,
+		});
+		spyOn(engine.embeddings, "embedBatch").mockImplementation(
+			async (texts: string[]) => texts.map(() => [1, 0, 0, 0, 0, 0, 0, 0]),
+		);
+
+		for (let i = 0; i < 3; i++) {
+			await engine.activate(`slow cue number ${i}`);
+		}
+		const started = performance.now();
+		const result = await engine.activate("slow cue number 3");
+		expect(performance.now() - started).toBeLessThan(STORE_TIMEOUT_MS * 0.75);
+		expect(findSimilarEntries.mock.calls.length).toBe(3);
+		expect(result.totalActive).toBe(2);
 	});
 });
