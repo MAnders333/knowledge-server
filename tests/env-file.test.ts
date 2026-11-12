@@ -1,5 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -46,15 +52,49 @@ describe("parseEnvText (single .env parser)", () => {
 	});
 });
 
-describe("parseEnvText: extended denylist", () => {
-	it("drops proxy, CA and shell-option keys in every letter case", () => {
+describe("parseEnvText: proxy and CA keys", () => {
+	it("keeps proxy and CA variables in every letter case", () => {
 		const text = [
+			"HTTPS_PROXY=http://proxy.example:3128",
 			"HTTP_PROXY=http://proxy.example:3128",
+			"ALL_PROXY=socks5://proxy.example:1080",
+			"NO_PROXY=localhost,.corp.example",
 			"https_proxy=http://proxy.example:3128",
-			"No_Proxy=*",
-			"NODE_EXTRA_CA_CERTS=/tmp/ca.pem",
+			"http_proxy=http://proxy.example:3128",
+			"all_proxy=socks5://proxy.example:1080",
+			"no_proxy=localhost",
+			"NODE_EXTRA_CA_CERTS=/etc/ssl/corp-ca.pem",
+			"CURL_CA_BUNDLE=/etc/ssl/corp-ca.pem",
+			"SSL_CERT_FILE=/etc/ssl/corp-ca.pem",
+		].join("\n");
+		const env = parseEnvText(text);
+		expect(Object.keys(env)).toEqual([
+			"HTTPS_PROXY",
+			"HTTP_PROXY",
+			"ALL_PROXY",
+			"NO_PROXY",
+			"https_proxy",
+			"http_proxy",
+			"all_proxy",
+			"no_proxy",
+			"NODE_EXTRA_CA_CERTS",
+			"CURL_CA_BUNDLE",
+			"SSL_CERT_FILE",
+		]);
+		expect(env.NODE_EXTRA_CA_CERTS).toBe("/etc/ssl/corp-ca.pem");
+	});
+});
+
+describe("parseEnvText: extended denylist", () => {
+	it("drops shell-option, trust-store and client-config keys in every letter case", () => {
+		const text = [
+			"SSL_CERT_DIR=/tmp/certs",
+			"ssl_cert_dir=/tmp/certs",
+			"CURL_HOME=/tmp/curl",
+			"curl_home=/tmp/curl",
+			"SSLKEYLOGFILE=/tmp/keys.log",
+			"sslkeylogfile=/tmp/keys.log",
 			"NODE_TLS_REJECT_UNAUTHORIZED=0",
-			"SSL_CERT_FILE=/tmp/ca.pem",
 			"NODE_PATH=/tmp/mods",
 			"TMPDIR=/tmp/x",
 			"SHELLOPTS=xtrace",
@@ -88,6 +128,31 @@ describe("loadEnvFile", () => {
 			expect(target.LLM_EXTRACTION_MODEL).toBe("anthropic/claude-sonnet-4-6");
 			expect(target.PATH).toBeUndefined();
 			expect(result.loaded).not.toContain("KNOWLEDGE_ADMIN_TOKEN");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("reports each dropped key by name and keeps the allowed proxy values", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ks-envfile-test-"));
+		try {
+			const path = join(dir, ".env");
+			writeFileSync(
+				path,
+				[
+					"NODE_OPTIONS=--require /tmp/SENTINEL-secret.js",
+					"PATH=/SENTINEL/bin",
+					"HTTPS_PROXY=http://proxy.example:3128",
+					"LD_PRELOAD=/SENTINEL.so",
+					"",
+				].join("\n"),
+			);
+			const target: NodeJS.ProcessEnv = {};
+			const result = loadEnvFile(path, target);
+			expect(result.ignored).toEqual(["NODE_OPTIONS", "PATH", "LD_PRELOAD"]);
+			expect(target.HTTPS_PROXY).toBe("http://proxy.example:3128");
+			expect(target.NODE_OPTIONS).toBeUndefined();
+			expect(result.loaded).toEqual(["HTTPS_PROXY"]);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -135,4 +200,60 @@ describe("launchers do not parse .env", () => {
 			expect(text).not.toMatch(/_val="\\?\$\{_line/);
 		});
 	}
+});
+
+describe("env.ts startup: ignored-key warning", () => {
+	const envModule = resolve(import.meta.dir, "../src/env.ts");
+
+	it("warns once per file with key names only and loads allowed proxy keys", () => {
+		const home = mkdtempSync(join(tmpdir(), "ks-envstartup-test-"));
+		try {
+			const configDir = join(home, "knowledge-server");
+			mkdirSync(configDir, { recursive: true });
+			const envFile = join(configDir, ".env");
+			writeFileSync(
+				envFile,
+				[
+					"NODE_OPTIONS=--require /tmp/SENTINEL-secret.js",
+					"PATH=/SENTINEL/bin",
+					"HTTPS_PROXY=http://proxy.example:3128",
+					"LD_PRELOAD=/SENTINEL.so",
+					"",
+				].join("\n"),
+			);
+			const childEnv: Record<string, string> = {};
+			for (const [key, value] of Object.entries(process.env)) {
+				if (
+					value !== undefined &&
+					!key.startsWith("KNOWLEDGE_") &&
+					key !== "NODE_OPTIONS"
+				) {
+					childEnv[key] = value;
+				}
+			}
+			Object.assign(childEnv, {
+				HOME: home,
+				XDG_CONFIG_HOME: home,
+				KNOWLEDGE_LOAD_ENV: "1",
+			});
+			const child = Bun.spawnSync(
+				[
+					process.execPath,
+					"-e",
+					`import ${JSON.stringify(envModule)}; process.stdout.write(process.env.HTTPS_PROXY ?? "");`,
+				],
+				{ env: childEnv, stdout: "pipe", stderr: "pipe" },
+			);
+			const stdout = child.stdout.toString();
+			const stderr = child.stderr.toString();
+			expect(stdout).toBe("http://proxy.example:3128");
+			const warnings = stderr.split("\n").filter((l) => l.includes("[env]"));
+			expect(warnings).toHaveLength(1);
+			expect(warnings[0]).toContain(`Ignored 3 key(s) in ${envFile}`);
+			expect(warnings[0]).toContain("NODE_OPTIONS, PATH, LD_PRELOAD");
+			expect(stderr).not.toContain("SENTINEL");
+		} finally {
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
 });
