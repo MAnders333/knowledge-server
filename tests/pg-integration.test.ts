@@ -1744,7 +1744,44 @@ describe.skipIf(!PG_URI)(
 			admin = postgres(uri, { max: 1 });
 		});
 
+		/** Create the non-owner login role (once) and grant it the app's DML. */
+		async function grantNonOwner(): Promise<void> {
+			await admin.unsafe(`
+			DO $$ BEGIN
+				IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${role}') THEN
+					CREATE ROLE ${role} LOGIN PASSWORD '${NONOWNER_PW}';
+				END IF;
+			END $$;
+			GRANT USAGE, CREATE ON SCHEMA public TO ${role};
+			GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${role};
+		`);
+		}
+
+		function nonOwnerUrl(): string {
+			const url = new URL(uri);
+			url.username = role;
+			url.password = NONOWNER_PW;
+			return url.toString();
+		}
+
+		/** Put the store at `version` with knowledge_entry.injection_count absent. */
+		async function rewindWithoutInjectionCount(version: number): Promise<void> {
+			await admin.unsafe(`
+			ALTER TABLE knowledge_entry DROP COLUMN IF EXISTS injection_count;
+			DELETE FROM schema_version;
+			INSERT INTO schema_version (version, applied_at) VALUES (${version}, ${Date.now()});
+		`);
+		}
+
+		/** Owner-side: put the column back so later tests see the current schema. */
+		async function restoreInjectionCount(): Promise<void> {
+			await admin.unsafe(
+				"ALTER TABLE knowledge_entry ADD COLUMN IF NOT EXISTS injection_count INTEGER NOT NULL DEFAULT 0",
+			);
+		}
+
 		afterAll(async () => {
+			await restoreInjectionCount();
 			await admin`DELETE FROM schema_version`;
 			await admin`INSERT INTO schema_version (version, applied_at) VALUES (${SCHEMA_VERSION}, ${Date.now()})`;
 			await admin.unsafe(`
@@ -1768,19 +1805,11 @@ describe.skipIf(!PG_URI)(
 			CREATE INDEX IF NOT EXISTS idx_entry_accessed ON knowledge_entry(last_accessed_at);
 			DELETE FROM schema_version;
 			INSERT INTO schema_version (version, applied_at) VALUES (17, ${Date.now()});
-			DO $$ BEGIN
-				IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${role}') THEN
-					CREATE ROLE ${role} LOGIN PASSWORD '${NONOWNER_PW}';
-				END IF;
-			END $$;
-			GRANT USAGE, CREATE ON SCHEMA public TO ${role};
-			GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${role};
 		`);
-			const url = new URL(uri);
-			url.username = role;
-			url.password = NONOWNER_PW;
+			await grantNonOwner();
+			const url = nonOwnerUrl();
 			const warn = spyOn(logger, "warn");
-			const store = new PostgresKnowledgeDB(url.toString());
+			const store = new PostgresKnowledgeDB(url);
 			try {
 				// v18 must not abort the store: the owner-only DDL is skipped with a warning.
 				await store.initialize();
@@ -1789,6 +1818,47 @@ describe.skipIf(!PG_URI)(
 				);
 			} finally {
 				warn.mockRestore();
+				await store.close();
+			}
+			const rows = await admin`SELECT MAX(version) AS v FROM schema_version`;
+			expect(Number((rows[0] as { v: number | string }).v)).toBe(
+				SCHEMA_VERSION,
+			);
+		});
+
+		it("a v18 store without injection_count stops with the owner-only fix named", async () => {
+			await grantNonOwner();
+			await rewindWithoutInjectionCount(18);
+			const store = new PostgresKnowledgeDB(nonOwnerUrl());
+			let error: Error | undefined;
+			try {
+				await store.initialize().catch((err: unknown) => {
+					error = err as Error;
+				});
+			} finally {
+				await store.close();
+				await restoreInjectionCount();
+			}
+			// v19 cannot be skipped: the write path increments injection_count.
+			expect(error?.message).toContain("Owner-only fix");
+			expect(error?.message).toContain(
+				"ALTER TABLE knowledge_entry ADD COLUMN injection_count",
+			);
+			const rows = await admin`SELECT MAX(version) AS v FROM schema_version`;
+			expect(Number((rows[0] as { v: number | string }).v)).toBe(18);
+		});
+
+		it("a non-owner opens the store once the owner runs the named fix", async () => {
+			await grantNonOwner();
+			await rewindWithoutInjectionCount(18);
+			// The owner-only fix from the error message, run as the table owner.
+			await admin.unsafe(
+				"ALTER TABLE knowledge_entry ADD COLUMN injection_count INTEGER NOT NULL DEFAULT 0",
+			);
+			const store = new PostgresKnowledgeDB(nonOwnerUrl());
+			try {
+				await store.initialize();
+			} finally {
 				await store.close();
 			}
 			const rows = await admin`SELECT MAX(version) AS v FROM schema_version`;

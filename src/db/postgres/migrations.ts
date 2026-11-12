@@ -591,7 +591,18 @@ export const PG_MIGRATIONS: Array<{
 				  AND a.attname = 'injection_count' AND a.attnum > 0 AND NOT a.attisdropped
 			`;
 			if (present.length === 0) {
-				await sql`ALTER TABLE knowledge_entry ADD COLUMN injection_count INTEGER NOT NULL DEFAULT 0`;
+				try {
+					await sql`ALTER TABLE knowledge_entry ADD COLUMN injection_count INTEGER NOT NULL DEFAULT 0`;
+				} catch (err) {
+					if ((err as { code?: string }).code !== "42501") throw err;
+					// Not skippable: the write path increments injection_count. The
+					// migration aborts, so the store stays at its version until the owner runs the fix.
+					throw new Error(
+						"Migration v19 needs the table owner: the connecting role cannot add knowledge_entry.injection_count. " +
+							"Owner-only fix: as the owner of knowledge_entry, run `ALTER TABLE knowledge_entry ADD COLUMN injection_count INTEGER NOT NULL DEFAULT 0`, then start the server again.",
+						{ cause: err },
+					);
+				}
 			}
 		},
 	},
