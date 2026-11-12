@@ -7,9 +7,3 @@
  */
 
 export type { IServerStateDB, IKnowledgeStore } from "./interface.js";
-export { KnowledgeDB } from "./sqlite/index.js";
-export { PostgresKnowledgeDB } from "./postgres/index.js";
-export {
-	ServerStateDB,
-	DEFAULT_SERVER_STATE_PATH,
-} from "./state/index.js";

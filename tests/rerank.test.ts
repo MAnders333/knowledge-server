@@ -82,7 +82,6 @@ function makeStoreStub(
 		getClustersWithMembers: mock(() => Promise.resolve([])),
 		persistClusters: mock(() => Promise.resolve()),
 		markClusterSynthesized: mock(() => Promise.resolve()),
-		clearAllEmbeddings: mock(() => Promise.resolve(0)),
 		tryAcquireConsolidationLock: mock(() => Promise.resolve(true)),
 		releaseConsolidationLock: mock(() => Promise.resolve()),
 		close: mock(() => Promise.resolve()),

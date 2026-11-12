@@ -3,6 +3,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { logger } from "../../logger.js";
+import { tryAcquireProcessLock } from "../../process-lock.js";
 import type {
 	ActivationEventRow,
 	ConsolidationState,
@@ -18,6 +19,7 @@ import {
 	assertNotNewerThanCode,
 	pendingMigrations,
 } from "../migration-registry.js";
+import { SQLITE_BUSY_TIMEOUT_MS } from "../sqlite-busy.js";
 import { runStateMigrations } from "./migrations.js";
 import { SERVER_LOCAL_MIGRATIONS } from "./schema.js";
 import {
@@ -36,6 +38,19 @@ export const DEFAULT_SERVER_STATE_PATH = join(
 	"knowledge-server",
 	"state.db",
 );
+/** Outcome of ServerStateDB.compactIfNeeded(). */
+export interface CompactionResult {
+	ran: boolean;
+	reason: string;
+	freedPages?: number;
+}
+
+/** compactIfNeeded() runs only for files at least this large … */
+const COMPACT_MIN_BYTES = 50 * 1024 * 1024;
+/** … and only when more than this fraction of their pages are free. */
+const COMPACT_MIN_FREE_RATIO = 0.5;
+/** PRAGMA auto_vacuum value for INCREMENTAL. */
+const AUTO_VACUUM_INCREMENTAL = 2;
 
 /**
  * ServerStateDB — the server-local SQLite database.
@@ -67,6 +82,8 @@ export class ServerStateDB implements IServerStateDB {
 		}
 		ensurePrivateFile(dbPath);
 		this.db = new Database(dbPath);
+		// Before journal_mode: the WAL switch takes a lock of its own.
+		this.db.exec(`PRAGMA busy_timeout=${SQLITE_BUSY_TIMEOUT_MS}`);
 		this.db.exec("PRAGMA journal_mode=WAL");
 		this.db.exec("PRAGMA foreign_keys=ON");
 		this.initialize(legacyKnowledgeDbPath);
@@ -518,6 +535,78 @@ export class ServerStateDB implements IServerStateDB {
 			)
 			.all(sinceMs) as Array<{ source: string; n: number }>;
 		return Object.fromEntries(rows.map((r) => [r.source, Number(r.n)]));
+	}
+
+	/**
+	 * Storage housekeeping for state.db, run once at server startup.
+	 *
+	 * Consolidated episodes are deleted from pending_episodes, and SQLite never
+	 * returns those pages to the OS, so a long-lived file can be mostly free space.
+	 * When the file is at least `minBytes` and more than `minFreeRatio` of its pages
+	 * are free, this switches the file to incremental auto_vacuum (a one-time full
+	 * VACUUM is needed for that) and reclaims the free pages.
+	 *
+	 * Skipped when another process holds `lockPath` (another server, the daemon's
+	 * maintenance or a second CLI), and when SQLite reports the file busy: the
+	 * housekeeping is best effort and never blocks startup.
+	 */
+	compactIfNeeded(options: {
+		lockPath: string;
+		minBytes?: number;
+		minFreeRatio?: number;
+	}): CompactionResult {
+		const minBytes = options.minBytes ?? COMPACT_MIN_BYTES;
+		const minFreeRatio = options.minFreeRatio ?? COMPACT_MIN_FREE_RATIO;
+		const pageSize = this.pragmaNumber("page_size");
+		const pageCount = this.pragmaNumber("page_count");
+		const freeBefore = this.pragmaNumber("freelist_count");
+		const sizeBytes = pageSize * pageCount;
+		if (sizeBytes < minBytes) {
+			return { ran: false, reason: "below size threshold" };
+		}
+		if (pageCount === 0 || freeBefore / pageCount <= minFreeRatio) {
+			return { ran: false, reason: "free space below threshold" };
+		}
+		const lock = tryAcquireProcessLock(options.lockPath);
+		if (lock === null) {
+			return {
+				ran: false,
+				reason: "another process holds the maintenance lock",
+			};
+		}
+		try {
+			// Full VACUUM only to convert an existing file to incremental mode.
+			if (this.pragmaNumber("auto_vacuum") !== AUTO_VACUUM_INCREMENTAL) {
+				this.db.exec(`PRAGMA auto_vacuum = ${AUTO_VACUUM_INCREMENTAL}`);
+				this.db.exec("VACUUM");
+			}
+			this.db.exec("PRAGMA incremental_vacuum");
+			// Move the freed pages out of the WAL so the main file actually shrinks.
+			this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+			const freeAfter = this.pragmaNumber("freelist_count");
+			logger.log(
+				`[db] state.db housekeeping: reclaimed ${freeBefore - freeAfter} of ${pageCount} pages (${Math.round((sizeBytes * (freeBefore - freeAfter)) / pageCount / 1048576)} MB).`,
+			);
+			return {
+				ran: true,
+				reason: "compacted",
+				freedPages: freeBefore - freeAfter,
+			};
+		} catch (err) {
+			const reason = err instanceof Error ? err.message : String(err);
+			logger.warn(`[db] state.db housekeeping skipped: ${reason}`);
+			return { ran: false, reason: `failed: ${reason}` };
+		} finally {
+			lock.release();
+		}
+	}
+
+	private pragmaNumber(name: string): number {
+		const row = this.db.prepare(`PRAGMA ${name}`).get() as Record<
+			string,
+			number
+		>;
+		return Number(Object.values(row)[0]);
 	}
 
 	async close(): Promise<void> {

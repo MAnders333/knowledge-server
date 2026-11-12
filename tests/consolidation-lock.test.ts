@@ -3,7 +3,7 @@
  * releaseConsolidationLock) on IKnowledgeStore implementations.
  *
  * Tests cover:
- * - KnowledgeDB (SQLite): always-acquires no-op (single-process, no cross-process risk)
+ * - KnowledgeDB (SQLite): lockfile beside the database, honoured across processes
  * - ConsolidationEngine: skips a store whose lock is held and leaves its episodes for retry
  * - ConsolidationEngine: releases store lock in finally even when consolidation throws
  * - ConsolidationEngine.tryLock / unlock: in-process guard is independent of store locks
@@ -17,7 +17,7 @@ import {
 	mock,
 	spyOn,
 } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ActivationEngine } from "../src/activation/activate";
@@ -31,16 +31,19 @@ import type {
 	ProcessedRange,
 } from "../src/types";
 import { fakeEmbedding } from "./fixtures";
+import { startLockHolder } from "./support/process-lock-holder";
 
-// ── SQLite KnowledgeDB lock (no-op) ──────────────────────────────────────────
+// ── SQLite KnowledgeDB lock (cross-process lockfile) ─────────────────────────
 
-describe("KnowledgeDB.tryAcquireConsolidationLock (SQLite no-op)", () => {
+describe("KnowledgeDB.tryAcquireConsolidationLock (SQLite lockfile)", () => {
 	let tempDir: string;
+	let dbPath: string;
 	let db: KnowledgeDB;
 
 	beforeEach(() => {
 		tempDir = mkdtempSync(join(tmpdir(), "ks-db-lock-test-"));
-		db = new KnowledgeDB(join(tempDir, "knowledge.db"));
+		dbPath = join(tempDir, "knowledge.db");
+		db = new KnowledgeDB(dbPath);
 	});
 
 	afterEach(async () => {
@@ -48,16 +51,45 @@ describe("KnowledgeDB.tryAcquireConsolidationLock (SQLite no-op)", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	it("always returns true (no cross-process lock needed for SQLite)", async () => {
+	it("takes a lockfile beside the database and releases it", async () => {
+		const lockFile = `${dbPath}.consolidate.lock`;
 		expect(await db.tryAcquireConsolidationLock()).toBe(true);
+		expect(existsSync(lockFile)).toBe(true);
+		await db.releaseConsolidationLock();
+		expect(existsSync(lockFile)).toBe(false);
 	});
 
-	it("returns true even when called multiple times without release", async () => {
-		await db.tryAcquireConsolidationLock();
+	it("refuses a second acquire while this store holds the lock", async () => {
 		expect(await db.tryAcquireConsolidationLock()).toBe(true);
+		expect(await db.tryAcquireConsolidationLock()).toBe(false);
+		await db.releaseConsolidationLock();
+		expect(await db.tryAcquireConsolidationLock()).toBe(true);
+		await db.releaseConsolidationLock();
 	});
 
-	it("releaseConsolidationLock is a no-op and does not throw", async () => {
+	it("refuses while another process holds the database's lock", async () => {
+		const holder = await startLockHolder(`${dbPath}.consolidate.lock`);
+		try {
+			expect(await db.tryAcquireConsolidationLock()).toBe(false);
+		} finally {
+			await holder.release();
+		}
+		expect(await db.tryAcquireConsolidationLock()).toBe(true);
+		await db.releaseConsolidationLock();
+	});
+
+	it("needs no file for an in-memory database", async () => {
+		const memory = new KnowledgeDB(":memory:");
+		try {
+			expect(await memory.tryAcquireConsolidationLock()).toBe(true);
+			expect(await memory.tryAcquireConsolidationLock()).toBe(true);
+			await memory.releaseConsolidationLock();
+		} finally {
+			await memory.close();
+		}
+	});
+
+	it("releaseConsolidationLock is safe when nothing is held", async () => {
 		await expect(db.releaseConsolidationLock()).resolves.toBeUndefined();
 	});
 });

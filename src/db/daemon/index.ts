@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { logger } from "../../logger.js";
 import type { DaemonCursor } from "../../types.js";
 import { ensurePrivateFile } from "../../utils.js";
+import { SQLITE_BUSY_TIMEOUT_MS } from "../sqlite-busy.js";
 
 /**
  * Default path for daemon.db — the daemon-local SQLite database.
@@ -80,6 +81,8 @@ export class DaemonDB {
 		}
 		ensurePrivateFile(dbPath);
 		this.db = new Database(dbPath);
+		// Before journal_mode: the WAL switch takes a lock of its own.
+		this.db.exec(`PRAGMA busy_timeout=${SQLITE_BUSY_TIMEOUT_MS}`);
 		this.db.exec("PRAGMA journal_mode=WAL");
 		this.db.exec("PRAGMA foreign_keys=ON");
 		this.initialize();

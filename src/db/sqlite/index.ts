@@ -6,6 +6,8 @@ import { dirname } from "node:path";
 import { DEFAULT_SQLITE_PATH } from "../../config-file.js";
 import { computeStrength } from "../../consolidation/decay.js";
 import { logger } from "../../logger.js";
+import { type LockHandle, tryAcquireProcessLock } from "../../process-lock.js";
+import { sqliteConsolidationLockPath } from "../../runtime-files.js";
 import { clampKnowledgeType } from "../../types.js";
 import type {
 	KnowledgeEntry,
@@ -18,12 +20,9 @@ import {
 	assertNotNewerThanCode,
 	pendingMigrations,
 } from "../migration-registry.js";
+import { SQLITE_BUSY_TIMEOUT_MS } from "../sqlite-busy.js";
 import { MIGRATIONS } from "./migrations.js";
-import {
-	CREATE_TABLES,
-	EXPECTED_TABLE_COLUMNS,
-	SCHEMA_VERSION,
-} from "./schema.js";
+import { CREATE_TABLES, SCHEMA_VERSION } from "./schema.js";
 
 /**
  * knowledge_entry columns read by rowToEntry(), without the embedding BLOB.
@@ -52,6 +51,8 @@ function qualifiedEntryColumns(alias: string): string {
  */
 export class KnowledgeDB implements IKnowledgeStore {
 	private db: Database;
+	/** Cross-process consolidation lock held for one store write (see tryAcquireConsolidationLock). */
+	private consolidationLock: LockHandle | null = null;
 	/** Absolute path to the SQLite file — exposed for migration tooling. */
 	readonly dbPath: string;
 	/** Store ID — set by StoreRegistry; defaults to "sqlite" in standalone/test use. */
@@ -72,8 +73,11 @@ export class KnowledgeDB implements IKnowledgeStore {
 			mkdirSync(dir, { recursive: true });
 		}
 
-		ensurePrivateFile(path);
+		// ":memory:" is not a file: creating one would leave a stray file in the cwd.
+		if (path !== ":memory:") ensurePrivateFile(path);
 		this.db = new Database(path);
+		// Must come before journal_mode: switching to WAL takes a lock of its own.
+		this.db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
 		this.db.exec("PRAGMA journal_mode = WAL");
 		// With WAL mode, NORMAL synchronous is safe and ~3x faster than FULL.
 		// FULL is only needed for non-WAL journals.
@@ -1289,79 +1293,28 @@ export class KnowledgeDB implements IKnowledgeStore {
 			.run(Date.now(), clusterId);
 	}
 
-	/**
-	 * NULL out all embeddings on active and conflicted entries.
-	 *
-	 * @internal — exposed for tests and manual recovery only. Production code
-	 * should never call this: clearing embeddings without immediately regenerating
-	 * them leaves similarity-based activation returning zero results until the
-	 * next consolidation run. The normal model-change path uses in-place re-embed via
-	 * checkAndReEmbed() instead.
-	 *
-	 * Returns the number of entries whose embeddings were cleared.
-	 */
-	async clearAllEmbeddings(): Promise<number> {
-		const result = this.db
-			.prepare(
-				"UPDATE knowledge_entry SET embedding = NULL WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL",
-			)
-			.run();
-		return result.changes;
-	}
-
 	// ── Consolidation Lock ────────────────────────────────────────────────────
-	// SQLite is always single-process (one writer at a time enforced by the
-	// file system lock). The in-process ConsolidationEngine flag (Layer 1) is
-	// sufficient — no cross-process advisory lock is needed.
+	// SQLite files can be opened by the server and the CLI at once. The lock is a
+	// lockfile beside the database (cross-process), so a second consolidation of the
+	// same file is refused for the duration of this store's write.
 
 	async tryAcquireConsolidationLock(): Promise<boolean> {
-		return true;
+		// In-memory databases are private to this process: nothing to lock across.
+		if (this.dbPath === "" || this.dbPath === ":memory:") return true;
+		if (this.consolidationLock !== null) return false;
+		this.consolidationLock = tryAcquireProcessLock(
+			sqliteConsolidationLockPath(this.dbPath),
+		);
+		return this.consolidationLock !== null;
 	}
 
 	async releaseConsolidationLock(): Promise<void> {
-		// no-op
+		this.consolidationLock?.release();
+		this.consolidationLock = null;
 	}
 
 	async close(): Promise<void> {
 		this.db.close();
-	}
-
-	/**
-	 * Compare the actual DB column set against EXPECTED_TABLE_COLUMNS for every
-	 * table. Returns a list of {table, column} pairs that are expected but absent.
-	 *
-	 * Only reports missing columns — extra columns in the DB (from a future schema
-	 * that was partially rolled back) are ignored. The intent is to detect tables
-	 * that are structurally incomplete, not to enforce exact parity.
-	 *
-	 * Tables that don't exist yet (empty PRAGMA result) are skipped — a missing
-	 * table is a normal first-run condition, not drift. CREATE_TABLES handles it.
-	 */
-	private getSchemaDrift(): Array<{ table: string; column: string }> {
-		const missing: Array<{ table: string; column: string }> = [];
-
-		for (const [table, expectedCols] of Object.entries(
-			EXPECTED_TABLE_COLUMNS,
-		)) {
-			const actualCols = new Set(
-				(
-					this.db.prepare(`PRAGMA table_info("${table}")`).all() as Array<{
-						name: string;
-					}>
-				).map((c) => c.name),
-			);
-
-			// Table doesn't exist yet — not drift, just a fresh DB
-			if (actualCols.size === 0) continue;
-
-			for (const col of expectedCols) {
-				if (!actualCols.has(col)) {
-					missing.push({ table, column: col });
-				}
-			}
-		}
-
-		return missing;
 	}
 }
 

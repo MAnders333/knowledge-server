@@ -95,54 +95,6 @@ import { MIGRATIONS } from "./migrations.js";
 
 export const SCHEMA_VERSION = latestVersion(MIGRATIONS);
 
-/**
- * Expected columns for each table, derived from the DDL below.
- * Used by initialize() to detect schema drift (missing columns) independently
- * of the schema_version number — catches partial startups where the version was
- * written before the DROP+recreate completed.
- *
- * Keep in sync with CREATE_TABLES. Adding a column to the DDL requires adding
- * it here too — the drift check will then catch any DB that's missing it.
- */
-export const EXPECTED_TABLE_COLUMNS: Readonly<
-	Record<string, readonly string[]>
-> = {
-	knowledge_entry: [
-		"id",
-		"type",
-		"content",
-		"topics",
-		"confidence",
-		"source",
-		"status",
-		"strength",
-		"created_at",
-		"updated_at",
-		"last_accessed_at",
-		"access_count",
-		"observation_count",
-		"superseded_by",
-		"derived_from",
-		"is_synthesized",
-		"embedding",
-	],
-	knowledge_relation: ["id", "source_id", "target_id", "type", "created_at"],
-	knowledge_cluster: [
-		"id",
-		"centroid",
-		"member_count",
-		"last_synthesized_at",
-		"last_membership_changed_at",
-		"created_at",
-	],
-	knowledge_cluster_member: ["cluster_id", "entry_id", "joined_at"],
-	embedding_metadata: ["id", "model", "dimensions", "recorded_at"],
-	// Note: consolidation_state, consolidated_episode, pending_episodes, daemon_cursor
-	// have moved to state.db (ServerStateDB) in v13+. They are no longer created
-	// in knowledge.db — omitting them here prevents false-positive drift warnings
-	// on new-architecture installs where these tables are absent from knowledge.db.
-};
-
 export const CREATE_TABLES = `
   -- Schema version tracking
   CREATE TABLE IF NOT EXISTS schema_version (

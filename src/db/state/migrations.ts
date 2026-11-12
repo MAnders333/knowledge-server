@@ -11,6 +11,7 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { logger } from "../../logger.js";
+import { SQLITE_BUSY_TIMEOUT_MS } from "../sqlite-busy.js";
 
 /**
  * Run all pending state.db data migrations.
@@ -211,6 +212,7 @@ function dropKnowledgeDbStagingTables(
 		return;
 
 	const rw = new Database(legacyPath);
+	rw.exec(`PRAGMA busy_timeout=${SQLITE_BUSY_TIMEOUT_MS}`);
 	try {
 		rw.transaction(() => {
 			rw.exec("DROP TABLE IF EXISTS pending_episodes");

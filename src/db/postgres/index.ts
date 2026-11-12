@@ -1589,21 +1589,6 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		`;
 	}
 
-	async clearAllEmbeddings(): Promise<number> {
-		// Only clear embedding_vec when the column exists.
-		const result =
-			this.vecColumnDims !== null
-				? await this.sql`
-				UPDATE knowledge_entry SET embedding = NULL, embedding_vec = NULL
-				WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL
-			`
-				: await this.sql`
-				UPDATE knowledge_entry SET embedding = NULL
-				WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL
-			`;
-		return result.count;
-	}
-
 	// ── Vector Search ─────────────────────────────────────────────────────────
 
 	/**
