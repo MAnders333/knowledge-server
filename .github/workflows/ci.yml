@@ -60,15 +60,19 @@ jobs:
       - name: Compile smoke test
         if: ${{ github.event_name == 'pull_request' }}
         env:
-          # Binary size budgets (bytes) for linux-x64 built with Bun 1.3.9.
-          # Measured 2026-11-12: server 127452896, daemon 102051666. Budget = measured + 10%.
-          # Raise deliberately, with the new measurement in this comment, when a
-          # dependency change legitimately grows the binary.
-          SERVER_SIZE_BUDGET: 140198185
-          DAEMON_SIZE_BUDGET: 112256832
+          # Binary size budgets (bytes) for linux-x64 built with Bun 1.3.9 and the
+          # same flags as below. Measured 2026-11-12 with
+          #   bunx bun@1.3.9 build --compile --minify --no-compile-autoload-dotenv \
+          #     --no-compile-autoload-bunfig --target=bun-linux-x64 <entry> --outfile <out>
+          # server 117174970 bytes, daemon 102529350 bytes. Budget = measured + 10%.
+          # To re-baseline: re-measure with that command, set each budget to the new
+          # size * 1.1 and update the numbers in this comment. Raise a budget only
+          # when a dependency change legitimately grows the binary.
+          SERVER_SIZE_BUDGET: 128892467
+          DAEMON_SIZE_BUDGET: 112782285
         run: |
-          bun build --compile --minify src/index.ts --outfile dist/knowledge-server-linux-x64
-          bun build --compile --minify src/daemon/index.ts --outfile dist/knowledge-daemon-linux-x64
+          bun build --compile --minify --no-compile-autoload-dotenv --no-compile-autoload-bunfig src/index.ts --outfile dist/knowledge-server-linux-x64
+          bun build --compile --minify --no-compile-autoload-dotenv --no-compile-autoload-bunfig src/daemon/index.ts --outfile dist/knowledge-daemon-linux-x64
           ./dist/knowledge-server-linux-x64 --help > /dev/null
           ./dist/knowledge-daemon-linux-x64 --version > /dev/null
 
