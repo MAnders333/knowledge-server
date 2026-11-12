@@ -2,6 +2,7 @@ import {
 	DEFAULT_CONFIG,
 	DEFAULT_CONFIG_PATH,
 	loadConfigFile,
+	resolveLegacyKnowledgeDbPath,
 	resolvePostgresUri,
 	resolveSqlitePath,
 } from "../config-file.js";
@@ -178,7 +179,10 @@ export class StoreRegistry {
 					`[db] Server state DB: Postgres at ${uri.replace(/:\/\/[^@]*@/, "://<redacted>@")}`,
 				);
 			} else {
-				serverStateDb = new ServerStateDB(config.stateDb.path);
+				serverStateDb = new ServerStateDB(
+					config.stateDb.path,
+					resolveLegacyKnowledgeDbPath(config),
+				);
 			}
 		} catch (e) {
 			throw new Error(

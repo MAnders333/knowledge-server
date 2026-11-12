@@ -10,6 +10,7 @@ import {
 	DEFAULT_CONFIG,
 	DEFAULT_CONFIG_PATH,
 	loadConfigFile,
+	resolveLegacyKnowledgeDbPath,
 } from "../../config-file.js";
 import { logger } from "../../logger.js";
 import { errCode } from "../../utils.js";
@@ -55,5 +56,8 @@ export async function createServerStateDB(
 		return db;
 	}
 
-	return new ServerStateDB(config.stateDb?.path);
+	return new ServerStateDB(
+		config.stateDb?.path,
+		resolveLegacyKnowledgeDbPath(config),
+	);
 }

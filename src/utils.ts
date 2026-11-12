@@ -1,3 +1,15 @@
+import { closeSync, existsSync, openSync } from "node:fs";
+
+/**
+ * Create `path` owner-only (mode 0600) if it does not exist yet. An existing
+ * file keeps its mode. Call before opening a SQLite file or appending to a log
+ * so the file is never briefly world-readable.
+ */
+export function ensurePrivateFile(path: string): void {
+	if (existsSync(path)) return;
+	closeSync(openSync(path, "a", 0o600));
+}
+
 /**
  * Extract the `code` property from an unknown thrown value.
  *

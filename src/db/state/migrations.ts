@@ -10,33 +10,23 @@
 
 import { Database, type SQLQueryBindings } from "bun:sqlite";
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { logger } from "../../logger.js";
-
-/**
- * The legacy knowledge.db path. Both knowledge.db and state.db share the same
- * data directory (~/.local/share/knowledge-server/) by convention — the
- * staging tables that need migrating were always at this fixed location.
- */
-const LEGACY_KNOWLEDGE_DB_PATH = join(
-	homedir(),
-	".local",
-	"share",
-	"knowledge-server",
-	"knowledge.db",
-);
 
 /**
  * Run all pending state.db data migrations.
  * Called from ServerStateDB.initialize() — no external coordination needed.
  *
  * @param db The state.db Database handle (schema tables already created).
+ * @param legacyKnowledgeDbPath The knowledge.db to copy v3 staging tables from.
+ *   Omit to skip the legacy steps: no other file is ever opened or modified.
  */
-export function runStateMigrations(db: Database): void {
+export function runStateMigrations(
+	db: Database,
+	legacyKnowledgeDbPath?: string,
+): void {
 	// Each step is independent with its own applied_migrations guard.
-	copyKnowledgeDbStagingTables(db);
-	dropKnowledgeDbStagingTables(db);
+	copyKnowledgeDbStagingTables(db, legacyKnowledgeDbPath);
+	dropKnowledgeDbStagingTables(db, legacyKnowledgeDbPath);
 	dropOrphanedDaemonCursorFromStateDb(db);
 }
 
@@ -50,11 +40,14 @@ export function runStateMigrations(db: Database): void {
  * Idempotent — the guard check and data copy are inside the same transaction
  * so a crash between commit and key stamp cannot cause a double-run.
  */
-function copyKnowledgeDbStagingTables(db: Database): void {
-	if (!existsSync(LEGACY_KNOWLEDGE_DB_PATH)) return;
+function copyKnowledgeDbStagingTables(
+	db: Database,
+	legacyPath: string | undefined,
+): void {
+	if (!legacyPath || !existsSync(legacyPath)) return;
 
 	const migrationKey = "v3_copy_staging_tables";
-	const src = new Database(LEGACY_KNOWLEDGE_DB_PATH, { readonly: true });
+	const src = new Database(legacyPath, { readonly: true });
 
 	try {
 		const tables = new Set(
@@ -193,8 +186,11 @@ function copyKnowledgeDbStagingTables(db: Database): void {
  * Independent from the copy step — has its own guard and checks that the
  * copy was recorded before dropping (never drops if copy failed).
  */
-function dropKnowledgeDbStagingTables(db: Database): void {
-	if (!existsSync(LEGACY_KNOWLEDGE_DB_PATH)) return;
+function dropKnowledgeDbStagingTables(
+	db: Database,
+	legacyPath: string | undefined,
+): void {
+	if (!legacyPath || !existsSync(legacyPath)) return;
 
 	const dropKey = "v3_drop_staging_tables";
 	if (
@@ -214,7 +210,7 @@ function dropKnowledgeDbStagingTables(db: Database): void {
 	)
 		return;
 
-	const rw = new Database(LEGACY_KNOWLEDGE_DB_PATH);
+	const rw = new Database(legacyPath);
 	try {
 		rw.transaction(() => {
 			rw.exec("DROP TABLE IF EXISTS pending_episodes");
