@@ -3,6 +3,12 @@ import { config } from "../config.js";
 import type { DaemonDB } from "../db/daemon/index.js";
 import type { IServerStateDB } from "../db/interface.js";
 import { logger } from "../logger.js";
+import type { RedactionResult } from "../redact.js";
+import {
+	formatRedactionCounts,
+	redactSecrets,
+	totalRedactions,
+} from "../redact.js";
 import type { Episode, IEpisodeReader, PendingEpisode } from "../types.js";
 
 /**
@@ -146,8 +152,22 @@ export class EpisodeUploader {
 		// If the loop exits via break (insert failure), the cursor won't advance
 		// past the failed episode — it will be retried on the next daemon run.
 		let lastSuccessMaxTime = cursor.lastMessageTimeCreated;
+		const redactionCounts: Record<string, number> = {};
 
 		for (const ep of newEpisodes) {
+			let scrubbed: RedactionResult;
+			try {
+				scrubbed = redactSecrets(ep.content);
+			} catch (err) {
+				// Fail closed: an episode that cannot be scrubbed is never uploaded.
+				logger.warn(
+					`[daemon/${reader.source}] Redaction failed; episode not uploaded (session ${ep.sessionId}): ${err}`,
+				);
+				continue;
+			}
+			for (const [kind, n] of Object.entries(scrubbed.counts)) {
+				redactionCounts[kind] = (redactionCounts[kind] ?? 0) + n;
+			}
 			const pending: PendingEpisode = {
 				id: randomUUID(),
 				userId: this.userId,
@@ -160,7 +180,7 @@ export class EpisodeUploader {
 				directory: ep.directory,
 				timeCreated: ep.timeCreated,
 				maxMessageTime: ep.maxMessageTime,
-				content: ep.content,
+				content: scrubbed.text,
 				contentType: ep.contentType,
 				approxTokens: ep.approxTokens,
 				uploadedAt: Date.now(),
@@ -177,6 +197,13 @@ export class EpisodeUploader {
 				// Stop processing — cursor won't advance past this episode.
 				break;
 			}
+		}
+
+		const redactedTotal = totalRedactions(redactionCounts);
+		if (redactedTotal > 0) {
+			logger.log(
+				`[redact] uploader: redacted ${redactedTotal} value(s) (${formatRedactionCounts(redactionCounts)})`,
+			);
 		}
 
 		// Advance daemon cursor.

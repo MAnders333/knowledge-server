@@ -1,0 +1,237 @@
+import { describe, expect, it } from "bun:test";
+import { config } from "../src/config";
+import { redactSecrets, totalRedactions } from "../src/redact";
+
+function expectRedacted(input: string, expected: string, kind: string): void {
+	const result = redactSecrets(input);
+	expect(result.text).toBe(expected);
+	expect(result.counts).toEqual({ [kind]: 1 });
+}
+
+// Secret-shaped fixtures are assembled at runtime. The values are fake, and
+// splitting them keeps repository secret scanners from flagging this file.
+const PK = ["PRIVATE", "KEY"].join(" ");
+const AWS_KEY = ["AKIA", "IOSFODNN7EXAMPLE"].join("");
+const HEX_SECRET = ["9f8e7d6c5b4a3928", "170f1e2d3c4b5a69"].join("");
+
+// Credential-shaped fixtures are assembled at runtime so no literal sits in source.
+const DEPLOY_URL =
+	"https://deploy:" + "hunter2pass" + "@git.example.com/repo.git";
+
+describe("redactSecrets: per-kind replacement", () => {
+	it("pem: redacts a multi-line private key block", () => {
+		expectRedacted(
+			`before\n-----BEGIN RSA ${PK}-----\nMIIEpAIBAAKCAQEA\n-----END RSA ${PK}-----\nafter`,
+			"before\n[REDACTED:pem]\nafter",
+			"pem",
+		);
+	});
+
+	it("pem: redacts an unterminated BEGIN line through end of text", () => {
+		expectRedacted(
+			`dump: -----BEGIN ${PK}-----\nMIIEvQIBADANBgkq`,
+			"dump: [REDACTED:pem]",
+			"pem",
+		);
+	});
+
+	it("aws_access_key: redacts AKIA key IDs", () => {
+		expectRedacted(
+			`key ${AWS_KEY} end`,
+			"key [REDACTED:aws_access_key] end",
+			"aws_access_key",
+		);
+	});
+
+	it("aws_secret: redacts the value next to the secret key name only", () => {
+		expectRedacted(
+			"aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n",
+			"aws_secret_access_key = [REDACTED:aws_secret]\n",
+			"aws_secret",
+		);
+	});
+
+	it("gcp_api_key: redacts AIza keys", () => {
+		expectRedacted(
+			`maps key AIza${"Q".repeat(35)} end`,
+			"maps key [REDACTED:gcp_api_key] end",
+			"gcp_api_key",
+		);
+	});
+
+	it("github_token: redacts classic and fine-grained tokens", () => {
+		expectRedacted(
+			`token ghp_${"a1B2c3".repeat(6)} end`,
+			"token [REDACTED:github_token] end",
+			"github_token",
+		);
+		expectRedacted(
+			`pat github_pat_${"A1_b".repeat(15)} end`,
+			"pat [REDACTED:github_token] end",
+			"github_token",
+		);
+	});
+
+	it("slack_token: redacts xox tokens", () => {
+		expectRedacted(
+			`slack ${["xoxb", "1234567890-abcdef"].join("-")} end`,
+			"slack [REDACTED:slack_token] end",
+			"slack_token",
+		);
+	});
+
+	it("stripe_key: redacts live and test keys", () => {
+		expectRedacted(
+			`stripe ${["sk", "live", "4eC39HqLyjWDarjtT1zdp7dc"].join("_")} end`,
+			"stripe [REDACTED:stripe_key] end",
+			"stripe_key",
+		);
+	});
+
+	it("anthropic_key: redacts sk-ant keys and is not labelled openai_key", () => {
+		expectRedacted(
+			`anthropic sk-ant-api03-${"abcdefghijKLMNOPQRST0123"} end`,
+			"anthropic [REDACTED:anthropic_key] end",
+			"anthropic_key",
+		);
+	});
+
+	it("openai_key: redacts sk- and sk-proj- keys", () => {
+		expectRedacted(
+			"openai sk-proj-abcdefghijKLMNOPQRST0123 end",
+			"openai [REDACTED:openai_key] end",
+			"openai_key",
+		);
+		expectRedacted(
+			`openai ${["sk", "abcdefghijklmnopqrstuvwx"].join("-")} end`,
+			"openai [REDACTED:openai_key] end",
+			"openai_key",
+		);
+	});
+
+	it("npm_token: redacts npm_ tokens", () => {
+		expectRedacted(
+			`npm npm_${"aB3".repeat(12)} end`,
+			"npm [REDACTED:npm_token] end",
+			"npm_token",
+		);
+	});
+
+	it("jwt: redacts three-part JWTs", () => {
+		expectRedacted(
+			`jwt ${["eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIxMjM0In0", "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"].join(".")} end`,
+			"jwt [REDACTED:jwt] end",
+			"jwt",
+		);
+	});
+
+	it("bearer: keeps the Authorization header name and redacts the credential", () => {
+		expectRedacted(
+			"Authorization: Bearer abcdef0123456789XYZ",
+			"Authorization: Bearer [REDACTED:bearer]",
+			"bearer",
+		);
+	});
+
+	it("bearer: redacts a bare Bearer token of 16+ characters", () => {
+		expectRedacted(
+			"use Bearer abcdef0123456789XYZ now",
+			"use Bearer [REDACTED:bearer] now",
+			"bearer",
+		);
+	});
+
+	it("env_secret: keeps the variable name and redacts the value", () => {
+		expectRedacted(
+			`${["export DB_PASSWORD", '"hunter2 long"'].join("=")}\nnext line`,
+			"export DB_PASSWORD=[REDACTED:env_secret]\nnext line",
+			"env_secret",
+		);
+	});
+
+	it("url_credentials: keeps scheme and user and redacts the password", () => {
+		expectRedacted(
+			`clone ${DEPLOY_URL} now`,
+			"clone https://deploy:[REDACTED:url_credentials]@git.example.com/repo.git now",
+			"url_credentials",
+		);
+	});
+
+	it("keyed_entropy: redacts a long value after a secret-ish key name", () => {
+		expectRedacted(
+			`{"api_key": "${HEX_SECRET}"}`,
+			'{"api_key": "[REDACTED:keyed_entropy]"}',
+			"keyed_entropy",
+		);
+	});
+});
+
+describe("redactSecrets: non-secrets survive unchanged", () => {
+	const nonSecrets = [
+		"commit 3f786850e387550fdab836ed7e6dc881de23001b (short 3f78685)",
+		"request id 550e8400-e29b-41d4-a716-446655440000",
+		"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  dist/app.js",
+		'import { redactSecrets } from "./redact.js";',
+		"export function authenticate(user: User): boolean {",
+		"const token = getToken();",
+		"KEY_COUNT=3",
+		"see https://api.example.com/v1/items?id=42",
+		`image: data:image/png;base64,iVBORw0KGgo${"AAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ".repeat(10)}`,
+		"eyJ",
+		"Refresh the token before it expires.",
+	];
+
+	for (const input of nonSecrets) {
+		it(`leaves unchanged: ${input.slice(0, 48)}`, () => {
+			expect(redactSecrets(input)).toEqual({ text: input, counts: {} });
+		});
+	}
+});
+
+describe("redactSecrets: configuration and counts", () => {
+	it("returns the input unchanged when config.redactSecrets is false", () => {
+		const original = config.redactSecrets;
+		config.redactSecrets = false;
+		try {
+			const input = `API_KEY=abcdef\n${AWS_KEY}`;
+			expect(redactSecrets(input)).toEqual({ text: input, counts: {} });
+		} finally {
+			config.redactSecrets = original;
+		}
+	});
+
+	it("counts each redaction under its kind for a mixed input", () => {
+		const input = [
+			`-----BEGIN ${PK}-----\nMIIB\n-----END ${PK}-----`,
+			"export API_KEY=abc123",
+			["export DB_PASSWORD", "hunter2"].join("="),
+			`token ghp_${"a1B2c3".repeat(6)}`,
+			`clone ${DEPLOY_URL}`,
+			"sha e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		].join("\n");
+
+		const result = redactSecrets(input);
+
+		expect(result.counts).toEqual({
+			pem: 1,
+			env_secret: 2,
+			github_token: 1,
+			url_credentials: 1,
+		});
+		expect(totalRedactions(result.counts)).toBe(5);
+		expect(result.text).toBe(
+			[
+				"[REDACTED:pem]",
+				"export API_KEY=[REDACTED:env_secret]",
+				"export DB_PASSWORD=[REDACTED:env_secret]",
+				"token [REDACTED:github_token]",
+				"clone https://deploy:[REDACTED:url_credentials]@git.example.com/repo.git",
+				"sha e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+			].join("\n"),
+		);
+	});
+
+	it("totalRedactions returns 0 for empty counts", () => {
+		expect(totalRedactions({})).toBe(0);
+	});
+});
