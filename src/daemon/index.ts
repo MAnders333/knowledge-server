@@ -34,6 +34,7 @@ import { resolveUserId } from "../config-file.js";
 import { DaemonDB } from "../db/daemon/index.js";
 import { createServerStateDB } from "../db/state/factory.js";
 import { logger } from "../logger.js";
+import { tightenOwnedPrivatePaths } from "../private-files.js";
 import { createEpisodeReaders } from "./readers/index.js";
 import { EpisodeUploader } from "./uploader.js";
 
@@ -54,6 +55,9 @@ const intervalMs =
 			: 30 * 60 * 1000; // default: 30 minutes — gives sessions time to reach a natural pause
 
 const onceFlag = args.includes("--once");
+
+// Upgraded installs may have group/other-readable state, DB or log files.
+tightenOwnedPrivatePaths();
 
 // No validateConfig() call here — the daemon does not use LLM or embedding.
 // It only needs state.db (SQLite or Postgres), which createServerStateDB()
