@@ -969,23 +969,25 @@ describe("VSCodeEpisodeReader — injected knowledge guard", () => {
 		expect(episodes[0].content).toContain("question one");
 	});
 
-	it("drops a user request whose injected block sits past 60K characters", () => {
+	it("removes an injected block past 60K characters and keeps the text before it", () => {
 		const episodes = extractWithFirst({
 			userText: `${"x".repeat(60_000)}\n${INJECTED_BLOCK}`,
 		});
 		expect(episodes).toHaveLength(1);
-		expect(episodes[0].content).not.toContain("[...truncated]");
-		expect(episodes[0].content).not.toContain("xxxx");
+		expect(episodes[0].content).not.toContain("addrl-activated-knowledge");
+		expect(episodes[0].content).not.toContain("Deploys go out on Thursdays");
+		expect(episodes[0].content).toContain("xxxx");
 		expect(episodes[0].content).toContain("question one");
 	});
 
-	it("drops an assistant response whose injected block sits past 60K characters", () => {
+	it("removes an injected block past 60K characters and keeps the text before it", () => {
 		const episodes = extractWithFirst({
 			replyText: `${"x".repeat(60_000)}\n${INJECTED_BLOCK}`,
 		});
 		expect(episodes).toHaveLength(1);
-		expect(episodes[0].content).not.toContain("[...truncated]");
-		expect(episodes[0].content).not.toContain("xxxx");
+		expect(episodes[0].content).not.toContain("addrl-activated-knowledge");
+		expect(episodes[0].content).not.toContain("Deploys go out on Thursdays");
+		expect(episodes[0].content).toContain("xxxx");
 		expect(episodes[0].content).toContain("question one");
 	});
 

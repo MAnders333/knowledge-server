@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import type { Statement } from "bun:sqlite";
-import { containsInjectedKnowledge } from "../../activation/format.js";
 import { config } from "../../config.js";
+import { stripInjectedKnowledge } from "../../consolidation/untrusted.js";
 import type {
 	Episode,
 	EpisodeMessage,
@@ -562,8 +562,9 @@ export class OpenCodeEpisodeReader implements IEpisodeReader {
 			let content = [textContent.trim(), toolContent.trim()]
 				.filter(Boolean)
 				.join("\n\n");
-			// Drop messages carrying our injected context, checked before truncation.
-			if (containsInjectedKnowledge(content)) continue;
+			// Remove our injected context before truncation; drop the message only if nothing else remains.
+			content = stripInjectedKnowledge(content);
+			if (!content.trim()) continue;
 			if (content.length > MAX_MESSAGE_CHARS) {
 				content = `${content.slice(0, MAX_MESSAGE_CHARS)}\n[...truncated]`;
 			}

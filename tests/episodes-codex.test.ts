@@ -930,7 +930,7 @@ describe("CodexEpisodeReader — injected knowledge guard", () => {
 		return reader.getNewEpisodes([SESSION_UUID], new Map([[SESSION_UUID, []]]));
 	}
 
-	it("drops a user message that carries the injected block", () => {
+	it("removes the injected block from a user message and keeps the rest", () => {
 		const episodes = extractWithFirst({
 			role: "user",
 			text: `Context follows.\n${INJECTED_BLOCK}`,
@@ -941,7 +941,7 @@ describe("CodexEpisodeReader — injected knowledge guard", () => {
 		expect(episodes[0].content).toContain("question one");
 	});
 
-	it("drops an assistant message that quotes the injected tag", () => {
+	it("keeps an assistant message that only quotes the injected tag", () => {
 		const episodes = extractWithFirst({
 			role: "assistant",
 			text: "The block opens with <addrl-activated-knowledge> and closes with </addrl-activated-knowledge>.",
@@ -951,25 +951,27 @@ describe("CodexEpisodeReader — injected knowledge guard", () => {
 		expect(episodes[0].content).toContain("answer two");
 	});
 
-	it("drops a user message whose injected block sits past 60K characters", () => {
+	it("removes an injected block past 60K characters and keeps the text before it", () => {
 		const episodes = extractWithFirst({
 			role: "user",
 			text: `${"x".repeat(60_000)}\n${INJECTED_BLOCK}`,
 		});
 		expect(episodes).toHaveLength(1);
-		expect(episodes[0].content).not.toContain("[...truncated]");
-		expect(episodes[0].content).not.toContain("xxxx");
+		expect(episodes[0].content).not.toContain("addrl-activated-knowledge");
+		expect(episodes[0].content).not.toContain("Deploys go out on Thursdays");
+		expect(episodes[0].content).toContain("xxxx");
 		expect(episodes[0].content).toContain("question one");
 	});
 
-	it("drops an assistant message whose injected block sits past 60K characters", () => {
+	it("removes an injected block past 60K characters and keeps the text before it", () => {
 		const episodes = extractWithFirst({
 			role: "assistant",
 			text: `${"x".repeat(60_000)}\n${INJECTED_BLOCK}`,
 		});
 		expect(episodes).toHaveLength(1);
-		expect(episodes[0].content).not.toContain("[...truncated]");
-		expect(episodes[0].content).not.toContain("xxxx");
+		expect(episodes[0].content).not.toContain("addrl-activated-knowledge");
+		expect(episodes[0].content).not.toContain("Deploys go out on Thursdays");
+		expect(episodes[0].content).toContain("xxxx");
 		expect(episodes[0].content).toContain("question one");
 	});
 

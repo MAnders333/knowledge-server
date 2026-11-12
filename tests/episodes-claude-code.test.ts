@@ -1012,7 +1012,7 @@ function sessionStartingWith(first: {
 }
 
 describe("ClaudeCodeEpisodeReader — injected knowledge guard", () => {
-	it("drops a user message that carries the injected block", () => {
+	it("removes the injected block from a user message and keeps the rest", () => {
 		sessionStartingWith({
 			role: "user",
 			content: [{ type: "text", text: `Context follows.\n${INJECTED_BLOCK}` }],
@@ -1025,7 +1025,20 @@ describe("ClaudeCodeEpisodeReader — injected knowledge guard", () => {
 		expect(episodes[0].content).toContain("question one");
 	});
 
-	it("drops an assistant message that quotes the injected tag", () => {
+	it("drops a message that holds nothing but the injected block", () => {
+		sessionStartingWith({
+			role: "user",
+			content: [{ type: "text", text: INJECTED_BLOCK }],
+		});
+
+		const episodes = reader.getNewEpisodes([SESSION_UUID], new Map());
+		expect(episodes).toHaveLength(1);
+		expect(episodes[0].content).not.toContain("Deploys go out on Thursdays");
+		expect(episodes[0].content).not.toContain("user: \n");
+		expect(episodes[0].content).toContain("question one");
+	});
+
+	it("keeps an assistant message that only quotes the injected tag", () => {
 		sessionStartingWith({
 			role: "assistant",
 			content:
@@ -1038,7 +1051,7 @@ describe("ClaudeCodeEpisodeReader — injected knowledge guard", () => {
 		expect(episodes[0].content).toContain("answer two");
 	});
 
-	it("drops a user message whose injected block sits past 60K characters", () => {
+	it("removes an injected block past 60K characters and keeps the text before it", () => {
 		sessionStartingWith({
 			role: "user",
 			content: `${"x".repeat(60_000)}\n${INJECTED_BLOCK}`,
@@ -1046,12 +1059,13 @@ describe("ClaudeCodeEpisodeReader — injected knowledge guard", () => {
 
 		const episodes = reader.getNewEpisodes([SESSION_UUID], new Map());
 		expect(episodes).toHaveLength(1);
-		expect(episodes[0].content).not.toContain("[...truncated]");
-		expect(episodes[0].content).not.toContain("xxxx");
+		expect(episodes[0].content).not.toContain("addrl-activated-knowledge");
+		expect(episodes[0].content).not.toContain("Deploys go out on Thursdays");
+		expect(episodes[0].content).toContain("xxxx");
 		expect(episodes[0].content).toContain("question one");
 	});
 
-	it("drops an assistant message whose injected block sits past 60K characters", () => {
+	it("removes an injected block past 60K characters and keeps the text before it", () => {
 		sessionStartingWith({
 			role: "assistant",
 			content: `${"x".repeat(60_000)}\n${INJECTED_BLOCK}`,
@@ -1059,8 +1073,9 @@ describe("ClaudeCodeEpisodeReader — injected knowledge guard", () => {
 
 		const episodes = reader.getNewEpisodes([SESSION_UUID], new Map());
 		expect(episodes).toHaveLength(1);
-		expect(episodes[0].content).not.toContain("[...truncated]");
-		expect(episodes[0].content).not.toContain("xxxx");
+		expect(episodes[0].content).not.toContain("addrl-activated-knowledge");
+		expect(episodes[0].content).not.toContain("Deploys go out on Thursdays");
+		expect(episodes[0].content).toContain("xxxx");
 		expect(episodes[0].content).toContain("question one");
 	});
 

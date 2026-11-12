@@ -1,8 +1,8 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import { containsInjectedKnowledge } from "../../activation/format.js";
 import { config } from "../../config.js";
+import { stripInjectedKnowledge } from "../../consolidation/untrusted.js";
 import type {
 	Episode,
 	EpisodeMessage,
@@ -513,10 +513,11 @@ export class CodexEpisodeReader implements IEpisodeReader {
 				continue;
 			}
 
-			// Drop messages carrying our injected context, checked before truncation.
-			if (containsInjectedKnowledge(text)) continue;
+			// Remove our injected context before truncation; drop the message only if nothing else remains.
+			const kept = stripInjectedKnowledge(text);
+			if (!kept.trim()) continue;
 
-			let truncated = text;
+			let truncated = kept;
 			if (truncated.length > MAX_MESSAGE_CHARS) {
 				truncated = `${truncated.slice(0, MAX_MESSAGE_CHARS)}\n[...truncated]`;
 			}

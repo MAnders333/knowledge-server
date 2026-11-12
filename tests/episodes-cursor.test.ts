@@ -1136,25 +1136,27 @@ for (const [format, extract] of CURSOR_FORMATS) {
 			expect(episodes[0].content).toContain("question one");
 		});
 
-		it("drops a user turn whose injected block sits past 60K characters", () => {
+		it("removes an injected block past 60K characters and keeps the text before it", () => {
 			const episodes = extract([
 				{ type: 1, text: `${"x".repeat(60_000)}\n${INJECTED_BLOCK}` },
 				...PLAIN_TURNS,
 			]);
 			expect(episodes).toHaveLength(1);
-			expect(episodes[0].content).not.toContain("[...truncated]");
-			expect(episodes[0].content).not.toContain("xxxx");
+			expect(episodes[0].content).not.toContain("addrl-activated-knowledge");
+			expect(episodes[0].content).not.toContain("Deploys go out on Thursdays");
+			expect(episodes[0].content).toContain("xxxx");
 			expect(episodes[0].content).toContain("question one");
 		});
 
-		it("drops an assistant turn whose injected block sits past 60K characters", () => {
+		it("removes an injected block past 60K characters and keeps the text before it", () => {
 			const episodes = extract([
 				{ type: 2, text: `${"x".repeat(60_000)}\n${INJECTED_BLOCK}` },
 				...PLAIN_TURNS,
 			]);
 			expect(episodes).toHaveLength(1);
-			expect(episodes[0].content).not.toContain("[...truncated]");
-			expect(episodes[0].content).not.toContain("xxxx");
+			expect(episodes[0].content).not.toContain("addrl-activated-knowledge");
+			expect(episodes[0].content).not.toContain("Deploys go out on Thursdays");
+			expect(episodes[0].content).toContain("xxxx");
 			expect(episodes[0].content).toContain("question one");
 		});
 
