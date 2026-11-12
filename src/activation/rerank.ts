@@ -7,7 +7,10 @@ import {
 	BertWordPieceTokenizer,
 	MAX_SEQUENCE_LENGTH,
 } from "./bert-tokenizer.js";
-import { createRemoteRerankerFromConfig } from "./rerank-remote.js";
+import {
+	RerankSkippedError,
+	createRemoteRerankerFromConfig,
+} from "./rerank-remote.js";
 
 // Onnxruntime-web WASM runtime (plain build, not asyncify), imported with Bun's
 // file loader:
@@ -131,6 +134,9 @@ const PINNED_MODELS: Record<
 /** Budget for one model download (headers and body). The model is ~23 MB. */
 const MODEL_DOWNLOAD_TIMEOUT_MS = 300_000;
 
+/** Calls that may wait behind the running scoring pass; more are refused (see scoreBatch). */
+const MAX_QUEUED_CALLS = 2;
+
 export class LocalReranker implements RerankScorer {
 	private readonly modelId: string;
 	private readonly timeoutMs: number;
@@ -144,6 +150,17 @@ export class LocalReranker implements RerankScorer {
 	 */
 	private loadPromise: Promise<LoadedModel> | null = null;
 	private failed = false;
+
+	/**
+	 * Scoring is single-flight: all callers share one ONNX session, and two runs
+	 * interleaved on it each take N times as long, so every caller would miss its
+	 * deadline together. `tail` chains the runs in FIFO order; `admitted` counts
+	 * calls whose scoring has not settled (the running one and the queued ones).
+	 */
+	private tail: Promise<void> = Promise.resolve();
+	private admitted = 0;
+	/** Calls refused because the queue was full, since this instance was created. */
+	skipped = 0;
 
 	constructor(opts?: {
 		model?: string;
@@ -321,12 +338,27 @@ export class LocalReranker implements RerankScorer {
 	 *
 	 * Throws on timeout and on any load/inference failure — callers are
 	 * expected to catch and fall back to dense-only ordering.
+	 *
+	 * Runs are single-flight and FIFO: one scoring pass at a time. At most
+	 * MAX_QUEUED_CALLS calls wait behind the running one; a newcomer beyond that
+	 * is refused at once with RerankSkippedError. The timeout covers queue wait
+	 * too, and a queued call whose deadline has passed never starts scoring.
 	 */
 	async scoreBatch(query: string, documents: string[]): Promise<number[]> {
 		if (documents.length === 0) return [];
+		// Admission is decided before any await, so refusals follow call order.
+		// `admitted` includes the running call, hence the comparison.
+		if (this.admitted > MAX_QUEUED_CALLS) {
+			this.skipped++;
+			throw new RerankSkippedError(
+				`rerank busy: ${MAX_QUEUED_CALLS} queued; ${this.skipped} skipped since start`,
+			);
+		}
 
 		const deadline = performance.now() + this.timeoutMs;
-		const work = this.scorePairs(query, documents, deadline);
+		const work = this.runQueued(() =>
+			this.scorePairs(query, documents, deadline),
+		);
 		const { promise: expired, reject } = Promise.withResolvers<never>();
 		const timer = setTimeout(
 			() => reject(new Error(`rerank timeout after ${this.timeoutMs}ms`)),
@@ -339,11 +371,32 @@ export class LocalReranker implements RerankScorer {
 		}
 	}
 
+	/**
+	 * Run `run` once every earlier admitted run has settled. The slot is released
+	 * when the run itself settles, not when its caller gives up, so a timed-out
+	 * run never overlaps the next one on the shared session.
+	 */
+	private runQueued<T>(run: () => Promise<T>): Promise<T> {
+		this.admitted++;
+		const result = this.tail.then(run).finally(() => {
+			this.admitted--;
+		});
+		this.tail = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	}
+
 	private async scorePairs(
 		query: string,
 		documents: string[],
 		deadline: number,
 	): Promise<number[]> {
+		// Turn check: a call that waited past its deadline must not occupy the session.
+		if (performance.now() >= deadline) {
+			throw new Error(`rerank timeout after ${this.timeoutMs}ms`);
+		}
 		const { tokenizer, session } = await this.load();
 		const ort = await import("onnxruntime-web");
 		const { maxQueryTokens, maxDocTokens } = config.activation.rerank;
