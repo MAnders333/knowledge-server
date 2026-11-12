@@ -1348,7 +1348,11 @@ ${programArgs}
   <true/>
 
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <!-- Restart after crashes only. A clean exit (e.g. "another daemon holds the lock") must not respawn. -->
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
 
   <key>StandardOutPath</key>
   <string>${home}/.local/share/knowledge-server/daemon.log</string>

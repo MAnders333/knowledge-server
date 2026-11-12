@@ -22,6 +22,13 @@ import {
 	takeSkipCount,
 } from "./readers/shared.js";
 
+/** Result of one polling upload cycle, reported to the daemon's status file. */
+export interface CycleOutcome {
+	ok: boolean;
+	uploaded: number;
+	error?: string;
+}
+
 /**
  * EpisodeUploader — the daemon's core upload loop.
  *
@@ -87,6 +94,8 @@ export class EpisodeUploader {
 		/** Unreadable sessions and malformed or poison-pill items skipped this cycle, all sources. */
 		itemsSkipped: number;
 		sources: Array<{ source: string; episodes: number; sessions: number }>;
+		/** Sources whose upload threw this cycle (skipped until the next cycle). */
+		failedSources: Array<{ source: string; error: string }>;
 	}> {
 		// Sources are independent — upload all concurrently.
 		const settled = await Promise.allSettled(
@@ -102,6 +111,7 @@ export class EpisodeUploader {
 			episodes: number;
 			sessions: number;
 		}> = [];
+		const failedSources: Array<{ source: string; error: string }> = [];
 
 		for (let i = 0; i < settled.length; i++) {
 			const result = settled[i];
@@ -118,10 +128,21 @@ export class EpisodeUploader {
 						sessions: result.value.sessions,
 					});
 				}
+				if (result.value.error !== undefined) {
+					failedSources.push({
+						source: reader.source,
+						error: result.value.error,
+					});
+				}
 			} else {
 				// The source's skip counter is not drained here; it is reset on the next
 				// cycle's uploadSource, and the reason is already logged there or here.
 				takeSkipCount(reader.source);
+				const error =
+					result.reason instanceof Error
+						? result.reason.message
+						: String(result.reason);
+				failedSources.push({ source: reader.source, error });
 				logger.error(
 					`[daemon/${reader.source}] Upload failed — skipping source this run:`,
 					result.reason,
@@ -146,6 +167,7 @@ export class EpisodeUploader {
 			cursorAdvanced: anyCursorAdvanced,
 			itemsSkipped: totalSkipped,
 			sources,
+			failedSources,
 		};
 	}
 
@@ -154,6 +176,8 @@ export class EpisodeUploader {
 		sessions: number;
 		cursorAdvanced: boolean;
 		skipped: number;
+		/** Set when the source could not be read this cycle. */
+		error?: string;
 	}> {
 		// Daemon cursor lives in DaemonDB (always local SQLite).
 		const firstRun = !(await this.daemonDb.hasDaemonCursor(reader.source));
@@ -197,6 +221,7 @@ export class EpisodeUploader {
 				sessions: 0,
 				cursorAdvanced: false,
 				skipped: takeSkipCount(reader.source),
+				error: err instanceof Error ? err.message : String(err),
 			};
 		}
 
@@ -414,6 +439,7 @@ export class EpisodeUploader {
 	async runPolling(
 		intervalMs = 30 * 60 * 1000,
 		onShutdown?: () => Promise<void>,
+		onCycle?: (outcome: CycleOutcome) => void,
 	): Promise<void> {
 		logger.log(
 			`[daemon] Starting. Upload interval: ${Math.round(intervalMs / 1000)}s. User: ${this.userId}`,
@@ -434,6 +460,17 @@ export class EpisodeUploader {
 			if (shuttingDown) return;
 			try {
 				const result = await this.upload();
+				onCycle?.(
+					result.failedSources.length > 0
+						? {
+								ok: false,
+								uploaded: result.episodesUploaded,
+								error: result.failedSources
+									.map((f) => `${f.source}: ${f.error}`)
+									.join("; "),
+							}
+						: { ok: true, uploaded: result.episodesUploaded },
+				);
 				// Re-run immediately when the cursor advanced — either episodes were
 				// uploaded or ineligible sessions were skipped past. Only sleep for
 				// intervalMs when all sources are genuinely caught up with no new or
@@ -441,6 +478,11 @@ export class EpisodeUploader {
 				scheduleNext(result.episodesUploaded > 0 || result.cursorAdvanced);
 			} catch (err) {
 				logger.error("[daemon] Upload cycle failed:", err);
+				onCycle?.({
+					ok: false,
+					uploaded: 0,
+					error: err instanceof Error ? err.message : String(err),
+				});
 				scheduleNext(false);
 			}
 		};
