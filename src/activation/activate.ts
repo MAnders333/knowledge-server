@@ -416,8 +416,8 @@ export class ActivationEngine {
 			/** Min similarity threshold. Overrides config.activation.similarityThreshold. */
 			threshold?: number;
 			/**
-			 * Read-only: no access records (recordAccess), so measuring activation
-			 * never changes the store. Used by the replay harness and the CLI.
+			 * Read-only: no injection writes (commitInjections never receives a plan),
+			 * so measuring activation never changes the store. Used by the replay harness and the CLI.
 			 */
 			dryRun?: boolean;
 			/**
@@ -687,6 +687,10 @@ export class ActivationEngine {
 					cueCount: queryList.length,
 					nCandidates: 0,
 					gateMode: this.reranker ? "dense" : "off",
+					gateDropped: 0,
+					budgetDropped: 0,
+					deduped: 0,
+					injectedTokens: 0,
 				},
 			};
 		}

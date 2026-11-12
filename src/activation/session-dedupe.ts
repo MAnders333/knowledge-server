@@ -9,7 +9,8 @@
  * An entry stays suppressed for `ttlMs` after its last injection, unless it now
  * scores at least `rescoreMargin` higher on raw cosine than it did then. The TTL
  * is measured from the injection, not from the last suppressed prompt, because
- * the injected copy stays in the agent's context until compaction.
+ * the injected copy stays in the agent's context until compaction. `ttlMs` of 0
+ * disables suppression.
  *
  * Failure modes (accepted):
  * - Compaction removes earlier injections from the context, and no compaction
@@ -17,7 +18,7 @@
  *   be suppressed for up to `ttlMs` after a compaction.
  * - A restart clears the map, so each entry can repeat once.
  * - Memory is bounded: at most `maxSessions` sessions (LRU), and expired entries
- *   are pruned when a session is touched.
+ *   are pruned when a session is written.
  */
 
 interface Injected {
@@ -46,10 +47,10 @@ export class SessionDedupe {
 		entry: { id: string; rawSimilarity: number },
 		now: number,
 	): boolean {
+		if (this.opts.ttlMs <= 0) return false;
 		const session = this.touch(key);
-		if (!session) return false;
-		const prior = session.get(entry.id);
-		if (!prior) return false;
+		const prior = session?.get(entry.id);
+		if (!session || !prior) return false;
 		if (now - prior.at > this.opts.ttlMs) {
 			session.delete(entry.id);
 			return false;
@@ -63,7 +64,7 @@ export class SessionDedupe {
 		injected: ReadonlyArray<{ id: string; rawSimilarity: number }>,
 		now: number,
 	): void {
-		if (injected.length === 0) return;
+		if (injected.length === 0 || this.opts.ttlMs <= 0) return;
 		let session = this.touch(key);
 		if (!session) {
 			session = new Map();
@@ -74,8 +75,8 @@ export class SessionDedupe {
 				this.sessions.delete(oldest);
 			}
 		}
-		for (const [id, at] of session) {
-			if (now - at.at > this.opts.ttlMs) session.delete(id);
+		for (const [id, prior] of session) {
+			if (now - prior.at > this.opts.ttlMs) session.delete(id);
 		}
 		for (const entry of injected) {
 			session.set(entry.id, { at: now, rawSimilarity: entry.rawSimilarity });
