@@ -8,7 +8,7 @@ const QUERY = "alpha topic for the dry run test";
 
 /** Scan-path store: only the methods activate() touches on a plain store. */
 function storeWith(entries: KnowledgeEntry[]) {
-	const recordAccess = mock(() => Promise.resolve());
+	const recordInjections = mock(() => Promise.resolve());
 	const store = {
 		id: "test-store",
 		getActiveEntriesWithEmbeddings: mock(() => Promise.resolve(entries)),
@@ -25,18 +25,18 @@ function storeWith(entries: KnowledgeEntry[]) {
 		),
 		getSupportSourcesForIds: mock(() => Promise.resolve(new Map())),
 		getContradictPairsForIds: mock(() => Promise.resolve(new Map())),
-		recordAccess,
+		recordInjections,
 	} as unknown as IKnowledgeStore;
-	return { store, recordAccess };
+	return { store, recordInjections };
 }
 
 function engineFor(entries: KnowledgeEntry[]) {
-	const { store, recordAccess } = storeWith(entries);
+	const { store, recordInjections } = storeWith(entries);
 	const engine = new ActivationEngine(store);
 	engine.embeddings.embedBatch = mock(async (qs: string[]) =>
 		qs.map((q) => fakeEmbedding(q)),
 	) as typeof engine.embeddings.embedBatch;
-	return { engine, recordAccess };
+	return { engine, recordInjections };
 }
 
 const entries = [
@@ -57,13 +57,20 @@ describe("activate dryRun", () => {
 		const { engine, recordAccess } = engineFor(entries);
 		const result = await engine.activate(QUERY, { dryRun: true });
 		expect(result.entries.length).toBeGreaterThan(0);
-		expect(recordAccess).not.toHaveBeenCalled();
+		expect(result.injection).toBeUndefined();
 	});
 
-	it("records access for returned entries by default", async () => {
-		const { engine, recordAccess } = engineFor(entries);
+	it("returns an injection plan for writable stores; commitInjections records it", async () => {
+		const { engine, recordInjections } = engineFor(entries);
 		const result = await engine.activate(QUERY);
-		expect(recordAccess).toHaveBeenCalledTimes(result.entries.length);
+		expect(result.injection?.writes).toEqual([
+			{
+				storeId: "test-store",
+				entryIds: result.entries.map((e) => e.entry.id),
+			},
+		]);
+		engine.commitInjections(result.injection);
+		expect(recordInjections).toHaveBeenCalledTimes(1);
 	});
 
 	it("reports telemetry: cue count, candidates and gate mode", async () => {

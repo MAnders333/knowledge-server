@@ -34,6 +34,10 @@ function row(overrides: Partial<ActivationEventRow> = {}): ActivationEventRow {
 		gateMode: "off",
 		latencyMs: 12,
 		clientDeadlineExceeded: false,
+		gateDropped: 0,
+		budgetDropped: 0,
+		deduped: 0,
+		injectedTokens: 0,
 		...overrides,
 	};
 }
@@ -72,12 +76,16 @@ describe("activation_event schema", () => {
 		raw.close();
 		expect(cols).toEqual(
 			[
+				"budget_dropped",
 				"client",
 				"client_deadline_exceeded",
 				"cue_count",
+				"deduped",
 				"entry_ids",
+				"gate_dropped",
 				"gate_mode",
 				"id",
+				"injected_tokens",
 				"latency_ms",
 				"n_candidates",
 				"n_returned",
@@ -90,8 +98,8 @@ describe("activation_event schema", () => {
 		);
 	});
 
-	it("state DB is at the registered v3 schema", () => {
-		expect(SERVER_LOCAL_SCHEMA_VERSION).toBe(3);
+	it("state DB is at the registered v4 schema", () => {
+		expect(SERVER_LOCAL_SCHEMA_VERSION).toBe(4);
 	});
 
 	it("upgrading a v2 state DB adds the table", async () => {
@@ -235,7 +243,15 @@ describe("HTTP activation writes telemetry without prompt text", () => {
 		],
 		query: SECRET_PROMPT,
 		totalActive: 1,
-		telemetry: { cueCount: 2, nCandidates: 4, gateMode: "off" },
+		telemetry: {
+			cueCount: 2,
+			nCandidates: 4,
+			gateMode: "off",
+			gateDropped: 0,
+			budgetDropped: 0,
+			deduped: 0,
+			injectedTokens: 0,
+		},
 	};
 
 	/** Requests carry a loopback Host, as a real client would send. */
@@ -257,6 +273,7 @@ describe("HTTP activation writes telemetry without prompt text", () => {
 	function appWith(recorder: ActivationEventRecorder) {
 		const activation = {
 			activate: mock(async () => result),
+			commitInjections: mock(() => {}),
 			embeddings: {},
 		} as unknown as ActivationEngine;
 		const consolidation = {
