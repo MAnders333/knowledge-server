@@ -238,6 +238,22 @@ describe("HTTP activation writes telemetry without prompt text", () => {
 		telemetry: { cueCount: 2, nCandidates: 4, gateMode: "off" },
 	};
 
+	/** Requests carry a loopback Host, as a real client would send. */
+	function withHost(app: {
+		request: (path: string, init?: RequestInit) => Response | Promise<Response>;
+	}) {
+		return {
+			request: (path: string, init: RequestInit = {}) =>
+				app.request(path, {
+					...init,
+					headers: {
+						Host: "127.0.0.1:8080",
+						...(init.headers as Record<string, string>),
+					},
+				}),
+		};
+	}
+
 	function appWith(recorder: ActivationEventRecorder) {
 		const activation = {
 			activate: mock(async () => result),
@@ -268,7 +284,7 @@ describe("HTTP activation writes telemetry without prompt text", () => {
 			flushDelayMs: 60_000,
 		});
 		const app = appWith(recorder);
-		const res = await app.request(
+		const res = await withHost(app).request(
 			`/activate?q=${encodeURIComponent(SECRET_PROMPT)}`,
 			{
 				headers: {
@@ -308,11 +324,11 @@ describe("HTTP activation writes telemetry without prompt text", () => {
 			flushDelayMs: 60_000,
 		});
 		const app = appWith(recorder);
-		await app.request("/activate?q=one");
-		await app.request("/activate?q=two", {
+		await withHost(app).request("/activate?q=one");
+		await withHost(app).request("/activate?q=two", {
 			headers: { "x-knowledge-client": "bogus" },
 		});
-		await app.request("/activate?q=three&client=pi");
+		await withHost(app).request("/activate?q=three&client=pi");
 		await recorder.flush();
 		expect(await state.countActivationsByClient(0)).toEqual({
 			unknown: 2,
@@ -326,7 +342,7 @@ describe("HTTP activation writes telemetry without prompt text", () => {
 			flushDelayMs: 60_000,
 		});
 		const app = appWith(recorder);
-		const res = await app.request("/hooks/claude-code/user-prompt", {
+		const res = await withHost(app).request("/hooks/claude-code/user-prompt", {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({

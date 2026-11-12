@@ -383,6 +383,8 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		registry.writableStores(),
 		registry.port,
 		activationEvents,
+		registry.host,
+		config.allowedHosts,
 	);
 
 	// port/host/daemonAutoSpawn come from the registry (config.jsonc with env var override)
@@ -392,8 +394,11 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	// Loopback-host check runs post-registry so it covers values set via config.jsonc
 	// (not just KNOWLEDGE_HOST env var). Checked here rather than in validateConfig()
 	// which runs before the registry is created.
+	// Bracketed IPv6 (`[::1]`, as written in a URL or config) is normalised to the
+	// bare address so both spellings pass the check and bind correctly.
+	const bindHost = host.replace(/^\[(.*)\]$/, "$1");
 	const loopbackHosts = ["127.0.0.1", "::1", "localhost"];
-	if (!loopbackHosts.includes(host)) {
+	if (!loopbackHosts.includes(bindHost)) {
 		logger.error(
 			`"host" is set to "${host}", which exposes the server on non-loopback interfaces with no authentication. Only use 127.0.0.1 unless you have added authentication and understand the security implications.`,
 		);
@@ -407,7 +412,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		server = serve({
 			fetch: app.fetch,
 			port,
-			hostname: host,
+			hostname: bindHost,
 			idleTimeout: 255, // max allowed by Bun — consolidation can take a while
 		});
 	} catch (e) {
