@@ -4,6 +4,7 @@ import { cosineSimilarity } from "../activation/embeddings.js";
 import { config } from "../config.js";
 import { approxTokens } from "../daemon/readers/shared.js";
 import type { IKnowledgeStore, IServerStateDB } from "../db/index.js";
+import { componentHealth } from "../health.js";
 import { logger } from "../logger.js";
 import {
 	type LockHandle,
@@ -28,7 +29,7 @@ import { clampKnowledgeType, episodeKeyId } from "../types.js";
 import { ContradictionScanner } from "./contradiction.js";
 import { computeStrength } from "./decay.js";
 import type { DomainResolution, DomainRouter } from "./domain-router.js";
-import { isDeterministicFailure } from "./errors.js";
+import { isDeterministicFailure, providerFailureClass } from "./errors.js";
 import { ConsolidationLLM, formatEpisodes } from "./llm.js";
 import type { ExtractedKnowledge } from "./llm.js";
 import { Reconsolidator } from "./reconsolidate.js";
@@ -59,6 +60,8 @@ type ChunkOutcome = "completed" | "deferred" | "transient" | "failed";
 interface ChunkResult {
 	outcome: ChunkOutcome;
 	error?: string;
+	/** Secret-free class of a transient extraction failure (see providerFailureClass). */
+	providerFailure?: string;
 	created: number;
 	updated: number;
 	conflictsDetected: number;
@@ -155,6 +158,12 @@ export class ConsolidationEngine {
 
 	/** Secret redactions applied during the current run, by kind (counts only). */
 	private _runRedactions: Record<string, number> = {};
+	/** Chunk outcomes of the current run, for the "llm" health component. */
+	private _runProgress = {
+		completedChunks: 0,
+		transientChunks: 0,
+		providerFailure: undefined as string | undefined,
+	};
 
 	/**
 	 * Concurrency guard — only one consolidation run at a time, regardless of
@@ -301,12 +310,30 @@ export class ConsolidationEngine {
 			const result = await this._consolidate(options.attempted ?? new Set());
 			this.outcome.consecutiveFailures = 0;
 			this.outcome.lastSuccessAt = Date.now();
+			this.recordLlmHealth();
 			return result;
 		} catch (err) {
 			this.outcome.consecutiveFailures++;
 			this.outcome.lastErrorAt = Date.now();
 			this.outcome.lastError = err instanceof Error ? err.message : String(err);
 			throw err;
+		}
+	}
+
+	/**
+	 * A run that completed episodes is a success for the LLM provider. A run that
+	 * only hit transient provider errors is a failing run. Runs with neither leave
+	 * the streak as it is.
+	 */
+	private recordLlmHealth(): void {
+		const progress = this._runProgress;
+		if (progress.completedChunks > 0) {
+			componentHealth.recordSuccess("llm");
+		} else if (progress.transientChunks > 0) {
+			componentHealth.recordFailure(
+				"llm",
+				progress.providerFailure ?? "provider call failed",
+			);
 		}
 	}
 
@@ -338,6 +365,11 @@ export class ConsolidationEngine {
 		this._lastTouchedStores = new Set();
 		const entryCache = new StoreEntryCache();
 		this._runRedactions = {};
+		this._runProgress = {
+			completedChunks: 0,
+			transientChunks: 0,
+			providerFailure: undefined,
+		};
 
 		let totalSessionsProcessed = 0;
 		let totalSegmentsProcessed = 0;
@@ -589,30 +621,43 @@ export class ConsolidationEngine {
 
 			// Use the first episode's source as the log label — all episodes in a
 			// domain-grouped chunk share the same original source.
-			const result = await this.processChunk(
+			const runs = await this.processChunkIsolatingFailures(
 				chunk[0]?.source ?? reader.source,
 				chunk,
 				entryCache,
 			);
-			totalCreated += result.created;
-			totalUpdated += result.updated;
-			totalConflictsDetected += result.conflictsDetected;
-			totalConflictsResolved += result.conflictsResolved;
-			for (const s of result.touchedStores) sourceTouchedStores.add(s);
+			for (const { episodes, result } of runs) {
+				totalCreated += result.created;
+				totalUpdated += result.updated;
+				totalConflictsDetected += result.conflictsDetected;
+				totalConflictsResolved += result.conflictsResolved;
+				for (const s of result.touchedStores) sourceTouchedStores.add(s);
 
-			const keys: EpisodeKey[] = chunk.map((ep) => ({
-				source: ep.source,
-				sessionId: ep.sessionId,
-				startMessageId: ep.startMessageId,
-				endMessageId: ep.endMessageId,
-			}));
-			for (const key of keys) attempted.add(episodeKeyId(key));
-			if (result.outcome === "completed") {
-				outcome.completed.push(...keys);
-				for (const ep of chunk) completedSessionIds.add(ep.sessionId);
-			} else if (result.outcome === "failed") {
-				const error = result.error ?? "unknown error";
-				for (const episode of keys) outcome.failed.push({ episode, error });
+				const keys: EpisodeKey[] = episodes.map((ep) => ({
+					source: ep.source,
+					sessionId: ep.sessionId,
+					startMessageId: ep.startMessageId,
+					endMessageId: ep.endMessageId,
+				}));
+				// Only episodes that failed or hit a transient error are kept out of later
+				// batches of this drain. Deferred episodes (store locked or unavailable)
+				// stay eligible: a contended drain must not leave the backlog for the next
+				// poll tick.
+				if (result.outcome === "completed") {
+					this._runProgress.completedChunks++;
+					outcome.completed.push(...keys);
+					for (const ep of episodes) completedSessionIds.add(ep.sessionId);
+				} else if (result.outcome === "failed") {
+					for (const key of keys) attempted.add(episodeKeyId(key));
+					const error = result.error ?? "unknown error";
+					for (const episode of keys) outcome.failed.push({ episode, error });
+				} else if (result.outcome === "transient") {
+					for (const key of keys) attempted.add(episodeKeyId(key));
+					if (result.providerFailure !== undefined) {
+						this._runProgress.transientChunks++;
+						this._runProgress.providerFailure = result.providerFailure;
+					}
+				}
 			}
 		}
 
@@ -659,6 +704,45 @@ export class ConsolidationEngine {
 			this._runRedactions[kind] = (this._runRedactions[kind] ?? 0) + n;
 		}
 		return result.text;
+	}
+
+	/**
+	 * Process a chunk. When a multi-episode chunk fails deterministically, its
+	 * episodes are retried one at a time, so one bad episode cannot dead-letter its
+	 * healthy neighbours. Only an episode that also fails alone is reported as
+	 * failed. The multi-episode pass is reported with no episodes and zero counts:
+	 * the single-episode runs redo its work (reconsolidate dedups), but its touched
+	 * stores are still returned.
+	 */
+	private async processChunkIsolatingFailures(
+		source: string,
+		chunk: Episode[],
+		entryCache: StoreEntryCache,
+	): Promise<Array<{ episodes: Episode[]; result: ChunkResult }>> {
+		const result = await this.processChunk(source, chunk, entryCache);
+		if (result.outcome !== "failed" || chunk.length === 1) {
+			return [{ episodes: chunk, result }];
+		}
+		logger.warn(
+			`[consolidation/${source}] Chunk of ${chunk.length} episodes failed — retrying each episode alone to isolate the failing one.`,
+		);
+		const runs: Array<{ episodes: Episode[]; result: ChunkResult }> = [
+			{
+				episodes: [],
+				result: {
+					...result,
+					created: 0,
+					updated: 0,
+					conflictsDetected: 0,
+					conflictsResolved: 0,
+				},
+			},
+		];
+		for (const episode of chunk) {
+			const single = await this.processChunk(source, [episode], entryCache);
+			runs.push({ episodes: [episode], result: single });
+		}
+		return runs;
 	}
 
 	/**
@@ -734,9 +818,13 @@ export class ConsolidationEngine {
 				`[consolidation/${source}] Extraction failed for a chunk of ${chunk.length} episodes — episodes kept for retry:`,
 				err,
 			);
+			const deterministic = isDeterministicFailure(err);
 			return {
-				outcome: isDeterministicFailure(err) ? "failed" : "transient",
+				outcome: deterministic ? "failed" : "transient",
 				error: `extraction failed: ${err instanceof Error ? err.message : String(err)}`,
+				...(deterministic
+					? {}
+					: { providerFailure: providerFailureClass(err) }),
 				...none,
 			};
 		}

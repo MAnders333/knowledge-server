@@ -16,12 +16,24 @@ export type HealthLevel = "ok" | "degraded" | "down";
 /** Backlog above this many pending sessions degrades health. */
 export const PENDING_BACKLOG_DEGRADED = 500;
 
+/**
+ * LLM outage thresholds, counted in consecutive consolidation runs that made no
+ * progress because of transient provider errors (rate limits, timeouts, rejected
+ * credentials, 5xx). Degraded from the third run; down once the outage has lasted
+ * ten runs and more than an hour.
+ */
+export const LLM_DEGRADED_FAILING_RUNS = 3;
+export const LLM_DOWN_FAILING_RUNS = 10;
+export const LLM_DOWN_AFTER_MS = 60 * 60 * 1000;
+
 export interface OutcomeSnapshot {
 	name: string;
 	lastSuccessAt: number | null;
 	lastErrorAt: number | null;
 	lastError: string | null;
 	consecutiveFailures: number;
+	/** When the current run of failures began; null after a success. */
+	failingSince: number | null;
 	/** The last outcome was a failure. */
 	failing: boolean;
 	/** Circuit open: `openAfter`+ consecutive failures, latest one inside `openMs`. */
@@ -39,6 +51,7 @@ interface MutableOutcome {
 	lastErrorAt: number | null;
 	lastError: string | null;
 	consecutiveFailures: number;
+	failingSince: number | null;
 	/** The most recent call failed. */
 	lastFailed: boolean;
 }
@@ -48,6 +61,7 @@ const NO_OUTCOME: MutableOutcome = {
 	lastErrorAt: null,
 	lastError: null,
 	consecutiveFailures: 0,
+	failingSince: null,
 	lastFailed: false,
 };
 
@@ -67,6 +81,7 @@ export class OutcomeTracker {
 		const o = this.entry(name);
 		o.lastSuccessAt = this.now();
 		o.consecutiveFailures = 0;
+		o.failingSince = null;
 		o.lastFailed = false;
 	}
 
@@ -74,6 +89,7 @@ export class OutcomeTracker {
 		const o = this.entry(name);
 		o.lastErrorAt = this.now();
 		o.lastError = error instanceof Error ? error.message : String(error);
+		if (o.consecutiveFailures === 0) o.failingSince = o.lastErrorAt;
 		o.consecutiveFailures++;
 		o.lastFailed = true;
 	}
@@ -126,6 +142,14 @@ export interface HealthInput {
 		consecutiveFailures: number;
 		deadLettered: number;
 		pendingSessions: number;
+	};
+	/** The LLM provider used for extraction. Counts runs without progress, not calls. */
+	llm: {
+		failingRuns: number;
+		/** Milliseconds since the first failing run of the current streak (0 if none). */
+		failingForMs: number;
+		/** Secret-free failure class of the latest failing run, e.g. "rate limited (HTTP 429)". */
+		failureClass: string | null;
 	};
 }
 
@@ -187,7 +211,17 @@ export function evaluateHealth(input: HealthInput): HealthReport {
 		}
 	}
 
-	const down = !input.stateDbReachable || allStoresFailing;
+	const { llm } = input;
+	if (llm.failingRuns >= LLM_DEGRADED_FAILING_RUNS) {
+		reasons.push(
+			`LLM provider failing for ${llm.failingRuns} consecutive consolidation runs (${llm.failureClass ?? "provider call failed"}); no episodes are being consolidated`,
+		);
+	}
+	const llmDown =
+		llm.failingRuns >= LLM_DOWN_FAILING_RUNS &&
+		llm.failingForMs > LLM_DOWN_AFTER_MS;
+
+	const down = !input.stateDbReachable || allStoresFailing || llmDown;
 	const health: HealthLevel = down
 		? "down"
 		: reasons.length > 0

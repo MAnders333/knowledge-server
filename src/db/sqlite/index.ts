@@ -483,13 +483,18 @@ export class KnowledgeDB implements IKnowledgeStore {
 	 * Never called during activation/retrieval.
 	 */
 	async reinforceObservation(id: string): Promise<void> {
-		this.db
+		const result = this.db
 			.prepare(
 				`UPDATE knowledge_entry
          SET observation_count = observation_count + 1, last_accessed_at = ?, updated_at = ?
          WHERE id = ?`,
 			)
 			.run(Date.now(), Date.now(), id);
+		if (result.changes === 0) {
+			logger.warn(
+				`[db] reinforceObservation: entry ${id} was deleted during this run — evidence not recorded.`,
+			);
+		}
 	}
 
 	/**
@@ -1018,7 +1023,15 @@ export class KnowledgeDB implements IKnowledgeStore {
 		embedding?: number[],
 	): Promise<void> {
 		const existing = await this.getEntry(id);
-		if (!existing) return;
+		if (!existing) {
+			// The target was deleted after it was chosen as a merge target (e.g. by
+			// DELETE /entries/:id or another server on a shared store). Writing the
+			// merge would resurrect nothing, so it is skipped, and logged, not silent.
+			logger.warn(
+				`[db] mergeEntry: entry ${id} was deleted during this run — its extracted knowledge was not merged.`,
+			);
+			return;
+		}
 
 		const mergedSources = [
 			...new Set([...existing.derivedFrom, ...updates.additionalSources]),

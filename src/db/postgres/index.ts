@@ -968,11 +968,16 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 
 	async reinforceObservation(id: string): Promise<void> {
 		const now = Date.now();
-		await this.sql`
+		const result = await this.sql`
 			UPDATE knowledge_entry
 			SET observation_count = observation_count + 1, last_accessed_at = ${now}, updated_at = ${now}
 			WHERE id = ${id}
 		`;
+		if (result.count === 0) {
+			logger.warn(
+				`[pg-db] reinforceObservation: entry ${id} was deleted during this run — evidence not recorded.`,
+			);
+		}
 	}
 
 	async getStats(): Promise<Record<string, number>> {
@@ -1321,7 +1326,14 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		embedding?: number[],
 	): Promise<void> {
 		const existing = await this.getEntry(id);
-		if (!existing) return;
+		if (!existing) {
+			// The target was deleted after it was chosen as a merge target. Skipped and
+			// logged, not silent (see the SQLite store).
+			logger.warn(
+				`[pg-db] mergeEntry: entry ${id} was deleted during this run — its extracted knowledge was not merged.`,
+			);
+			return;
+		}
 
 		const mergedSources = [
 			...new Set([...existing.derivedFrom, ...updates.additionalSources]),

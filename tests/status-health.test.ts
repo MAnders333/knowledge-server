@@ -13,6 +13,9 @@ import { KnowledgeDB } from "../src/db/sqlite/index";
 import { ServerStateDB } from "../src/db/state/index";
 import {
 	type HealthInput,
+	LLM_DEGRADED_FAILING_RUNS,
+	LLM_DOWN_AFTER_MS,
+	LLM_DOWN_FAILING_RUNS,
 	OutcomeTracker,
 	componentHealth,
 	evaluateHealth,
@@ -33,6 +36,7 @@ const HEALTHY: HealthInput = {
 		deadLettered: 0,
 		pendingSessions: 0,
 	},
+	llm: { failingRuns: 0, failingForMs: 0, failureClass: null },
 };
 
 describe("evaluateHealth", () => {
@@ -106,6 +110,52 @@ describe("evaluateHealth", () => {
 		});
 		expect(r.health).toBe("degraded");
 		expect(r.reasons.join(" ")).toContain("rerank provider circuit open");
+	});
+});
+
+describe("evaluateHealth: LLM provider outage", () => {
+	const llm = (failingRuns: number, failingForMs = 0) => ({
+		failingRuns,
+		failingForMs,
+		failureClass: "rate limited (HTTP 429)",
+	});
+
+	it("stays ok below the degraded threshold", () => {
+		expect(
+			evaluateHealth({ ...HEALTHY, llm: llm(LLM_DEGRADED_FAILING_RUNS - 1) })
+				.health,
+		).toBe("ok");
+	});
+
+	it("is degraded after consecutive failing runs and names the failure class, not a message", () => {
+		const r = evaluateHealth({
+			...HEALTHY,
+			llm: llm(LLM_DEGRADED_FAILING_RUNS, 2 * 60 * 60 * 1000),
+		});
+		expect(r.health).toBe("degraded");
+		expect(r.reasons.join("\n")).toContain("LLM provider failing");
+		expect(r.reasons.join("\n")).toContain("rate limited (HTTP 429)");
+	});
+
+	it("is down only after many failing runs that have lasted more than an hour", () => {
+		const longer = LLM_DOWN_AFTER_MS + 1;
+		expect(
+			evaluateHealth({ ...HEALTHY, llm: llm(LLM_DOWN_FAILING_RUNS, longer) })
+				.health,
+		).toBe("down");
+		// Many quick retries inside the hour are not an outage of that length.
+		expect(
+			evaluateHealth({
+				...HEALTHY,
+				llm: llm(LLM_DOWN_FAILING_RUNS, LLM_DOWN_AFTER_MS),
+			}).health,
+		).toBe("degraded");
+		expect(
+			evaluateHealth({
+				...HEALTHY,
+				llm: llm(LLM_DOWN_FAILING_RUNS - 1, longer),
+			}).health,
+		).toBe("degraded");
 	});
 });
 

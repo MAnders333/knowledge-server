@@ -701,6 +701,7 @@ export function createApp(
 		const providerSnapshots = PROVIDER_NAMES.map((name) =>
 			componentHealth.snapshot(name),
 		);
+		const llmHealth = componentHealth.snapshot("llm");
 		const { health, reasons } = evaluateHealth({
 			stateDbReachable,
 			stores: storeInputs,
@@ -717,6 +718,14 @@ export function createApp(
 				consecutiveFailures: outcome.consecutiveFailures,
 				deadLettered,
 				pendingSessions,
+			},
+			llm: {
+				failingRuns: llmHealth.consecutiveFailures,
+				failingForMs:
+					llmHealth.failingSince === null
+						? 0
+						: Date.now() - llmHealth.failingSince,
+				failureClass: llmHealth.lastError,
 			},
 		});
 
