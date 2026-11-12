@@ -1,5 +1,6 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { containsInjectedKnowledge } from "../../activation/format.js";
 import { config } from "../../config.js";
 import type {
 	Episode,
@@ -724,13 +725,22 @@ export class ClaudeCodeEpisodeReader implements IEpisodeReader {
 			.join("\n\n");
 		if (!content) return null;
 
+		// A user record with no typed text carries only tool output: label it as tool.
+		const role: EpisodeMessage["role"] =
+			rec.type === "user" && !textContent.trim()
+				? "tool"
+				: (rec.type as "user" | "assistant");
+
+		// Drop any message (any role) that carries our injected context, checked before truncation.
+		if (containsInjectedKnowledge(content)) return null;
+
 		if (content.length > MAX_MESSAGE_CHARS) {
 			content = `${content.slice(0, MAX_MESSAGE_CHARS)}\n[...truncated]`;
 		}
 
 		return {
 			messageId: rec.uuid,
-			role: rec.type as "user" | "assistant",
+			role,
 			content,
 			timestamp: timestampMs,
 		};

@@ -585,6 +585,42 @@ describe("PiEpisodeReader tool output extraction", () => {
 			config.consolidation.includeToolOutputs = originalAllowlist;
 		}
 	});
+
+	it("labels toolResult output as tool output, not as a user turn", () => {
+		const originalAllowlist = config.consolidation.includeToolOutputs;
+		config.consolidation.includeToolOutputs = ["read"];
+		try {
+			writeSession([
+				headerRecord({ id: SESSION_UUID, timestamp: ts(BASE, 0) }),
+				msgRecord({ role: "user", timestamp: ts(BASE, 0), content: "read it" }),
+				msgRecord({
+					role: "toolResult",
+					timestamp: ts(BASE, 1000),
+					toolName: "read",
+					content: [{ type: "text", text: "TOOL BODY" }],
+				}),
+				msgRecord({
+					role: "assistant",
+					timestamp: ts(BASE, 2000),
+					content: [{ type: "text", text: "got it" }],
+				}),
+				msgRecord({ role: "user", timestamp: ts(BASE, 3000), content: "ok" }),
+			]);
+
+			const candidates = reader.getCandidateSessions(BASE - 1);
+			const episodes = reader.getNewEpisodes(
+				candidates.map((c) => c.id),
+				new Map(),
+			);
+			expect(episodes).toHaveLength(1);
+			expect(episodes[0].content).toContain(
+				"tool output (third-party text): [tool: read]\nTOOL BODY",
+			);
+			expect(episodes[0].content).not.toContain("user: [tool: read]");
+		} finally {
+			config.consolidation.includeToolOutputs = originalAllowlist;
+		}
+	});
 });
 
 // ── Title fallback ────────────────────────────────────────────────────────────
@@ -623,5 +659,112 @@ describe("PiEpisodeReader session title", () => {
 			new Map(),
 		);
 		expect(episodes[0].sessionTitle).toBe("hello");
+	});
+});
+
+// ── Injected knowledge guard ──────────────────────────────────────────────────
+
+const INJECTED_BLOCK = [
+	"<addrl-activated-knowledge>",
+	"## Recalled Knowledge (from prior sessions)",
+	"- [fact] Deploys go out on Thursdays",
+	"</addrl-activated-knowledge>",
+].join("\n");
+
+describe("PiEpisodeReader — injected knowledge guard", () => {
+	/** Session whose first message is `first`, then four plain messages; returns the episodes. */
+	function extractWithFirst(first: {
+		role: "user" | "assistant";
+		text: string;
+	}) {
+		writeSession([
+			headerRecord({ id: SESSION_UUID, timestamp: ts(BASE, 0) }),
+			msgRecord({
+				role: first.role,
+				timestamp: ts(BASE, 1000),
+				content:
+					first.role === "user"
+						? first.text
+						: [{ type: "text", text: first.text }],
+			}),
+			msgRecord({
+				role: "user",
+				timestamp: ts(BASE, 2000),
+				content: "question one",
+			}),
+			msgRecord({
+				role: "assistant",
+				timestamp: ts(BASE, 3000),
+				content: [{ type: "text", text: "answer one" }],
+			}),
+			msgRecord({
+				role: "user",
+				timestamp: ts(BASE, 4000),
+				content: "question two",
+			}),
+			msgRecord({
+				role: "assistant",
+				timestamp: ts(BASE, 5000),
+				content: [{ type: "text", text: "answer two" }],
+			}),
+		]);
+		const candidates = reader.getCandidateSessions(BASE - 1);
+		return reader.getNewEpisodes(
+			candidates.map((c) => c.id),
+			new Map(),
+		);
+	}
+
+	it("drops a user message that carries the injected block", () => {
+		const episodes = extractWithFirst({
+			role: "user",
+			text: `Context follows.\n${INJECTED_BLOCK}`,
+		});
+		expect(episodes).toHaveLength(1);
+		expect(episodes[0].content).not.toContain("addrl-activated-knowledge");
+		expect(episodes[0].content).not.toContain("Deploys go out on Thursdays");
+		expect(episodes[0].content).toContain("question one");
+	});
+
+	it("drops an assistant message that quotes the injected tag", () => {
+		const episodes = extractWithFirst({
+			role: "assistant",
+			text: "The block opens with <addrl-activated-knowledge> and closes with </addrl-activated-knowledge>.",
+		});
+		expect(episodes).toHaveLength(1);
+		expect(episodes[0].content).not.toContain("addrl-activated-knowledge");
+		expect(episodes[0].content).toContain("question one");
+	});
+
+	it("drops a user message whose injected block sits past 60K characters", () => {
+		const episodes = extractWithFirst({
+			role: "user",
+			text: `${"x".repeat(60_000)}\n${INJECTED_BLOCK}`,
+		});
+		expect(episodes).toHaveLength(1);
+		expect(episodes[0].content).not.toContain("[...truncated]");
+		expect(episodes[0].content).not.toContain("xxxx");
+		expect(episodes[0].content).toContain("question one");
+	});
+
+	it("drops an assistant message whose injected block sits past 60K characters", () => {
+		const episodes = extractWithFirst({
+			role: "assistant",
+			text: `${"x".repeat(60_000)}\n${INJECTED_BLOCK}`,
+		});
+		expect(episodes).toHaveLength(1);
+		expect(episodes[0].content).not.toContain("[...truncated]");
+		expect(episodes[0].content).not.toContain("xxxx");
+		expect(episodes[0].content).toContain("question one");
+	});
+
+	it("keeps ordinary messages unchanged", () => {
+		const episodes = extractWithFirst({
+			role: "user",
+			text: "plain first message",
+		});
+		expect(episodes).toHaveLength(1);
+		expect(episodes[0].content).toContain("  user: plain first message");
+		expect(episodes[0].content).toContain("  assistant: answer one");
 	});
 });

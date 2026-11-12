@@ -893,3 +893,103 @@ describe("resolveVSCodeDataDir", () => {
 		}
 	});
 });
+
+// ── Injected knowledge guard ──────────────────────────────────────────────────
+
+describe("VSCodeEpisodeReader — injected knowledge guard", () => {
+	let tmpDir: string;
+	let dataDir: string;
+	let chatDir: string;
+
+	beforeEach(() => {
+		({ tmpDir, dataDir, chatDir } = setupDataDir());
+	});
+
+	afterEach(() => {
+		rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	const INJECTED_BLOCK = [
+		"<addrl-activated-knowledge>",
+		"## Recalled Knowledge (from prior sessions)",
+		"- [fact] Deploys go out on Thursdays",
+		"</addrl-activated-knowledge>",
+	].join("\n");
+
+	function extractRequests(
+		requests: Array<{
+			messageText?: string;
+			response?: Array<{ value: string }>;
+		}>,
+	) {
+		writeSession(
+			chatDir,
+			"s1.json",
+			makeSession({ sessionId: "session-1", requests }),
+		);
+		const reader = new VSCodeEpisodeReader(dataDir);
+		const candidates = reader.getCandidateSessions(0);
+		const episodes = reader.getNewEpisodes([candidates[0].id], new Map());
+		reader.close();
+		return episodes;
+	}
+
+	/** Three requests: the first carries the given user and reply text, the rest are plain. */
+	function extractWithFirst(first: { userText?: string; replyText?: string }) {
+		return extractRequests([
+			{
+				messageText: first.userText ?? "question zero",
+				response: [{ value: first.replyText ?? "reply zero" }],
+			},
+			{ messageText: "question one", response: [{ value: "answer one" }] },
+			{ messageText: "question two", response: [{ value: "answer two" }] },
+		]);
+	}
+
+	it("drops a user request that carries the injected block", () => {
+		const episodes = extractWithFirst({
+			userText: `Context follows.\n${INJECTED_BLOCK}`,
+		});
+		expect(episodes).toHaveLength(1);
+		expect(episodes[0].content).not.toContain("addrl-activated-knowledge");
+		expect(episodes[0].content).not.toContain("Deploys go out on Thursdays");
+		expect(episodes[0].content).toContain("question one");
+	});
+
+	it("drops an assistant response that quotes the injected tag", () => {
+		const episodes = extractWithFirst({
+			replyText:
+				"The block opens with <addrl-activated-knowledge> and closes with </addrl-activated-knowledge>.",
+		});
+		expect(episodes).toHaveLength(1);
+		expect(episodes[0].content).not.toContain("addrl-activated-knowledge");
+		expect(episodes[0].content).toContain("question one");
+	});
+
+	it("drops a user request whose injected block sits past 60K characters", () => {
+		const episodes = extractWithFirst({
+			userText: `${"x".repeat(60_000)}\n${INJECTED_BLOCK}`,
+		});
+		expect(episodes).toHaveLength(1);
+		expect(episodes[0].content).not.toContain("[...truncated]");
+		expect(episodes[0].content).not.toContain("xxxx");
+		expect(episodes[0].content).toContain("question one");
+	});
+
+	it("drops an assistant response whose injected block sits past 60K characters", () => {
+		const episodes = extractWithFirst({
+			replyText: `${"x".repeat(60_000)}\n${INJECTED_BLOCK}`,
+		});
+		expect(episodes).toHaveLength(1);
+		expect(episodes[0].content).not.toContain("[...truncated]");
+		expect(episodes[0].content).not.toContain("xxxx");
+		expect(episodes[0].content).toContain("question one");
+	});
+
+	it("keeps ordinary requests unchanged", () => {
+		const episodes = extractWithFirst({});
+		expect(episodes).toHaveLength(1);
+		expect(episodes[0].content).toContain("user: question zero");
+		expect(episodes[0].content).toContain("assistant: reply zero");
+	});
+});

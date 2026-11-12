@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
+import { containsInjectedKnowledge } from "../../activation/format.js";
 import { config } from "../../config.js";
 import type {
 	Episode,
@@ -371,7 +372,7 @@ export class VSCodeEpisodeReader implements IEpisodeReader {
 
 			// User message
 			const userText = (request.message?.text ?? "").trim();
-			if (userText) {
+			if (userText && !containsInjectedKnowledge(userText)) {
 				const messageId =
 					request.requestId ?? `${session.sessionId}-req-${i}-user`;
 				messages.push({
@@ -411,8 +412,8 @@ export class VSCodeEpisodeReader implements IEpisodeReader {
 				}
 			}
 
-			if (textParts.length > 0) {
-				const assistantText = textParts.join("\n\n");
+			const assistantText = textParts.join("\n\n");
+			if (assistantText && !containsInjectedKnowledge(assistantText)) {
 				const responseId = `${request.requestId ?? `${session.sessionId}-req-${i}`}-response`;
 				messages.push({
 					messageId: responseId,
