@@ -1,10 +1,23 @@
 import { existsSync, readFileSync } from "node:fs";
 import pkg from "../../package.json" with { type: "json" };
+import { resolveServerAddress } from "../config-file.js";
 import { StoreRegistry } from "../db/store-registry.js";
 import { errCode } from "../utils.js";
 
 /** Window for the per-source capture vs injection check. */
 export const COVERAGE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Capture source (reader `source`) -> activation client tag, where they differ.
+ * The oh-my-pi reader writes episodes as "oh-my-pi"; its plugin and MCP calls
+ * send the client tag "omp". Other sources use the same name on both sides.
+ */
+const SOURCE_TO_CLIENT: Readonly<Record<string, string>> = {
+	"oh-my-pi": "omp",
+};
+const CLIENT_TO_SOURCE = Object.fromEntries(
+	Object.entries(SOURCE_TO_CLIENT).map(([source, client]) => [client, source]),
+);
 
 export interface CoverageRow {
 	source: string;
@@ -21,13 +34,19 @@ export function summarizeCoverage(
 	captured: Record<string, number>,
 	injected: Record<string, number>,
 ): { rows: CoverageRow[]; warnings: string[] } {
+	// Injected counts are keyed by client tag; fold them onto the capture source.
+	const injectedBySource: Record<string, number> = {};
+	for (const [client, count] of Object.entries(injected)) {
+		const source = CLIENT_TO_SOURCE[client] ?? client;
+		injectedBySource[source] = (injectedBySource[source] ?? 0) + count;
+	}
 	const sources = [
-		...new Set([...Object.keys(captured), ...Object.keys(injected)]),
+		...new Set([...Object.keys(captured), ...Object.keys(injectedBySource)]),
 	].sort();
 	const rows = sources.map((source) => ({
 		source,
 		captured: captured[source] ?? 0,
-		injected: injected[source] ?? 0,
+		injected: injectedBySource[source] ?? 0,
 	}));
 	const warnings = rows
 		.filter((r) => r.captured > 0 && r.injected === 0)
@@ -36,6 +55,35 @@ export function summarizeCoverage(
 				`${r.source}: ${r.captured} episodes captured in the last 7 days but nothing injected. Check that the client calls /activate with its client tag.`,
 		);
 	return { rows, warnings };
+}
+
+export interface ServerHealth {
+	health: string;
+	reasons: string[];
+}
+
+/**
+ * Health verdict from a running server's GET /status. Null when the server does
+ * not answer or the reply has no health field (for example an older server).
+ */
+export async function fetchServerHealth(
+	baseUrl: string,
+	timeoutMs = 2000,
+): Promise<ServerHealth | null> {
+	try {
+		const res = await fetch(`${baseUrl}/status`, {
+			signal: AbortSignal.timeout(timeoutMs),
+		});
+		if (!res.ok) return null;
+		const body = (await res.json()) as { health?: unknown; reasons?: unknown };
+		if (typeof body.health !== "string") return null;
+		const reasons = Array.isArray(body.reasons)
+			? body.reasons.filter((r): r is string => typeof r === "string")
+			: [];
+		return { health: body.health, reasons };
+	} catch {
+		return null;
+	}
 }
 
 /**
@@ -68,6 +116,16 @@ export async function runStatus(pidPath: string): Promise<void> {
 				: "stopped (stale PID file)";
 		}
 	}
+
+	const address = resolveServerAddress();
+	const serverHealth = await fetchServerHealth(
+		`http://${address.host}:${address.port}`,
+	);
+	const healthLine = serverHealth
+		? serverHealth.reasons.length > 0
+			? `${serverHealth.health} (${serverHealth.reasons.join("; ")})`
+			: serverHealth.health
+		: "unavailable (server not answering)";
 
 	const registry = await StoreRegistry.create();
 	const { serverStateDb } = registry;
@@ -106,6 +164,7 @@ export async function runStatus(pidPath: string): Promise<void> {
 		console.log("───────────────────────────────────────");
 		console.log(`  Version:            ${pkg.version}`);
 		console.log(`  Server:             ${serverLine}`);
+		console.log(`  Health:             ${healthLine}`);
 		console.log(
 			`  Knowledge entries:  ${stats.total ?? 0} total, ${stats.active ?? 0} active`,
 		);
