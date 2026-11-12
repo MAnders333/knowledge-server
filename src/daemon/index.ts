@@ -40,7 +40,11 @@ import { DaemonDB } from "../db/daemon/index.js";
 import { createServerStateDB } from "../db/state/factory.js";
 import { logger, parseLogLevel } from "../logger.js";
 import { tightenOwnedPrivatePaths } from "../private-files.js";
-import { lockHolder, tryAcquireProcessLock } from "../process-lock.js";
+import {
+	type LockHandle,
+	lockHolder,
+	tryAcquireProcessLock,
+} from "../process-lock.js";
 import {
 	daemonLockPath,
 	daemonLogPath,
@@ -49,6 +53,7 @@ import {
 import { currentUserId } from "../user-id.js";
 import { parseInitialLookbackDays } from "./lookback.js";
 import { createEpisodeReaders } from "./readers/index.js";
+import { DAEMON_LOCK_RETRY_MS, acquireDaemonLock } from "./single-instance.js";
 import { type DaemonStatus, writeDaemonStatus } from "./status.js";
 import { EpisodeUploader } from "./uploader.js";
 
@@ -103,16 +108,34 @@ logger.init(
 	config.logMaxBytes,
 );
 
-// Single instance per data directory. Taken before any DB connection, so a
-// second start (launchd restart, manual run, auto-spawn race) exits here.
-const daemonLock = tryAcquireProcessLock(daemonLockPath(dataDir));
-if (!daemonLock) {
-	const holder = lockHolder(daemonLockPath(dataDir));
-	const who = holder && holder.pid > 0 ? ` (PID ${holder.pid})` : "";
-	logger.warn(
-		`[daemon] Another knowledge-daemon${who} already runs for ${dataDir}. Exiting: only one daemon may run per data directory.`,
-	);
-	process.exit(0);
+// Single instance per data directory. Taken before any DB connection. A polling
+// daemon that finds another one running idles and takes over when it exits; it
+// does not exit, so launchd/systemd do not restart it in a loop. A one-shot run
+// (--once, cron/on-demand) has nothing to wait for and exits instead.
+const daemonLockFile = daemonLockPath(dataDir);
+let daemonLock: LockHandle;
+if (onceFlag) {
+	const lock = tryAcquireProcessLock(daemonLockFile);
+	if (!lock) {
+		const holder = lockHolder(daemonLockFile);
+		const who = holder && holder.pid > 0 ? ` (PID ${holder.pid})` : "";
+		logger.warn(
+			`[daemon] Another knowledge-daemon${who} already runs for ${dataDir}. Exiting: only one daemon may run per data directory.`,
+		);
+		process.exit(0);
+	}
+	daemonLock = lock;
+} else {
+	const { lock, waited } = await acquireDaemonLock(daemonLockFile, {
+		onWaiting: (pid) => {
+			const who = pid > 0 ? ` (PID ${pid})` : "";
+			logger.warn(
+				`[daemon] Another knowledge-daemon${who} already runs for ${dataDir}. Waiting to take over; retrying every ${DAEMON_LOCK_RETRY_MS / 1000} s.`,
+			);
+		},
+	});
+	daemonLock = lock;
+	if (waited) logger.log("[daemon] Took over the daemon lock; starting.");
 }
 const releaseDaemonLock = () => daemonLock.release();
 
