@@ -583,6 +583,76 @@ function makeEpisode(overrides: Partial<Episode> = {}): Episode {
 
 // ── ConsolidationEngine.reconsolidate() paths ─────────────────────────────────
 
+describe("ConsolidationEngine entry cache", () => {
+	it("loads each store's embedded entries once per batch, across chunks", async () => {
+		// 25 episodes with the default chunk size of 10 → 3 chunks in one batch.
+		mockReader._sessions = [{ id: "session-1", maxMessageTime: Date.now() }];
+		mockReader._episodes = Array.from({ length: 25 }, (_, i) =>
+			makeEpisode({ startMessageId: `msg-${i}`, endMessageId: `msg-${i}-end` }),
+		);
+		spyOn(activation, "ensureEmbeddings").mockResolvedValue(0);
+		spyOn(activation.embeddings, "embed").mockImplementation(
+			async (text: string) => fakeEmbedding(text),
+		);
+
+		let extractCall = 0;
+		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockImplementation(
+			async () => [
+				{
+					type: "fact",
+					content: `Distinct fact ${extractCall++}`,
+					topics: [`topic-${extractCall}`],
+					confidence: 0.9,
+					source: "test",
+				},
+			],
+		);
+		// Near-duplicate candidates (if any) are kept as distinct entries.
+		spyOn(ConsolidationLLM.prototype, "batchDecideMerge").mockImplementation(
+			async (pairs: unknown[]) =>
+				pairs.map(() => ({ action: "insert" }) as never),
+		);
+		const loads = spyOn(db, "getActiveEntriesWithEmbeddings");
+
+		const result = await engine.consolidate();
+
+		expect(result.entriesCreated).toBe(3);
+		expect(loads).toHaveBeenCalledTimes(1);
+	});
+
+	it("a later chunk deduplicates against an entry inserted by an earlier chunk", async () => {
+		mockReader._sessions = [{ id: "session-1", maxMessageTime: Date.now() }];
+		mockReader._episodes = Array.from({ length: 11 }, (_, i) =>
+			makeEpisode({ startMessageId: `msg-${i}`, endMessageId: `msg-${i}-end` }),
+		);
+		spyOn(activation, "ensureEmbeddings").mockResolvedValue(0);
+		spyOn(activation.embeddings, "embed").mockResolvedValue([
+			1, 0, 0, 0, 0, 0, 0, 0,
+		]);
+		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockResolvedValue([
+			{
+				type: "fact",
+				content: "Same fact in every chunk.",
+				topics: ["shared"],
+				confidence: 0.9,
+				source: "test",
+			},
+		]);
+		const decide = spyOn(
+			ConsolidationLLM.prototype,
+			"batchDecideMerge",
+		).mockImplementation(async (pairs: unknown[]) =>
+			pairs.map(() => ({ action: "keep" }) as never),
+		);
+
+		const result = await engine.consolidate();
+
+		// Chunk 1 inserts; chunk 2 sees that entry through the cache and asks decideMerge.
+		expect(result.entriesCreated).toBe(1);
+		expect(decide).toHaveBeenCalledTimes(1);
+	});
+});
+
 describe("ConsolidationEngine.reconsolidate() — novel entry (below threshold)", () => {
 	it("inserts a new entry when the knowledge base is empty", async () => {
 		// No existing entries → similarity is 0 → insert unconditionally

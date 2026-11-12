@@ -58,6 +58,39 @@ interface ChunkResult {
 /** Thrown when another process holds a store's consolidation lock. The chunk is deferred, not failed. */
 class StoreLockHeldError extends Error {}
 
+type EmbeddedEntry = KnowledgeEntry & { embedding: number[] };
+
+/**
+ * Embedded entries of each store, loaded once per consolidate() batch.
+ *
+ * Every chunk used to reload the whole store (≈10–14 full loads per batch). Each
+ * map is mutated in place as chunks insert, merge and supersede, which mirrors the
+ * writes made through this batch. A store is dropped from the cache (and reloaded
+ * by the next chunk) when a write is not mirrored exactly, e.g. a contradiction
+ * merge clears the stored embedding, or when a chunk fails part-way.
+ */
+class StoreEntryCache {
+	private readonly maps = new Map<
+		IKnowledgeStore,
+		Map<string, EmbeddedEntry>
+	>();
+
+	async get(store: IKnowledgeStore): Promise<Map<string, EmbeddedEntry>> {
+		let entries = this.maps.get(store);
+		if (!entries) {
+			entries = new Map(
+				(await store.getActiveEntriesWithEmbeddings()).map((e) => [e.id, e]),
+			);
+			this.maps.set(store, entries);
+		}
+		return entries;
+	}
+
+	invalidate(store: IKnowledgeStore): void {
+		this.maps.delete(store);
+	}
+}
+
 /**
  * The consolidation engine — the heart of the knowledge system.
  *
@@ -236,6 +269,7 @@ export class ConsolidationEngine {
 
 		// Reset touched stores for this run — accumulates across all source batches.
 		this._lastTouchedStores = new Set();
+		const entryCache = new StoreEntryCache();
 
 		let totalSessionsProcessed = 0;
 		let totalSegmentsProcessed = 0;
@@ -246,7 +280,11 @@ export class ConsolidationEngine {
 
 		// Process each reader source independently with its own cursor.
 		for (const reader of this.readers) {
-			const sourceTotals = await this.consolidateSource(reader, attempted);
+			const sourceTotals = await this.consolidateSource(
+				reader,
+				attempted,
+				entryCache,
+			);
 			totalSessionsProcessed += sourceTotals.sessionsProcessed;
 			totalSegmentsProcessed += sourceTotals.segmentsProcessed;
 			totalCreated += sourceTotals.entriesCreated;
@@ -337,6 +375,7 @@ export class ConsolidationEngine {
 	private async consolidateSource(
 		reader: IEpisodeReader,
 		attempted: Set<string>,
+		entryCache: StoreEntryCache,
 	): Promise<{
 		sessionsProcessed: number;
 		segmentsProcessed: number;
@@ -494,6 +533,7 @@ export class ConsolidationEngine {
 			const result = await this.processChunk(
 				chunk[0]?.source ?? reader.source,
 				chunk,
+				entryCache,
 			);
 			totalCreated += result.created;
 			totalUpdated += result.updated;
@@ -578,6 +618,7 @@ export class ConsolidationEngine {
 	private async processChunk(
 		source: string,
 		chunk: ReturnType<IEpisodeReader["getNewEpisodes"]>,
+		entryCache: StoreEntryCache,
 	): Promise<ChunkResult> {
 		const none = {
 			created: 0,
@@ -662,6 +703,7 @@ export class ConsolidationEngine {
 					entriesForStore,
 					sessionIds,
 					chunkSessionTimestamp,
+					entryCache,
 				).then((counts) => ({ store, counts })),
 			),
 		);
@@ -857,6 +899,7 @@ export class ConsolidationEngine {
 		entries: ExtractedKnowledge[],
 		sessionIds: string[],
 		chunkSessionTimestamp: number,
+		entryCache: StoreEntryCache,
 	): Promise<{
 		created: number;
 		updated: number;
@@ -891,12 +934,14 @@ export class ConsolidationEngine {
 			);
 		}
 
+		// True once the cached map provably matches the store; otherwise the cache
+		// entry is dropped so the next chunk reloads it.
+		let mapMirrorsStore = false;
 		try {
-			// Load all active entries from this store once.
-			// entriesMap is mutated in place as inserts/updates happen so that
-			// subsequent entries in this batch can deduplicate against earlier ones.
-			const allEntries = await store.getActiveEntriesWithEmbeddings();
-			const entriesMap = new Map(allEntries.map((e) => [e.id, e]));
+			// entriesMap is shared across the batch (see StoreEntryCache) and mutated
+			// in place as inserts/updates happen so that later entries deduplicate
+			// against earlier ones.
+			const entriesMap = await entryCache.get(store);
 
 			let created = 0;
 			let updated = 0;
@@ -1110,6 +1155,9 @@ export class ConsolidationEngine {
 				entriesMap,
 				contradictionCandidates,
 			);
+			// A resolved contradiction can rewrite a stored entry in a way the map does
+			// not mirror (a merge clears the winner's embedding), so reload next time.
+			mapMirrorsStore = contradictions.detected === 0;
 
 			return {
 				created,
@@ -1118,6 +1166,7 @@ export class ConsolidationEngine {
 				conflictsResolved: contradictions.resolved,
 			};
 		} finally {
+			if (!mapMirrorsStore) entryCache.invalidate(store);
 			await store.releaseConsolidationLock();
 		}
 	}
