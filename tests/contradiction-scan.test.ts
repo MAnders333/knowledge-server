@@ -1,0 +1,308 @@
+/**
+ * Contradiction batch contract: the wrapper-object parser, the candidate
+ * index guard, the per-call cap and batching, the similarity floor, and the
+ * intra-chunk path. The LLM is replaced by a spy, so no network calls are made.
+ */
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { config } from "../src/config";
+import { ContradictionScanner } from "../src/consolidation/contradiction";
+import {
+	ConsolidationLLM,
+	type ContradictionResult,
+} from "../src/consolidation/llm";
+import {
+	MalformedLlmOutputError,
+	parseContradictionReply,
+} from "../src/consolidation/llm-output";
+import type { IKnowledgeStore } from "../src/db/index";
+import type { KnowledgeEntry } from "../src/types";
+
+type Scanned = KnowledgeEntry & { embedding: number[] };
+const consolidation = config.consolidation as {
+	reconsolidationThreshold: number;
+	contradictionMinSimilarity: number;
+	contradictionMaxCandidates: number;
+	contradictionMinTopSimilarity: number;
+};
+const saved = { ...consolidation };
+
+// Unit vectors with a controlled cosine to the query [1, 0].
+const vecAt = (sim: number): number[] => [sim, Math.sqrt(1 - sim * sim)];
+
+function makeEntry(id: string, sim: number, topics = ["server"]): Scanned {
+	return {
+		id,
+		content: `entry ${id}`,
+		type: "fact",
+		topics,
+		confidence: 0.9,
+		createdAt: 0,
+		embedding: vecAt(sim),
+	} as unknown as Scanned;
+}
+
+beforeEach(() => {
+	consolidation.reconsolidationThreshold = 0.94;
+	consolidation.contradictionMinSimilarity = 0.4;
+	consolidation.contradictionMaxCandidates = Number.POSITIVE_INFINITY;
+	consolidation.contradictionMinTopSimilarity = 0;
+});
+
+afterEach(() => {
+	Object.assign(consolidation, saved);
+	llmSpy?.mockRestore();
+	llmSpy = null;
+});
+
+// ── parseContradictionReply ───────────────────────────────────────────────────
+
+describe("parseContradictionReply", () => {
+	it("rejects a checked count that differs from the batch size", () => {
+		expect(() =>
+			parseContradictionReply({ checked: 9, conflicts: [] }, 10),
+		).toThrow(MalformedLlmOutputError);
+		expect(() =>
+			parseContradictionReply({ checked: 10, conflicts: [] }, 10),
+		).not.toThrow();
+	});
+
+	it("rejects a reply without the wrapper object", () => {
+		expect(() => parseContradictionReply([], 1)).toThrow(
+			MalformedLlmOutputError,
+		);
+		expect(() => parseContradictionReply({ conflicts: [] }, 1)).toThrow(
+			MalformedLlmOutputError,
+		);
+		expect(() => parseContradictionReply(null, 1)).toThrow(
+			MalformedLlmOutputError,
+		);
+	});
+
+	it("accepts checked as a numeric string", () => {
+		expect(parseContradictionReply({ checked: "2", conflicts: [] }, 2)).toEqual(
+			[],
+		);
+	});
+
+	it("drops out-of-range candidate numbers and keeps the valid siblings", () => {
+		const out = parseContradictionReply(
+			{
+				checked: 2,
+				conflicts: [
+					{ candidate: 0, type: "supersede_old", reason: "x" },
+					{ candidate: 3, type: "supersede_old", reason: "x" },
+					{ candidate: -1, type: "irresolvable", reason: "x" },
+					{ candidate: 2, type: "irresolvable", reason: "tie" },
+				],
+			},
+			2,
+		);
+		expect(out.map((c) => [c.index, c.resolution])).toEqual([
+			[2, "irresolvable"],
+		]);
+	});
+
+	it("keeps the first conflict when a candidate is listed twice", () => {
+		const out = parseContradictionReply(
+			{
+				checked: 1,
+				conflicts: [
+					{ candidate: 1, type: "supersede_old", reason: "first" },
+					{ candidate: 1, type: "irresolvable", reason: "second" },
+				],
+			},
+			1,
+		);
+		expect(out.map((c) => [c.index, c.reason])).toEqual([[1, "first"]]);
+	});
+
+	it("drops no_conflict and unknown types, since conflicts-only output has neither", () => {
+		const out = parseContradictionReply(
+			{
+				checked: 2,
+				conflicts: [
+					{ candidate: 1, type: "no_conflict", reason: "x" },
+					{ candidate: 2, type: "bogus", reason: "x" },
+				],
+			},
+			2,
+		);
+		expect(out).toEqual([]);
+	});
+});
+
+// ── ContradictionScanner: cap, batching, floor, intra-chunk ───────────────────
+
+interface Recorded {
+	resolution: string;
+	entryId: string;
+	candidateId: string;
+}
+
+function fakeStore(pool: Scanned[], applied: Recorded[]): IKnowledgeStore {
+	return {
+		findContradictionCandidates: async () => pool,
+		applyContradictionResolution: async (
+			resolution: string,
+			entryId: string,
+			candidateId: string,
+		) => {
+			applied.push({ resolution, entryId, candidateId });
+		},
+	} as unknown as IKnowledgeStore;
+}
+
+let llmSpy: { mockRestore(): void } | null = null;
+
+function spyLLM(
+	reply: (
+		entry: { id: string },
+		candidates: Array<{ id: string }>,
+	) => ContradictionResult[],
+) {
+	const calls: Array<{ entryId: string; candidateIds: string[] }> = [];
+	llmSpy = spyOn(
+		ConsolidationLLM.prototype,
+		"detectAndResolveContradiction",
+	).mockImplementation(async (newEntry, candidates) => {
+		calls.push({
+			entryId: newEntry.id,
+			candidateIds: candidates.map((c) => c.id),
+		});
+		return reply(newEntry, candidates);
+	});
+	return { calls };
+}
+
+describe("ContradictionScanner: candidate cap and batching", () => {
+	it("checks every candidate when no cap is set, in batches of 10", async () => {
+		const entry = makeEntry("new", 1);
+		const pool = Array.from({ length: 25 }, (_, i) =>
+			makeEntry(`c${String(i).padStart(2, "0")}`, 0.9 - i * 0.01),
+		);
+		const { calls } = spyLLM(() => []);
+		await new ContradictionScanner(new ConsolidationLLM()).scan(
+			fakeStore(pool, []),
+			new Map([[entry.id, entry]]),
+			new Set([entry.id]),
+		);
+		expect(calls.map((c) => c.candidateIds.length)).toEqual([10, 10, 5]);
+	});
+
+	it("checks only the top N by similarity, in batches of 10", async () => {
+		consolidation.contradictionMaxCandidates = 40;
+		const entry = makeEntry("new", 1);
+		// 60 band candidates, similarity 0.9 down to ~0.49 (ids c00 is most similar).
+		const pool = Array.from({ length: 60 }, (_, i) =>
+			makeEntry(`c${String(i).padStart(2, "0")}`, 0.9 - i * 0.007),
+		);
+		const { calls } = spyLLM(() => []);
+		const applied: Recorded[] = [];
+		const entriesMap = new Map<string, Scanned>([[entry.id, entry]]);
+
+		await new ContradictionScanner(new ConsolidationLLM()).scan(
+			fakeStore(pool, applied),
+			entriesMap,
+			new Set([entry.id]),
+		);
+
+		expect(calls.map((c) => c.candidateIds.length)).toEqual([10, 10, 10, 10]);
+		const sent = calls.flatMap((c) => c.candidateIds);
+		expect(sent).toEqual(pool.slice(0, 40).map((c) => c.id));
+		expect(sent).not.toContain("c40");
+	});
+
+	it("honours CONTRADICTION_MAX_CANDIDATES", async () => {
+		consolidation.contradictionMaxCandidates = 3;
+		const entry = makeEntry("new", 1);
+		const pool = [0.9, 0.8, 0.7, 0.6, 0.5].map((s, i) => makeEntry(`c${i}`, s));
+		const { calls } = spyLLM(() => []);
+		await new ContradictionScanner(new ConsolidationLLM()).scan(
+			fakeStore(pool, []),
+			new Map([[entry.id, entry]]),
+			new Set([entry.id]),
+		);
+		expect(calls).toHaveLength(1);
+		expect(calls[0].candidateIds).toEqual(["c0", "c1", "c2"]);
+	});
+
+	it("skips an entry whose best candidate is below the floor", async () => {
+		consolidation.contradictionMinTopSimilarity = 0.8;
+		const entry = makeEntry("new", 1);
+		const pool = [makeEntry("c0", 0.7), makeEntry("c1", 0.6)];
+		const { calls } = spyLLM(() => []);
+		await new ContradictionScanner(new ConsolidationLLM()).scan(
+			fakeStore(pool, []),
+			new Map([[entry.id, entry]]),
+			new Set([entry.id]),
+		);
+		expect(calls).toHaveLength(0);
+	});
+});
+
+describe("ContradictionScanner: intra-chunk path", () => {
+	it("checks two changed entries of one chunk against each other and applies the verdict", async () => {
+		// No pre-existing candidates: the only pair is the two changed entries.
+		const a = makeEntry("chunk-a", 1);
+		const b = makeEntry("chunk-b", 0.85);
+		const { calls } = spyLLM((_entry, candidates) => [
+			{
+				candidateId: candidates[0].id,
+				resolution: "supersede_old",
+				reason: "newer",
+			},
+		]);
+		const applied: Recorded[] = [];
+		const entriesMap = new Map<string, Scanned>([
+			[a.id, a],
+			[b.id, b],
+		]);
+
+		const result = await new ContradictionScanner(new ConsolidationLLM()).scan(
+			fakeStore([], applied),
+			entriesMap,
+			new Set([a.id, b.id]),
+		);
+
+		expect(calls).toEqual([{ entryId: "chunk-a", candidateIds: ["chunk-b"] }]);
+		expect(applied).toEqual([
+			{
+				resolution: "supersede_old",
+				entryId: "chunk-a",
+				candidateId: "chunk-b",
+			},
+		]);
+		expect(result).toEqual({ detected: 1, resolved: 1 });
+	});
+
+	it("ignores an intra-chunk pair outside the band", async () => {
+		const a = makeEntry("chunk-a", 1);
+		const b = makeEntry("chunk-b", 0.97); // above reconsolidationThreshold: decideMerge's job
+		const { calls } = spyLLM(() => []);
+		await new ContradictionScanner(new ConsolidationLLM()).scan(
+			fakeStore([], []),
+			new Map([
+				[a.id, a],
+				[b.id, b],
+			]),
+			new Set([a.id, b.id]),
+		);
+		expect(calls).toHaveLength(0);
+	});
+
+	it("applies the same cap to intra-chunk candidates", async () => {
+		consolidation.contradictionMaxCandidates = 2;
+		const a = makeEntry("chunk-a", 1);
+		const others = [0.85, 0.84, 0.83, 0.82].map((s, i) =>
+			makeEntry(`chunk-${i}`, s),
+		);
+		const { calls } = spyLLM(() => []);
+		await new ContradictionScanner(new ConsolidationLLM()).scan(
+			fakeStore([], []),
+			new Map([a, ...others].map((e) => [e.id, e])),
+			new Set([a.id, ...others.map((o) => o.id)]),
+		);
+		const first = calls.find((c) => c.entryId === "chunk-a");
+		expect(first?.candidateIds).toEqual(["chunk-0", "chunk-1"]);
+	});
+});

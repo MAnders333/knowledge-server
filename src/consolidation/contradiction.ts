@@ -5,12 +5,7 @@ import { logger } from "../logger.js";
 import type { KnowledgeEntry } from "../types.js";
 import type { ConsolidationLLM } from "./llm.js";
 
-/**
- * Maximum number of candidates sent to the LLM in a single contradiction-check call.
- * When there are more mid-band candidates, they are split into sequential batches
- * sorted by similarity descending (most likely contradictions first).
- * Keeping this small bounds prompt size and prevents LLM timeouts as the KB grows.
- */
+/** Candidates sent to the LLM in one contradiction-check call. */
 const CONTRADICTION_BATCH_SIZE = 10;
 
 /**
@@ -46,6 +41,11 @@ export class ContradictionScanner {
 	 * Precondition: `candidates` must already be filtered to the mid-similarity band
 	 * [contradictionMinSimilarity, reconsolidationThreshold) by the caller.
 	 *
+	 * Only the top `contradictionMaxCandidates` by similarity are checked. When the
+	 * best candidate is below `contradictionMinTopSimilarity`, the entry is skipped.
+	 * Both limits apply to each call, so the cross-store and intra-chunk paths each
+	 * get their own cap.
+	 *
 	 * Returns { entrySuperseded, detected, resolved } so the caller can update
 	 * its outer state (loop counters, early-continue logic).
 	 */
@@ -70,10 +70,27 @@ export class ContradictionScanner {
 		}
 
 		// Sort by similarity descending so highest-risk pairs go first.
-		const sorted = candidates
+		const ranked = candidates
 			.map((c) => ({ c, sim: cosineSimilarity(entry.embedding, c.embedding) }))
-			.sort((a, b) => b.sim - a.sim)
+			.sort((a, b) => b.sim - a.sim);
+		const simById = new Map(ranked.map(({ c, sim }) => [c.id, sim]));
+
+		const { contradictionMaxCandidates, contradictionMinTopSimilarity } =
+			config.consolidation;
+		if (ranked[0].sim < contradictionMinTopSimilarity) {
+			logger.log(
+				`[contradiction] ${logPrefix}Skipped: best candidate similarity ${ranked[0].sim.toFixed(3)} is below ${contradictionMinTopSimilarity}.`,
+			);
+			return { entrySuperseded: false, detected: 0, resolved: 0 };
+		}
+		const sorted = ranked
+			.slice(0, contradictionMaxCandidates)
 			.map(({ c }) => c);
+		if (ranked.length > sorted.length) {
+			logger.log(
+				`[contradiction] ${logPrefix}Capped ${ranked.length} candidates to the top ${sorted.length} by similarity.`,
+			);
+		}
 
 		const totalBatches = Math.ceil(sorted.length / CONTRADICTION_BATCH_SIZE);
 		if (totalBatches > 1) {
@@ -125,7 +142,7 @@ export class ContradictionScanner {
 				}
 				detected++;
 				logger.log(
-					`[contradiction] ${logPrefix}${result.resolution}: ${JSON.stringify(entry.content)} vs candidate ${result.candidateId} — ${JSON.stringify(result.reason)}`,
+					`[contradiction] ${logPrefix}${result.resolution}: ${JSON.stringify(entry.content)} vs candidate ${result.candidateId} (sim=${simById.get(result.candidateId)?.toFixed(3)}) — ${JSON.stringify(result.reason)}`,
 				);
 
 				// The LLM layer has already validated merge fields (see llm-output.ts), so a

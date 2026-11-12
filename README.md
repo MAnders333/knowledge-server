@@ -442,6 +442,8 @@ All sources are auto-detected. Override paths or disable sources via environment
 | `CONSOLIDATION_MIN_MESSAGES` | `4` | Minimum messages for a session to be eligible |
 | `RECONSOLIDATION_SIMILARITY_THRESHOLD` | `0.78` | Near-duplicate merge cutoff |
 | `CONTRADICTION_MIN_SIMILARITY` | `0.4` | Lower bound of the contradiction scan band |
+| `CONTRADICTION_MAX_CANDIDATES` | unset (no cap) | Most candidates checked per entry and scan path, highest similarity first; checked in batches of 10 |
+| `CONTRADICTION_MIN_TOP_SIMILARITY` | unset | Skip an entry whose best candidate is below this similarity (unset = no floor) |
 
 ### Decay
 

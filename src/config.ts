@@ -124,6 +124,11 @@ export const REVIEW_STALE_STRENGTH_THRESHOLD = 0.3;
 export const DEFAULT_RECONSOLIDATION_THRESHOLD = 0.78;
 /** Lower bound of the contradiction scan band. */
 export const DEFAULT_CONTRADICTION_MIN_SIMILARITY = 0.4;
+/**
+ * Most candidates checked per entry and per scan path, ranked by similarity.
+ * Unbounded by default: a lower cap has not been validated for recall.
+ */
+export const DEFAULT_CONTRADICTION_MAX_CANDIDATES = Number.POSITIVE_INFINITY;
 /** Minimum raw cosine similarity to activate an entry. */
 export const DEFAULT_ACTIVATION_SIMILARITY_THRESHOLD = 0.42;
 /**
@@ -463,6 +468,20 @@ export const config = {
 		contradictionMinSimilarity: parseFloatEnv(
 			process.env.CONTRADICTION_MIN_SIMILARITY,
 			DEFAULT_CONTRADICTION_MIN_SIMILARITY,
+		),
+		// Most candidates sent to the contradiction check per entry and scan path,
+		// highest similarity first. Unset = no cap. Lower values cut LLM calls but
+		// lose detections past the cap.
+		contradictionMaxCandidates: parseIntEnv(
+			process.env.CONTRADICTION_MAX_CANDIDATES,
+			DEFAULT_CONTRADICTION_MAX_CANDIDATES,
+			1,
+		),
+		// An entry whose best candidate is below this similarity is not scanned.
+		// 0 disables the floor (every in-band candidate is checked).
+		contradictionMinTopSimilarity: parseFloatEnv(
+			process.env.CONTRADICTION_MIN_TOP_SIMILARITY,
+			0,
 		),
 		// Cosine similarity threshold for assigning an entry to an existing cluster
 		// during greedy clustering. Kept broad by default — heterogeneous members give
@@ -840,6 +859,19 @@ export function validateConfig(): string[] {
 		liveReconsolidationThreshold,
 		`Must be strictly below the ${liveReconsolidationThreshold} reconsolidation threshold. Default is ${config.consolidation.contradictionMinSimilarity}.`,
 		true, // hiExclusive
+	);
+	validateIntMin(
+		process.env.CONTRADICTION_MAX_CANDIDATES,
+		"CONTRADICTION_MAX_CANDIDATES",
+		1,
+		"Leave unset for no cap.",
+	);
+	validateFloatRange(
+		process.env.CONTRADICTION_MIN_TOP_SIMILARITY,
+		"CONTRADICTION_MIN_TOP_SIMILARITY",
+		0,
+		1,
+		"Leave unset to disable the floor.",
 	);
 	validateFloatRange(
 		process.env.ACTIVATION_SIMILARITY_THRESHOLD,

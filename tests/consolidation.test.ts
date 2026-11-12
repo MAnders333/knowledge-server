@@ -1073,6 +1073,70 @@ describe("ConsolidationEngine.reconsolidate() — 'update' decision (above thres
 	});
 });
 
+describe("ConsolidationEngine.reconsolidate() — unchanged 'update' is not re-checked", () => {
+	const setup = async (updatedContent: string) => {
+		// The existing entry and a topic-overlapping neighbour at cos 0.6, inside the scan band.
+		const existingEmb = [1, 0, 0, 0, 0, 0, 0, 0];
+		await db.insertEntry(
+			makeEntry({
+				id: "existing-ts",
+				content: "TypeScript is statically typed.",
+				topics: ["typescript"],
+				confidence: 0.8,
+				embedding: existingEmb,
+			}),
+		);
+		await db.insertEntry(
+			makeEntry({
+				id: "neighbour-ts",
+				content: "TypeScript compiles to JavaScript.",
+				topics: ["typescript"],
+				embedding: [0.6, 0.8, 0, 0, 0, 0, 0, 0],
+			}),
+		);
+		mockReader._sessions = [{ id: "session-1", maxMessageTime: Date.now() }];
+		mockReader._episodes = [makeEpisode()];
+		spyOn(activation, "ensureEmbeddings").mockResolvedValue(0);
+		spyOn(activation.embeddings, "embed").mockResolvedValue(existingEmb);
+		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockResolvedValue([
+			{
+				type: "fact",
+				content: "TypeScript is statically typed.",
+				topics: ["typescript"],
+				confidence: 0.9,
+				source: "test",
+			},
+		]);
+		spyOn(ConsolidationLLM.prototype, "batchDecideMerge").mockResolvedValue([
+			{
+				action: "update",
+				content: updatedContent,
+				type: "fact",
+				topics: ["typescript"],
+				confidence: 0.92,
+			},
+		]);
+		return spyOn(
+			ConsolidationLLM.prototype,
+			"detectAndResolveContradiction",
+		).mockResolvedValue([]);
+	};
+
+	it("does not run the contradiction scan when the update keeps the content", async () => {
+		const contradiction = await setup("TypeScript is statically typed.");
+		await engine.consolidate();
+		expect(contradiction).not.toHaveBeenCalled();
+	});
+
+	it("runs the contradiction scan when the update changes the content", async () => {
+		const contradiction = await setup(
+			"TypeScript is statically typed and supports inference.",
+		);
+		await engine.consolidate();
+		expect(contradiction).toHaveBeenCalled();
+	});
+});
+
 // (synthesis trigger on 'update' tests consolidated into "cluster-based synthesis" describe above)
 
 describe("ConsolidationEngine.reconsolidate() — 'insert' decision (above threshold but distinct)", () => {
