@@ -487,6 +487,15 @@ All sources are auto-detected. Override paths or disable sources via environment
 |---|---|---|
 | `ACTIVATION_MAX_RESULTS` | `10` | Max entries returned per activation |
 | `ACTIVATION_SIMILARITY_THRESHOLD` | `0.42` | Minimum cosine similarity to activate |
+| `ACTIVATION_PRECISION_GATE` | `on` | `off` disables the floors and the token budget below (dedupe is separate) |
+| `RERANK_FLOOR` | unset | Absolute rerank-score floor for the configured scorer. Unset: relative rule only, since no per-model floor is calibrated yet |
+| `RERANK_REL_FRAC` | `0.35` | A candidate must reach this fraction of the best rerank score |
+| `ACTIVATION_DENSE_MARGIN` | `0` | Used when rerank did not run: raw cosine must clear the threshold by this margin |
+| `ACTIVATION_TOKEN_BUDGET` | `2000` | Estimated tokens (chars / 4) for the injected entries. The top entry is always kept. Codex truncates hook output near 2,500 tokens, so keep this at or below 2,000 |
+| `ACTIVATION_SESSION_TTL_MS` | `1800000` | Per-session dedupe: an entry injected in a session with a client session id is suppressed for this long. `0` disables it. Without a session id there is no dedupe |
+| `ACTIVATION_STRENGTH_DAMPENING` | `false` | Rank-time freshness dampening: `rerank × (0.5 + 0.5·strength)` instead of `rerank × strength` |
+
+Injected entries are counted in `injection_count`, and `last_accessed_at` moves at most once per entry per 24 h. `access_count` is no longer incremented by injection and keeps its existing values. Injections are recorded in the store that owns each entry; read-only stores are skipped. Requests the client abandoned are not recorded. Dedupe state lives in server memory: a restart or a compaction in the client can repeat one injection (the TTL is the only reset).
 
 ### Reranking
 
