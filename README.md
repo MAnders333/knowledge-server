@@ -242,6 +242,10 @@ Configuration is split across two files:
 
 **`~/.config/knowledge-server/.env`** — credentials and tuning parameters (API keys, model names, thresholds). Read by the server binary at startup from `$KNOWLEDGE_CONFIG_HOME/.env` or `$XDG_CONFIG_HOME/knowledge-server/.env` (default `~/.config/knowledge-server/.env`; the legacy `~/.local/share/knowledge-server/.env` is used when neither exists). Compiled binaries never read a `.env` from the current directory.
 
+**Keys a `.env` cannot set.** Process-control keys are ignored: `PATH`, `HOME`, `TMPDIR`, `IFS`, `SHELL`, `SHELLOPTS`, `BASHOPTS`, `BASH_ENV`, `ENV`, `PS4`, `PROMPT_COMMAND`, `CDPATH`, `GLOBIGNORE`, `NODE_OPTIONS`, `NODE_PATH`, `NODE_TLS_REJECT_UNAUTHORIZED`, `BUN_OPTIONS`, `SSL_CERT_DIR`, `CURL_HOME`, `SSLKEYLOGFILE`, `KNOWLEDGE_CONFIG_HOME`, and every `LD_*`, `DYLD_*`, `BUN_INSTALL*`, `BUN_CONFIG_*` and `XDG_*` key. Each ignored key is named in a startup warning (`[env] Ignored N key(s) in <file>`); its value is never printed. Set these in the service environment instead (the launchd plist `EnvironmentVariables`, the systemd unit `Environment=`, or the shell that starts the server).
+
+**Proxy and CA variables are read from `.env`.** `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` (and their lowercase forms), `NODE_EXTRA_CA_CERTS`, `CURL_CA_BUNDLE` and `SSL_CERT_FILE` are loaded from this file, so a machine behind a corporate proxy or CA keeps them across binary upgrades.
+
 **`~/.config/knowledge-server/config.jsonc`** — store topology (which databases to use and where). Created automatically on first run (default: local SQLite). Edit this for Postgres or multi-store setups.
 
 ### Editor validation (`$schema`)
