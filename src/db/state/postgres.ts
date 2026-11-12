@@ -13,6 +13,14 @@ type TxSql = any;
 
 const STATE_SCHEMA_VERSION = 2;
 
+const PG_ATTEMPTS_TABLE = `
+  CREATE TABLE IF NOT EXISTS pending_episode_attempts (
+    id              TEXT    PRIMARY KEY,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT
+  );
+`;
+
 const PG_CREATE_STATE_TABLES = `
   CREATE TABLE IF NOT EXISTS state_schema_version (
     version    INTEGER NOT NULL UNIQUE,
@@ -34,10 +42,10 @@ const PG_CREATE_STATE_TABLES = `
     session_timestamp BIGINT  NOT NULL DEFAULT 0,
     max_message_time  BIGINT  NOT NULL DEFAULT 0,
     approx_tokens     INTEGER NOT NULL DEFAULT 0,
-    uploaded_at       BIGINT  NOT NULL,
-    failed_attempts   INTEGER NOT NULL DEFAULT 0,
-    last_error        TEXT
+    uploaded_at       BIGINT  NOT NULL
   );
+
+  ${PG_ATTEMPTS_TABLE}
 
   CREATE INDEX IF NOT EXISTS idx_pending_source_time
     ON pending_episodes(source, max_message_time);
@@ -166,11 +174,7 @@ export class PostgresServerStateDB implements IServerStateDB {
 			const versionRow = rows[0] as { v: number | null } | undefined;
 			const current = Number(versionRow?.v ?? 0);
 			if (current >= STATE_SCHEMA_VERSION) return;
-			await tx.unsafe(`
-				ALTER TABLE pending_episodes
-					ADD COLUMN IF NOT EXISTS failed_attempts INTEGER NOT NULL DEFAULT 0,
-					ADD COLUMN IF NOT EXISTS last_error TEXT
-			`);
+			await tx.unsafe(PG_ATTEMPTS_TABLE);
 			await tx`
 				INSERT INTO state_schema_version (version, applied_at)
 				VALUES (${STATE_SCHEMA_VERSION}, ${Date.now()})
@@ -210,11 +214,7 @@ export class PostgresServerStateDB implements IServerStateDB {
 	): Promise<PendingEpisode[]> {
 		await this.initialize();
 		const rows = await this.sql`
-			SELECT * FROM pending_episodes
-			WHERE max_message_time > ${afterMaxMessageTime}
-			  AND failed_attempts < ${PENDING_EPISODE_MAX_ATTEMPTS}
-			ORDER BY max_message_time ASC
-			LIMIT ${limit}
+			SELECT p.*, COALESCE(a.failed_attempts, 0) AS failed_attempts FROM pending_episodes p LEFT JOIN pending_episode_attempts a ON a.id = p.id WHERE p.max_message_time > ${afterMaxMessageTime} AND COALESCE(a.failed_attempts, 0) < ${PENDING_EPISODE_MAX_ATTEMPTS} ORDER BY p.max_message_time ASC LIMIT ${limit}
 		`;
 		return rows.map((r) => ({
 			id: r.id as string,
@@ -239,8 +239,10 @@ export class PostgresServerStateDB implements IServerStateDB {
 	async deletePendingEpisodes(ids: string[]): Promise<void> {
 		if (ids.length === 0) return;
 		await this.initialize();
-		await this
-			.sql`DELETE FROM pending_episodes WHERE id = ANY(${this.sql.array(ids)})`;
+		await this.sql.begin(async (sql: TxSql) => {
+			await sql`DELETE FROM pending_episode_attempts WHERE id = ANY(${this.sql.array(ids)})`;
+			await sql`DELETE FROM pending_episodes WHERE id = ANY(${this.sql.array(ids)})`;
+		});
 	}
 
 	async recordPendingEpisodeFailures(
@@ -250,17 +252,37 @@ export class PostgresServerStateDB implements IServerStateDB {
 		if (ids.length === 0) return;
 		await this.initialize();
 		await this.sql`
-			UPDATE pending_episodes
-			SET failed_attempts = failed_attempts + 1, last_error = ${error}
-			WHERE id = ANY(${this.sql.array(ids)})
+			INSERT INTO pending_episode_attempts (id, failed_attempts, last_error)
+			SELECT u, 1, ${error} FROM unnest(${this.sql.array(ids)}::text[]) AS u
+			ON CONFLICT (id) DO UPDATE SET
+				failed_attempts = pending_episode_attempts.failed_attempts + 1,
+				last_error = EXCLUDED.last_error
 		`;
+	}
+
+	async countDeadLetteredEpisodes(): Promise<number> {
+		await this.initialize();
+		const result = await this.sql`
+			SELECT COUNT(*) AS n FROM pending_episodes p
+			JOIN pending_episode_attempts a ON a.id = p.id
+			WHERE a.failed_attempts >= ${PENDING_EPISODE_MAX_ATTEMPTS}
+		`;
+		return Number((result[0] as { n: number }).n);
+	}
+
+	async retryDeadLetteredEpisodes(): Promise<number> {
+		await this.initialize();
+		const result = await this.sql`
+			DELETE FROM pending_episode_attempts
+			WHERE failed_attempts >= ${PENDING_EPISODE_MAX_ATTEMPTS}
+		`;
+		return result.count;
 	}
 
 	async countPendingSessions(): Promise<number> {
 		await this.initialize();
 		const result = await this.sql`
-			SELECT COUNT(DISTINCT session_id) as n FROM pending_episodes
-			WHERE failed_attempts < ${PENDING_EPISODE_MAX_ATTEMPTS}
+			SELECT COUNT(DISTINCT p.session_id) as n FROM pending_episodes p LEFT JOIN pending_episode_attempts a ON a.id = p.id WHERE COALESCE(a.failed_attempts, 0) < ${PENDING_EPISODE_MAX_ATTEMPTS}
 		`;
 		return Number((result[0] as { n: number }).n);
 	}
@@ -391,8 +413,10 @@ export class PostgresServerStateDB implements IServerStateDB {
 		await this.initialize();
 		await this.sql.begin(async (sql: TxSql) => {
 			if (userId === undefined) {
+				await sql`DELETE FROM pending_episode_attempts`;
 				await sql`DELETE FROM pending_episodes`;
 			} else {
+				await sql`DELETE FROM pending_episode_attempts WHERE id IN (SELECT id FROM pending_episodes WHERE user_id = ${userId})`;
 				await sql`DELETE FROM pending_episodes WHERE user_id = ${userId}`;
 			}
 			await sql`DELETE FROM consolidated_episode`;

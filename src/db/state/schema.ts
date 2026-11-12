@@ -39,10 +39,8 @@ export const SERVER_LOCAL_CREATE_TABLES = `
 
   -- Pending episodes — staging table written by the daemon, drained by the server.
   -- user_id is set by the daemon from KNOWLEDGE_USER_ID / hostname (provenance only).
-  -- Rows are deleted after successful consolidation. A row whose consolidation
-  -- failed keeps its row with failed_attempts incremented (dead-lettered at
-  -- PENDING_EPISODE_MAX_ATTEMPTS). v2 added failed_attempts/last_error; existing
-  -- v1 DBs get them from runStateMigrations().
+  -- Rows are deleted after successful consolidation. Failure counts live in
+  -- pending_episode_attempts.
   CREATE TABLE IF NOT EXISTS pending_episodes (
     id               TEXT    PRIMARY KEY,
     user_id          TEXT    NOT NULL DEFAULT 'default',
@@ -58,10 +56,18 @@ export const SERVER_LOCAL_CREATE_TABLES = `
     session_timestamp INTEGER NOT NULL DEFAULT 0,
     max_message_time  INTEGER NOT NULL DEFAULT 0,
     approx_tokens    INTEGER NOT NULL DEFAULT 0,
-    uploaded_at      INTEGER NOT NULL,
-    failed_attempts  INTEGER NOT NULL DEFAULT 0,
-    last_error       TEXT
+    uploaded_at      INTEGER NOT NULL
   );
+
+  -- Failed-attempt bookkeeping, kept apart from pending_episodes. A separate table
+  -- means a schema upgrade never needs ALTER TABLE on pending_episodes, which a
+  -- non-owner role cannot run on a shared Postgres state DB.
+  CREATE TABLE IF NOT EXISTS pending_episode_attempts (
+    id              TEXT    PRIMARY KEY,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT
+  );
+
 
   CREATE INDEX IF NOT EXISTS idx_pending_source_time
     ON pending_episodes(source, max_message_time);

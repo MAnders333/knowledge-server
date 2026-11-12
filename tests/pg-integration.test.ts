@@ -36,6 +36,8 @@ import { PostgresServerStateDB } from "../src/db/state/postgres";
 import { logger } from "../src/logger";
 
 const PG_URI = process.env.PG_TEST_URI;
+// Non-owner role password, built at runtime so no credential literal sits in source.
+const NONOWNER_PW = `pw${crypto.randomUUID().replaceAll("-", "")}`;
 
 // Helper: create a standard test entry object
 function makeEntry(id: string, overrides: Record<string, unknown> = {}) {
@@ -1376,9 +1378,7 @@ describe.skipIf(!PG_URI)("PostgresServerStateDB", () => {
 		await admin`CREATE TABLE IF NOT EXISTS state_schema_version (version INTEGER NOT NULL UNIQUE, applied_at BIGINT NOT NULL)`;
 		await admin`DELETE FROM state_schema_version`;
 		await admin`INSERT INTO state_schema_version (version, applied_at) VALUES (1, 0)`;
-		await admin.unsafe(
-			"ALTER TABLE pending_episodes DROP COLUMN IF EXISTS failed_attempts, DROP COLUMN IF EXISTS last_error",
-		);
+		await admin.unsafe("DROP TABLE IF EXISTS pending_episode_attempts");
 		await admin`DELETE FROM pending_episodes`;
 		for (const row of rows) {
 			await admin`
@@ -1438,6 +1438,38 @@ describe.skipIf(!PG_URI)("PostgresServerStateDB", () => {
 			expect(remaining.map((r) => r.id)).toEqual(["bob-1"]);
 		} finally {
 			await state.close();
+		}
+	});
+	it("upgrades a v1 state DB owned by another role without ALTER TABLE", async () => {
+		await rewindStateToV1([{ id: "owned-1", userId: "alice" }]);
+		const role = "ks_state_nonowner";
+		await admin.unsafe(`
+			DO $$ BEGIN
+				IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${role}') THEN
+					CREATE ROLE ${role} LOGIN PASSWORD '${NONOWNER_PW}';
+				END IF;
+			END $$;
+			GRANT USAGE, CREATE ON SCHEMA public TO ${role};
+			GRANT SELECT, INSERT, UPDATE, DELETE ON pending_episodes, consolidated_episode, consolidation_state, state_schema_version TO ${role};
+		`);
+		const url = new URL(uri);
+		url.username = role;
+		url.password = NONOWNER_PW;
+		const state = new PostgresServerStateDB(url.toString());
+		try {
+			// Must not run ALTER TABLE on pending_episodes (owned by another role).
+			await state.initialize();
+			const [row] = await state.getPendingEpisodes(0);
+			expect(row.id).toBe("owned-1");
+			await state.recordPendingEpisodeFailures(["owned-1"], "boom");
+			expect((await state.getPendingEpisodes(0))[0].failedAttempts).toBe(1);
+		} finally {
+			await state.close();
+			await admin.unsafe(`
+				DROP TABLE IF EXISTS pending_episode_attempts;
+				DROP OWNED BY ${role};
+				DROP ROLE IF EXISTS ${role};
+			`);
 		}
 	});
 });

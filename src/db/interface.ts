@@ -71,6 +71,14 @@ export interface IServerStateDB {
 	 * failed_attempts and stores the error message. Rows are kept for retry.
 	 */
 	recordPendingEpisodeFailures(ids: string[], error: string): Promise<void>;
+	/** Number of pending episodes that reached PENDING_EPISODE_MAX_ATTEMPTS. */
+	countDeadLetteredEpisodes(): Promise<number>;
+
+	/**
+	 * Requeue dead-lettered episodes by clearing their attempt counts.
+	 * Returns the number of episodes requeued.
+	 */
+	retryDeadLetteredEpisodes(): Promise<number>;
 
 	// ── Episode Tracking (idempotency) ────────────────────────────────────────
 

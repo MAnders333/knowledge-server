@@ -153,11 +153,7 @@ export class ServerStateDB implements IServerStateDB {
 	): Promise<PendingEpisode[]> {
 		const rows = this.db
 			.prepare(
-				`SELECT * FROM pending_episodes
-         WHERE max_message_time > ?
-           AND failed_attempts < ?
-         ORDER BY max_message_time ASC
-         LIMIT ?`,
+				"SELECT p.*, COALESCE(a.failed_attempts, 0) AS failed_attempts FROM pending_episodes p LEFT JOIN pending_episode_attempts a ON a.id = p.id WHERE p.max_message_time > ? AND COALESCE(a.failed_attempts, 0) < ? ORDER BY p.max_message_time ASC LIMIT ?",
 			)
 			.all(afterMaxMessageTime, PENDING_EPISODE_MAX_ATTEMPTS, limit) as Array<{
 			id: string;
@@ -201,7 +197,7 @@ export class ServerStateDB implements IServerStateDB {
 	async countPendingSessions(): Promise<number> {
 		const row = this.db
 			.prepare(
-				"SELECT COUNT(DISTINCT session_id) as n FROM pending_episodes WHERE failed_attempts < ?",
+				"SELECT COUNT(DISTINCT p.session_id) as n FROM pending_episodes p LEFT JOIN pending_episode_attempts a ON a.id = p.id WHERE COALESCE(a.failed_attempts, 0) < ?",
 			)
 			.get(PENDING_EPISODE_MAX_ATTEMPTS) as { n: number } | undefined;
 		return row?.n ?? 0;
@@ -209,11 +205,19 @@ export class ServerStateDB implements IServerStateDB {
 
 	async deletePendingEpisodes(ids: string[]): Promise<void> {
 		if (ids.length === 0) return;
-		this.db
-			.prepare(
-				"DELETE FROM pending_episodes WHERE id IN (SELECT value FROM json_each(?))",
-			)
-			.run(JSON.stringify(ids));
+		const json = JSON.stringify(ids);
+		this.db.transaction(() => {
+			this.db
+				.prepare(
+					"DELETE FROM pending_episode_attempts WHERE id IN (SELECT value FROM json_each(?))",
+				)
+				.run(json);
+			this.db
+				.prepare(
+					"DELETE FROM pending_episodes WHERE id IN (SELECT value FROM json_each(?))",
+				)
+				.run(json);
+		})();
 	}
 
 	async recordPendingEpisodeFailures(
@@ -223,11 +227,32 @@ export class ServerStateDB implements IServerStateDB {
 		if (ids.length === 0) return;
 		this.db
 			.prepare(
-				`UPDATE pending_episodes
-         SET failed_attempts = failed_attempts + 1, last_error = ?
-         WHERE id IN (SELECT value FROM json_each(?))`,
+				`INSERT INTO pending_episode_attempts (id, failed_attempts, last_error)
+         SELECT value, 1, ? FROM json_each(?) WHERE true
+         ON CONFLICT (id) DO UPDATE SET
+           failed_attempts = failed_attempts + 1,
+           last_error = excluded.last_error`,
 			)
 			.run(error, JSON.stringify(ids));
+	}
+
+	async countDeadLetteredEpisodes(): Promise<number> {
+		const row = this.db
+			.prepare(
+				`SELECT COUNT(*) as n FROM pending_episodes p
+         JOIN pending_episode_attempts a ON a.id = p.id
+         WHERE a.failed_attempts >= ?`,
+			)
+			.get(PENDING_EPISODE_MAX_ATTEMPTS) as { n: number } | undefined;
+		return row?.n ?? 0;
+	}
+
+	async retryDeadLetteredEpisodes(): Promise<number> {
+		return this.db
+			.prepare(
+				"DELETE FROM pending_episode_attempts WHERE failed_attempts >= ?",
+			)
+			.run(PENDING_EPISODE_MAX_ATTEMPTS).changes;
 	}
 
 	// ── Episode Tracking ──────────────────────────────────────────────────────
@@ -378,8 +403,14 @@ export class ServerStateDB implements IServerStateDB {
 	async reinitialize(userId?: string): Promise<void> {
 		this.db.transaction(() => {
 			if (userId === undefined) {
+				this.db.exec("DELETE FROM pending_episode_attempts");
 				this.db.exec("DELETE FROM pending_episodes");
 			} else {
+				this.db
+					.prepare(
+						"DELETE FROM pending_episode_attempts WHERE id IN (SELECT id FROM pending_episodes WHERE user_id = ?)",
+					)
+					.run(userId);
 				this.db
 					.prepare("DELETE FROM pending_episodes WHERE user_id = ?")
 					.run(userId);
