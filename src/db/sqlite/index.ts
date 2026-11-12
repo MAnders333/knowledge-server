@@ -1010,6 +1010,8 @@ export class KnowledgeDB implements IKnowledgeStore {
 	 *   If supplied, it is written atomically in the same UPDATE statement so the
 	 *   entry never passes through a NULL-embedding state. If omitted, embedding
 	 *   is set to NULL and ensureEmbeddings will regenerate it at end of run.
+	 *
+	 * Resolves true when merged, false (writing nothing) when the target is gone.
 	 */
 	async mergeEntry(
 		id: string,
@@ -1021,7 +1023,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 			additionalSources: string[]; // session IDs from the new episode
 		},
 		embedding?: number[],
-	): Promise<void> {
+	): Promise<boolean> {
 		const existing = await this.getEntry(id);
 		if (!existing) {
 			// The target was deleted after it was chosen as a merge target (e.g. by
@@ -1030,7 +1032,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 			logger.warn(
 				`[db] mergeEntry: entry ${id} was deleted during this run — its extracted knowledge was not merged.`,
 			);
-			return;
+			return false;
 		}
 
 		const mergedSources = [
@@ -1064,6 +1066,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 				embeddingBlob,
 				id,
 			);
+		return true;
 	}
 
 	/**

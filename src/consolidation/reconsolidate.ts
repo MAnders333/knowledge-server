@@ -321,11 +321,28 @@ export class Reconsolidator {
 					),
 				);
 				// existingDb — nearestEntry lives in whichever store entriesMap was loaded from.
-				await existingDb.mergeEntry(
+				const merged = await existingDb.mergeEntry(
 					nearestEntry.id,
 					mergeUpdates,
 					freshEmbedding,
 				);
+				if (!merged) {
+					// The target was deleted after entriesMap was loaded. Keep the extracted
+					// knowledge as a new entry; the stale id must not stay in the cache.
+					entriesMap.delete(nearestEntry.id);
+					const inserted = await this.insertNewEntry(
+						entry,
+						sessionIds,
+						entryEmbedding,
+						sessionTimestamp,
+						insertDb,
+					);
+					logger.log(
+						`[${logPrefix}] Insert (merge target deleted): ${JSON.stringify(entry.content)}`,
+					);
+					await callbacks.onInsert(inserted);
+					break;
+				}
 				logger.log(
 					`[${logPrefix}] ${decision.action === "update" ? "Updated" : "Replaced"}: ${JSON.stringify(nearestEntry.content)} → ${JSON.stringify(decision.content)}`,
 				);
@@ -803,6 +820,7 @@ export class Reconsolidator {
 			updatedAt: entryTime,
 			lastAccessedAt: entryTime,
 			accessCount: 0,
+			injectionCount: 0,
 			observationCount: 1,
 			supersededBy: null,
 			derivedFrom: sessionIds,

@@ -1295,7 +1295,18 @@ export class ConsolidationEngine {
 							const freshEmbedding = await this.activation.embeddings.embed(
 								formatEmbeddingText(safeType, content, decision.topics ?? []),
 							);
-							await store.mergeEntry(nearest.id, mergeUpdates, freshEmbedding);
+							const merged = await store.mergeEntry(
+								nearest.id,
+								mergeUpdates,
+								freshEmbedding,
+							);
+							if (!merged) {
+								// The target was deleted after it was chosen. Keep the extracted
+								// knowledge as a new entry; the stale id must not stay in the cache.
+								entriesMap.delete(nearest.id);
+								await applyInsert(c);
+								break;
+							}
 							logger.log(
 								`[consolidation/${source}] ${decision.action === "update" ? "Updated" : "Replaced"}: ${JSON.stringify(nearest.content)} → ${JSON.stringify(content)}`,
 							);

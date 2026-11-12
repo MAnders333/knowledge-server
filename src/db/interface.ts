@@ -310,6 +310,11 @@ export interface IKnowledgeStore {
 
 	// ── Entry Merge ──
 
+	/**
+	 * Merge new content into an existing entry. Resolves true when the row was
+	 * merged, false when the target no longer exists (deleted after it was chosen).
+	 * On false nothing is written; the caller keeps the knowledge as a new entry.
+	 */
 	mergeEntry(
 		id: string,
 		updates: {
@@ -320,7 +325,7 @@ export interface IKnowledgeStore {
 			additionalSources: string[];
 		},
 		embedding?: number[],
-	): Promise<void>;
+	): Promise<boolean>;
 
 	/**
 	 * Wipe all knowledge entries, relations, clusters, and embeddings.

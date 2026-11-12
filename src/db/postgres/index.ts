@@ -1313,6 +1313,8 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	 * entry temporarily invisible to similarity queries — the same trade-off as
 	 * the SQLite backend. Callers that have already computed the new embedding
 	 * should pass it here to avoid the NULL window.
+	 *
+	 * Resolves true when merged, false (writing nothing) when the target is gone.
 	 */
 	async mergeEntry(
 		id: string,
@@ -1324,7 +1326,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			additionalSources: string[];
 		},
 		embedding?: number[],
-	): Promise<void> {
+	): Promise<boolean> {
 		const existing = await this.getEntry(id);
 		if (!existing) {
 			// The target was deleted after it was chosen as a merge target. Skipped and
@@ -1332,7 +1334,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			logger.warn(
 				`[pg-db] mergeEntry: entry ${id} was deleted during this run — its extracted knowledge was not merged.`,
 			);
-			return;
+			return false;
 		}
 
 		const mergedSources = [
@@ -1395,6 +1397,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				] as postgres.ParameterOrJSON<never>[],
 			);
 		}
+		return true;
 	}
 
 	async reinitialize(): Promise<void> {
