@@ -34,7 +34,7 @@ import { CREATE_TABLES, SCHEMA_VERSION } from "./schema.js";
  * Keep in sync with RawEntryRow.
  */
 const ENTRY_COLUMNS =
-	"id, type, content, topics, confidence, source, status, strength, created_at, updated_at, last_accessed_at, access_count, observation_count, superseded_by, derived_from, is_synthesized";
+	"id, type, content, topics, confidence, source, status, strength, created_at, updated_at, last_accessed_at, access_count, injection_count, observation_count, superseded_by, derived_from, is_synthesized";
 
 /** ENTRY_COLUMNS qualified with a table alias (for joins). */
 function qualifiedEntryColumns(alias: string): string {
@@ -989,6 +989,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 			updatedAt: row.updated_at,
 			lastAccessedAt: row.last_accessed_at,
 			accessCount: row.access_count,
+			injectionCount: row.injection_count,
 			observationCount: row.observation_count,
 			supersededBy: row.superseded_by,
 			derivedFrom: JSON.parse(row.derived_from),
@@ -1382,6 +1383,7 @@ interface RawEntryRow {
 	updated_at: number;
 	last_accessed_at: number;
 	access_count: number;
+	injection_count: number;
 	observation_count: number;
 	superseded_by: string | null;
 	derived_from: string;

@@ -52,6 +52,7 @@ interface RawEntryRow {
 	updated_at: number | string;
 	last_accessed_at: number | string;
 	access_count: number | string;
+	injection_count: number | string;
 	observation_count: number | string;
 	superseded_by: string | null;
 	derived_from: string[] | string;
@@ -69,7 +70,7 @@ const SCHEMA_LOCK_NAME = "knowledge-server:schema-migration";
  * Keep in sync with RawEntryRow.
  */
 const ENTRY_COLUMNS =
-	"id, type, content, topics, confidence, source, status, strength, created_at, updated_at, last_accessed_at, access_count, observation_count, superseded_by, derived_from, is_synthesized";
+	"id, type, content, topics, confidence, source, status, strength, created_at, updated_at, last_accessed_at, access_count, injection_count, observation_count, superseded_by, derived_from, is_synthesized";
 
 /** ENTRY_COLUMNS qualified with the `ke` alias used by the ANN and join queries. */
 const KE_ENTRY_COLUMNS = qualifyColumns(ENTRY_COLUMNS, "ke");
@@ -652,6 +653,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			updatedAt: toNum(row.updated_at),
 			lastAccessedAt: toNum(row.last_accessed_at),
 			accessCount: toNum(row.access_count),
+			injectionCount: toNum(row.injection_count),
 			observationCount: toNum(row.observation_count),
 			supersededBy: row.superseded_by,
 			derivedFrom: Array.isArray(derivedFrom) ? derivedFrom : [],
