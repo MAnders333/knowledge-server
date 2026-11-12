@@ -1,4 +1,5 @@
 import type {
+	ActivationEventRow,
 	ConsolidationState,
 	KnowledgeEntry,
 	KnowledgeRelation,
@@ -131,6 +132,20 @@ export interface IServerStateDB {
 	 * Call DaemonDB.resetDaemonCursors() separately if re-upload is also needed.
 	 */
 	reinitialize(userId?: string): Promise<void>;
+
+	// ── Activation events (measurement, content-free) ─────────────────────────
+
+	/** Append content-free activation_event rows. Batched by the caller. */
+	insertActivationEvents(rows: ActivationEventRow[]): Promise<void>;
+
+	/** Delete activation_event rows with ts < cutoffMs. Returns the number deleted. */
+	pruneActivationEvents(cutoffMs: number): Promise<number>;
+
+	/** Injected activations per client since sinceMs (ts >= sinceMs). */
+	countActivationsByClient(sinceMs: number): Promise<Record<string, number>>;
+
+	/** Captured episodes per source since sinceMs (consolidated_episode.processed_at >= sinceMs). */
+	countEpisodesBySource(sinceMs: number): Promise<Record<string, number>>;
 
 	close(): Promise<void>;
 }

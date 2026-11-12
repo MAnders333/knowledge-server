@@ -309,6 +309,40 @@ export interface ActivationResult {
 	}>;
 	query: string;
 	totalActive: number;
+	/**
+	 * Facts about how this result was produced, for the activation_event table.
+	 * Never sent to clients (the HTTP handler strips it) and carries no content.
+	 */
+	telemetry?: ActivationTelemetry;
+}
+
+/** How the candidate ordering was produced: cross-encoder, dense-only, or no reranker configured. */
+export type GateMode = "rerank" | "dense" | "off";
+
+export interface ActivationTelemetry {
+	cueCount: number;
+	nCandidates: number;
+	gateMode: GateMode;
+}
+
+/** One content-free row of the activation_event table (see src/activation/events.ts). */
+export interface ActivationEventRow {
+	/** Epoch milliseconds. */
+	ts: number;
+	client: string;
+	/** Hash of the client session id; null when the client did not send one. */
+	sessionHash: string | null;
+	promptChars: number;
+	cueCount: number;
+	nCandidates: number;
+	nReturned: number;
+	entryIds: string[];
+	rawSims: number[];
+	/** Cross-encoder score per returned entry (null for support sources); null when no rerank ran. */
+	rerankScores: Array<number | null> | null;
+	gateMode: GateMode;
+	latencyMs: number;
+	clientDeadlineExceeded: boolean;
 }
 
 /**

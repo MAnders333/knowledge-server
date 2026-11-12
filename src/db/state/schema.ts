@@ -22,6 +22,7 @@ import { latestVersion } from "../migration-registry.js";
 export const SERVER_LOCAL_MIGRATIONS = [
 	{ version: 1, label: "baseline state schema" },
 	{ version: 2, label: "pending_episode_attempts table" },
+	{ version: 3, label: "activation_event table (content-free measurement)" },
 ] as const;
 
 export const SERVER_LOCAL_SCHEMA_VERSION = latestVersion(
@@ -77,6 +78,31 @@ export const SERVER_LOCAL_CREATE_TABLES = `
     last_error      TEXT
   );
 
+
+  -- Content-free telemetry, one row per /activate result. Never holds prompt or
+  -- entry text. Pruned after 90 days (see src/activation/events.ts).
+  CREATE TABLE IF NOT EXISTS activation_event (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                       INTEGER NOT NULL,
+    client                   TEXT    NOT NULL,
+    session_hash             TEXT,
+    prompt_chars             INTEGER NOT NULL,
+    cue_count                INTEGER NOT NULL,
+    n_candidates             INTEGER NOT NULL,
+    n_returned               INTEGER NOT NULL,
+    entry_ids                TEXT    NOT NULL,
+    raw_sims                 TEXT    NOT NULL,
+    rerank_scores            TEXT,
+    gate_mode                TEXT    NOT NULL CHECK(gate_mode IN ('rerank', 'dense', 'off')),
+    latency_ms               INTEGER NOT NULL,
+    client_deadline_exceeded INTEGER NOT NULL DEFAULT 0
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_activation_event_ts
+    ON activation_event(ts);
+
+  CREATE INDEX IF NOT EXISTS idx_activation_event_client_ts
+    ON activation_event(client, ts);
 
   CREATE INDEX IF NOT EXISTS idx_pending_source_time
     ON pending_episodes(source, max_message_time);
