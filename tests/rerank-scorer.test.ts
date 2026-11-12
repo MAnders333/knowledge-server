@@ -206,18 +206,26 @@ describe("LocalReranker (stub session)", () => {
 		expect(new Set(scores).size).toBe(3);
 	});
 
-	it("keeps the last 64 query tokens and the first 128 document tokens", async () => {
+	it("exposes its provider and model", () => {
+		expect(synthReranker().identity).toEqual({
+			provider: "local",
+			model: SYNTH_MODEL,
+		});
+	});
+
+	it("keeps the last maxQueryTokens query tokens and the first maxDocTokens document tokens", async () => {
 		installSyntheticModel();
 		const session = await useFakeSession();
+		const { maxQueryTokens: q, maxDocTokens: d } = config.activation.rerank;
 		await synthReranker().scoreBatch(words(600, 0), [words(300, 500)]);
 
 		const ids = Array.from(session.runs[0].input_ids.data, Number);
-		const queryTail = Array.from({ length: 64 }, (_, i) => 10 + 536 + i);
-		expect(ids.slice(1, 65)).toEqual(queryTail);
-		expect(ids[65]).toBe(3); // [SEP]
-		expect(ids[66]).toBe(10 + 500); // document starts at its first word
-		expect(ids[66 + 128]).toBe(3); // [SEP] after 128 document tokens
-		expect(ids).toHaveLength(66 + 128 + 1);
+		const queryTail = Array.from({ length: q }, (_, i) => 10 + 600 - q + i);
+		expect(ids.slice(1, 1 + q)).toEqual(queryTail);
+		expect(ids[1 + q]).toBe(3); // [SEP]
+		expect(ids[2 + q]).toBe(10 + 500); // document starts at its first word
+		expect(ids[2 + q + d]).toBe(3); // [SEP] after maxDocTokens document tokens
+		expect(ids).toHaveLength(2 + q + d + 1);
 	});
 
 	it("downloads artifacts through a temp file and renames them into place", async () => {

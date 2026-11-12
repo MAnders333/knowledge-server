@@ -488,21 +488,31 @@ All sources are auto-detected. Override paths or disable sources via environment
 | `ACTIVATION_MAX_RESULTS` | `10` | Max entries returned per activation |
 | `ACTIVATION_SIMILARITY_THRESHOLD` | `0.42` | Minimum cosine similarity to activate |
 
-### Reranking (local cross-encoder)
+### Reranking
 
-Dense retrieval overfetches `RERANK_CANDIDATES` entries and a local cross-encoder re-scores them. It runs offline after a one-time model download (~23MB). The default model is pinned to a Hugging Face revision and checksum. If reranking fails or times out, activation uses dense ordering.
+Dense retrieval overfetches `RERANK_CANDIDATES` entries and a second stage re-scores them. If reranking fails or times out, activation uses dense ordering. Two providers are available:
+
+- `local` (default): an in-process cross-encoder. It runs offline after a one-time model download (~23MB). The default model is pinned to a Hugging Face revision and checksum. Nothing leaves the machine.
+- `remote` (opt-in): one listwise call per activation to a decision model on the LLM gateway (`RERANK_REMOTE_MODEL`, default `clef`). It uses the gateway in `LLM_BASE_ENDPOINT` and `LLM_API_KEY`; per-provider keys are not used. It needs no local model memory and does not block the event loop. After 3 consecutive failures remote reranking pauses for 60 s, and dense ordering is used meanwhile.
+
+> **Privacy: `RERANK_PROVIDER=remote` sends content off this machine.** On every activation the remote provider sends (1) the query tail, the last `RERANK_MAX_QUERY_TOKENS` tokens of the prompt, and (2) the text of each candidate entry, its first `RERANK_MAX_DOC_TOKENS` tokens with its type and topics. Only the candidates dense retrieval returned for that prompt are sent, never the whole store. The gateway forwards the request to the hosting provider of `RERANK_REMOTE_MODEL`. Retention and processing terms are those of the gateway and the model host, which this project does not control. Keep the default `local` provider unless you accept that.
 
 | Variable | Default | Description |
 |---|---|---|
 | `RERANK_ENABLED` | `true` | `false` restores dense-only ordering |
-| `RERANK_MODEL` | `Xenova/ms-marco-MiniLM-L-6-v2` | Hugging Face ONNX cross-encoder. **The default is English-only.** For other languages use a multilingual ONNX export with a WordPiece `tokenizer.json`. Other models are fetched from `main` without a checksum |
-| `RERANK_MODELS_DIR` | `~/.local/share/knowledge-server/models` | Model cache |
-| `RERANK_CANDIDATES` | `40` | Dense candidates scored per activation |
-| `RERANK_TIMEOUT_MS` | `2000` | Budget for one rerank call. On expiry the whole batch falls back to dense ordering (no partial scores) |
-| `RERANK_MAX_QUERY_TOKENS` | `64` | Last N tokens of the prompt used as the rerank query |
-| `RERANK_MAX_DOC_TOKENS` | `128` | First N tokens of each candidate that is scored |
+| `RERANK_PROVIDER` | `local` | `local` or `remote`. Any other value fails validation. `remote` sends content off this machine (see the privacy note) |
+| `RERANK_MODEL` | `Xenova/ms-marco-MiniLM-L-6-v2` | Local Hugging Face ONNX cross-encoder. **The default is English-only.** For other languages use a multilingual ONNX export with a WordPiece `tokenizer.json`. Other models are fetched from `main` without a checksum |
+| `RERANK_MODELS_DIR` | `~/.local/share/knowledge-server/models` | Local model cache |
+| `RERANK_CANDIDATES` | `16` | Dense candidates scored per activation. Remote scores at most 40 |
+| `RERANK_TIMEOUT_MS` | `3000` | Budget for one local rerank call. On expiry the whole batch falls back to dense ordering (no partial scores) |
+| `RERANK_MAX_QUERY_TOKENS` | `128` | Last N tokens of the prompt used as the rerank query (remote: N × 4 characters) |
+| `RERANK_MAX_DOC_TOKENS` | `256` | First N tokens of each candidate that is scored (remote: N × 4 characters). Shorter caps lowered quality on long documents |
+| `RERANK_REMOTE_MODEL` | `clef` | Gateway decision model for `RERANK_PROVIDER=remote`. Lower-tier models (for example `clef-flash`) scored below BM25 in our evaluation |
+| `RERANK_REMOTE_TIMEOUT_MS` | `4000` | Budget for one gateway call. It sits inside the 5 s plugin budget; on expiry dense ordering is used |
 
-Pairs are scored one at a time and the event loop is yielded between them, so one long candidate no longer stalls other requests. Size `RERANK_CANDIDATES` so that candidates × ~40 ms (Apple Silicon) fits within `RERANK_TIMEOUT_MS`; on slower CPUs lower the count or raise the timeout.
+Remote mode needs both `LLM_BASE_ENDPOINT` and `LLM_API_KEY`. If either is missing (or still a template placeholder), the server logs a warning at startup and uses the local reranker.
+
+Pairs are scored one at a time and the event loop is yielded between them, so one long candidate no longer stalls other requests. Latency grows with the token caps. Measured on a 10-core Apple Silicon machine at a load average of about 12, 16 candidates at the defaults took a median of 2.5 s and 20 candidates took 3.2 s. With long prompts and long candidates on every pair, 16 candidates took 3.9 s, so those calls fall back to dense ordering. On slower CPUs lower `RERANK_CANDIDATES` or `RERANK_MAX_QUERY_TOKENS`, or raise `RERANK_TIMEOUT_MS`. Keep it well under 5 s, because the plugin gives up after that.
 
 ## Usage
 

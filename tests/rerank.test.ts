@@ -128,6 +128,7 @@ function makeEntries() {
 function makeInvertingScorer(): RerankScorer & { calls: string[][] } {
 	const calls: string[][] = [];
 	return {
+		identity: { provider: "local", model: "test/inverting" },
 		calls,
 		scoreBatch: mock((_query: string, documents: string[]) => {
 			calls.push(documents);
@@ -143,6 +144,7 @@ function makeInvertingScorer(): RerankScorer & { calls: string[][] } {
 
 function makeFailingScorer(): RerankScorer {
 	return {
+		identity: { provider: "local", model: "test/failing" },
 		scoreBatch: mock(() => Promise.reject(new Error("model exploded"))),
 	};
 }

@@ -7,6 +7,7 @@ import {
 	BertWordPieceTokenizer,
 	MAX_SEQUENCE_LENGTH,
 } from "./bert-tokenizer.js";
+import { createRemoteRerankerFromConfig } from "./rerank-remote.js";
 
 // Onnxruntime-web WASM runtime (plain build, not asyncify), imported with Bun's
 // file loader:
@@ -71,12 +72,23 @@ import wasmRuntimeBin from "../../node_modules/onnxruntime-web/dist/ort-wasm-sim
  * dense-only ordering — activation must never break because of the reranker.
  */
 
+/** Where a scorer's numbers come from. Score-dependent settings are keyed by it. */
+export type RerankProvider = "local" | "remote";
+
+export interface RerankIdentity {
+	provider: RerankProvider;
+	/** Hugging Face repo for the local model, gateway model name for remote. */
+	model: string;
+}
+
 /**
  * Minimal scorer interface used by ActivationEngine. Kept separate from
  * LocalReranker so tests can inject deterministic fakes without loading a
  * model (and without network access).
  */
 export interface RerankScorer {
+	/** Provider and model that produced the scores. */
+	readonly identity: RerankIdentity;
 	/**
 	 * Score each document's relevance to the query.
 	 * Returns one score per document (same order), normalized to [0, 1].
@@ -142,6 +154,10 @@ export class LocalReranker implements RerankScorer {
 		this.timeoutMs = opts?.timeoutMs ?? config.activation.rerank.timeoutMs;
 		this.downloadTimeoutMs =
 			opts?.downloadTimeoutMs ?? MODEL_DOWNLOAD_TIMEOUT_MS;
+	}
+
+	get identity(): RerankIdentity {
+		return { provider: "local", model: this.modelId };
 	}
 
 	/**
@@ -380,7 +396,7 @@ export class LocalReranker implements RerankScorer {
  * The model load is kicked off in the background (preload) so server startup
  * is not blocked by the first-download case.
  */
-export function createRerankerFromConfig(): LocalReranker | null {
+export function createRerankerFromConfig(): RerankScorer | null {
 	const rerank = config.activation.rerank;
 	if (!rerank.enabled) {
 		logger.log(
@@ -388,9 +404,21 @@ export function createRerankerFromConfig(): LocalReranker | null {
 		);
 		return null;
 	}
+	if (rerank.provider === "remote") {
+		const remote = createRemoteRerankerFromConfig();
+		if (remote) {
+			logger.log(
+				`[rerank] Enabled: provider "remote", model "${remote.identity.model}" via LLM_BASE_ENDPOINT. Each activation sends the query tail and candidate text to the gateway. Timeout ${rerank.remote.timeoutMs}ms; candidates ${rerank.candidates}; document ≤${rerank.maxDocTokens} tokens.`,
+			);
+			return remote;
+		}
+		logger.warn(
+			"[rerank] RERANK_PROVIDER=remote needs LLM_BASE_ENDPOINT and LLM_API_KEY (unset or still the template placeholder) — using the local reranker.",
+		);
+	}
 	const pin = PINNED_MODELS[rerank.model];
 	logger.log(
-		`[rerank] Enabled: model "${rerank.model}" (${pin ? `pinned to ${pin.revision.slice(0, 12)}` : "unpinned, revision main"}${rerank.model === DEFAULT_RERANK_MODEL ? ", English-only" : ""}); mode: WASM, one pair per run, timeout ${rerank.timeoutMs}ms; candidates ${rerank.candidates}, query ≤${rerank.maxQueryTokens} tokens, document ≤${rerank.maxDocTokens} tokens.`,
+		`[rerank] Enabled: provider "local", model "${rerank.model}" (${pin ? `pinned to ${pin.revision.slice(0, 12)}` : "unpinned, revision main"}${rerank.model === DEFAULT_RERANK_MODEL ? ", English-only" : ""}); mode: WASM, one pair per run, timeout ${rerank.timeoutMs}ms; candidates ${rerank.candidates}, query ≤${rerank.maxQueryTokens} tokens, document ≤${rerank.maxDocTokens} tokens.`,
 	);
 	const reranker = new LocalReranker();
 	reranker.preload();

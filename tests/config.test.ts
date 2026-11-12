@@ -26,6 +26,7 @@ const ENV_VARS = [
 	"ACTIVATION_SIMILARITY_THRESHOLD",
 	"EMBEDDING_DIMENSIONS",
 	"OPENAI_MAX_TOKENS_PARAM",
+	"RERANK_PROVIDER",
 ] as const;
 
 type EnvVar = (typeof ENV_VARS)[number];
@@ -331,5 +332,23 @@ describe("validateConfig — multiple errors accumulated", () => {
 		expect(
 			errors.filter((e) => e.includes("EMBEDDING_DIMENSIONS")),
 		).toHaveLength(1);
+	});
+});
+
+// ── RERANK_PROVIDER ───────────────────────────────────────────────────────────
+
+describe("validateConfig — RERANK_PROVIDER", () => {
+	it("accepts local and remote, in any case", () => {
+		for (const value of ["local", "remote", " Remote "]) {
+			process.env.RERANK_PROVIDER = value;
+			expect(envErrors()).toEqual([]);
+		}
+	});
+
+	it("reports an unknown provider instead of running a silent fallback", () => {
+		process.env.RERANK_PROVIDER = "remtoe";
+		const errors = envErrors();
+		expect(errors).toHaveLength(1);
+		expect(errors[0]).toContain('RERANK_PROVIDER must be "local" or "remote"');
 	});
 });
