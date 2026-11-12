@@ -15,6 +15,7 @@ const PLUGIN_DIR = join(import.meta.dir, "..", "plugin");
 async function startupProbeUrls(
 	pluginFile: "knowledge.ts" | "pi-knowledge.ts" | "omp-knowledge.ts",
 	configJsonc: string,
+	extraEnv: Record<string, string> = {},
 ): Promise<string[]> {
 	const home = mkdtempSync(join(tmpdir(), "ks-plugin-home-"));
 	try {
@@ -58,6 +59,7 @@ console.log(JSON.stringify(urls));
 			if (v !== undefined && !k.startsWith("KNOWLEDGE_")) env[k] = v;
 		}
 		env.HOME = home;
+		Object.assign(env, extraEnv);
 
 		const proc = Bun.spawnSync([process.execPath, probe], {
 			env,
@@ -93,6 +95,17 @@ describe.each(["knowledge.ts", "pi-knowledge.ts", "omp-knowledge.ts"] as const)(
 				`{ "stores": [{ "id": "main", "kind": "sqlite", "writable": true }] }`,
 			);
 			expect(urls[0]).toBe("http://127.0.0.1:3179/status");
+		});
+
+		// WHATWG URL reports an IPv6 literal with its brackets, so the loopback
+		// check must compare "[::1]", not "::1".
+		it("accepts an IPv6 loopback KNOWLEDGE_SERVER_URL", async () => {
+			const urls = await startupProbeUrls(
+				pluginFile,
+				`{ "stores": [{ "id": "main", "kind": "sqlite", "writable": true }] }`,
+				{ KNOWLEDGE_SERVER_URL: "http://[::1]:3179" },
+			);
+			expect(urls[0]).toBe("http://[::1]:3179/status");
 		});
 	},
 );
