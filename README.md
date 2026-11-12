@@ -444,6 +444,7 @@ All sources are auto-detected. Override paths or disable sources via environment
 | `CONTRADICTION_MIN_SIMILARITY` | `0.4` | Lower bound of the contradiction scan band |
 | `CONTRADICTION_MAX_CANDIDATES` | unset (no cap) | Most candidates checked per entry and scan path, highest similarity first; checked in batches of 10 |
 | `CONTRADICTION_MIN_TOP_SIMILARITY` | unset | Skip an entry whose best candidate is below this similarity (unset = no floor) |
+| `CONTRADICTION_CONFLICTS_ONLY` | `false` | Opt-in: reply lists conflicts only (about 65% fewer output tokens per call). Recall is not validated; enable only after an online spot-check |
 
 ### Decay
 
