@@ -185,3 +185,118 @@ describe("runKBSynthesis — peer cap and token budget", () => {
 		expect(targets).toEqual([sentId]);
 	});
 });
+
+describe("runKBSynthesis — ripeness of already-synthesized clusters", () => {
+	let db: KnowledgeDB;
+	let tempDir: string;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(join(tmpdir(), "synthesis-ripeness-"));
+		db = new KnowledgeDB(join(tempDir, "test.db"));
+	});
+
+	afterEach(async () => {
+		await db.close();
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	const flush = () => new Promise((resolve) => setTimeout(resolve, 5));
+
+	function member(i: number, prefix = "r"): KnowledgeEntry {
+		return makeEntry({
+			id: `${prefix}${i}`,
+			content: `Ripeness member ${prefix}${i}.`,
+			topics: ["topic"],
+			embedding: memberVec(i),
+		});
+	}
+
+	async function insertMembers(from: number, to: number, prefix = "r") {
+		for (let i = from; i < to; i++) await db.insertEntry(member(i, prefix));
+	}
+
+	function makeReconsolidator() {
+		const synthesizePrinciple = mock(
+			async (_peers: SentPeer[]): Promise<SynthesisResult[]> => [],
+		);
+		const llm = { synthesizePrinciple } as unknown as ConsolidationLLM;
+		const embeddings = {
+			embed: async () => SYNTH_EMBEDDING,
+		} as unknown as EmbeddingClient;
+		return {
+			rec: new Reconsolidator(db, embeddings, llm),
+			synthesizePrinciple,
+		};
+	}
+
+	/** Synthesize a 20-member cluster once (never-synthesized → ripe), then settle. */
+	async function synthesizedCluster(size = 20) {
+		await insertMembers(0, size);
+		const harness = makeReconsolidator();
+		await harness.rec.runKBSynthesis(db);
+		expect(harness.synthesizePrinciple).toHaveBeenCalledTimes(1);
+		await flush();
+		harness.synthesizePrinciple.mockClear();
+		return harness;
+	}
+
+	it("a never-synthesized cluster at the minimum size is always ripe", async () => {
+		await insertMembers(0, 5);
+		const { rec, synthesizePrinciple } = makeReconsolidator();
+		await rec.runKBSynthesis(db);
+		expect(synthesizePrinciple).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not re-synthesize after a single new member joins a 20-member cluster", async () => {
+		const { rec, synthesizePrinciple } = await synthesizedCluster();
+
+		await insertMembers(20, 21, "n");
+		await rec.runKBSynthesis(db);
+
+		expect(synthesizePrinciple).not.toHaveBeenCalled();
+	});
+
+	it("re-synthesizes once three members join a 20-member cluster at once", async () => {
+		const { rec, synthesizePrinciple } = await synthesizedCluster();
+
+		await insertMembers(20, 23, "n");
+		await rec.runKBSynthesis(db);
+
+		expect(synthesizePrinciple).toHaveBeenCalledTimes(1);
+	});
+
+	it("accumulates new members across passes until the bar is crossed", async () => {
+		const { rec, synthesizePrinciple } = await synthesizedCluster();
+
+		await insertMembers(20, 21, "n");
+		await rec.runKBSynthesis(db);
+		expect(synthesizePrinciple).not.toHaveBeenCalled();
+
+		await insertMembers(21, 23, "n");
+		await rec.runKBSynthesis(db);
+		// 1 joined in the earlier pass + 2 now = 3 new since last synthesis.
+		expect(synthesizePrinciple).toHaveBeenCalledTimes(1);
+	});
+
+	it("uses the fraction bar for a small cluster: 2 new of 10 members is ripe", async () => {
+		// 8 synthesized members + 2 new = 10 current; 2 >= 0.2 * 10 (and below the
+		// absolute bar of 3), so the fraction condition alone makes it ripe.
+		const { rec, synthesizePrinciple } = await synthesizedCluster(8);
+
+		await insertMembers(8, 10, "n");
+		await rec.runKBSynthesis(db);
+
+		expect(synthesizePrinciple).toHaveBeenCalledTimes(1);
+	});
+
+	it("members that only left do not count as a material change", async () => {
+		const { rec, synthesizePrinciple } = await synthesizedCluster();
+
+		for (let i = 0; i < 5; i++) {
+			await db.updateEntry(`r${i}`, { status: "archived" });
+		}
+		await rec.runKBSynthesis(db);
+
+		expect(synthesizePrinciple).not.toHaveBeenCalled();
+	});
+});

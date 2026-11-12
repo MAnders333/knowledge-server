@@ -75,6 +75,32 @@ function selectSynthesisPeers(
 }
 
 /**
+ * True when an already-synthesized cluster has changed materially since its last
+ * synthesis: at least SYNTHESIS_MIN_NEW_MEMBERS current members joined since, or at
+ * least SYNTHESIS_MIN_NEW_FRACTION of its members did. A member counts as new when its
+ * persisted join time is absent (joined in this pass) or after lastSynthesizedAt.
+ * Members that only left never count.
+ */
+function hasMaterialChange(
+	memberIds: string[],
+	joinedAt: Map<string, number>,
+	lastSynthesizedAt: number,
+): boolean {
+	let newSince = 0;
+	for (const id of memberIds) {
+		const joined = joinedAt.get(id);
+		if (joined === undefined || joined > lastSynthesizedAt) newSince++;
+	}
+	if (newSince === 0) return false;
+	const { synthesisMinNewMembers, synthesisMinNewFraction } =
+		config.consolidation;
+	return (
+		newSince >= synthesisMinNewMembers ||
+		newSince >= synthesisMinNewFraction * memberIds.length
+	);
+}
+
+/**
  * Handles the reconsolidation of a single extracted knowledge entry
  * against the current knowledge base.
  *
@@ -343,8 +369,10 @@ export class Reconsolidator {
 	 *    - Persisted clusters with no match → deleted (entries dispersed).
 	 *
 	 * 3. RIPENESS CHECK:
-	 *    - last_membership_changed_at > last_synthesized_at OR last_synthesized_at IS NULL.
 	 *    - Minimum CLUSTER_MIN_MEMBERS (env: CLUSTER_MIN_MEMBERS) members.
+	 *    - last_synthesized_at IS NULL, OR a material change since then: at least
+	 *      SYNTHESIS_MIN_NEW_MEMBERS members (or SYNTHESIS_MIN_NEW_FRACTION of members)
+	 *      joined after last_synthesized_at (see hasMaterialChange).
 	 *
 	 * 4. SYNTHESIS (per ripe cluster):
 	 *    - All members are candidate peers (no anchor/neighbor distinction), but the
@@ -453,11 +481,13 @@ export class Reconsolidator {
 			isNew: boolean;
 			membershipChanged: boolean;
 			lastSynthesizedAt: number | null;
+			joinedAt: Map<string, number>;
 		}> = inMemoryClusters.map((cluster, idx) => {
 			// Find the persisted cluster that matched this in-memory cluster (if any)
 			let matchedId: string | null = null;
 			let lastSynthesizedAt: number | null = null;
 			let previousMemberIds: string[] = [];
+			let previousJoinedAt = new Map<string, number>();
 
 			for (const [persistedId, inMemIdx] of persistedToInMemory) {
 				if (inMemIdx === idx) {
@@ -468,6 +498,7 @@ export class Reconsolidator {
 					if (persistedCluster) {
 						lastSynthesizedAt = persistedCluster.lastSynthesizedAt;
 						previousMemberIds = persistedCluster.memberIds;
+						previousJoinedAt = persistedCluster.memberJoinedAt;
 					}
 					break;
 				}
@@ -490,6 +521,7 @@ export class Reconsolidator {
 				isNew,
 				membershipChanged,
 				lastSynthesizedAt: isNew ? null : lastSynthesizedAt,
+				joinedAt: previousJoinedAt,
 			};
 		});
 
@@ -513,11 +545,16 @@ export class Reconsolidator {
 		let synthesized = 0;
 
 		for (const cluster of resolvedClusters) {
-			// Ripeness: must have changed membership since last synthesis (or never synthesized)
-			// AND meet minimum member count.
+			// Ripeness: never synthesized, or materially changed since last synthesis,
+			// AND meets minimum member count.
 			const isRipe =
 				cluster.memberIds.length >= CLUSTER_MIN_MEMBERS &&
-				(cluster.lastSynthesizedAt === null || cluster.membershipChanged);
+				(cluster.lastSynthesizedAt === null ||
+					hasMaterialChange(
+						cluster.memberIds,
+						cluster.joinedAt,
+						cluster.lastSynthesizedAt,
+					));
 
 			if (!isRipe) continue;
 

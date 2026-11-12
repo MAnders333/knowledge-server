@@ -383,6 +383,19 @@ export const config = {
 			30_000,
 			1000,
 		),
+		// Re-synthesizing an already-synthesized cluster requires a material change: at
+		// least SYNTHESIS_MIN_NEW_MEMBERS members joined since its last synthesis, or at
+		// least SYNTHESIS_MIN_NEW_FRACTION (0..1) of its current members did. Counting is
+		// cumulative across clustering passes until the cluster synthesizes.
+		synthesisMinNewMembers: parseIntEnv(
+			process.env.SYNTHESIS_MIN_NEW_MEMBERS,
+			3,
+			1,
+		),
+		synthesisMinNewFraction: Math.min(
+			1,
+			parseFloatEnv(process.env.SYNTHESIS_MIN_NEW_FRACTION, 0.2, 0),
+		),
 		// Polling interval for background auto-consolidation while the server is running.
 		// Default: 8 hours (28_800_000 ms). Only triggers when pending sessions exist,
 		// so a quiet period costs nothing. Matches the sleep-consolidation metaphor —
