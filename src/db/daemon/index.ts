@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { logger } from "../../logger.js";
 import type { DaemonCursor } from "../../types.js";
+import { ensurePrivateFile } from "../../utils.js";
 
 /**
  * Default path for daemon.db — the daemon-local SQLite database.
@@ -57,6 +58,7 @@ export class DaemonDB {
 		if (!existsSync(dir)) {
 			mkdirSync(dir, { recursive: true });
 		}
+		ensurePrivateFile(dbPath);
 		this.db = new Database(dbPath);
 		this.db.exec("PRAGMA journal_mode=WAL");
 		this.db.exec("PRAGMA foreign_keys=ON");

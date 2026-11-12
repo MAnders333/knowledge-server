@@ -1,5 +1,6 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { ensurePrivateFile } from "./utils.js";
 
 /**
  * Minimal logger that tees all output to stdout AND an append-only log file.
@@ -11,7 +12,6 @@ import { dirname } from "node:path";
  *   immediately useful. raw() writes a timestamp to the file but not to stdout,
  *   so the banner looks clean in the terminal while still being parseable on disk.
  * - Same .log/.warn/.error API as console.* so call sites are a mechanical replace.
- * - cli.ts is intentionally excluded — CLI output is user-facing, not operational.
  * - mcp/index.ts is intentionally excluded — it uses stdio transport; writing to
  *   stdout would corrupt the MCP framing.
  * - Disabled when logPath is empty string ("") — stdout-only mode (used in tests).
@@ -53,6 +53,8 @@ class Logger {
 			// degrades to stdout-only rather than crashing before any output reaches the user.
 			try {
 				mkdirSync(dirname(logPath), { recursive: true });
+				// Logs can carry prompts and tokens — create the file owner-only.
+				ensurePrivateFile(logPath);
 			} catch (err) {
 				process.stderr.write(
 					`[logger] Could not create log directory for ${logPath}: ${serialize(err)}\n`,

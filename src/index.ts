@@ -395,7 +395,10 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	}
 
 	if (config.pidPath) {
-		writeFileSync(config.pidPath, String(process.pid), "utf8");
+		writeFileSync(config.pidPath, String(process.pid), {
+			encoding: "utf8",
+			mode: 0o600,
+		});
 	}
 
 	logger.raw(`\n✓ HTTP API listening on http://${host}:${port}`);
@@ -412,7 +415,17 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	logger.raw(
 		`  ALL  /mcp                              — MCP streamable-http${adminTokenIsStable ? " [admin token required]" : " (unauthenticated — local only)"}`,
 	);
-	logger.rawStdoutOnly(`\n  Admin token (keep this private): ${adminToken}`);
+	if (process.stdout.isTTY) {
+		logger.rawStdoutOnly(`\n  Admin token (keep this private): ${adminToken}`);
+	} else {
+		// Non-terminal stdout is usually a log file (launchd/systemd/nohup redirect),
+		// so the token is never printed there.
+		logger.raw(
+			adminTokenIsStable
+				? "\n  Admin token: from KNOWLEDGE_ADMIN_TOKEN (not printed: stdout is not a terminal)."
+				: "\n  Admin token: random per process (not printed: stdout is not a terminal). Set KNOWLEDGE_ADMIN_TOKEN for a stable token.",
+		);
+	}
 	logger.rawStdoutOnly(
 		`  curl -X POST -H "Authorization: Bearer <token>" http://${host}:${port}/consolidate`,
 	);
