@@ -154,4 +154,17 @@ describe("containsInjectedKnowledge", () => {
 			false,
 		);
 	});
+
+	it("still detects a tag with spaces and slashes inside the brackets", () => {
+		expect(containsInjectedKnowledge("< / addrl-activated-knowledge>")).toBe(
+			true,
+		);
+	});
+
+	it("answers quickly on a long whitespace run after '<'", () => {
+		const hostile = `<${" ".repeat(200_000)}x`;
+		const started = performance.now();
+		expect(containsInjectedKnowledge(hostile)).toBe(false);
+		expect(performance.now() - started).toBeLessThan(250);
+	});
 });

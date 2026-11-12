@@ -17,8 +17,14 @@ export const MAX_ENTRY_CHARS = 1000;
 /** Total cap for the injected block's entry lines (characters, before escaping). */
 export const MAX_CONTEXT_CHARS = 6000;
 
+/**
+ * Opening or closing form of the tag. The gap between `<` and the name is
+ * bounded: unbounded whitespace and slash quantifiers backtrack quadratically
+ * on a long run of spaces after one `<`, and this runs on whole untrusted
+ * transcript messages.
+ */
 const INJECTED_TAG_PATTERN = new RegExp(
-	`<\\s*/?\\s*${ACTIVATED_KNOWLEDGE_TAG}(?![\\w-])`,
+	`<[\\s/]{0,32}${ACTIVATED_KNOWLEDGE_TAG}(?![\\w-])`,
 	"i",
 );
 
