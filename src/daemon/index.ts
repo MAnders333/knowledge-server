@@ -30,6 +30,7 @@
 
 // Load .env from default config location for binary installs — must be first.
 import "../env.js";
+import pkg from "../../package.json" with { type: "json" };
 import { DaemonDB } from "../db/daemon/index.js";
 import { createServerStateDB } from "../db/state/factory.js";
 import { logger } from "../logger.js";
@@ -40,6 +41,26 @@ import { EpisodeUploader } from "./uploader.js";
 
 // Parse CLI args
 const args = process.argv.slice(2);
+
+// Side-effect-free exits, before any DB connection. `knowledge-server update`
+// runs `--version` on staged binaries before swapping them in.
+if (args.includes("--version")) {
+	console.log(`knowledge-daemon v${pkg.version}`);
+	process.exit(0);
+}
+if (args.includes("--help") || args.includes("-h")) {
+	console.log(`knowledge-daemon v${pkg.version}
+
+Usage: knowledge-daemon [--interval=SECONDS] [--once]
+
+Uploads local AI tool session episodes to the server state DB.
+  --interval=SECONDS  Polling interval (default 1800)
+  --once              Upload once and exit
+  --version           Print version and exit
+  -h, --help          Show this help message and exit
+`);
+	process.exit(0);
+}
 const intervalArg = args.find((a) => a.startsWith("--interval="));
 const parsedInterval = intervalArg
 	? Number.parseInt(intervalArg.split("=")[1], 10)
