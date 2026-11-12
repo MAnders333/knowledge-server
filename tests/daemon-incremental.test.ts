@@ -356,3 +356,44 @@ describe("DaemonDB — session cursors", () => {
 		expect(await daemonDb.hasDaemonCursor(SOURCE)).toBe(false);
 	});
 });
+
+describe("EpisodeUploader — free-text fields are scrubbed before staging", () => {
+	it("redacts a credential in the session title, project and directory", async () => {
+		const token = ["ghp_", "d".repeat(36)].join("");
+		const start = Date.now() - 2 * HOUR_MS;
+		const sessions = new Map<string, FakeSession>([
+			[
+				"s1",
+				{
+					id: "s1",
+					messages: msgs(
+						Array.from({ length: MIN + 2 }, (_, i) => `t${i}`),
+						start,
+					),
+				},
+			],
+		]);
+		const base = fakeReader(sessions);
+		const reader = {
+			...base,
+			getNewEpisodes: (ids: string[], ranges: Map<string, ProcessedRange[]>) =>
+				base.getNewEpisodes(ids, ranges).map((ep) => ({
+					...ep,
+					sessionTitle: `Debug ${token}`,
+					projectName: `proj ${token}`,
+					directory: `/work/${token}`,
+				})),
+		};
+		const uploader = new EpisodeUploader([reader], db, daemonDb, "alice", {
+			initialLookbackDays: 0,
+		});
+
+		await uploader.upload();
+
+		const rows = await db.getPendingEpisodes(0);
+		expect(rows.length).toBeGreaterThan(0);
+		const staged = JSON.stringify(rows);
+		expect(staged).not.toContain(token);
+		expect(staged).toContain("[REDACTED:github_token]");
+	});
+});

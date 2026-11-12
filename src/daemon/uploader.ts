@@ -242,9 +242,21 @@ export class EpisodeUploader {
 			const ep = stripNulFromEpisode(raw);
 			if (ep !== raw) nulStripped++;
 
-			let scrubbed: RedactionResult;
+			// Every free-text field is scrubbed: the title, project and directory are
+			// copied into the staged row and into each extraction prompt, not only the content.
+			let scrubbed: [
+				RedactionResult,
+				RedactionResult,
+				RedactionResult,
+				RedactionResult,
+			];
 			try {
-				scrubbed = redactSecrets(ep.content);
+				scrubbed = [
+					redactSecrets(ep.content),
+					redactSecrets(ep.sessionTitle),
+					redactSecrets(ep.projectName),
+					redactSecrets(ep.directory),
+				];
 			} catch (err) {
 				// Fail closed: an episode that cannot be scrubbed is never uploaded. It
 				// is recorded as handled so it cannot hold the cursor back forever.
@@ -261,9 +273,12 @@ export class EpisodeUploader {
 				progressMax = Math.max(progressMax, ep.maxMessageTime);
 				continue;
 			}
-			for (const [kind, n] of Object.entries(scrubbed.counts)) {
-				redactionCounts[kind] = (redactionCounts[kind] ?? 0) + n;
+			for (const result of scrubbed) {
+				for (const [kind, n] of Object.entries(result.counts)) {
+					redactionCounts[kind] = (redactionCounts[kind] ?? 0) + n;
+				}
 			}
+			const [content, title, project, directory] = scrubbed;
 			const pending: PendingEpisode = {
 				id: randomUUID(),
 				userId: this.userId,
@@ -271,12 +286,12 @@ export class EpisodeUploader {
 				sessionId: ep.sessionId,
 				startMessageId: ep.startMessageId,
 				endMessageId: ep.endMessageId,
-				sessionTitle: ep.sessionTitle,
-				projectName: ep.projectName,
-				directory: ep.directory,
+				sessionTitle: title.text,
+				projectName: project.text,
+				directory: directory.text,
 				timeCreated: ep.timeCreated,
 				maxMessageTime: ep.maxMessageTime,
-				content: scrubbed.text,
+				content: content.text,
 				contentType: ep.contentType,
 				approxTokens: ep.approxTokens,
 				uploadedAt: Date.now(),

@@ -2,6 +2,7 @@ import { cosineSimilarity } from "../activation/embeddings.js";
 import { config } from "../config.js";
 import type { IKnowledgeStore } from "../db/index.js";
 import { logger } from "../logger.js";
+import { redactSecrets } from "../redact.js";
 import type { KnowledgeEntry } from "../types.js";
 import type { ConsolidationLLM } from "./llm.js";
 
@@ -152,7 +153,8 @@ export class ContradictionScanner {
 					result.mergedContent !== undefined &&
 					result.mergedType !== undefined
 						? {
-								content: result.mergedContent,
+								// LLM output is stored, so it is scrubbed like any transcript text.
+								content: redactSecrets(result.mergedContent).text,
 								type: result.mergedType,
 								topics: result.mergedTopics ?? [],
 								confidence: result.mergedConfidence ?? 0.7,

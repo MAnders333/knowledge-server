@@ -186,6 +186,55 @@ describe("runKBSynthesis — peer cap and token budget", () => {
 	});
 });
 
+describe("runKBSynthesis — stored principles are scrubbed", () => {
+	let db: KnowledgeDB;
+	let tempDir: string;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(join(tmpdir(), "synthesis-scrub-"));
+		db = new KnowledgeDB(join(tempDir, "test.db"));
+	});
+
+	afterEach(async () => {
+		await db.close();
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("redacts a credential in a synthesized principle before it is stored", async () => {
+		const members = Array.from({ length: 60 }, (_, i) =>
+			makeEntry({
+				id: `scrub${i}`,
+				content: `Member ${i} says something short.`,
+				topics: ["topic"],
+				embedding: memberVec(i),
+			}),
+		);
+		for (const m of members) await db.insertEntry(m);
+		const token = ["sk-", "c".repeat(24)].join("");
+		const llm = {
+			synthesizePrinciple: async (): Promise<SynthesisResult[]> => [
+				{
+					type: "principle",
+					content: `Rotate the key ${token} monthly`,
+					topics: ["topic"],
+					confidence: 0.8,
+					sourceIds: [members[0].id],
+				},
+			],
+		} as unknown as ConsolidationLLM;
+		const embeddings = {
+			embed: async () => SYNTH_EMBEDDING,
+		} as unknown as EmbeddingClient;
+
+		await new Reconsolidator(db, embeddings, llm).runKBSynthesis(db);
+
+		const stored = (await db.getEntries({})).map((e) => e.content).join("\n");
+		expect(stored).toContain("Rotate the key");
+		expect(stored).not.toContain(token);
+		expect(stored).toContain("[REDACTED:openai_key]");
+	});
+});
+
 describe("runKBSynthesis — ripeness of already-synthesized clusters", () => {
 	let db: KnowledgeDB;
 	let tempDir: string;

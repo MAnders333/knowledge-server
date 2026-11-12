@@ -196,6 +196,7 @@ interface Recorded {
 	resolution: string;
 	entryId: string;
 	candidateId: string;
+	mergedData?: { content: string };
 }
 
 function fakeStore(pool: Scanned[], applied: Recorded[]): IKnowledgeStore {
@@ -205,8 +206,9 @@ function fakeStore(pool: Scanned[], applied: Recorded[]): IKnowledgeStore {
 			resolution: string,
 			entryId: string,
 			candidateId: string,
+			mergedData?: { content: string },
 		) => {
-			applied.push({ resolution, entryId, candidateId });
+			applied.push({ resolution, entryId, candidateId, mergedData });
 		},
 	} as unknown as IKnowledgeStore;
 }
@@ -363,5 +365,41 @@ describe("ContradictionScanner: intra-chunk path", () => {
 		);
 		const first = calls.find((c) => c.entryId === "chunk-a");
 		expect(first?.candidateIds).toEqual(["chunk-0", "chunk-1"]);
+	});
+});
+
+describe("ContradictionScanner: stored merge content is scrubbed", () => {
+	it("redacts a credential the LLM echoes into a merged entry", async () => {
+		const a = makeEntry("merge-a", 1);
+		const b = makeEntry("merge-b", 0.85);
+		const token = ["ghp_", "b".repeat(36)].join("");
+		spyLLM((_entry, candidates) => [
+			{
+				candidateId: candidates[0].id,
+				resolution: "merge",
+				reason: "same fact",
+				mergedContent: `Deploy with token ${token} on Thursdays`,
+				mergedType: "fact",
+				mergedTopics: ["server"],
+				mergedConfidence: 0.8,
+			},
+		]);
+		const applied: Recorded[] = [];
+		const entriesMap = new Map<string, Scanned>([
+			[a.id, a],
+			[b.id, b],
+		]);
+
+		await new ContradictionScanner(new ConsolidationLLM()).scan(
+			fakeStore([], applied),
+			entriesMap,
+			new Set([a.id, b.id]),
+		);
+
+		expect(applied).toHaveLength(1);
+		const stored = applied[0].mergedData?.content ?? "";
+		expect(stored).not.toContain(token);
+		expect(stored).toContain("[REDACTED:github_token]");
+		expect(stored).toContain("on Thursdays");
 	});
 });
