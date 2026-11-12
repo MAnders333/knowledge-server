@@ -1,6 +1,9 @@
 import { existsSync } from "node:fs";
 import { rename, unlink } from "node:fs/promises";
+import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { resolveDataDir } from "../config-file.js";
+import { restartDaemonAfterUpdate } from "./daemon-restart.js";
 import {
 	EXTENSION_ASSETS,
 	readExtensionTargets,
@@ -27,6 +30,8 @@ export interface InstallDeps {
 	fetchFn?: FetchFn;
 	/** Runs a staged or installed binary; true when it exits 0. Injectable for tests. */
 	smoke?: SmokeFn;
+	/** Restarts or stops the running daemon after the swap. Injectable for tests. */
+	restartDaemon?: () => Promise<unknown>;
 }
 
 /** One release asset to install. `dest` decides the staging directory. */
@@ -291,6 +296,24 @@ export async function downloadAndInstallDaemon(
  * @param currentVersion - the version string of the currently running binary (e.g. "v1.0.1")
  * @param deps - injectable I/O for tests
  */
+/** Restart or stop the running daemon using the real environment. Never throws. */
+async function restartDaemonFromUpdate(): Promise<void> {
+	try {
+		await restartDaemonAfterUpdate({
+			platform: process.platform,
+			home: process.env.HOME || homedir(),
+			uid: process.getuid?.() ?? 0,
+			dataDir: resolveDataDir(),
+			log: (line) => console.log(line),
+			warn: (line) => console.warn(line),
+		});
+	} catch (err) {
+		console.warn(
+			`  ⚠ Could not restart the daemon: ${err instanceof Error ? err.message : String(err)}. Restart it manually.`,
+		);
+	}
+}
+
 export async function runUpdate(
 	argv: string[],
 	currentVersion: string,
@@ -476,6 +499,9 @@ export async function runUpdate(
 	console.log(
 		`  Previous binaries kept as ${basename(execPath)}${PREV_SUFFIX} and knowledge-daemon${PREV_SUFFIX} for rollback.`,
 	);
+
+	// The daemon still running the old binary would upload next to the new one.
+	await (deps.restartDaemon ?? restartDaemonFromUpdate)();
 	console.log("  Restart the server to pick up the new binary.");
 
 	const current = parseVersion(currentVersion);

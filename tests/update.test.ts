@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { restartDaemonAfterUpdate } from "../src/commands/daemon-restart";
 import {
 	GITHUB_RELEASES,
 	detectPlatform,
@@ -23,6 +24,8 @@ import {
 	installVerifiedAssets,
 	isDowngrade,
 } from "../src/commands/update";
+import { tryAcquireProcessLock } from "../src/process-lock";
+import { daemonLockPath } from "../src/runtime-files";
 
 const VERSION = "v9.9.9";
 
@@ -330,5 +333,135 @@ describe("isDowngrade", () => {
 		expect(isDowngrade("v3.10.3", "v3.10.3")).toBe(false);
 		expect(isDowngrade("v3.10.3", "v3.11.0")).toBe(false);
 		expect(isDowngrade("v3.10.3", "v4.0.0")).toBe(false);
+	});
+});
+
+describe("restartDaemonAfterUpdate", () => {
+	const noSleep = async () => {};
+	let home: string;
+	let dataDir: string;
+	const log = () => {};
+	const warn = () => {};
+
+	beforeEach(() => {
+		home = mkdtempSync(join(tmpdir(), "ks-restart-home-"));
+		dataDir = mkdtempSync(join(tmpdir(), "ks-restart-data-"));
+	});
+
+	afterEach(() => {
+		rmSync(home, { recursive: true, force: true });
+		rmSync(dataDir, { recursive: true, force: true });
+	});
+
+	it("kickstarts a registered launchd service instead of signalling the process", async () => {
+		const plistDir = join(home, "Library", "LaunchAgents");
+		mkdirSync(plistDir, { recursive: true });
+		writeFileSync(
+			join(plistDir, "com.knowledge-server.daemon.plist"),
+			"<plist/>",
+		);
+		const calls: Array<[string, string[]]> = [];
+		const signal = () => {
+			throw new Error("must not signal a service-managed daemon");
+		};
+
+		const outcome = await restartDaemonAfterUpdate({
+			platform: "darwin",
+			home,
+			uid: 501,
+			dataDir,
+			run: (cmd, args) => {
+				calls.push([cmd, args]);
+				return 0;
+			},
+			signal,
+			log,
+			warn,
+		});
+
+		expect(outcome).toBe("service-restarted");
+		expect(calls).toEqual([
+			["launchctl", ["kickstart", "-k", "gui/501/com.knowledge-server.daemon"]],
+		]);
+	});
+
+	it("restarts a systemd user unit on Linux and reports a failed restart", async () => {
+		const unitDir = join(home, ".config", "systemd", "user");
+		mkdirSync(unitDir, { recursive: true });
+		writeFileSync(join(unitDir, "knowledge-daemon.service"), "[Unit]");
+		const calls: string[][] = [];
+		const ok = await restartDaemonAfterUpdate({
+			platform: "linux",
+			home,
+			uid: 1000,
+			dataDir,
+			run: (cmd, args) => {
+				calls.push([cmd, ...args]);
+				return 0;
+			},
+			log,
+			warn,
+		});
+		expect(ok).toBe("service-restarted");
+		expect(calls).toEqual([
+			["systemctl", "--user", "restart", "knowledge-daemon"],
+		]);
+
+		const failed = await restartDaemonAfterUpdate({
+			platform: "linux",
+			home,
+			uid: 1000,
+			dataDir,
+			run: () => 1,
+			log,
+			warn,
+		});
+		expect(failed).toBe("failed");
+	});
+
+	it("stops a running auto-spawned daemon with SIGTERM and waits for it to exit", async () => {
+		const lock = tryAcquireProcessLock(daemonLockPath(dataDir));
+		expect(lock).not.toBeNull();
+		const signals: Array<[number, string]> = [];
+		let stopped = false;
+		try {
+			const outcome = await restartDaemonAfterUpdate({
+				platform: "darwin",
+				home,
+				uid: 501,
+				dataDir,
+				run: () => {
+					throw new Error("no service registered");
+				},
+				signal: (pid, sig) => {
+					signals.push([pid, sig]);
+					stopped = true;
+				},
+				alive: () => !stopped,
+				sleep: noSleep,
+				log,
+				warn,
+			});
+			expect(outcome).toBe("daemon-stopped");
+			expect(signals).toEqual([[process.pid, "SIGTERM"]]);
+		} finally {
+			lock?.release();
+		}
+	});
+
+	it("reports not-running when no daemon holds the lock", async () => {
+		const outcome = await restartDaemonAfterUpdate({
+			platform: "linux",
+			home,
+			uid: 1000,
+			dataDir,
+			run: () => 1,
+			signal: () => {
+				throw new Error("nothing to signal");
+			},
+			log,
+			warn,
+		});
+		expect(outcome).toBe("not-running");
 	});
 });
