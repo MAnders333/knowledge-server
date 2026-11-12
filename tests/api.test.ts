@@ -709,18 +709,26 @@ describe("HTTP API", () => {
 			);
 
 			// All resolution types should return 422
-			for (const resolution of ["supersede_this", "supersede_other", "merge", "delete"]) {
+			for (const resolution of [
+				"supersede_this",
+				"supersede_other",
+				"merge",
+				"delete",
+			]) {
 				const body: Record<string, string> = { resolution };
 				if (resolution === "merge") body.mergedContent = "merged text";
 
-				const res = await crossStoreApp.request("/entries/cross-store-entry/resolve", {
-					method: "POST",
-					headers: {
-						Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
-						"Content-Type": "application/json",
+				const res = await crossStoreApp.request(
+					"/entries/cross-store-entry/resolve",
+					{
+						method: "POST",
+						headers: {
+							Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
+							"Content-Type": "application/json",
+						},
+						body: JSON.stringify(body),
 					},
-					body: JSON.stringify(body),
-				});
+				);
 				expect(res.status).toBe(422);
 				const data = await res.json();
 				expect(data.error).toMatch(/[Cc]ross.store/);

@@ -2,18 +2,18 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import type { IServerStateDB } from "../interface.js";
 import { logger } from "../../logger.js";
 import type {
 	ConsolidationState,
 	PendingEpisode,
 	ProcessedRange,
 } from "../../types.js";
+import type { IServerStateDB } from "../interface.js";
+import { runStateMigrations } from "./migrations.js";
 import {
 	SERVER_LOCAL_CREATE_TABLES,
 	SERVER_LOCAL_SCHEMA_VERSION,
 } from "./schema.js";
-import { runStateMigrations } from "./migrations.js";
 
 /**
  * Default path for state.db — the server-local staging/bookkeeping database.

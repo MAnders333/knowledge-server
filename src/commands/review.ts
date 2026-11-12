@@ -125,7 +125,7 @@ export async function runReview(args: string[]): Promise<void> {
 			const entryService = serviceByStore.get(entryStore);
 			if (!entryService) {
 				throw new Error(
-					`[review] No service for entry store — this is a bug (store not in readDbs)`,
+					"[review] No service for entry store — this is a bug (store not in readDbs)",
 				);
 			}
 

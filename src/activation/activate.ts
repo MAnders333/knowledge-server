@@ -450,18 +450,14 @@ export class ActivationEngine {
 				const documents = scored.map((s) =>
 					formatEmbeddingText(s.entry.type, s.entry.content, s.entry.topics),
 				);
-				const scores = await this.reranker.scoreBatch(
-					primaryQuery,
-					documents,
-				);
+				const scores = await this.reranker.scoreBatch(primaryQuery, documents);
 				for (let i = 0; i < scored.length; i++) {
 					scored[i].rerankScore = scores[i];
 					scored[i].similarity = scores[i] * scored[i].staleness.strength;
 				}
 			} catch (err) {
 				logger.warn(
-					`[activation] Rerank failed — using dense-only ordering. ` +
-						`Reason: ${err instanceof Error ? err.message : String(err)}`,
+					`[activation] Rerank failed — using dense-only ordering. Reason: ${err instanceof Error ? err.message : String(err)}`,
 				);
 			}
 		}

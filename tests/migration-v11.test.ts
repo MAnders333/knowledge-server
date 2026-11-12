@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 /**
  * Tests for the SQLite migration chain from v10 → v17.
  *
@@ -12,7 +13,6 @@
  * This test verifies the full migration chain produces the correct final schema version.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

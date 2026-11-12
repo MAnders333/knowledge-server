@@ -22,9 +22,13 @@ import { BertWordPieceTokenizer } from "./bert-tokenizer.js";
 // Paths are relative because onnxruntime-web's package `exports` does not
 // expose ./dist/* — the bundler resolves and embeds them identically.
 // @ts-ignore — path module declared in src/assets.d.ts
-import wasmRuntimeMjs from "../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.mjs" with { type: "file" };
+import wasmRuntimeMjs from "../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.mjs" with {
+	type: "file",
+};
 // @ts-ignore — path module declared in src/assets.d.ts
-import wasmRuntimeBin from "../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.wasm" with { type: "file" };
+import wasmRuntimeBin from "../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.wasm" with {
+	type: "file",
+};
 
 /**
  * Local in-process cross-encoder reranker.
@@ -109,7 +113,10 @@ export class LocalReranker implements RerankScorer {
 		});
 	}
 
-	private async load(): Promise<{ tokenizer: BertWordPieceTokenizer; session: OrtSession }> {
+	private async load(): Promise<{
+		tokenizer: BertWordPieceTokenizer;
+		session: OrtSession;
+	}> {
 		if (this.failed) {
 			throw new Error("reranker model failed to load previously");
 		}
@@ -118,15 +125,17 @@ export class LocalReranker implements RerankScorer {
 			this.loadPromise.catch((err) => {
 				this.failed = true;
 				logger.warn(
-					`[rerank] Model load failed — reranking disabled for this process (dense-only ordering). ` +
-						`Reason: ${err instanceof Error ? err.message : String(err)}`,
+					`[rerank] Model load failed — reranking disabled for this process (dense-only ordering). Reason: ${err instanceof Error ? err.message : String(err)}`,
 				);
 			});
 		}
 		return this.loadPromise;
 	}
 
-	private async doLoad(): Promise<{ tokenizer: BertWordPieceTokenizer; session: OrtSession }> {
+	private async doLoad(): Promise<{
+		tokenizer: BertWordPieceTokenizer;
+		session: OrtSession;
+	}> {
 		const start = Date.now();
 		logger.log(
 			`[rerank] Loading cross-encoder model "${this.modelId}" (first run downloads ~23MB into ${config.activation.rerank.modelsDir})...`,
@@ -225,11 +234,7 @@ export class LocalReranker implements RerankScorer {
 
 			const ort = await import("onnxruntime-web");
 			const inputs: Record<string, unknown> = {
-				input_ids: new ort.Tensor(
-					"int64",
-					features.inputIds,
-					features.dims,
-				),
+				input_ids: new ort.Tensor("int64", features.inputIds, features.dims),
 				attention_mask: new ort.Tensor(
 					"int64",
 					features.attentionMask,
@@ -277,7 +282,9 @@ export class LocalReranker implements RerankScorer {
  */
 export function createRerankerFromConfig(): LocalReranker | null {
 	if (!config.activation.rerank.enabled) {
-		logger.log("[rerank] Disabled (RERANK_ENABLED=false) — dense-only ordering.");
+		logger.log(
+			"[rerank] Disabled (RERANK_ENABLED=false) — dense-only ordering.",
+		);
 		return null;
 	}
 	const reranker = new LocalReranker();

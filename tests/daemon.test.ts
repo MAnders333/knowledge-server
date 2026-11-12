@@ -11,11 +11,11 @@ import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EpisodeUploader } from "../src/daemon/uploader";
-import { KnowledgeDB } from "../src/db/sqlite/index";
-import { DaemonDB } from "../src/db/daemon/index";
-import { ServerStateDB } from "../src/db/state/index";
 import { PendingEpisodesReader } from "../src/consolidation/readers/pending";
+import { EpisodeUploader } from "../src/daemon/uploader";
+import { DaemonDB } from "../src/db/daemon/index";
+import { KnowledgeDB } from "../src/db/sqlite/index";
+import { ServerStateDB } from "../src/db/state/index";
 import type { IEpisodeReader, PendingEpisode } from "../src/types";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -250,9 +250,9 @@ describe("EpisodeUploader.upload", () => {
 		const sessionRanges = ranges.get("session-dedup");
 		expect(sessionRanges).toBeDefined();
 		expect(sessionRanges).toHaveLength(1);
-		expect(sessionRanges![0].source).toBe("opencode");
-		expect(sessionRanges![0].startMessageId).toBe("msg-a");
-		expect(sessionRanges![0].endMessageId).toBe("msg-b");
+		expect(sessionRanges?.[0].source).toBe("opencode");
+		expect(sessionRanges?.[0].startMessageId).toBe("msg-a");
+		expect(sessionRanges?.[0].endMessageId).toBe("msg-b");
 
 		// Confirm it still returns consolidated_episode ranges too
 		await db.recordEpisode(

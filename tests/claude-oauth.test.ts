@@ -62,7 +62,10 @@ describe("loadOAuthTokens", () => {
 		const { join: pathJoin } = await import("node:path");
 		const dir = pathJoin(tempDir, "knowledge-server");
 		mkdirSync(dir, { recursive: true });
-		writeFileSync(pathJoin(dir, "claude-oauth.json"), JSON.stringify({ refresh_token: "rt" }));
+		writeFileSync(
+			pathJoin(dir, "claude-oauth.json"),
+			JSON.stringify({ refresh_token: "rt" }),
+		);
 		expect(loadOAuthTokens()).toBeNull();
 	});
 
@@ -97,8 +100,16 @@ describe("saveOAuthTokens / loadOAuthTokens", () => {
 
 	it("overwrites existing tokens on save", async () => {
 		const { saveOAuthTokens, loadOAuthTokens } = await getOAuth();
-		saveOAuthTokens({ access_token: "old-at", refresh_token: "old-rt", expires_at: 1 });
-		saveOAuthTokens({ access_token: "new-at", refresh_token: "new-rt", expires_at: 2 });
+		saveOAuthTokens({
+			access_token: "old-at",
+			refresh_token: "old-rt",
+			expires_at: 1,
+		});
+		saveOAuthTokens({
+			access_token: "new-at",
+			refresh_token: "new-rt",
+			expires_at: 2,
+		});
 		const loaded = loadOAuthTokens();
 		if (!loaded) throw new Error("expected tokens to be loaded");
 		expect(loaded.access_token).toBe("new-at");
@@ -139,8 +150,13 @@ describe("hasOAuthTokens", () => {
 
 describe("clearOAuthTokens", () => {
 	it("removes stored tokens", async () => {
-		const { saveOAuthTokens, clearOAuthTokens, hasOAuthTokens } = await getOAuth();
-		saveOAuthTokens({ access_token: "at", refresh_token: "rt", expires_at: Date.now() + 3600_000 });
+		const { saveOAuthTokens, clearOAuthTokens, hasOAuthTokens } =
+			await getOAuth();
+		saveOAuthTokens({
+			access_token: "at",
+			refresh_token: "rt",
+			expires_at: Date.now() + 3600_000,
+		});
 		expect(hasOAuthTokens()).toBe(true);
 		clearOAuthTokens();
 		expect(hasOAuthTokens()).toBe(false);
@@ -157,7 +173,9 @@ describe("clearOAuthTokens", () => {
 describe("getAccessToken", () => {
 	it("throws when no tokens are stored", async () => {
 		const { getAccessToken } = await getOAuth();
-		await expect(getAccessToken()).rejects.toThrow("No Claude OAuth tokens found");
+		await expect(getAccessToken()).rejects.toThrow(
+			"No Claude OAuth tokens found",
+		);
 	});
 
 	it("returns the stored access token when it is still fresh", async () => {
@@ -202,7 +220,8 @@ describe("getAccessToken", () => {
 	});
 
 	it("persists refreshed tokens to disk", async () => {
-		const { saveOAuthTokens, getAccessToken, loadOAuthTokens } = await getOAuth();
+		const { saveOAuthTokens, getAccessToken, loadOAuthTokens } =
+			await getOAuth();
 
 		saveOAuthTokens({
 			access_token: "expiring-at",

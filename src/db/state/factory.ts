@@ -8,12 +8,12 @@
  */
 import {
 	DEFAULT_CONFIG,
-	loadConfigFile,
 	DEFAULT_CONFIG_PATH,
+	loadConfigFile,
 } from "../../config-file.js";
-import type { IServerStateDB } from "../interface.js";
-import { errCode } from "../../utils.js";
 import { logger } from "../../logger.js";
+import { errCode } from "../../utils.js";
+import type { IServerStateDB } from "../interface.js";
 import { ServerStateDB } from "./index.js";
 import { PostgresServerStateDB } from "./postgres.js";
 

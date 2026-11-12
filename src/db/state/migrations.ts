@@ -8,7 +8,7 @@
  * Adding a new migration: add a function below and call it in runStateMigrations().
  */
 
-import { type SQLQueryBindings, Database } from "bun:sqlite";
+import { Database, type SQLQueryBindings } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";

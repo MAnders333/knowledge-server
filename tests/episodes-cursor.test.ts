@@ -893,7 +893,10 @@ describe("collectFilePathsFromString", () => {
 
 	it("returns nothing when no file:// URI is present", () => {
 		const out: string[] = [];
-		collectFilePathsFromString('{"key":"value","other":"https://example.com"}', out);
+		collectFilePathsFromString(
+			'{"key":"value","other":"https://example.com"}',
+			out,
+		);
 		expect(out).toEqual([]);
 	});
 
@@ -936,14 +939,12 @@ describe("CursorEpisodeReader — workspace root resolution", () => {
 				fileSelections: [
 					{
 						uri: {
-							external:
-								"file:///Users/x/Documents/my-project/src/index.ts",
+							external: "file:///Users/x/Documents/my-project/src/index.ts",
 						},
 					},
 					{
 						uri: {
-							external:
-								"file:///Users/x/Documents/my-project/src/utils.ts",
+							external: "file:///Users/x/Documents/my-project/src/utils.ts",
 						},
 					},
 				],

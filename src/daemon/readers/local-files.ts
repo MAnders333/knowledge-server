@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { type Dirent, readdirSync, readFileSync, statSync } from "node:fs";
+import { type Dirent, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, extname, join } from "node:path";
 import { config } from "../../config.js";
 import { logger } from "../../logger.js";

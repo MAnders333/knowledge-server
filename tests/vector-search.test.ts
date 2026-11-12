@@ -11,6 +11,7 @@
  *     exposes it; falls back to getEntriesWithOverlappingTopics otherwise.
  */
 import {
+	type Mock,
 	afterEach,
 	beforeEach,
 	describe,
@@ -18,7 +19,6 @@ import {
 	it,
 	mock,
 	spyOn,
-	type Mock,
 } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -26,13 +26,13 @@ import { join } from "node:path";
 import { ActivationEngine } from "../src/activation/activate";
 import { cosineSimilarity } from "../src/activation/embeddings";
 import { config } from "../src/config";
-import type { IKnowledgeStore } from "../src/db/interface";
-import { KnowledgeDB } from "../src/db/sqlite/index";
-import { PG_MIGRATIONS } from "../src/db/postgres/migrations";
-import { SCHEMA_VERSION } from "../src/db/sqlite/schema";
-import * as loggerModule from "../src/logger";
 import { ContradictionScanner } from "../src/consolidation/contradiction";
 import { ConsolidationLLM } from "../src/consolidation/llm";
+import type { IKnowledgeStore } from "../src/db/interface";
+import { PG_MIGRATIONS } from "../src/db/postgres/migrations";
+import { KnowledgeDB } from "../src/db/sqlite/index";
+import { SCHEMA_VERSION } from "../src/db/sqlite/schema";
+import * as loggerModule from "../src/logger";
 import type { KnowledgeEntry } from "../src/types";
 import { fakeEmbedding, makeEntry } from "./fixtures";
 
@@ -86,11 +86,7 @@ function makeStoreStub(
 
 	if (opts.supportAnn) {
 		base.findSimilarEntries = mock(
-			(
-				queryVector: number[],
-				limit: number,
-				threshold: number,
-			) => {
+			(queryVector: number[], limit: number, threshold: number) => {
 				const results = entries
 					.map((e) => ({
 						entry: e,
@@ -138,9 +134,10 @@ describe("ActivationEngine.activate — ANN path (Path A)", () => {
 	});
 
 	beforeEach(() => {
-		annStore = makeStoreStub([highEntry, lowEntry] as Array<
-			KnowledgeEntry & { embedding: number[] }
-		>, { supportAnn: true });
+		annStore = makeStoreStub(
+			[highEntry, lowEntry] as Array<KnowledgeEntry & { embedding: number[] }>,
+			{ supportAnn: true },
+		);
 		activation = new ActivationEngine(annStore);
 		// Mock embedBatch to return the query embedding without hitting the API.
 		spyOn(activation.embeddings, "embedBatch").mockResolvedValue([queryEmb]);
@@ -552,22 +549,20 @@ describe("PG_MIGRATIONS gap-safety", () => {
 		// Simulate: DB at v10, code at SCHEMA_VERSION.
 		// The migration runner should pick up every migration from v11 onward.
 		const startVersion = 10;
-		const pending = PG_MIGRATIONS
-			.filter((m) => m.version > startVersion)
-			.sort((a, b) => a.version - b.version);
+		const pending = PG_MIGRATIONS.filter((m) => m.version > startVersion).sort(
+			(a, b) => a.version - b.version,
+		);
 
 		// Every migration with version > startVersion must be included.
-		const expectedVersions = PG_MIGRATIONS
-			.map((m) => m.version)
-			.filter((v) => v > startVersion);
+		const expectedVersions = PG_MIGRATIONS.map((m) => m.version).filter(
+			(v) => v > startVersion,
+		);
 
 		expect(pending.map((m) => m.version)).toEqual(expectedVersions);
 	});
 
 	it("pending migrations filter is empty when already at SCHEMA_VERSION", () => {
-		const pending = PG_MIGRATIONS.filter(
-			(m) => m.version > SCHEMA_VERSION,
-		);
+		const pending = PG_MIGRATIONS.filter((m) => m.version > SCHEMA_VERSION);
 		expect(pending).toHaveLength(0);
 	});
 
@@ -575,13 +570,13 @@ describe("PG_MIGRATIONS gap-safety", () => {
 		// Simulate a DB that has only had v8 applied (skipped v9-v15).
 		// Every migration from v9 through v16 must appear in pending.
 		const dbVersion = 8;
-		const pending = PG_MIGRATIONS
-			.filter((m) => m.version > dbVersion)
-			.sort((a, b) => a.version - b.version);
+		const pending = PG_MIGRATIONS.filter((m) => m.version > dbVersion).sort(
+			(a, b) => a.version - b.version,
+		);
 
-		const allVersionsAbove8 = PG_MIGRATIONS
-			.map((m) => m.version)
-			.filter((v) => v > dbVersion);
+		const allVersionsAbove8 = PG_MIGRATIONS.map((m) => m.version).filter(
+			(v) => v > dbVersion,
+		);
 
 		expect(pending.map((m) => m.version)).toEqual(allVersionsAbove8);
 
@@ -658,7 +653,11 @@ describe("ContradictionScanner — findContradictionCandidates", () => {
 			status: "active",
 		}) as KnowledgeEntry & { embedding: number[] };
 
-		await scanner.scan(store, new Map([[entry.id, entry]]), new Set([entry.id]));
+		await scanner.scan(
+			store,
+			new Map([[entry.id, entry]]),
+			new Set([entry.id]),
+		);
 
 		// ANN path must be used.
 		expect(store.findContradictionCandidates).toHaveBeenCalled();
@@ -690,7 +689,11 @@ describe("ContradictionScanner — findContradictionCandidates", () => {
 			status: "active",
 		}) as KnowledgeEntry & { embedding: number[] };
 
-		await scanner.scan(store, new Map([[entry.id, entry]]), new Set([entry.id]));
+		await scanner.scan(
+			store,
+			new Map([[entry.id, entry]]),
+			new Set([entry.id]),
+		);
 
 		// Fallback must be used.
 		expect(store.getEntriesWithOverlappingTopics).toHaveBeenCalled();
@@ -718,7 +721,11 @@ describe("ContradictionScanner — findContradictionCandidates", () => {
 			status: "active",
 		}) as KnowledgeEntry & { embedding: number[] };
 
-		await scanner.scan(store, new Map([[entry.id, entry]]), new Set([entry.id]));
+		await scanner.scan(
+			store,
+			new Map([[entry.id, entry]]),
+			new Set([entry.id]),
+		);
 
 		const findSpy = store.findContradictionCandidates as Mock<
 			NonNullable<IKnowledgeStore["findContradictionCandidates"]>

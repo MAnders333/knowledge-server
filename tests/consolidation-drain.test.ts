@@ -10,6 +10,7 @@
  *   skips gracefully when lock is unavailable; swallows synthesis errors
  */
 import { beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
+import type { ActivationEngine } from "../src/activation/activate";
 import {
 	drainConsolidation,
 	runEmbeddingCheck,
@@ -17,14 +18,17 @@ import {
 	tryAcquireLock,
 } from "../src/commands/consolidation-drain";
 import type { ConsolidationEngine } from "../src/consolidation/consolidate";
-import type { ActivationEngine } from "../src/activation/activate";
 
 // ── Minimal stubs ─────────────────────────────────────────────────────────────
 
-function makeActivation(opts: { reEmbedThrows?: boolean } = {}): ActivationEngine {
+function makeActivation(
+	opts: { reEmbedThrows?: boolean } = {},
+): ActivationEngine {
 	return {
 		checkAndReEmbed: opts.reEmbedThrows
-			? async () => { throw new Error("embed model unavailable"); }
+			? async () => {
+					throw new Error("embed model unavailable");
+				}
 			: async () => {},
 	} as unknown as ActivationEngine;
 }
@@ -43,18 +47,22 @@ interface BatchSpec {
  * @param lockHeld     If true, tryLock() always returns false (lock unavailable).
  * @param throwOnBatch 1-based index of the batch that should throw.
  */
-function makeConsolidation(opts: {
-	batches?: BatchSpec[];
-	lockHeld?: boolean;
-	throwOnBatch?: number;
-} = {}): ConsolidationEngine & { synthesisCalled: number } {
+function makeConsolidation(
+	opts: {
+		batches?: BatchSpec[];
+		lockHeld?: boolean;
+		throwOnBatch?: number;
+	} = {},
+): ConsolidationEngine & { synthesisCalled: number } {
 	const { batches = [], lockHeld = false, throwOnBatch } = opts;
 	let callCount = 0;
 	let locked = false;
 	let synthesisCalled = 0;
 
 	const engine = {
-		get synthesisCalled() { return synthesisCalled; },
+		get synthesisCalled() {
+			return synthesisCalled;
+		},
 
 		tryLock(): boolean {
 			if (lockHeld || locked) return false;
@@ -74,7 +82,13 @@ function makeConsolidation(opts: {
 			if (throwOnBatch !== undefined && callCount === throwOnBatch) {
 				throw new Error(`Batch ${throwOnBatch} failed`);
 			}
-			return batches[idx] ?? { sessionsProcessed: 0, entriesCreated: 0, entriesUpdated: 0 };
+			return (
+				batches[idx] ?? {
+					sessionsProcessed: 0,
+					entriesCreated: 0,
+					entriesUpdated: 0,
+				}
+			);
 		},
 
 		async runSynthesis(): Promise<number> {
@@ -91,7 +105,11 @@ function makeConsolidation(opts: {
 describe("runEmbeddingCheck", () => {
 	it("calls checkAndReEmbed on the activation engine", async () => {
 		let called = false;
-		const activation = { checkAndReEmbed: async () => { called = true; } } as unknown as ActivationEngine;
+		const activation = {
+			checkAndReEmbed: async () => {
+				called = true;
+			},
+		} as unknown as ActivationEngine;
 		await runEmbeddingCheck(activation);
 		expect(called).toBe(true);
 	});
@@ -127,12 +145,17 @@ describe("tryAcquireLock", () => {
 
 		const engine = {
 			tryLock(): boolean {
-				if (holdCount < MAX_HOLDS) { holdCount++; return false; }
+				if (holdCount < MAX_HOLDS) {
+					holdCount++;
+					return false;
+				}
 				if (locked) return false;
 				locked = true;
 				return true;
 			},
-			unlock(): void { locked = false; },
+			unlock(): void {
+				locked = false;
+			},
 		} as unknown as ConsolidationEngine;
 
 		const acquired = await tryAcquireLock(engine, 500, 50);
@@ -192,10 +215,21 @@ describe("drainConsolidation", () => {
 		let locked = false;
 
 		const engine = {
-			tryLock(): boolean { if (locked) return false; locked = true; return true; },
-			unlock(): void { unlockCalled = true; locked = false; },
-			async consolidate(): Promise<never> { throw new Error("consolidate exploded"); },
-			async runSynthesis(): Promise<number> { return 0; },
+			tryLock(): boolean {
+				if (locked) return false;
+				locked = true;
+				return true;
+			},
+			unlock(): void {
+				unlockCalled = true;
+				locked = false;
+			},
+			async consolidate(): Promise<never> {
+				throw new Error("consolidate exploded");
+			},
+			async runSynthesis(): Promise<number> {
+				return 0;
+			},
 		} as unknown as ConsolidationEngine;
 
 		await drainConsolidation(engine);
@@ -229,9 +263,17 @@ describe("runSynthesisPass", () => {
 	it("swallows errors thrown by runSynthesis", async () => {
 		let locked = false;
 		const engine = {
-			tryLock(): boolean { if (locked) return false; locked = true; return true; },
-			unlock(): void { locked = false; },
-			async runSynthesis(): Promise<never> { throw new Error("synthesis exploded"); },
+			tryLock(): boolean {
+				if (locked) return false;
+				locked = true;
+				return true;
+			},
+			unlock(): void {
+				locked = false;
+			},
+			async runSynthesis(): Promise<never> {
+				throw new Error("synthesis exploded");
+			},
 			synthesisCalled: 0,
 		} as unknown as ConsolidationEngine & { synthesisCalled: number };
 

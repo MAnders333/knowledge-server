@@ -1,8 +1,5 @@
 import { logger } from "../../logger.js";
-import {
-	bufferToFloats,
-	floatsToVectorLiteral,
-} from "./embedding-codec.js";
+import { bufferToFloats, floatsToVectorLiteral } from "./embedding-codec.js";
 
 // biome-ignore lint: TS limitation with Omit stripping call signatures from postgres Sql
 type TxSql = any;
@@ -371,11 +368,13 @@ export const PG_MIGRATIONS: Array<{
 						}
 						await sql.unsafe(
 							"UPDATE knowledge_entry SET embedding_vec = v.vec::vector " +
-							"FROM (SELECT UNNEST($1::text[]) AS id, UNNEST($2::text[]) AS vec) v " +
-							"WHERE knowledge_entry.id = v.id",
+								"FROM (SELECT UNNEST($1::text[]) AS id, UNNEST($2::text[]) AS vec) v " +
+								"WHERE knowledge_entry.id = v.id",
 							[ids, vecs],
 						);
-						logger.log(`[pg-db] Migration v16: backfilled embedding_vec for ${toBackfill.length} rows.`);
+						logger.log(
+							`[pg-db] Migration v16: backfilled embedding_vec for ${toBackfill.length} rows.`,
+						);
 					}
 
 					// ── 4. Create ANN index (best-effort) ────────────────────────────
@@ -484,9 +483,7 @@ export const PG_MIGRATIONS: Array<{
 			}
 
 			// Repair backfill for rows that have BYTEA embedding but missing embedding_vec.
-			const toBackfill = await sql<
-				{ id: string; embedding: Buffer }[]
-			>`
+			const toBackfill = await sql<{ id: string; embedding: Buffer }[]>`
 				SELECT id, embedding
 				FROM knowledge_entry
 				WHERE embedding IS NOT NULL
@@ -502,8 +499,8 @@ export const PG_MIGRATIONS: Array<{
 				}
 				await sql.unsafe(
 					"UPDATE knowledge_entry SET embedding_vec = v.vec::vector " +
-					"FROM (SELECT UNNEST($1::text[]) AS id, UNNEST($2::text[]) AS vec) v " +
-					"WHERE knowledge_entry.id = v.id",
+						"FROM (SELECT UNNEST($1::text[]) AS id, UNNEST($2::text[]) AS vec) v " +
+						"WHERE knowledge_entry.id = v.id",
 					[ids, vecs],
 				);
 				logger.log(

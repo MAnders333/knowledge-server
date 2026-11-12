@@ -282,18 +282,14 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 	});
 
 	it("getEntries with filters", async () => {
-		await db.insertEntry(
-			makeEntry("f1", { status: "active", type: "fact" }),
-		);
+		await db.insertEntry(makeEntry("f1", { status: "active", type: "fact" }));
 		await db.insertEntry(
 			makeEntry("f2", {
 				status: "active",
 				type: "principle",
 			}),
 		);
-		await db.insertEntry(
-			makeEntry("f3", { status: "archived", type: "fact" }),
-		);
+		await db.insertEntry(makeEntry("f3", { status: "archived", type: "fact" }));
 
 		const byStatus = await db.getEntries({ status: "active" });
 		expect(byStatus.length).toBe(2);
