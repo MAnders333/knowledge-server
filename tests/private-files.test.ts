@@ -5,6 +5,7 @@ import {
 	mkdtempSync,
 	rmSync,
 	statSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -50,6 +51,22 @@ describe("tightenPrivatePaths", () => {
 			}),
 		).not.toThrow();
 		expect(mode(file)).toBe(0o600);
+	});
+
+	it("never follows a symlink: the target keeps its mode and chmod is not called on the link", () => {
+		const target = join(tempDir, "shared-target.env");
+		writeFileSync(target, "KEY=value");
+		chmodSync(target, 0o644);
+		const link = join(tempDir, ".env");
+		symlinkSync(target, link);
+		const calls: string[] = [];
+
+		tightenPrivatePaths({ files: [link], dirs: [] }, (p) => {
+			calls.push(p);
+		});
+
+		expect(calls).toEqual([]);
+		expect(mode(target)).toBe(0o644);
 	});
 
 	it("a chmod failure neither throws nor stops the remaining paths", () => {
