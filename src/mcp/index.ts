@@ -244,7 +244,7 @@ export async function main() {
 
 	server.tool(
 		"knowledge_flag",
-		"Report a recalled knowledge entry that is wrong, outdated or irrelevant, using the id shown in its injected line. The entry is queued for review and marked conflicted; nothing is deleted. Requires KNOWLEDGE_ADMIN_TOKEN in this process's environment.",
+		"Report a recalled knowledge entry that is wrong, outdated or irrelevant, using the id shown in its injected line. The entry is queued for review and is no longer injected into sessions; nothing is deleted. Requires KNOWLEDGE_ADMIN_TOKEN in this process's environment.",
 		flagInputSchema,
 		async ({ id, reason }) => {
 			if (!config.adminToken) {
@@ -287,7 +287,7 @@ export async function main() {
 					content: [
 						{
 							type: "text" as const,
-							text: `Flagged entry ${id} (${reason}). It is queued for review and no longer active.`,
+							text: `Flagged entry ${id} (${reason}). It is queued for review and is no longer injected into sessions. Nothing was deleted.`,
 						},
 					],
 				};
