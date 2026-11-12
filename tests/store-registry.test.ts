@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { type AddressInfo, type Socket, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,14 +21,34 @@ describe("StoreRegistry", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	// ── No config file (default) ───────────────────────────────────────────────
+	// ── No config file (fallback) ──────────────────────────────────────────────
 
-	it("defaults to a single writable SQLite store when no config file exists", () => {
-		// StoreRegistry.create() on a missing config would open the real default
-		// knowledge.db and state.db under the user's home, so assert the default shape.
-		expect(DEFAULT_CONFIG.stores).toEqual([
-			{ id: "default", kind: "sqlite", writable: true },
-		]);
+	it("with no config file, opens the fallback config's stores and state DB", async () => {
+		const knowledgePath = join(tempDir, "knowledge.db");
+		const statePath = join(tempDir, "state.db");
+		const registry = await StoreRegistry.create(
+			join(tempDir, "nonexistent.jsonc"),
+			{
+				...DEFAULT_CONFIG,
+				stores: [
+					{
+						id: "default",
+						kind: "sqlite",
+						writable: true,
+						path: knowledgePath,
+					},
+				],
+				stateDb: { kind: "sqlite", path: statePath },
+			},
+		);
+		try {
+			expect(registry.writableStore()).toBeInstanceOf(KnowledgeDB);
+			expect(registry.readStores()).toHaveLength(1);
+			expect(existsSync(knowledgePath)).toBe(true);
+			expect(existsSync(statePath)).toBe(true);
+		} finally {
+			await registry.close();
+		}
 	});
 
 	// ── Single SQLite store ────────────────────────────────────────────────────

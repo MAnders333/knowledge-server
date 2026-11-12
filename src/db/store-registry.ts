@@ -141,9 +141,12 @@ export class StoreRegistry {
 	 * Falls back to a single default SQLite store if no config file exists.
 	 *
 	 * @param configPath Override config file path — used in tests.
+	 * @param fallbackConfig Used when no config file exists. Defaults to the
+	 *   single SQLite store at the default paths; tests pass temp paths.
 	 */
 	static async create(
 		configPath = DEFAULT_CONFIG_PATH,
+		fallbackConfig: KnowledgeServerConfig = DEFAULT_CONFIG,
 	): Promise<StoreRegistry> {
 		let fileConfig: KnowledgeServerConfig | null;
 		try {
@@ -154,7 +157,7 @@ export class StoreRegistry {
 			);
 		}
 
-		const config = fileConfig ?? DEFAULT_CONFIG;
+		const config = fileConfig ?? fallbackConfig;
 
 		if (!fileConfig) {
 			logger.log("[db] No config.jsonc found — using default SQLite store.");
