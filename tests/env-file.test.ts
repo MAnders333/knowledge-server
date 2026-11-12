@@ -46,6 +46,33 @@ describe("parseEnvText (single .env parser)", () => {
 	});
 });
 
+describe("parseEnvText: extended denylist", () => {
+	it("drops proxy, CA and shell-option keys in every letter case", () => {
+		const text = [
+			"HTTP_PROXY=http://proxy.example:3128",
+			"https_proxy=http://proxy.example:3128",
+			"No_Proxy=*",
+			"NODE_EXTRA_CA_CERTS=/tmp/ca.pem",
+			"NODE_TLS_REJECT_UNAUTHORIZED=0",
+			"SSL_CERT_FILE=/tmp/ca.pem",
+			"NODE_PATH=/tmp/mods",
+			"TMPDIR=/tmp/x",
+			"SHELLOPTS=xtrace",
+			"BASHOPTS=extdebug",
+			"PS4=$(id)",
+			"PROMPT_COMMAND=id",
+			"CDPATH=/tmp",
+			"GLOBIGNORE=*",
+			"BUN_INSTALL=/tmp/bun",
+			"BUN_CONFIG_REGISTRY=http://r.example",
+			"XDG_CONFIG_HOME=/tmp/xdg",
+			"KNOWLEDGE_CONFIG_HOME=/tmp/kc",
+			"KEEP_ME=yes",
+		].join("\n");
+		expect(Object.keys(parseEnvText(text))).toEqual(["KEEP_ME"]);
+	});
+});
+
 describe("loadEnvFile", () => {
 	it("assigns parsed values and keeps variables already set in the environment", () => {
 		const dir = mkdtempSync(join(tmpdir(), "ks-envfile-test-"));

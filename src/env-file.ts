@@ -23,14 +23,41 @@ import * as dotenv from "dotenv";
 const DENIED_KEYS: Record<string, true> = {
 	PATH: true,
 	HOME: true,
+	TMPDIR: true,
 	IFS: true,
 	SHELL: true,
+	SHELLOPTS: true,
+	BASHOPTS: true,
 	BASH_ENV: true,
 	ENV: true,
+	PS4: true,
+	PROMPT_COMMAND: true,
+	CDPATH: true,
+	GLOBIGNORE: true,
 	NODE_OPTIONS: true,
+	NODE_PATH: true,
+	NODE_EXTRA_CA_CERTS: true,
+	NODE_TLS_REJECT_UNAUTHORIZED: true,
 	BUN_OPTIONS: true,
+	// Trust store and proxies: a pasted .env could otherwise send API keys elsewhere.
+	SSL_CERT_FILE: true,
+	SSL_CERT_DIR: true,
+	HTTP_PROXY: true,
+	HTTPS_PROXY: true,
+	ALL_PROXY: true,
+	NO_PROXY: true,
+	KNOWLEDGE_CONFIG_HOME: true,
 };
-const DENIED_PREFIXES = ["LD_", "DYLD_"];
+const DENIED_PREFIXES = ["LD_", "DYLD_", "BUN_INSTALL", "BUN_CONFIG_", "XDG_"];
+
+/** Proxy and CA variables are denied in every letter case (`http_proxy` too). */
+function isDenied(key: string): boolean {
+	const upper = key.toUpperCase();
+	return (
+		DENIED_KEYS[upper] === true ||
+		DENIED_PREFIXES.some((p) => upper.startsWith(p))
+	);
+}
 
 /** The preferred (XDG) `.env` location. Reported when no file exists yet. */
 export function preferredEnvFile(
@@ -67,10 +94,7 @@ export function findEnvFile(
 export function parseEnvText(text: string): Record<string, string> {
 	const out: Record<string, string> = {};
 	for (const [key, value] of Object.entries(dotenv.parse(text))) {
-		const denied =
-			DENIED_KEYS[key] === true ||
-			DENIED_PREFIXES.some((p) => key.startsWith(p));
-		if (!denied) out[key] = value;
+		if (!isDenied(key)) out[key] = value;
 	}
 	return out;
 }
