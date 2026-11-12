@@ -2,6 +2,8 @@ import { describe, expect, it } from "bun:test";
 import { config } from "../src/config";
 import { redactSecrets, totalRedactions } from "../src/redact";
 
+const MB = 1_000_000;
+
 function expectRedacted(input: string, expected: string, kind: string): void {
 	const result = redactSecrets(input);
 	expect(result.text).toBe(expected);
@@ -233,5 +235,53 @@ describe("redactSecrets: configuration and counts", () => {
 
 	it("totalRedactions returns 0 for empty counts", () => {
 		expect(totalRedactions({})).toBe(0);
+	});
+});
+
+describe("redactSecrets: linear time on 1 MB adversarial input", () => {
+	// Each input targets a rule that used a variable-length lookbehind over a
+	// whitespace or identifier run, or a nested identifier-run pattern.
+	const cases: Record<string, string> = {
+		spaces: " ".repeat(MB),
+		tabs: "\t".repeat(MB),
+		"< then spaces": `<${" ".repeat(MB)}x`,
+		"Bearer then spaces": `Bearer${" ".repeat(MB)}x`,
+		"Authorization then spaces": `Authorization:${" ".repeat(MB)}x`,
+		"password then spaces": `password${" ".repeat(MB)}x`,
+		"aws secret key then spaces": `aws_secret_access_key${" ".repeat(MB)}x`,
+		"TOKEN run after a dot": `.${"TOKEN".repeat(MB / 5)}=`,
+		"env name run on one line": `${"A".repeat(MB)}TOKEN`,
+		"PEM header repeated": `-----BEGIN ${PK}-----`.repeat(MB / 28),
+		"a: repeated": "a:".repeat(MB / 2),
+		"scheme and userinfo run": `http://${"u".repeat(MB)}`,
+	};
+	for (const [name, text] of Object.entries(cases)) {
+		it(`${name}: completes under 500 ms`, () => {
+			const start = performance.now();
+			redactSecrets(text);
+			expect(performance.now() - start).toBeLessThan(500);
+		});
+	}
+});
+
+describe("redactSecrets: context kept after the move to captured prefixes", () => {
+	it("keeps the Authorization scheme and redacts only the credential", () => {
+		const token = ["abc", "def", "ghi", "jkl", "mno", "pqr"].join("");
+		expect(redactSecrets(`Authorization: Bearer ${token}`).text).toBe(
+			"Authorization: Bearer [REDACTED:bearer]",
+		);
+	});
+
+	it("redacts a keyed value after a long whitespace gap as before", () => {
+		const value = "x".repeat(40);
+		expect(redactSecrets(`password:    ${value}`).text).toBe(
+			"password:    [REDACTED:keyed_entropy]",
+		);
+	});
+
+	it("keeps the env var name and redacts its value", () => {
+		expect(redactSecrets("export API_TOKEN=abc123").text).toBe(
+			"export API_TOKEN=[REDACTED:env_secret]",
+		);
 	});
 });
