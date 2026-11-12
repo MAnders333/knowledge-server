@@ -25,11 +25,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import postgres from "postgres";
 import type { IKnowledgeStore } from "../src/db/interface";
+import { PENDING_EPISODE_MAX_ATTEMPTS } from "../src/db/interface";
 import {
 	PostgresKnowledgeDB,
 	buildAnnSimilarEntriesSql,
 } from "../src/db/postgres/index";
+import { SCHEMA_VERSION } from "../src/db/postgres/schema";
 import { ServerStateDB } from "../src/db/state/index";
+import { PostgresServerStateDB } from "../src/db/state/postgres";
 import { logger } from "../src/logger";
 
 const PG_URI = process.env.PG_TEST_URI;
@@ -1260,5 +1263,181 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		await db.reinitialize();
 
 		expect(await db.getClustersWithMembers()).toHaveLength(0);
+	});
+});
+
+// ── Migrations v16/v17: pgvector setup from a v15 store ──────────────────────
+
+describe.skipIf(!PG_URI)("PostgreSQL migrations v16/v17", () => {
+	const uri = PG_URI as string;
+	let admin: ReturnType<typeof postgres>;
+
+	/**
+	 * Turn the test DB into a v15 store with an embedding_metadata row (dims 8)
+	 * and no embedding_vec column, so v16 and v17 are the pending migrations.
+	 */
+	async function rewindToV15(): Promise<void> {
+		// Earlier tests may have dropped pgvector or left injected objects behind;
+		// clear them before seeding so initialize() starts from a clean v15 shape.
+		await admin`CREATE EXTENSION IF NOT EXISTS vector`;
+		await admin`DROP INDEX IF EXISTS idx_entry_embedding_vec_hnsw`;
+		await admin`DROP INDEX IF EXISTS idx_entry_embedding_halfvec_hnsw`;
+		await admin.unsafe(
+			"ALTER TABLE IF EXISTS knowledge_entry DROP COLUMN IF EXISTS embedding_vec",
+		);
+		// Create the current schema if the test DB is fresh.
+		const seed = new PostgresKnowledgeDB(uri);
+		await seed.initialize();
+		await seed.close();
+		await admin`TRUNCATE knowledge_entry, knowledge_cluster, embedding_metadata CASCADE`;
+		await admin.unsafe(
+			"ALTER TABLE knowledge_entry DROP COLUMN IF EXISTS embedding_vec",
+		);
+		await admin`INSERT INTO embedding_metadata (id, model, dimensions, recorded_at) VALUES (1, 'test-model', 8, ${Date.now()}) ON CONFLICT (id) DO UPDATE SET dimensions = 8`;
+		await admin`DELETE FROM schema_version`;
+		await admin`INSERT INTO schema_version (version, applied_at) VALUES (15, ${Date.now()})`;
+	}
+
+	async function storeVersion(): Promise<number> {
+		const rows = await admin`SELECT MAX(version) AS v FROM schema_version`;
+		return Number((rows[0] as { v: number | string }).v);
+	}
+
+	beforeAll(() => {
+		admin = postgres(uri, { max: 2 });
+	});
+
+	afterAll(async () => {
+		// Leave the shared test DB at the current schema with pgvector available.
+		await admin`DROP INDEX IF EXISTS idx_entry_embedding_halfvec_hnsw`;
+		await admin.unsafe(
+			"ALTER TABLE knowledge_entry DROP COLUMN IF EXISTS embedding_vec",
+		);
+		await admin`CREATE EXTENSION IF NOT EXISTS vector`;
+		await admin`TRUNCATE knowledge_entry, knowledge_cluster, embedding_metadata CASCADE`;
+		await admin`DELETE FROM schema_version`;
+		await admin`INSERT INTO schema_version (version, applied_at) VALUES (${SCHEMA_VERSION}, ${Date.now()})`;
+		await admin.end();
+	});
+
+	it("a failing optional ANN index build does not abort the migration transaction", async () => {
+		await rewindToV15();
+		// Make the halfvec index build fail: an integer column has no cast to halfvec.
+		await admin`ALTER TABLE knowledge_entry ADD COLUMN embedding_vec integer`;
+
+		const store = new PostgresKnowledgeDB(uri);
+		try {
+			// Must resolve: the optional index is skipped with a warning, not fatal.
+			await store.initialize();
+			expect(store.isVectorSearchReady()).toBe(false);
+		} finally {
+			await store.close();
+		}
+		expect(await storeVersion()).toBe(SCHEMA_VERSION);
+	});
+
+	it("creates the pgvector extension before adding embedding_vec", async () => {
+		await rewindToV15();
+		// Simulate a server where the extension is not installed yet.
+		await admin`DROP EXTENSION IF EXISTS vector CASCADE`;
+
+		const store = new PostgresKnowledgeDB(uri);
+		try {
+			await store.initialize();
+			expect(store.isVectorSearchReady()).toBe(true);
+		} finally {
+			await store.close();
+		}
+		expect(await storeVersion()).toBe(SCHEMA_VERSION);
+	});
+
+	it("serialises migrations when several processes start against the same v15 store", async () => {
+		await rewindToV15();
+		const stores = [new PostgresKnowledgeDB(uri), new PostgresKnowledgeDB(uri)];
+		try {
+			// Without a cross-process lock both processes see no embedding_vec column,
+			// and the second ADD COLUMN fails with "column already exists".
+			await Promise.all(stores.map((s) => s.initialize()));
+		} finally {
+			await Promise.all(stores.map((s) => s.close()));
+		}
+		expect(await storeVersion()).toBe(SCHEMA_VERSION);
+	});
+});
+
+// ── PostgresServerStateDB: schema upgrade, dead-lettering, user-scoped reset ──
+
+describe.skipIf(!PG_URI)("PostgresServerStateDB", () => {
+	const uri = PG_URI as string;
+	let admin: ReturnType<typeof postgres>;
+
+	/** Make the state tables look like schema v1 (no attempt columns), with one row. */
+	async function rewindStateToV1(rows: Array<{ id: string; userId: string }>) {
+		await admin`CREATE TABLE IF NOT EXISTS state_schema_version (version INTEGER NOT NULL UNIQUE, applied_at BIGINT NOT NULL)`;
+		await admin`DELETE FROM state_schema_version`;
+		await admin`INSERT INTO state_schema_version (version, applied_at) VALUES (1, 0)`;
+		await admin.unsafe(
+			"ALTER TABLE pending_episodes DROP COLUMN IF EXISTS failed_attempts, DROP COLUMN IF EXISTS last_error",
+		);
+		await admin`DELETE FROM pending_episodes`;
+		for (const row of rows) {
+			await admin`
+				INSERT INTO pending_episodes
+				(id, user_id, source, session_id, start_message_id, end_message_id,
+				 content, content_type, max_message_time, uploaded_at)
+				VALUES (${row.id}, ${row.userId}, 'opencode', ${`s-${row.id}`}, 'a', 'b',
+				        'content', 'messages', 1, 1)
+			`;
+		}
+	}
+
+	beforeAll(async () => {
+		admin = postgres(uri, { max: 1 });
+		// Create the state schema once so the tables exist before rewinding them.
+		const seed = new PostgresServerStateDB(uri);
+		await seed.initialize();
+		await seed.close();
+	});
+
+	afterAll(async () => {
+		await admin`DELETE FROM pending_episodes`;
+		await admin`DELETE FROM consolidated_episode`;
+		await admin.end();
+	});
+
+	it("upgrades a v1 state schema and dead-letters rows after the attempt limit", async () => {
+		await rewindStateToV1([{ id: "legacy-1", userId: "alice" }]);
+
+		const state = new PostgresServerStateDB(uri);
+		try {
+			await state.initialize();
+			const [row] = await state.getPendingEpisodes(0);
+			expect(row.id).toBe("legacy-1");
+			expect(row.failedAttempts).toBe(0);
+
+			for (let i = 0; i < PENDING_EPISODE_MAX_ATTEMPTS; i++) {
+				await state.recordPendingEpisodeFailures(["legacy-1"], "boom");
+			}
+			expect(await state.getPendingEpisodes(0)).toEqual([]);
+			expect(await state.countPendingSessions()).toBe(0);
+		} finally {
+			await state.close();
+		}
+	});
+
+	it("reinitialize(userId) deletes only that user's pending episodes", async () => {
+		await rewindStateToV1([
+			{ id: "alice-1", userId: "alice" },
+			{ id: "bob-1", userId: "bob" },
+		]);
+		const state = new PostgresServerStateDB(uri);
+		try {
+			await state.initialize();
+			await state.reinitialize("alice");
+			const remaining = await state.getPendingEpisodes(0);
+			expect(remaining.map((r) => r.id)).toEqual(["bob-1"]);
+		} finally {
+			await state.close();
+		}
 	});
 });

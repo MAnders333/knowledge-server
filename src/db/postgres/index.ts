@@ -48,6 +48,9 @@ interface RawEntryRow {
 	embedding: Buffer | Uint8Array | null;
 }
 
+/** Advisory lock name serialising schema bootstrap and migrations across processes. */
+const SCHEMA_LOCK_NAME = "knowledge-server:schema-migration";
+
 /**
  * knowledge_entry columns read by rowToEntry(), qualified with the `ke` alias
  * used by the ANN queries. Deliberately excludes `embedding_vec`: rowToEntry()
@@ -159,6 +162,9 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	 */
 	private efSearchUnsupported = false;
 
+	/** Connection string, reused for the dedicated schema-lock connection. */
+	private readonly connectionUri: string;
+
 	/**
 	 * @param connectionUri  Full postgres:// connection string.
 	 * @param poolMax        Maximum pool connections. Defaults to POSTGRES_POOL_MAX
@@ -172,6 +178,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			return Number.isNaN(v) || v < 1 ? 10 : v;
 		})(),
 	) {
+		this.connectionUri = connectionUri;
 		this.sql = postgres(connectionUri, {
 			max: poolMax,
 			// idle_timeout is intentionally disabled (0 = no timeout).
@@ -231,6 +238,11 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		`;
 		this.advisoryLockKey = BigInt((oidRows[0] as { oid: string | number }).oid);
 
+		await this.withSchemaLock(() => this.initializeSchema());
+	}
+
+	/** Schema bootstrap and migrations. Always called under withSchemaLock(). */
+	private async initializeSchema(): Promise<void> {
 		// Create schema_version table first
 		await this.sql`
 			CREATE TABLE IF NOT EXISTS schema_version (
@@ -343,6 +355,37 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		// dimensions are not yet known (no metadata row) it sets pgvectorReady=false
 		// and defers column creation to the next setEmbeddingMetadata() call.
 		await this.ensureVectorColumn();
+	}
+
+	/**
+	 * Run schema setup under a cross-process advisory lock.
+	 *
+	 * Several processes can start against one database at once (server, daemon, a
+	 * second server sharing the store). Without serialisation they race on the
+	 * version read and on check-then-ALTER migrations, and the loser fails with
+	 * "column already exists". The lock is session-level on a dedicated
+	 * single-connection client, so it cannot starve the pool, and Postgres frees it
+	 * if the process dies mid-migration.
+	 */
+	private async withSchemaLock(fn: () => Promise<void>): Promise<void> {
+		const lockSql = postgres(this.connectionUri, {
+			max: 1,
+			idle_timeout: 0,
+			connect_timeout: 10,
+		});
+		try {
+			await lockSql`SELECT pg_advisory_lock(hashtext(${SCHEMA_LOCK_NAME}))`;
+			try {
+				await fn();
+			} finally {
+				// Closing the session below releases the lock even if this fails.
+				await lockSql`SELECT pg_advisory_unlock(hashtext(${SCHEMA_LOCK_NAME}))`.catch(
+					() => undefined,
+				);
+			}
+		} finally {
+			await lockSql.end();
+		}
 	}
 
 	// ── pgvector helpers ──
