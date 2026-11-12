@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+	containsInjectedKnowledge,
 	escapeUntrusted,
 	inlineUntrusted,
 	scrubUntrusted,
@@ -223,5 +224,41 @@ describe("stripInjectedKnowledge", () => {
 				name,
 			).toBeLessThan(500);
 		}
+	});
+});
+
+describe("containsInjectedKnowledge", () => {
+	it("detects the opening and closing tag", () => {
+		expect(containsInjectedKnowledge("<addrl-activated-knowledge>\nfoo")).toBe(
+			true,
+		);
+		expect(containsInjectedKnowledge("bar\n</addrl-activated-knowledge>")).toBe(
+			true,
+		);
+	});
+
+	it("detects the tag when invisible characters are inserted", () => {
+		expect(containsInjectedKnowledge("<addrl-activated-\u200Bknowledge>")).toBe(
+			true,
+		);
+	});
+
+	it("ignores unrelated text", () => {
+		expect(containsInjectedKnowledge("knowledge base and <div> tags")).toBe(
+			false,
+		);
+	});
+
+	it("still detects a tag with spaces and slashes inside the brackets", () => {
+		expect(containsInjectedKnowledge("< / addrl-activated-knowledge>")).toBe(
+			true,
+		);
+	});
+
+	it("answers quickly on a long whitespace run after '<'", () => {
+		const hostile = `<${" ".repeat(200_000)}x`;
+		const started = performance.now();
+		expect(containsInjectedKnowledge(hostile)).toBe(false);
+		expect(performance.now() - started).toBeLessThan(250);
 	});
 });
