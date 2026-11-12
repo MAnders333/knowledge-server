@@ -22,14 +22,22 @@ import { runSetupTool } from "./commands/setup-tool.js";
 import { runStatus } from "./commands/status.js";
 import { runStop } from "./commands/stop.js";
 import { downloadAndInstallDaemon, runUpdate } from "./commands/update.js";
+import { resolveDataDir } from "./config-file.js";
 import { config, validateConfig } from "./config.js";
 import { ConsolidationEngine } from "./consolidation/consolidate.js";
 import { runDecayTick, runPollTick } from "./consolidation/poll.js";
 import { PendingEpisodesReader } from "./consolidation/readers/pending.js";
+import { ServerStateDB } from "./db/state/index.js";
 import { StoreRegistry } from "./db/store-registry.js";
 import { logger, parseLogLevel } from "./logger.js";
 import { main as mcpMain } from "./mcp/index.js";
 import { tightenOwnedPrivatePaths } from "./private-files.js";
+import { lockHolder } from "./process-lock.js";
+import {
+	consolidationLockPath,
+	daemonLockPath,
+	stateMaintenanceLockPath,
+} from "./runtime-files.js";
 import { errCode } from "./utils.js";
 
 // Bun normalises process.argv the same way for both compiled binaries and `bun run`:
@@ -237,7 +245,11 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	}
 
 	// Initialize logger first so all subsequent output (including config errors) is captured.
-	logger.init(config.logPath, parseLogLevel(process.env.LOG_LEVEL));
+	logger.init(
+		config.logPath,
+		parseLogLevel(process.env.LOG_LEVEL),
+		config.logMaxBytes,
+	);
 	// Upgraded installs may have group/other-readable logs, DBs or .env (server.log can hold an old admin token).
 	tightenOwnedPrivatePaths();
 
@@ -261,6 +273,15 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	const registry = await StoreRegistry.create();
 	const db = registry.writableStore();
 	const { serverStateDb } = registry;
+	// Data directory: lockfiles and the daemon status file live here, shared with the daemon and CLI.
+	const dataDir = resolveDataDir();
+	// Housekeeping before anything else writes heavily: reclaim state.db free pages
+	// when the file is large and mostly empty. Skipped if another process is busy with it.
+	if (serverStateDb instanceof ServerStateDB) {
+		serverStateDb.compactIfNeeded({
+			lockPath: stateMaintenanceLockPath(dataDir),
+		});
+	}
 	const activation = new ActivationEngine(
 		db,
 		registry.readStores(),
@@ -273,6 +294,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		activation,
 		[new PendingEpisodesReader(serverStateDb)],
 		registry.domainRouter,
+		{ lockPath: consolidationLockPath(dataDir) },
 	);
 
 	// Check if this is a first run (no knowledge yet, but episodes exist)
@@ -385,6 +407,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		activationEvents,
 		registry.host,
 		config.allowedHosts,
+		{ dataDir, daemonAutoSpawn: registry.daemonAutoSpawn },
 	);
 
 	// port/host/daemonAutoSpawn come from the registry (config.jsonc with env var override)
@@ -493,7 +516,16 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	// The daemon child inherits the server's environment so it picks up the
 	// same KNOWLEDGE_* env vars. Its stdout/stderr are forwarded to the server log.
 
-	if (daemonAutoSpawn) {
+	// One daemon per data directory. A service-managed (launchd/systemd) or manually
+	// started daemon already holding daemon.lock means the server must not add a second.
+	const runningDaemon = lockHolder(daemonLockPath(dataDir));
+	if (runningDaemon) {
+		logger.log(
+			`[daemon] Auto-spawn skipped — a knowledge-daemon${runningDaemon.pid > 0 ? ` (PID ${runningDaemon.pid})` : ""} already runs for ${dataDir}. Not starting a second one.`,
+		);
+	}
+
+	if (daemonAutoSpawn && !runningDaemon) {
 		// Resolve the daemon command to spawn.
 		//
 		// Compiled install:   process.execPath = .../libexec/knowledge-server
@@ -548,7 +580,9 @@ Run \`knowledge-server help-advanced\` for additional commands.
 				daemonChild = Bun.spawn(daemonCmd, {
 					stdout: "pipe",
 					stderr: "pipe",
-					env: { ...process.env },
+					// The daemon's lines are forwarded into server.log below; it must not
+					// also write its own daemon.log.
+					env: { ...process.env, KNOWLEDGE_DAEMON_LOG_PATH: "" },
 				});
 				// Forward daemon output to the server log.
 				// TextDecoder is stateful: using { stream: true } preserves carry-over

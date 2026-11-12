@@ -1,6 +1,7 @@
 import { config } from "../config.js";
 import { computeStrength } from "../consolidation/decay.js";
 import type { IKnowledgeStore } from "../db/index.js";
+import { componentHealth } from "../health.js";
 import { logger } from "../logger.js";
 import type {
 	ActivationResult,
@@ -670,7 +671,9 @@ export class ActivationEngine {
 					scored[i].similarity = scores[i] * scored[i].staleness.strength;
 				}
 				gateMode = "rerank";
+				componentHealth.recordSuccess("rerank");
 			} catch (err) {
+				componentHealth.recordFailure("rerank", err);
 				logger.warn(
 					`[activation] Rerank failed — using dense-only ordering. Reason: ${err instanceof Error ? err.message : String(err)}`,
 				);

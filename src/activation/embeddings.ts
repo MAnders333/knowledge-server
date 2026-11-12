@@ -1,4 +1,5 @@
 import { config } from "../config.js";
+import { componentHealth } from "../health.js";
 import { logger } from "../logger.js";
 import type { KnowledgeType } from "../types.js";
 
@@ -302,6 +303,21 @@ export class EmbeddingClient {
 		return parsed.embeddings;
 	}
 
+	/** Embeddings for `texts`; outcome recorded for /status (`embedding` provider). */
+	async embedBatch(
+		texts: string[],
+		opts?: EmbedBatchOptions,
+	): Promise<number[][]> {
+		try {
+			const vectors = await this.embedChunks(texts, opts);
+			if (texts.length > 0) componentHealth.recordSuccess("embedding");
+			return vectors;
+		} catch (err) {
+			componentHealth.recordFailure("embedding", err);
+			throw err;
+		}
+	}
+
 	/**
 	 * Generate embeddings for multiple texts.
 	 * The API may have limits on batch size - we chunk at CHUNK_SIZE.
@@ -311,7 +327,7 @@ export class EmbeddingClient {
 	 * are per chunk and off by default; pass `maxRetries` for background bulk
 	 * work. Only retryable failures are repeated, with exponential backoff.
 	 */
-	async embedBatch(
+	private async embedChunks(
 		texts: string[],
 		opts?: EmbedBatchOptions,
 	): Promise<number[][]> {
