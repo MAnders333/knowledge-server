@@ -17,12 +17,7 @@ import {
 	ActivationEventRecorder,
 	hashSessionId,
 } from "../activation/events.js";
-import {
-	contradictionTagBlock,
-	contradictionTagInline,
-	formatActivatedKnowledge,
-	staleTag,
-} from "../activation/format.js";
+import { formatActivatedKnowledge } from "../activation/format.js";
 import { DEFAULT_CONFIG } from "../config-file.js";
 import { REVIEW_STALE_STRENGTH_THRESHOLD, config } from "../config.js";
 import type { ConsolidationEngine } from "../consolidation/consolidate.js";
