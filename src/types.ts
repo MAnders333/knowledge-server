@@ -315,6 +315,8 @@ export interface ActivationResult {
 	 * Never sent to clients (the HTTP handler strips it) and carries no content.
 	 */
 	telemetry?: ActivationTelemetry;
+	/** Present for activations that are not dryRun: what to record as injected (see ActivationEngine.commitInjections). Never sent to clients. */
+	injection?: InjectionPlan;
 }
 
 /** How the candidate ordering was produced: cross-encoder, dense-only, or no reranker configured. */
@@ -324,6 +326,15 @@ export interface ActivationTelemetry {
 	cueCount: number;
 	nCandidates: number;
 	gateMode: GateMode;
+	gateDropped: number;
+	budgetDropped: number;
+	deduped: number;
+	injectedTokens: number;
+}
+
+/** Entry ids to record as injected, grouped by the writable store that owns them. */
+export interface InjectionPlan {
+	writes: Array<{ storeId: string; entryIds: string[] }>;
 }
 
 /** One content-free row of the activation_event table (see src/activation/events.ts). */
@@ -344,6 +355,14 @@ export interface ActivationEventRow {
 	gateMode: GateMode;
 	latencyMs: number;
 	clientDeadlineExceeded: boolean;
+	/** Candidates the precision gate excluded: floor, support-source gate, and flagged conflicted entries. */
+	gateDropped: number;
+	/** Candidates the token budget excluded. */
+	budgetDropped: number;
+	/** Candidates suppressed because this session already received them. */
+	deduped: number;
+	/** Estimated tokens of the injected entry lines (chars / 4). */
+	injectedTokens: number;
 }
 
 /**

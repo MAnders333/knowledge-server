@@ -7,6 +7,7 @@ import type {
 	ActivationResult,
 	ContradictionAnnotation,
 	GateMode,
+	InjectionPlan,
 	KnowledgeEntry,
 } from "../types.js";
 import {
@@ -18,8 +19,23 @@ import {
 	prepareQuery,
 	storedNorm,
 } from "./embeddings.js";
+import { formatKnowledgeLine } from "./format.js";
+import {
+	applyTokenBudget,
+	denseFloor,
+	estimateTokens,
+	rerankFloor,
+} from "./gate.js";
 import { RerankSkippedError } from "./rerank-remote.js";
 import type { RerankScorer } from "./rerank.js";
+import { SessionDedupe } from "./session-dedupe.js";
+
+/** Session dedupe: retained sessions (LRU). */
+const MAX_SESSIONS = 1000;
+/** Raw-cosine gain that lets a suppressed session entry be injected again. */
+const SESSION_RESCORE_MARGIN = 0.1;
+/** Relation-expanded sources are gated and ranked at this fraction of their parent. */
+const SOURCE_GATE_DISCOUNT = 0.9;
 
 /** Server-side cap on activation cues per call (see normalizeCues). */
 export const MAX_CUES = 12;
@@ -237,6 +253,12 @@ export class ActivationEngine {
 	 */
 	private readonly breaker: StoreBreaker;
 
+	/** Per-session dedupe of injected entries (see session-dedupe.ts). */
+	private readonly sessions: SessionDedupe;
+
+	/** Stores whose injection writes are currently failing (logged once per streak). */
+	private readonly injectionFailing = new Set<string>();
+
 	/**
 	 * Last logged ANN vs full-scan partition of reachable stores. Used to log the
 	 * retrieval path per store only when it changes, not on every activation.
@@ -275,6 +297,11 @@ export class ActivationEngine {
 		this.breaker = new StoreBreaker({
 			threshold: ActivationEngine.STORE_FAILURE_THRESHOLD,
 			windowMs: ActivationEngine.STORE_RETRY_INTERVAL_MS,
+		});
+		this.sessions = new SessionDedupe({
+			ttlMs: config.activation.gate.sessionTtlMs,
+			maxSessions: MAX_SESSIONS,
+			rescoreMargin: SESSION_RESCORE_MARGIN,
 		});
 	}
 
@@ -393,6 +420,12 @@ export class ActivationEngine {
 			 * never changes the store. Used by the replay harness and the CLI.
 			 */
 			dryRun?: boolean;
+			/**
+			 * Client-scoped session key (for example `${client}\0${sessionId}`). When set,
+			 * entries already injected in this session are suppressed (session-dedupe.ts).
+			 * Requests without a key are not deduplicated.
+			 */
+			session?: string;
 		},
 	): Promise<ActivationResult> {
 		const queryList = normalizeCues(
@@ -453,6 +486,10 @@ export class ActivationEngine {
 			rawSimilarity: number;
 			similarity: number;
 			rerankScore?: number;
+			/** Score the precision gate compares with its floor (rerank score, or cosine when dense). */
+			gateScore: number;
+			/** Store the entry was read from. Injection writes go to this store. */
+			owner: IKnowledgeStore;
 			staleness: {
 				ageDays: number;
 				strength: number;
@@ -498,9 +535,16 @@ export class ActivationEngine {
 						(
 							await this.fanOutSafe(
 								annDbs,
-								(db) =>
+								async (db) => {
+									// Path A only runs for stores that pass storeSupportsAnn.
 									// biome-ignore lint/style/noNonNullAssertion: guarded by storeSupportsAnn
-									db.findSimilarEntries!(qEmb, fetchLimit, similarityThreshold),
+									const hits = await db.findSimilarEntries!(
+										qEmb,
+										fetchLimit,
+										similarityThreshold,
+									);
+									return hits.map((hit) => ({ db, ...hit }));
+								},
 								"ANN search",
 								slots,
 							)
@@ -560,17 +604,22 @@ export class ActivationEngine {
 			{
 				entry: KnowledgeEntry;
 				rawSimilarity: number;
+				owner: IKnowledgeStore;
 			}
 		>();
-		const keepBest = (entry: KnowledgeEntry, rawSimilarity: number) => {
+		const keepBest = (
+			entry: KnowledgeEntry,
+			rawSimilarity: number,
+			owner: IKnowledgeStore,
+		) => {
 			const existing = bestById.get(entry.id);
 			if (!existing || rawSimilarity > existing.rawSimilarity) {
-				bestById.set(entry.id, { entry, rawSimilarity });
+				bestById.set(entry.id, { entry, rawSimilarity, owner });
 			}
 		};
 		for (const queryResults of annResultsPerQuery) {
-			for (const { entry, similarity } of queryResults) {
-				keepBest(entry, similarity);
+			for (const { db, entry, similarity } of queryResults) {
+				keepBest(entry, similarity, db);
 			}
 		}
 		// Hydrate only the scan hits that cleared the threshold.
@@ -591,10 +640,10 @@ export class ActivationEngine {
 		const hydratedById = new Map(hydrated.map((e) => [e.id, e]));
 		for (const hit of scanHits) {
 			const entry = hydratedById.get(hit.id);
-			if (entry) keepBest(entry, hit.rawSimilarity);
+			if (entry) keepBest(entry, hit.rawSimilarity, hit.db);
 		}
 
-		for (const { entry, rawSimilarity } of bestById.values()) {
+		for (const { entry, rawSimilarity, owner } of bestById.values()) {
 			const ageDays = (now - entry.createdAt) / DAY_MS;
 			const lastAccessedDaysAgo = (now - entry.lastAccessedAt) / DAY_MS;
 			const halfLife =
@@ -610,6 +659,8 @@ export class ActivationEngine {
 				// The staleness signals in the response let the LLM reason about reliability.
 				rawSimilarity,
 				similarity: rawSimilarity * liveStrength,
+				gateScore: rawSimilarity,
+				owner,
 				staleness: {
 					ageDays: Math.round(ageDays),
 					strength: liveStrength,
@@ -652,6 +703,7 @@ export class ActivationEngine {
 		// Fail-open: any reranker error (model load, inference, timeout) logs a
 		// warning and leaves the dense-only ordering intact.
 		const nCandidates = scored.length;
+		let gateDropped = 0;
 		let gateMode: GateMode = this.reranker ? "dense" : "off";
 		if (this.reranker && scored.length > 1) {
 			// Bound the rerank input: across multiple cues and stores the pool
@@ -669,7 +721,12 @@ export class ActivationEngine {
 				const scores = await this.reranker.scoreBatch(primaryQuery, documents);
 				for (let i = 0; i < scored.length; i++) {
 					scored[i].rerankScore = scores[i];
-					scored[i].similarity = scores[i] * scored[i].staleness.strength;
+					scored[i].gateScore = scores[i];
+					scored[i].similarity =
+						scores[i] *
+						(config.activation.gate.strengthDampening
+							? 0.5 + 0.5 * scored[i].staleness.strength
+							: scored[i].staleness.strength);
 				}
 				gateMode = "rerank";
 				componentHealth.recordSuccess("rerank");
@@ -690,17 +747,22 @@ export class ActivationEngine {
 			}
 		}
 
+		// ── Precision gate: floor ───────────────────────────────────────────────
+		// Runs before the cap, so the cap is spent on candidates that pass. Support
+		// sources are gated when they are added below.
+		const gateOn = config.activation.gate.enabled;
+		const floor = gateOn
+			? this.gateFloor(gateMode, scored, similarityThreshold)
+			: null;
+		if (floor !== null) {
+			const passing = scored.filter((s) => s.gateScore >= floor);
+			gateDropped += scored.length - passing.length;
+			scored.splice(0, scored.length, ...passing);
+		}
+
 		// Sort and cap.
 		scored.sort((a, b) => b.similarity - a.similarity);
 		scored.splice(maxResults);
-
-		// Record access for activated entries (reinforces their strength).
-		// Skipped in dryRun so measuring never changes the store.
-		if (!dryRun) {
-			for (const { entry } of scored) {
-				await this.db.recordAccess(entry.id);
-			}
-		}
 
 		// ── Relation-aware activation: pull in supports sources ───────────────────
 		// When a synthesized principle/pattern activates, surface its source entries
@@ -713,6 +775,8 @@ export class ActivationEngine {
 		// - For each source entry not already in the scored set, compute its score
 		//   as the synthesized entry's similarity × 0.9 (slightly lower to rank it
 		//   below the principle itself, but still nearby)
+		// - Gate: a source inherits no rerank score, so it is gated at 0.9× its
+		//   parent's gate score (the same discount as its rank), against the same floor
 		// - Add sources to the result (but do NOT exceed maxResults)
 		const synthesizedIds = scored
 			.filter(
@@ -723,31 +787,51 @@ export class ActivationEngine {
 		const scoredIdSet = new Set(scored.map(({ entry }) => entry.id));
 
 		if (synthesizedIds.length > 0) {
-			// Fan out support sources lookup across reachable stores and merge maps.
+			// Fan out support sources lookup across reachable stores. A synthesized
+			// entry's sources come from the first store that returns them (the same
+			// precedence as mergeMaps), and each source keeps its owning store.
 			const sourceMaps = await this.fanOutSafe(
 				this.reachableReadDbs(),
-				(db) => db.getSupportSourcesForIds(synthesizedIds),
+				async (db) => ({
+					db,
+					map: await db.getSupportSourcesForIds(synthesizedIds),
+				}),
 				"support sources lookup",
 				slots,
 			);
-			const sourcesMap = mergeMaps(sourceMaps);
+			const sourcesMap = new Map<
+				string,
+				Array<{ source: KnowledgeEntry; owner: IKnowledgeStore }>
+			>();
+			for (const { db, map } of sourceMaps) {
+				for (const [synthId, sources] of map) {
+					if (sourcesMap.has(synthId)) continue;
+					sourcesMap.set(
+						synthId,
+						sources.map((source) => ({ source, owner: db })),
+					);
+				}
+			}
 
 			// Snapshot the array before iterating — we push source entries into `scored`
 			// during the loop and don't want to visit newly-added entries (which could
 			// cascade if a source is itself a principle with its own supports relations).
 			const snapshot = [...scored];
-			for (const {
-				entry,
-				rawSimilarity,
-				similarity: synthSimilarity,
-			} of snapshot) {
+			for (const parent of snapshot) {
+				const { entry, rawSimilarity, similarity: synthSimilarity } = parent;
 				if (entry.type !== "principle" && entry.type !== "pattern") continue;
 				const sources = sourcesMap.get(entry.id);
 				if (!sources) continue;
 
-				for (const source of sources) {
+				for (const { source, owner } of sources) {
 					if (scoredIdSet.has(source.id)) continue; // already activated
 					if (scored.length >= maxResults) break;
+
+					const sourceGate = parent.gateScore * SOURCE_GATE_DISCOUNT;
+					if (floor !== null && sourceGate < floor) {
+						gateDropped++;
+						continue;
+					}
 
 					const liveStrength = computeStrength(source, now);
 					const ageDays = (now - source.createdAt) / DAY_MS;
@@ -761,7 +845,9 @@ export class ActivationEngine {
 					scored.push({
 						entry: source,
 						rawSimilarity,
-						similarity: synthSimilarity * 0.9 * liveStrength,
+						similarity: synthSimilarity * SOURCE_GATE_DISCOUNT * liveStrength,
+						gateScore: sourceGate,
+						owner,
 						staleness: {
 							ageDays: Math.round(ageDays),
 							strength: liveStrength,
@@ -770,7 +856,6 @@ export class ActivationEngine {
 						},
 					});
 					scoredIdSet.add(source.id);
-					if (!dryRun) await this.db.recordAccess(source.id);
 				}
 
 				// Respect maxResults cap for the outer loop too.
@@ -778,12 +863,6 @@ export class ActivationEngine {
 			}
 		}
 		// ─────────────────────────────────────────────────────────────────────────
-
-		// Build a map of activated entries for fast lookup during annotation.
-		// Used to determine whether a conflicted entry's counterpart also activated
-		// (we only annotate when both sides of the conflict are relevant to this query),
-		// and to retrieve the counterpart's content without an extra DB round-trip.
-		const scoredById = new Map(scored.map(({ entry }) => [entry.id, entry]));
 
 		// Batch-fetch all contradicts relations for conflicted entries in a single query,
 		// avoiding N+1 DB calls. Only fetch for entries with status 'conflicted'.
@@ -799,6 +878,40 @@ export class ActivationEngine {
 			slots,
 		);
 		const contradictPairs = mergeMaps(contradictMaps);
+
+		// A conflicted entry with no contradicts partner was flagged for review (not
+		// trustworthy), so it is never injected. Conflicted pairs stay and are annotated below.
+		const beforeFlagCheck = scored.length;
+		const unflagged = scored.filter(
+			({ entry }) =>
+				entry.status !== "conflicted" || contradictPairs.has(entry.id),
+		);
+		gateDropped += beforeFlagCheck - unflagged.length;
+		scored.splice(0, scored.length, ...unflagged);
+
+		// ── Session dedupe ──────────────────────────────────────────────────────
+		// Entries already injected in this session (within the TTL) are suppressed
+		// unless they now score much higher. See session-dedupe.ts.
+		const sessionKey = options?.session;
+		let deduped = 0;
+		if (sessionKey !== undefined) {
+			const fresh = scored.filter((s) => {
+				const suppressed = this.sessions.isSuppressed(
+					sessionKey,
+					{ id: s.entry.id, rawSimilarity: s.rawSimilarity },
+					now,
+				);
+				if (suppressed) deduped++;
+				return !suppressed;
+			});
+			scored.splice(0, scored.length, ...fresh);
+		}
+
+		// Build a map of activated entries for fast lookup during annotation.
+		// Used to determine whether a conflicted entry's counterpart also activated
+		// (we only annotate when both sides of the conflict are relevant to this query),
+		// and to retrieve the counterpart's content without an extra DB round-trip.
+		const scoredById = new Map(scored.map(({ entry }) => [entry.id, entry]));
 
 		// Build contradiction annotations for conflicted entries whose counterpart
 		// also activated in this query (both sides relevant — only then is the caveat useful).
@@ -823,8 +936,58 @@ export class ActivationEngine {
 			});
 		}
 
+		// ── Token budget ────────────────────────────────────────────────────────
+		// Greedy prefix in ranking order; the top-ranked entry is always kept. Token
+		// counts are estimates (see gate.ts) of the formatted line of each entry.
+		const lineTokens = new Map(
+			scored.map((s) => [
+				s,
+				estimateTokens(
+					formatKnowledgeLine({
+						entry: s.entry,
+						staleness: s.staleness,
+						contradiction: contradictionMap.get(s.entry.id),
+					}).length,
+				),
+			]),
+		);
+		let final = scored;
+		let budgetDropped = 0;
+		if (gateOn) {
+			final = applyTokenBudget(
+				scored,
+				config.activation.gate.tokenBudget,
+				(s) => lineTokens.get(s) ?? 0,
+				(s) => s.rawSimilarity >= similarityThreshold,
+			);
+			budgetDropped = scored.length - final.length;
+		}
+		// A counterpart the budget dropped is no longer in the response, so its
+		// annotation would point at nothing. Remove it.
+		const finalIds = new Set(final.map(({ entry }) => entry.id));
+		for (const [id, annotation] of contradictionMap) {
+			if (!finalIds.has(annotation.conflictingEntryId)) {
+				contradictionMap.delete(id);
+			}
+		}
+		const injectedTokens = final.reduce(
+			(n, s) => n + (lineTokens.get(s) ?? 0),
+			0,
+		);
+
+		if (sessionKey !== undefined) {
+			this.sessions.remember(
+				sessionKey,
+				final.map(({ entry, rawSimilarity }) => ({
+					id: entry.id,
+					rawSimilarity,
+				})),
+				now,
+			);
+		}
+
 		return {
-			entries: scored.map(
+			entries: final.map(
 				({ entry, rawSimilarity, similarity, rerankScore, staleness }) => ({
 					entry: { ...entry, embedding: undefined } as KnowledgeEntry,
 					similarity,
@@ -836,8 +999,92 @@ export class ActivationEngine {
 			),
 			query: primaryQuery,
 			totalActive,
-			telemetry: { cueCount: queryList.length, nCandidates, gateMode },
+			telemetry: {
+				cueCount: queryList.length,
+				nCandidates,
+				gateMode,
+				gateDropped,
+				budgetDropped,
+				deduped,
+				injectedTokens,
+			},
+			injection: dryRun ? undefined : this.injectionPlan(final),
 		};
+	}
+
+	/**
+	 * Injection writes for one response, grouped by owning store. Only writable
+	 * stores get a write: entries read from writable:false stores are not recorded.
+	 */
+	private injectionPlan(
+		items: ReadonlyArray<{ entry: KnowledgeEntry; owner: IKnowledgeStore }>,
+	): InjectionPlan {
+		const byStore = new Map<string, string[]>();
+		for (const { entry, owner } of items) {
+			if (!this.writableDbs.some((db) => db.id === owner.id)) continue;
+			const ids = byStore.get(owner.id);
+			if (ids) ids.push(entry.id);
+			else byStore.set(owner.id, [entry.id]);
+		}
+		return {
+			writes: [...byStore].map(([storeId, entryIds]) => ({
+				storeId,
+				entryIds,
+			})),
+		};
+	}
+
+	/**
+	 * Floor of the precision gate for this ordering mode, or null when no gate
+	 * applies (no reranker configured).
+	 */
+	private gateFloor(
+		gateMode: GateMode,
+		scored: ReadonlyArray<{ gateScore: number }>,
+		similarityThreshold: number,
+	): number | null {
+		const gate = config.activation.gate;
+		if (gateMode === "rerank" && this.reranker) {
+			let top = 0;
+			for (const s of scored) top = Math.max(top, s.gateScore);
+			return rerankFloor({
+				identity: this.reranker.identity,
+				floorOverride: gate.rerankFloor,
+				relFrac: gate.rerankRelFrac,
+				topScore: top,
+			});
+		}
+		if (gateMode === "dense") {
+			return denseFloor(similarityThreshold, gate.denseMargin);
+		}
+		return null;
+	}
+
+	/**
+	 * Record one response's injections: one batched write per owning writable
+	 * store. Call it after the response is built. It is not awaited, so it adds no
+	 * latency. A failing store is logged once per failure streak and never reaches
+	 * the caller. The caller skips abandoned requests.
+	 */
+	commitInjections(plan: InjectionPlan | undefined): void {
+		if (!plan) return;
+		const now = Date.now();
+		for (const write of plan.writes) {
+			const db = this.writableDbs.find((d) => d.id === write.storeId);
+			if (!db) continue;
+			db.recordInjections(write.entryIds, now).then(
+				() => {
+					this.injectionFailing.delete(db.id);
+				},
+				(err: unknown) => {
+					if (this.injectionFailing.has(db.id)) return;
+					this.injectionFailing.add(db.id);
+					logger.warn(
+						`[activation] Recording injections failed on store "${db.id}"; access stats are not updated until it recovers. Reason: ${describeError(err)}`,
+					);
+				},
+			);
+		}
 	}
 
 	/**
