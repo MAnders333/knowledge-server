@@ -457,7 +457,7 @@ All sources are auto-detected. Override paths or disable sources via environment
 
 | Variable | Default | Description |
 |---|---|---|
-| `INITIAL_LOOKBACK_DAYS` | `30` | First run of each source the daemon reads only ingests sessions (or local Markdown files, by modification time) with activity in the last N days. `0` ingests all history. A session in the window is ingested in full. The `process-inbox` command is not affected. |
+| `INITIAL_LOOKBACK_DAYS` | `30` | First run of each source the daemon reads only ingests sessions (or local Markdown files, by modification time) with activity in the last N days. Set `0` to ingest all history on the first run. A session in the window is ingested in full. The `process-inbox` command is not affected. After `reinitialize` (cursor reset), the next run re-reads all history regardless of this setting. |
 
 - **First run preview.** The daemon logs the episode count and a rough token estimate for each batch of the first run. No LLM cost is estimated, because no model price is configured. Review the count before a large history is consolidated.
 - **Only new content is uploaded.** A session that grows is uploaded from its last uploaded message onward. Earlier chunks are not re-sent.
@@ -601,7 +601,8 @@ The `reinitialize` command resets varying amounts of state depending on which fl
 
 ```bash
 # Default — reset daemon cursor only.
-# The daemon re-uploads all historical episodes on its next tick.
+# The daemon re-reads the full history of every source on its next tick. This is
+# not limited by INITIAL_LOOKBACK_DAYS. Once that pass completes, the lookback applies again.
 # Safe for shared stores (only local state is touched).
 # Use when: connecting to a new or existing store for the first time.
 knowledge-server reinitialize --confirm

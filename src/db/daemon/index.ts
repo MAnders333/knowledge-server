@@ -35,6 +35,13 @@ const CREATE_TABLES = `
     last_uploaded_at          INTEGER NOT NULL DEFAULT 0
   );
 
+  -- One-shot requests from other commands (e.g. reinitialize). A row present
+  -- means the request is pending; the daemon removes it after it has been served.
+  CREATE TABLE IF NOT EXISTS daemon_flag (
+    name   TEXT    PRIMARY KEY,
+    set_at INTEGER NOT NULL
+  );
+
   -- Per-session upload watermark — the last message ID the daemon has staged
   -- for each (source, session). A grown session is read from this message on,
   -- so only its new tail is uploaded. Per-machine, like daemon_cursor.
@@ -51,9 +58,13 @@ const CREATE_TABLES = `
  * Schema history:
  *   1 — schema_version + daemon_cursor.
  *   2 — daemon_session_cursor (incremental upload watermark per session).
+ *   3 — daemon_flag (pending full re-ingest request).
  * CREATE TABLE IF NOT EXISTS applies new tables on open; the version is recorded.
  */
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
+
+/** daemon_flag name: the next upload ignores the first-run lookback window. */
+const FULL_BACKFILL_FLAG = "full_backfill";
 
 /** Max session IDs per IN (...) query; keeps well under SQLite's bound-parameter limit. */
 const SESSION_LOOKUP_CHUNK = 500;
@@ -198,10 +209,37 @@ export class DaemonDB {
 			.run(source, sessionId, lastMessageId, Date.now());
 	}
 
-	/** Forget every cursor (source-level and per-session), so the next run rescans from scratch. */
+	/**
+	 * Forget every cursor (source-level and per-session) and request a full
+	 * re-ingest. Without the request, sources with no cursor would be treated as a
+	 * first run and only read the INITIAL_LOOKBACK_DAYS window. Both happen in one
+	 * transaction so a crash cannot leave cursors cleared without the request.
+	 */
 	async resetDaemonCursors(): Promise<void> {
-		this.db.exec("DELETE FROM daemon_cursor");
-		this.db.exec("DELETE FROM daemon_session_cursor");
+		this.db.transaction(() => {
+			this.db.exec("DELETE FROM daemon_cursor");
+			this.db.exec("DELETE FROM daemon_session_cursor");
+			this.db
+				.prepare(
+					"INSERT OR REPLACE INTO daemon_flag (name, set_at) VALUES (?, ?)",
+				)
+				.run(FULL_BACKFILL_FLAG, Date.now());
+		})();
+	}
+
+	/** True while a full re-ingest requested by resetDaemonCursors() is pending. */
+	async hasFullBackfillRequest(): Promise<boolean> {
+		const row = this.db
+			.prepare("SELECT 1 FROM daemon_flag WHERE name = ?")
+			.get(FULL_BACKFILL_FLAG);
+		return row !== null && row !== undefined;
+	}
+
+	/** Called once a full re-ingest has read every source to its end. */
+	async clearFullBackfillRequest(): Promise<void> {
+		this.db
+			.prepare("DELETE FROM daemon_flag WHERE name = ?")
+			.run(FULL_BACKFILL_FLAG);
 	}
 
 	close(): void {

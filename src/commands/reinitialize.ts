@@ -14,9 +14,10 @@ import { errCode } from "../utils.js";
  * ── Levels (choose one) ───────────────────────────────────────────────────────
  *
  * (default, no level flag)
- *   Resets the daemon upload cursor only. The daemon will re-upload all
- *   historical episodes on its next tick. Knowledge entries and server state
- *   are untouched. Safe for shared stores.
+ *   Resets the daemon upload cursor only. The daemon re-reads the full history
+ *   of every source on its next tick (INITIAL_LOOKBACK_DAYS does not apply to
+ *   this one re-ingest). Knowledge entries and server state are untouched. Safe
+ *   for shared stores.
  *   Use when: connecting to a new or existing store for the first time.
  *
  * --reset-state
@@ -139,7 +140,7 @@ export async function runReinitialize(args: string[]): Promise<void> {
 
 		// Describe what will happen (entry count fetched lazily, only when confirming)
 		const actions: string[] = [
-			"Reset daemon cursor — daemon re-uploads all historical episodes on next tick",
+			"Reset daemon cursor — daemon re-reads all history (ignores INITIAL_LOOKBACK_DAYS) on next tick",
 		];
 		if (resetState) {
 			actions.push(
@@ -202,7 +203,7 @@ export async function runReinitialize(args: string[]): Promise<void> {
 		try {
 			await daemonDb.resetDaemonCursors();
 			console.log(
-				"  ✓ Reset daemon cursor (all sources) — daemon will re-upload all episodes on next tick",
+				"  ✓ Reset daemon cursor (all sources) — daemon will re-read all history on next tick",
 			);
 
 			if (resetState) {
@@ -230,7 +231,7 @@ export async function runReinitialize(args: string[]): Promise<void> {
 		console.log("\nDone.");
 		if (level === "cursor") {
 			console.log(
-				"  Daemon will re-upload all historical episodes on its next tick.\n" +
+				"  Daemon will re-read all history on its next tick (INITIAL_LOOKBACK_DAYS does not apply).\n" +
 					"  Trigger consolidation when ready: knowledge-server consolidate",
 			);
 		} else if (level === "state") {
