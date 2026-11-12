@@ -45,6 +45,21 @@ function makeStoreStub(
 		getEntry: mock(() => Promise.resolve(null)),
 		getActiveEntries: mock(() => Promise.resolve([])),
 		getActiveEntriesWithEmbeddings: mock(() => Promise.resolve(entries)),
+		scanEmbeddings: mock(() =>
+			Promise.resolve(
+				entries.map((e) => ({
+					id: e.id,
+					embedding: Float32Array.from(e.embedding),
+				})),
+			),
+		),
+		getEntriesByIds: mock((ids: string[]) =>
+			Promise.resolve(
+				entries
+					.filter((e) => ids.includes(e.id))
+					.map(({ embedding: _embedding, ...rest }) => rest),
+			),
+		),
 		getOneEntryWithEmbedding: mock(() => Promise.resolve(null)),
 		getActiveAndConflictedEntries: mock(() => Promise.resolve([])),
 		getEntriesMissingEmbeddings: mock(() => Promise.resolve([])),

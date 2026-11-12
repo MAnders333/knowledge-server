@@ -254,6 +254,34 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		expect(entry?.lastAccessedAt).toBeGreaterThanOrEqual(now);
 	});
 
+	it("scanEmbeddings and getEntriesByIds return id/vector and plain entries", async () => {
+		await db.insertEntry(makeEntry("scan-pg-a", { embedding: [0.5, -1, 2] }));
+		await db.insertEntry(
+			makeEntry("scan-pg-c", { status: "conflicted", embedding: [1, 1, 1] }),
+		);
+		await db.insertEntry(
+			makeEntry("scan-pg-old", { status: "superseded", embedding: [9, 9, 9] }),
+		);
+		await db.insertEntry(makeEntry("scan-pg-none"));
+
+		const rows = await db.scanEmbeddings();
+		expect(rows.map((r) => r.id).sort()).toEqual(["scan-pg-a", "scan-pg-c"]);
+		const a = rows.find((r) => r.id === "scan-pg-a");
+		expect(a?.embedding).toBeInstanceOf(Float32Array);
+		expect(Array.from(a?.embedding ?? [])).toEqual([0.5, -1, 2]);
+
+		const hydrated = await db.getEntriesByIds([
+			"scan-pg-a",
+			"scan-pg-old",
+			"scan-pg-none",
+		]);
+		expect(hydrated.map((e) => e.id).sort()).toEqual([
+			"scan-pg-a",
+			"scan-pg-none",
+		]);
+		for (const entry of hydrated) expect(entry.embedding).toBeUndefined();
+	});
+
 	it("reports strength computed on read, not the stored column", async () => {
 		const now = Date.now();
 		await db.insertEntry(

@@ -387,6 +387,77 @@ export function formatEmbeddingText(
  * Compute cosine similarity between two vectors.
  * Returns a value between -1 and 1 (1 = identical, 0 = orthogonal, -1 = opposite).
  */
+/**
+ * Dot product of a prepared (Float64) query with a stored (Float32) vector, using
+ * four accumulators. Kept monomorphic: a generic ArrayLike loop is deoptimised by
+ * the JIT when it sees both array types, which made scan scoring ~10x slower.
+ */
+function dotQueryStored(a: Float64Array, b: Float32Array): number {
+	const n = a.length;
+	let s0 = 0;
+	let s1 = 0;
+	let s2 = 0;
+	let s3 = 0;
+	let i = 0;
+	for (; i + 3 < n; i += 4) {
+		s0 += a[i] * b[i];
+		s1 += a[i + 1] * b[i + 1];
+		s2 += a[i + 2] * b[i + 2];
+		s3 += a[i + 3] * b[i + 3];
+	}
+	for (; i < n; i++) s0 += a[i] * b[i];
+	return s0 + s1 + (s2 + s3);
+}
+
+/** Euclidean norm of a stored float32 vector (4 accumulators, see dotQueryStored). */
+export function storedNorm(v: Float32Array): number {
+	const n = v.length;
+	let s0 = 0;
+	let s1 = 0;
+	let s2 = 0;
+	let s3 = 0;
+	let i = 0;
+	for (; i + 3 < n; i += 4) {
+		s0 += v[i] * v[i];
+		s1 += v[i + 1] * v[i + 1];
+		s2 += v[i + 2] * v[i + 2];
+		s3 += v[i + 3] * v[i + 3];
+	}
+	for (; i < n; i++) s0 += v[i] * v[i];
+	return Math.sqrt(s0 + s1 + (s2 + s3));
+}
+
+/** A query vector normalised once, for scoring against many stored vectors. */
+export interface PreparedQuery {
+	/** Unit-length copy of the query (Float64, so scores match cosineSimilarity). */
+	readonly unit: Float64Array;
+	readonly zero: boolean;
+}
+
+export function prepareQuery(q: ArrayLike<number>): PreparedQuery {
+	let sum = 0;
+	for (let i = 0; i < q.length; i++) sum += q[i] * q[i];
+	const norm = Math.sqrt(sum);
+	const unit = new Float64Array(q.length);
+	if (norm === 0) return { unit, zero: true };
+	for (let i = 0; i < q.length; i++) unit[i] = q[i] / norm;
+	return { unit, zero: false };
+}
+
+/**
+ * Cosine similarity of a prepared query against a stored float32 vector whose
+ * norm is already known (see storedNorm). Equals cosineSimilarity(q, b) up to
+ * float rounding.
+ */
+export function cosineToPrepared(
+	q: PreparedQuery,
+	b: Float32Array,
+	bNorm: number,
+): number {
+	if (q.zero || bNorm === 0) return 0;
+	return dotQueryStored(q.unit, b) / bNorm;
+}
+
 export function cosineSimilarity(a: number[], b: number[]): number {
 	if (a.length !== b.length) {
 		throw new Error(`Vector dimension mismatch: ${a.length} vs ${b.length}`);

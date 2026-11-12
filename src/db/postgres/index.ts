@@ -15,6 +15,7 @@ import {
 } from "../migration-registry.js";
 import {
 	bufferToFloats,
+	byteaToFloat32,
 	floatsToBuffer,
 	floatsToVectorLiteral,
 } from "./embedding-codec.js";
@@ -790,6 +791,28 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			.filter(
 				(e): e is KnowledgeEntry & { embedding: number[] } => !!e.embedding,
 			);
+	}
+
+	async scanEmbeddings(): Promise<
+		Array<{ id: string; embedding: Float32Array }>
+	> {
+		const rows = await this.sql.unsafe(
+			`SELECT id, embedding FROM knowledge_entry
+			WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL`,
+		);
+		return (rows as unknown as Array<{ id: string; embedding: Buffer }>).map(
+			(r) => ({ id: r.id, embedding: byteaToFloat32(r.embedding) }),
+		);
+	}
+
+	async getEntriesByIds(ids: string[]): Promise<KnowledgeEntry[]> {
+		if (ids.length === 0) return [];
+		const rows = await this.sql.unsafe(
+			`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry
+			WHERE status IN ('active', 'conflicted') AND id = ANY($1::text[])`,
+			[ids],
+		);
+		return (rows as unknown as RawEntryRow[]).map((r) => this.rowToEntry(r));
 	}
 
 	async getOneEntryWithEmbedding(): Promise<

@@ -11,9 +11,11 @@ import type {
 import {
 	EmbeddingClient,
 	bulkEmbedOptions,
-	cosineSimilarity,
+	cosineToPrepared,
 	describeError,
 	formatEmbeddingText,
+	prepareQuery,
+	storedNorm,
 } from "./embeddings.js";
 import type { RerankScorer } from "./rerank.js";
 
@@ -514,20 +516,38 @@ export class ActivationEngine {
 				),
 				this.fanOutSafe(
 					scanDbs,
-					(db) => db.getActiveEntriesWithEmbeddings(),
+					async (db) => ({ db, rows: await db.scanEmbeddings() }),
 					"full-scan load",
 					slots,
 				),
 			]);
 
-		// Scan stores: entries synced to several scan stores share an ID -
-		// deduplicate among scan stores keeping the first occurrence.
+		// Scan stores: score id + embedding rows only. Entries synced to several scan
+		// stores share an ID, so the first occurrence is scored and the rest skipped.
+		const preparedQueries = queryEmbeddings.map((q) => prepareQuery(q));
 		const scanSeenIds = new Set<string>();
-		const scanEntries = scanEntriesPerStore.flat().filter((e) => {
-			if (scanSeenIds.has(e.id)) return false;
-			scanSeenIds.add(e.id);
-			return true;
-		});
+		const scanHits: Array<{
+			db: IKnowledgeStore;
+			id: string;
+			rawSimilarity: number;
+		}> = [];
+		for (const { db, rows } of scanEntriesPerStore) {
+			for (const row of rows) {
+				if (scanSeenIds.has(row.id)) continue;
+				scanSeenIds.add(row.id);
+				const bNorm = storedNorm(row.embedding);
+				let rawSimilarity = Number.NEGATIVE_INFINITY;
+				for (const q of preparedQueries) {
+					rawSimilarity = Math.max(
+						rawSimilarity,
+						cosineToPrepared(q, row.embedding, bNorm),
+					);
+				}
+				// ANN stores filter by threshold in the DB; apply the same cut here.
+				if (rawSimilarity < similarityThreshold) continue;
+				scanHits.push({ db, id: row.id, rawSimilarity });
+			}
+		}
 
 		// Merge candidates from both paths: entry ID -> best rawSimilarity across
 		// all query vectors and stores. ANN candidates are inserted first, so on a
@@ -551,15 +571,25 @@ export class ActivationEngine {
 				keepBest(entry, similarity);
 			}
 		}
-		for (const entry of scanEntries) {
-			const rawSimilarity = Math.max(
-				...queryEmbeddings.map((qEmb) =>
-					cosineSimilarity(qEmb, entry.embedding),
-				),
-			);
-			// ANN stores filter by threshold in the DB; apply the same cut here.
-			if (rawSimilarity < similarityThreshold) continue;
-			keepBest(entry, rawSimilarity);
+		// Hydrate only the scan hits that cleared the threshold.
+		const hitIdsByStore = new Map<IKnowledgeStore, string[]>();
+		for (const hit of scanHits) {
+			const ids = hitIdsByStore.get(hit.db);
+			if (ids) ids.push(hit.id);
+			else hitIdsByStore.set(hit.db, [hit.id]);
+		}
+		const hydrated = (
+			await this.fanOutSafe(
+				[...hitIdsByStore.keys()],
+				(db) => db.getEntriesByIds(hitIdsByStore.get(db) ?? []),
+				"entry hydrate",
+				slots,
+			)
+		).flat();
+		const hydratedById = new Map(hydrated.map((e) => [e.id, e]));
+		for (const hit of scanHits) {
+			const entry = hydratedById.get(hit.id);
+			if (entry) keepBest(entry, hit.rawSimilarity);
 		}
 
 		for (const { entry, rawSimilarity } of bestById.values()) {

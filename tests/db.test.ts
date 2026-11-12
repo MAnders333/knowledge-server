@@ -222,6 +222,69 @@ describe("KnowledgeDB", () => {
 		expect(stale[0]?.strength).toBeLessThan(0.3);
 	});
 
+	it("scanEmbeddings returns id and vector only, for active and conflicted entries", async () => {
+		const now = Date.now();
+		const base = {
+			type: "fact" as const,
+			topics: ["t"],
+			confidence: 0.5,
+			source: "test",
+			strength: 1.0,
+			createdAt: now,
+			updatedAt: now,
+			lastAccessedAt: now,
+			accessCount: 0,
+			observationCount: 1,
+			supersededBy: null,
+			derivedFrom: [],
+		};
+		await db.insertEntry({
+			...base,
+			id: "scan-a",
+			content: "a",
+			status: "active",
+			embedding: [0.5, -1, 2],
+		});
+		await db.insertEntry({
+			...base,
+			id: "scan-c",
+			content: "c",
+			status: "conflicted",
+			embedding: [1, 1, 1],
+		});
+		await db.insertEntry({
+			...base,
+			id: "scan-old",
+			content: "o",
+			status: "superseded",
+			embedding: [9, 9, 9],
+		});
+		await db.insertEntry({
+			...base,
+			id: "scan-none",
+			content: "n",
+			status: "active",
+		});
+
+		const rows = await db.scanEmbeddings();
+		expect(rows.map((r) => r.id).sort()).toEqual(["scan-a", "scan-c"]);
+		const a = rows.find((r) => r.id === "scan-a");
+		expect(a).toBeDefined();
+		expect(a?.embedding).toBeInstanceOf(Float32Array);
+		expect(Array.from(a?.embedding ?? [])).toEqual([0.5, -1, 2]);
+
+		const hydrated = await db.getEntriesByIds([
+			"scan-a",
+			"scan-old",
+			"scan-none",
+		]);
+		// Hydration returns active/conflicted rows whatever their embedding state.
+		expect(hydrated.map((e) => e.id).sort()).toEqual(["scan-a", "scan-none"]);
+		expect(hydrated[0].embedding).toBeUndefined();
+		expect(hydrated[0].content).toBe("a");
+		expect(await db.getEntriesByIds([])).toEqual([]);
+	});
+
 	it("plain entry reads never carry the embedding", async () => {
 		const now = Date.now();
 		await db.insertEntry({

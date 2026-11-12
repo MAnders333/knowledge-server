@@ -376,7 +376,7 @@ describe("ActivationEngine multi-store fan-out", () => {
 			fakeEmbedding("entry from healthy store"),
 		]);
 		// Make db2 throw on full-scan load (Path B — neither store has ANN)
-		spyOn(db2, "getActiveEntriesWithEmbeddings").mockRejectedValue(
+		spyOn(db2, "scanEmbeddings").mockRejectedValue(
 			new Error("connection refused"),
 		);
 
@@ -387,7 +387,7 @@ describe("ActivationEngine multi-store fan-out", () => {
 		expect(ids).not.toContain("e2");
 	});
 
-	it("skips a previously-failed store on subsequent calls (health tracking)", async () => {
+	it("skips a store once its circuit opens (three consecutive failures)", async () => {
 		await db1.insertEntry(
 			makeEntry({
 				id: "e1",
@@ -410,22 +410,26 @@ describe("ActivationEngine multi-store fan-out", () => {
 		spyOn(engine.embeddings, "embedBatch").mockResolvedValue([
 			fakeEmbedding("healthy entry"),
 		]);
-		// db2 always fails
-		const failSpy = spyOn(
-			db2,
-			"getActiveEntriesWithEmbeddings",
-		).mockRejectedValue(new Error("connection refused"));
+		// db2 is dead: every call fails, so its consecutive-failure count only grows.
+		const failSpy = spyOn(db2, "scanEmbeddings").mockRejectedValue(
+			new Error("connection refused"),
+		);
+		spyOn(db2, "getContradictPairsForIds").mockRejectedValue(
+			new Error("connection refused"),
+		);
 
-		// First call — db2 is tried and fails
-		const result1 = await engine.activate("healthy entry");
-		expect(result1.entries.map((e) => e.entry.id)).toContain("e1");
-		expect(failSpy).toHaveBeenCalledTimes(1);
+		// Failing calls accumulate until three in a row open the circuit; then the store
+		// is no longer called at all, however many activations follow.
+		for (let call = 1; call <= 3; call++) {
+			const result = await engine.activate("healthy entry");
+			expect(result.entries.map((e) => e.entry.id)).toContain("e1");
+		}
+		const callsWhileOpening = failSpy.mock.calls.length;
+		expect(callsWhileOpening).toBeLessThanOrEqual(3);
 
-		// Second call — db2 should be skipped (health tracking), not retried
-		const result2 = await engine.activate("healthy entry");
-		expect(result2.entries.map((e) => e.entry.id)).toContain("e1");
-		// failSpy still at 1 — db2 was not called again
-		expect(failSpy).toHaveBeenCalledTimes(1);
+		const result = await engine.activate("healthy entry");
+		expect(result.entries.map((e) => e.entry.id)).toContain("e1");
+		expect(failSpy).toHaveBeenCalledTimes(callsWhileOpening);
 	});
 });
 

@@ -288,6 +288,39 @@ export class KnowledgeDB implements IKnowledgeStore {
 	}
 
 	/**
+	 * id + embedding of every active or conflicted entry, for the full-scan path.
+	 * Other columns are not read, so no entry object is built per row.
+	 */
+	async scanEmbeddings(): Promise<
+		Array<{ id: string; embedding: Float32Array }>
+	> {
+		const rows = this.db
+			.prepare(
+				"SELECT id, embedding FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL",
+			)
+			.all() as Array<{ id: string; embedding: Uint8Array }>;
+		return rows.map((r) => ({
+			id: r.id,
+			embedding: blobToFloat32(r.embedding),
+		}));
+	}
+
+	/**
+	 * Full entries (no embedding) for the given active or conflicted ids.
+	 */
+	async getEntriesByIds(ids: string[]): Promise<KnowledgeEntry[]> {
+		if (ids.length === 0) return [];
+		const rows = this.db
+			.prepare(
+				`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry
+         WHERE status IN ('active', 'conflicted')
+           AND id IN (SELECT value FROM json_each(?))`,
+			)
+			.all(JSON.stringify(ids)) as RawEntryRow[];
+		return rows.map((r) => this.rowToEntry(r));
+	}
+
+	/**
 	 * Get a single active or conflicted entry that has an embedding.
 	 * Used to probe embedding dimensions without loading all entries into memory.
 	 */
@@ -1291,6 +1324,17 @@ function blobToFloats(blob: Uint8Array): number[] {
 		blob.byteLength / 4,
 	);
 	return Array.from(float32);
+}
+
+/**
+ * View a BLOB of raw float32 bytes as a Float32Array without converting it to
+ * number[]. Copies only when the blob is not 4-byte aligned.
+ */
+function blobToFloat32(blob: Uint8Array): Float32Array {
+	if (blob.byteOffset % 4 === 0) {
+		return new Float32Array(blob.buffer, blob.byteOffset, blob.byteLength / 4);
+	}
+	return new Float32Array(blob.slice().buffer);
 }
 
 /**

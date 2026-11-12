@@ -108,7 +108,7 @@ describe("ActivationEngine.activate: q list goes through the same cap", () => {
 	it("embeds at most MAX_CUES deduped cues and keeps the full message last", async () => {
 		const store = {
 			id: "scan",
-			getActiveEntriesWithEmbeddings: mock(async () => []),
+			scanEmbeddings: mock(async () => []),
 		} as unknown as IKnowledgeStore;
 		const engine = new ActivationEngine(store);
 		const embed = spyOn(engine.embeddings, "embedBatch").mockImplementation(

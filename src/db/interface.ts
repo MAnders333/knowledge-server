@@ -197,6 +197,19 @@ export interface IKnowledgeStore {
 		(KnowledgeEntry & { embedding: number[] }) | null
 	>;
 
+	/**
+	 * id + embedding of every active or conflicted entry, for the in-process
+	 * full-scan retrieval path. Loads no other columns, so scoring does not
+	 * materialise whole entries.
+	 */
+	scanEmbeddings(): Promise<Array<{ id: string; embedding: Float32Array }>>;
+
+	/**
+	 * Full entries (no embedding) for the given ids that are active or conflicted.
+	 * Hydrates the few scan hits that clear the similarity threshold.
+	 */
+	getEntriesByIds(ids: string[]): Promise<KnowledgeEntry[]>;
+
 	getActiveAndConflictedEntries(): Promise<KnowledgeEntry[]>;
 
 	getEntriesMissingEmbeddings(): Promise<KnowledgeEntry[]>;
