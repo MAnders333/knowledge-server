@@ -17,6 +17,37 @@ import {
 } from "./embeddings.js";
 import type { RerankScorer } from "./rerank.js";
 
+/** Server-side cap on activation cues per call (see normalizeCues). */
+export const MAX_CUES = 12;
+
+/**
+ * Dedupe and cap activation cues. Applied wherever cues enter the engine:
+ * splitIntoCues and every activate() call (the /activate `q` list, the MCP tool
+ * and the plugin all go through it).
+ *
+ *   - Cues are compared by a normalised key (trimmed, whitespace collapsed,
+ *     lowercased). The first occurrence wins and keeps its original text.
+ *     Blank cues are dropped.
+ *   - More than MAX_CUES unique cues keep the first ceil(MAX_CUES/2) and the last
+ *     floor(MAX_CUES/2). The last cue is the holistic full message, so it is kept.
+ *
+ * Deterministic: the same input always yields the same output.
+ */
+export function normalizeCues(cues: readonly string[]): string[] {
+	const seen = new Set<string>();
+	const unique: string[] = [];
+	for (const cue of cues) {
+		const key = cue.replace(/\s+/g, " ").trim().toLowerCase();
+		if (key.length === 0 || seen.has(key)) continue;
+		seen.add(key);
+		unique.push(cue);
+	}
+	if (unique.length <= MAX_CUES) return unique;
+	const head = Math.ceil(MAX_CUES / 2);
+	const tail = Math.floor(MAX_CUES / 2);
+	return [...unique.slice(0, head), ...unique.slice(unique.length - tail)];
+}
+
 /**
  * Split a prompt into activation cues for multi-topic retrieval.
  *
@@ -24,9 +55,9 @@ import type { RerankScorer } from "./rerank.js";
  *   1. Per-line segments — each newline is a topic boundary (Shift+Enter in most UIs).
  *      Segments shorter than MIN_CUE_CHARS are skipped (greetings, "yes", "ok", etc.)
  *   2. The full trimmed prompt as a holistic cue — captures overall intent that no
- *      individual line may fully express.
- *   3. Deduplication — if the message is a single line, the segment and the full
- *      message are the same string; the Set removes the duplicate.
+ *      individual line may fully express. It is always the last cue.
+ *   3. normalizeCues — duplicates (by normalised key) are dropped and the list is
+ *      capped at MAX_CUES.
  *
  * All resulting cues are embedded in a single batched API call downstream.
  *
@@ -42,8 +73,7 @@ export function splitIntoCues(prompt: string): string[] {
 		.split("\n")
 		.map((s) => s.trim())
 		.filter((s) => s.length >= MIN_CUE_CHARS);
-	// Union: unique segments + full message (Set deduplicates single-line messages)
-	return [...new Set([...segments, trimmed])];
+	return normalizeCues([...segments, trimmed]);
 }
 
 /**
@@ -227,8 +257,8 @@ export class ActivationEngine {
 			dryRun?: boolean;
 		},
 	): Promise<ActivationResult> {
-		const queryList = (Array.isArray(queries) ? queries : [queries]).filter(
-			(q) => q.trim().length > 0,
+		const queryList = normalizeCues(
+			Array.isArray(queries) ? queries : [queries],
 		);
 		if (queryList.length === 0) {
 			return { entries: [], query: "", totalActive: 0 };
