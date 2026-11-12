@@ -24,7 +24,12 @@ import { ActivationEngine } from "../src/activation/activate";
 import { ConsolidationEngine } from "../src/consolidation/consolidate";
 import { KnowledgeDB } from "../src/db/sqlite/index";
 import { ServerStateDB } from "../src/db/state/index";
-import type { Episode, IEpisodeReader, ProcessedRange } from "../src/types";
+import type {
+	Episode,
+	EpisodeOutcome,
+	IEpisodeReader,
+	ProcessedRange,
+} from "../src/types";
 import { fakeEmbedding } from "./fixtures";
 
 // ── SQLite KnowledgeDB lock (no-op) ──────────────────────────────────────────
@@ -60,34 +65,48 @@ describe("KnowledgeDB.tryAcquireConsolidationLock (SQLite no-op)", () => {
 // ── ConsolidationEngine: store-level lock integration ────────────────────────
 
 /**
- * Minimal mock episode reader that serves a single episode.
+ * Fake episode reader that holds rows like pending_episodes does: an episode
+ * stays in `pending` until afterConsolidated() reports it completed.
  */
 class SingleEpisodeReader implements IEpisodeReader {
 	readonly source = "opencode";
-	private readonly episode: Episode;
+	/** Episodes the reader still holds. */
+	pending: Episode[];
+	/** Every outcome passed to afterConsolidated(), in call order. */
+	readonly outcomes: EpisodeOutcome[] = [];
 
 	constructor(episode: Episode) {
-		this.episode = episode;
+		this.pending = [episode];
 	}
 
 	getCandidateSessions(_after: number) {
-		return [
-			{
-				id: this.episode.sessionId,
-				maxMessageTime: this.episode.maxMessageTime,
-			},
-		];
+		return this.pending.map((ep) => ({
+			id: ep.sessionId,
+			maxMessageTime: ep.maxMessageTime,
+		}));
 	}
 
 	countNewSessions(_after: number) {
-		return 1;
+		return this.pending.length;
 	}
 
 	getNewEpisodes(
 		_ids: string[],
 		_ranges: Map<string, ProcessedRange[]>,
 	): Episode[] {
-		return [this.episode];
+		return this.pending;
+	}
+
+	afterConsolidated(outcome: EpisodeOutcome): Promise<void> {
+		this.outcomes.push(outcome);
+		const key = (ep: {
+			sessionId: string;
+			startMessageId: string;
+			endMessageId: string;
+		}) => JSON.stringify([ep.sessionId, ep.startMessageId, ep.endMessageId]);
+		const completed = new Set(outcome.completed.map(key));
+		this.pending = this.pending.filter((ep) => !completed.has(key(ep)));
+		return Promise.resolve();
 	}
 
 	close() {}
@@ -115,6 +134,7 @@ describe("ConsolidationEngine: store lock in consolidateExtractedToStore", () =>
 	let tempDir: string;
 	let db: KnowledgeDB;
 	let serverStateDb: ServerStateDB;
+	let reader: SingleEpisodeReader;
 	let engine: ConsolidationEngine;
 
 	beforeEach(() => {
@@ -122,7 +142,7 @@ describe("ConsolidationEngine: store lock in consolidateExtractedToStore", () =>
 		db = new KnowledgeDB(join(tempDir, "test.db"));
 		serverStateDb = new ServerStateDB(join(tempDir, "state.db"));
 		const activation = new ActivationEngine(db);
-		const reader = new SingleEpisodeReader(FAKE_EPISODE);
+		reader = new SingleEpisodeReader(FAKE_EPISODE);
 		engine = new ConsolidationEngine(
 			db,
 			serverStateDb,
@@ -166,6 +186,10 @@ describe("ConsolidationEngine: store lock in consolidateExtractedToStore", () =>
 		expect(result.entriesCreated).toBe(0);
 		// release must NOT be called when acquire returned false.
 		expect(releaseSpy).not.toHaveBeenCalled();
+		// The episode is deferred, not settled: the reader still holds it, and
+		// nothing was reported completed or failed (so no attempt is counted).
+		expect(reader.pending).toEqual([FAKE_EPISODE]);
+		expect(reader.outcomes).toEqual([{ completed: [], failed: [] }]);
 	});
 
 	it("releases the store lock after successful consolidation", async () => {

@@ -599,7 +599,17 @@ describe("PendingEpisodesReader", () => {
 		const reader = new PendingEpisodesReader(db);
 		await reader.prepare(0);
 
-		await reader.afterConsolidated(["session-del-1"]);
+		await reader.afterConsolidated({
+			completed: [
+				{
+					source: "opencode",
+					sessionId: "session-del-1",
+					startMessageId: "msg-start",
+					endMessageId: "msg-end",
+				},
+			],
+			failed: [],
+		});
 
 		const remaining = await db.getPendingEpisodes(0);
 		expect(remaining).toHaveLength(1);

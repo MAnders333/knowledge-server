@@ -5,12 +5,13 @@ import type {
 	PendingEpisode,
 	ProcessedRange,
 } from "../../types.js";
+import { PENDING_EPISODE_MAX_ATTEMPTS } from "../interface.js";
 import type { IServerStateDB } from "../interface.js";
 
 // biome-ignore lint: TS limitation with Omit stripping call signatures
 type TxSql = any;
 
-const STATE_SCHEMA_VERSION = 1;
+const STATE_SCHEMA_VERSION = 2;
 
 const PG_CREATE_STATE_TABLES = `
   CREATE TABLE IF NOT EXISTS state_schema_version (
@@ -33,7 +34,9 @@ const PG_CREATE_STATE_TABLES = `
     session_timestamp BIGINT  NOT NULL DEFAULT 0,
     max_message_time  BIGINT  NOT NULL DEFAULT 0,
     approx_tokens     INTEGER NOT NULL DEFAULT 0,
-    uploaded_at       BIGINT  NOT NULL
+    uploaded_at       BIGINT  NOT NULL,
+    failed_attempts   INTEGER NOT NULL DEFAULT 0,
+    last_error        TEXT
   );
 
   CREATE INDEX IF NOT EXISTS idx_pending_source_time
@@ -143,9 +146,40 @@ export class PostgresServerStateDB implements IServerStateDB {
 				ON CONFLICT DO NOTHING
 			`;
 			logger.log("[pg-state-db] Initialized Postgres state DB (fresh schema).");
+		} else if (v < STATE_SCHEMA_VERSION) {
+			await this.upgradeSchema();
 		} else {
 			logger.log(`[pg-state-db] Postgres state DB at schema v${v}.`);
 		}
+	}
+
+	/**
+	 * Upgrade an existing state DB to STATE_SCHEMA_VERSION. Runs in one transaction
+	 * under a transaction-scoped advisory lock, and re-reads the version under the
+	 * lock, so concurrent server/daemon starts do not both run the ALTER.
+	 * v2: pending_episodes gains failed_attempts / last_error (dead-lettering).
+	 */
+	private async upgradeSchema(): Promise<void> {
+		await this.sql.begin(async (tx: TxSql) => {
+			await tx`SELECT pg_advisory_xact_lock(hashtext('knowledge-server:state-schema'))`;
+			const rows = await tx`SELECT MAX(version) AS v FROM state_schema_version`;
+			const versionRow = rows[0] as { v: number | null } | undefined;
+			const current = Number(versionRow?.v ?? 0);
+			if (current >= STATE_SCHEMA_VERSION) return;
+			await tx.unsafe(`
+				ALTER TABLE pending_episodes
+					ADD COLUMN IF NOT EXISTS failed_attempts INTEGER NOT NULL DEFAULT 0,
+					ADD COLUMN IF NOT EXISTS last_error TEXT
+			`);
+			await tx`
+				INSERT INTO state_schema_version (version, applied_at)
+				VALUES (${STATE_SCHEMA_VERSION}, ${Date.now()})
+				ON CONFLICT DO NOTHING
+			`;
+			logger.log(
+				`[pg-state-db] Upgraded Postgres state DB to schema v${STATE_SCHEMA_VERSION}.`,
+			);
+		});
 	}
 
 	// ── Pending Episodes ──────────────────────────────────────────────────────
@@ -178,6 +212,7 @@ export class PostgresServerStateDB implements IServerStateDB {
 		const rows = await this.sql`
 			SELECT * FROM pending_episodes
 			WHERE max_message_time > ${afterMaxMessageTime}
+			  AND failed_attempts < ${PENDING_EPISODE_MAX_ATTEMPTS}
 			ORDER BY max_message_time ASC
 			LIMIT ${limit}
 		`;
@@ -197,6 +232,7 @@ export class PostgresServerStateDB implements IServerStateDB {
 			maxMessageTime: Number(r.max_message_time),
 			approxTokens: Number(r.approx_tokens),
 			uploadedAt: Number(r.uploaded_at),
+			failedAttempts: Number(r.failed_attempts),
 		}));
 	}
 
@@ -207,10 +243,24 @@ export class PostgresServerStateDB implements IServerStateDB {
 			.sql`DELETE FROM pending_episodes WHERE id = ANY(${this.sql.array(ids)})`;
 	}
 
+	async recordPendingEpisodeFailures(
+		ids: string[],
+		error: string,
+	): Promise<void> {
+		if (ids.length === 0) return;
+		await this.initialize();
+		await this.sql`
+			UPDATE pending_episodes
+			SET failed_attempts = failed_attempts + 1, last_error = ${error}
+			WHERE id = ANY(${this.sql.array(ids)})
+		`;
+	}
+
 	async countPendingSessions(): Promise<number> {
 		await this.initialize();
 		const result = await this.sql`
 			SELECT COUNT(DISTINCT session_id) as n FROM pending_episodes
+			WHERE failed_attempts < ${PENDING_EPISODE_MAX_ATTEMPTS}
 		`;
 		return Number((result[0] as { n: number }).n);
 	}
@@ -337,10 +387,14 @@ export class PostgresServerStateDB implements IServerStateDB {
 
 	// ── Reinitialize ──────────────────────────────────────────────────────────
 
-	async reinitialize(): Promise<void> {
+	async reinitialize(userId?: string): Promise<void> {
 		await this.initialize();
 		await this.sql.begin(async (sql: TxSql) => {
-			await sql`DELETE FROM pending_episodes`;
+			if (userId === undefined) {
+				await sql`DELETE FROM pending_episodes`;
+			} else {
+				await sql`DELETE FROM pending_episodes WHERE user_id = ${userId}`;
+			}
 			await sql`DELETE FROM consolidated_episode`;
 			// Use UPSERT rather than UPDATE so the singleton row is restored even if
 			// a previous reinitialize or failed init left the table without a row.

@@ -17,7 +17,7 @@
  *   the staging tables are copied from knowledge.db to state.db automatically.
  */
 
-export const SERVER_LOCAL_SCHEMA_VERSION = 1;
+export const SERVER_LOCAL_SCHEMA_VERSION = 2;
 
 // Schema is always additive (CREATE TABLE IF NOT EXISTS), so column-manifest
 // drift detection is not used for state.db. See KnowledgeDB (knowledge.db)
@@ -39,7 +39,10 @@ export const SERVER_LOCAL_CREATE_TABLES = `
 
   -- Pending episodes — staging table written by the daemon, drained by the server.
   -- user_id is set by the daemon from KNOWLEDGE_USER_ID / hostname (provenance only).
-  -- Rows are deleted after successful consolidation.
+  -- Rows are deleted after successful consolidation. A row whose consolidation
+  -- failed keeps its row with failed_attempts incremented (dead-lettered at
+  -- PENDING_EPISODE_MAX_ATTEMPTS). v2 added failed_attempts/last_error; existing
+  -- v1 DBs get them from runStateMigrations().
   CREATE TABLE IF NOT EXISTS pending_episodes (
     id               TEXT    PRIMARY KEY,
     user_id          TEXT    NOT NULL DEFAULT 'default',
@@ -55,7 +58,9 @@ export const SERVER_LOCAL_CREATE_TABLES = `
     session_timestamp INTEGER NOT NULL DEFAULT 0,
     max_message_time  INTEGER NOT NULL DEFAULT 0,
     approx_tokens    INTEGER NOT NULL DEFAULT 0,
-    uploaded_at      INTEGER NOT NULL
+    uploaded_at      INTEGER NOT NULL,
+    failed_attempts  INTEGER NOT NULL DEFAULT 0,
+    last_error       TEXT
   );
 
   CREATE INDEX IF NOT EXISTS idx_pending_source_time

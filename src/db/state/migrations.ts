@@ -28,6 +28,7 @@ export function runStateMigrations(
 	copyKnowledgeDbStagingTables(db, legacyKnowledgeDbPath);
 	dropKnowledgeDbStagingTables(db, legacyKnowledgeDbPath);
 	dropOrphanedDaemonCursorFromStateDb(db);
+	addPendingEpisodeFailureColumns(db);
 }
 
 /**
@@ -276,6 +277,44 @@ function dropOrphanedDaemonCursorFromStateDb(db: Database): void {
 			);
 		}
 
+		db.prepare(
+			"INSERT OR IGNORE INTO applied_migrations (name, applied_at) VALUES (?, ?)",
+		).run(key, Date.now());
+	})();
+}
+
+/**
+ * v2 schema step: add failed_attempts / last_error to pending_episodes.
+ *
+ * Fresh DBs get these columns from SERVER_LOCAL_CREATE_TABLES. Existing v1 DBs
+ * do not (CREATE TABLE IF NOT EXISTS is a no-op for them), so they are added
+ * here. The column check makes the step safe whichever path created the table.
+ */
+function addPendingEpisodeFailureColumns(db: Database): void {
+	const key = "v2_pending_episode_failure_columns";
+	if (
+		db
+			.prepare("SELECT 1 FROM applied_migrations WHERE name = ? LIMIT 1")
+			.get(key)
+	)
+		return;
+
+	db.transaction(() => {
+		const cols = new Set(
+			(
+				db.prepare("PRAGMA table_info(pending_episodes)").all() as Array<{
+					name: string;
+				}>
+			).map((c) => c.name),
+		);
+		if (!cols.has("failed_attempts")) {
+			db.exec(
+				"ALTER TABLE pending_episodes ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0",
+			);
+		}
+		if (!cols.has("last_error")) {
+			db.exec("ALTER TABLE pending_episodes ADD COLUMN last_error TEXT");
+		}
 		db.prepare(
 			"INSERT OR IGNORE INTO applied_migrations (name, applied_at) VALUES (?, ?)",
 		).run(key, Date.now());
