@@ -151,6 +151,12 @@ export interface IServerStateDB {
 }
 
 /**
+ * Minimum gap between two last_accessed_at bumps from injection. Decay reads
+ * last_accessed_at, so retrieval keeps an entry fresh at most once a day.
+ */
+export const LAST_ACCESS_TOUCH_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+/**
  * Knowledge store interface — the extracted knowledge graph.
  *
  * Implemented by SQLiteKnowledgeStore and PostgresKnowledgeStore.
@@ -236,7 +242,14 @@ export interface IKnowledgeStore {
 		type?: string;
 	}): Promise<KnowledgeEntry[]>;
 
-	recordAccess(id: string): Promise<void>;
+	/**
+	 * Record one activation's injections as a batch: injection_count +1 for each id,
+	 * and last_accessed_at moved to `now` at most once per entry per
+	 * LAST_ACCESS_TOUCH_INTERVAL_MS. access_count is not touched (frozen, see
+	 * plan-review §3.1(d)); updated_at is not touched (content did not change).
+	 * Retrieval-only: never called during consolidation.
+	 */
+	recordInjections(ids: string[], now: number): Promise<void>;
 
 	reinforceObservation(id: string): Promise<void>;
 

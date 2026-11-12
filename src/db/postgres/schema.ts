@@ -45,6 +45,7 @@ export const PG_CREATE_TABLES = `
     updated_at BIGINT NOT NULL,
     last_accessed_at BIGINT NOT NULL,
     access_count INTEGER NOT NULL DEFAULT 0,
+    injection_count INTEGER NOT NULL DEFAULT 0,
     observation_count INTEGER NOT NULL DEFAULT 1,
 
     -- Provenance

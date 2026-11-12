@@ -117,6 +117,7 @@ export const CREATE_TABLES = `
     updated_at INTEGER NOT NULL,
     last_accessed_at INTEGER NOT NULL,
     access_count INTEGER NOT NULL DEFAULT 0,
+    injection_count INTEGER NOT NULL DEFAULT 0,
     observation_count INTEGER NOT NULL DEFAULT 1,
     
     -- Provenance

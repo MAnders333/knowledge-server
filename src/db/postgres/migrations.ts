@@ -540,4 +540,11 @@ export const PG_MIGRATIONS: Array<{
 			await sql`ALTER TABLE knowledge_entry SET (fillfactor = 85)`;
 		},
 	},
+	{
+		version: 19,
+		label: "add injection_count to knowledge_entry (access_count frozen)",
+		up: async (sql: TxSql) => {
+			await sql`ALTER TABLE knowledge_entry ADD COLUMN IF NOT EXISTS injection_count INTEGER NOT NULL DEFAULT 0`;
+		},
+	},
 ];

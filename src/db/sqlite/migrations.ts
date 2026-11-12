@@ -337,4 +337,21 @@ export const MIGRATIONS: Array<{
 			db.exec("DROP INDEX IF EXISTS idx_entry_accessed");
 		},
 	},
+	{
+		version: 19,
+		label: "add injection_count to knowledge_entry (access_count frozen)",
+		up: (db) => {
+			const cols = db
+				.prepare("PRAGMA table_info(knowledge_entry)")
+				.all() as Array<{ name: string }>;
+			// cols is empty when the table doesn't exist yet (fresh DB): CREATE_TABLES
+			// already includes the column.
+			if (cols.length === 0) return;
+			if (!cols.some((c) => c.name === "injection_count")) {
+				db.exec(
+					"ALTER TABLE knowledge_entry ADD COLUMN injection_count INTEGER NOT NULL DEFAULT 0",
+				);
+			}
+		},
+	},
 ];
