@@ -95,6 +95,7 @@ const KNOWLEDGE_SERVER_URL_SAFE =
 interface ActivateResponse {
 	entries: Array<{
 		entry: {
+			id: string;
 			type: string;
 			content: string;
 			topics: string[];
@@ -188,6 +189,8 @@ function cleanForBlock(text: string, maxChars: number): string {
 
 type ActivateEntry = ActivateResponse["entries"][number];
 
+const SHORT_ID_CHARS = 8;
+
 function formatKnowledgeLine(item: ActivateEntry): string {
 	const type = cleanForBlock(item.entry.type, 32);
 	const content = cleanForBlock(item.entry.content, MAX_ENTRY_CHARS);
@@ -197,7 +200,11 @@ function formatKnowledgeLine(item: ActivateEntry): string {
 	const contradiction = item.contradiction
 		? ` [CONFLICTED — conflicts with: "${cleanForBlock(item.contradiction.conflictingContent, MAX_ENTRY_CHARS)}". ${cleanForBlock(item.contradiction.caveat, 300)}]`
 		: "";
-	return `- [${type}] ${content}${staleTag}${contradiction}`;
+	const id = cleanForBlock(
+		item.entry.id.slice(0, SHORT_ID_CHARS),
+		SHORT_ID_CHARS,
+	);
+	return `- [${type}] (id ${id}) ${content}${staleTag}${contradiction}`;
 }
 
 function formatActivatedKnowledgeFallback(entries: ActivateEntry[]): string {
