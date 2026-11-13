@@ -8,8 +8,9 @@ import {
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { homeDir } from "../src/home";
 import { ownedPrivatePaths, tightenPrivatePaths } from "../src/private-files";
 
 const mode = (p: string): number => statSync(p).mode & 0o777;
@@ -128,7 +129,7 @@ describe("ownedPrivatePaths", () => {
 
 	it("includes the server log, PID file, daemon log and both .env locations", () => {
 		const owned = ownedPrivatePaths(join(tempDir, "missing.jsonc"));
-		const home = homedir();
+		const home = homeDir();
 		expect(owned.files).toContain(
 			join(home, ".local", "share", "knowledge-server", "daemon.log"),
 		);

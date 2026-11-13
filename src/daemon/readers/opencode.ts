@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import type { Statement } from "bun:sqlite";
 import { config } from "../../config.js";
-import { stripInjectedKnowledge } from "../../consolidation/untrusted.js";
+import { stripInjectedKnowledge } from "../../domain/untrusted.js";
 import type {
 	Episode,
 	EpisodeMessage,

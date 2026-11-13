@@ -22,8 +22,8 @@ import type {
 	SynthesisResult,
 } from "../src/consolidation/llm";
 import { Reconsolidator } from "../src/consolidation/reconsolidate";
-import { approxTokens } from "../src/daemon/readers/shared";
 import { KnowledgeDB } from "../src/db/sqlite/index";
+import { approxTokens } from "../src/domain/tokens";
 import type { KnowledgeEntry } from "../src/types";
 import { makeEntry } from "./fixtures";
 

@@ -9,6 +9,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseEnv, spawnedDaemonIntervalArgs } from "../src/config";
+import { loadConfigFile } from "../src/config-file";
 import { homeDir } from "../src/home";
 
 /** A config file path that does not exist, so no data-dir override applies. */
@@ -430,5 +431,92 @@ describe("validateConfig — an invalid value fails startup", () => {
 		expect(errors).toContain(
 			'RERANK_TIMEOUT_MS must be an integer ≥ 100 (got "50").',
 		);
+	});
+});
+
+describe("parseEnv — enable switches use the same spellings as the other flags", () => {
+	it.each(["false", "0", "no", "off"])(
+		"%s disables RERANK_ENABLED and a source",
+		(value) => {
+			const parsed = parse({ RERANK_ENABLED: value, CODEX_ENABLED: value });
+			expect(parsed.issues).toEqual([]);
+			expect(parsed.config.activation.rerank.enabled).toBe(false);
+			expect(parsed.config.codexEnabled).toBe(false);
+		},
+	);
+
+	it.each(["true", "1", "yes", "on"])("%s enables a source", (value) => {
+		expect(parse({ PI_ENABLED: value }).config.piEnabled).toBe(true);
+	});
+
+	it("reports an unknown spelling instead of enabling the source", () => {
+		const parsed = parse({ OMP_ENABLED: "disabled" });
+		expect(parsed.issues).toHaveLength(1);
+		expect(parsed.issues[0]).toContain("OMP_ENABLED must be one of");
+		expect(parsed.config.ompEnabled).toBe(true);
+	});
+});
+
+describe("parseEnv — state DB pool", () => {
+	it("sizes the state DB pool from POSTGRES_POOL_MAX", () => {
+		expect(parse({ POSTGRES_POOL_MAX: "4" }).config.postgres.poolMax).toBe(4);
+	});
+});
+
+describe("parseEnv — REDACT_SECRETS and DAEMON_AUTO_SPAWN", () => {
+	it.each(["false", "0", "no", "off"])(
+		"%s disables secret redaction",
+		(value) => {
+			const parsed = parse({ REDACT_SECRETS: value });
+			expect(parsed.issues).toEqual([]);
+			expect(parsed.config.redactSecrets).toBe(false);
+		},
+	);
+
+	it("redacts by default and reports an unknown spelling", () => {
+		expect(parse({}).config.redactSecrets).toBe(true);
+		const parsed = parse({ REDACT_SECRETS: "maybe" });
+		expect(parsed.issues).toHaveLength(1);
+		expect(parsed.issues[0]).toContain("REDACT_SECRETS must be one of");
+		expect(parsed.config.redactSecrets).toBe(true);
+	});
+
+	it("reports an unknown DAEMON_AUTO_SPAWN spelling and accepts the known ones", () => {
+		expect(parse({ DAEMON_AUTO_SPAWN: "off" }).issues).toEqual([]);
+		expect(parse({}).issues).toEqual([]);
+		const parsed = parse({ DAEMON_AUTO_SPAWN: "sometimes" });
+		expect(parsed.issues[0]).toContain("DAEMON_AUTO_SPAWN must be one of");
+	});
+});
+
+describe("loadConfigFile — DAEMON_AUTO_SPAWN spellings", () => {
+	let dir: string;
+	let saved: string | undefined;
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "ks-config-autospawn-"));
+		saved = process.env.DAEMON_AUTO_SPAWN;
+	});
+
+	afterEach(() => {
+		if (saved === undefined)
+			Reflect.deleteProperty(process.env, "DAEMON_AUTO_SPAWN");
+		else process.env.DAEMON_AUTO_SPAWN = saved;
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	it("applies 0 as false over the config file, and keeps the file value for an unknown spelling", () => {
+		const configPath = join(dir, "config.jsonc");
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				stores: [{ id: "main", kind: "sqlite", writable: true }],
+				daemonAutoSpawn: true,
+			}),
+		);
+		process.env.DAEMON_AUTO_SPAWN = "0";
+		expect(loadConfigFile(configPath).daemonAutoSpawn).toBe(false);
+		process.env.DAEMON_AUTO_SPAWN = "sometimes";
+		expect(loadConfigFile(configPath).daemonAutoSpawn).toBe(true);
 	});
 });

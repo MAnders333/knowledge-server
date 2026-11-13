@@ -8,7 +8,7 @@
  */
 import {
 	DEFAULT_CONFIG,
-	DEFAULT_CONFIG_PATH,
+	defaultConfigPath,
 	loadConfigFile,
 	resolveLegacyKnowledgeDbPath,
 } from "../../config-file.js";
@@ -24,7 +24,7 @@ import { PostgresServerStateDB } from "./postgres.js";
  * Reads config.jsonc (or uses DEFAULT_CONFIG if absent).
  */
 export async function createServerStateDB(
-	configPath = DEFAULT_CONFIG_PATH,
+	configPath = defaultConfigPath(),
 ): Promise<IServerStateDB> {
 	let config = DEFAULT_CONFIG;
 	try {

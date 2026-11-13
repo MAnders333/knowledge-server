@@ -35,7 +35,7 @@
 import "../env.js";
 import pkg from "../../package.json" with { type: "json" };
 import { resolveDataDir } from "../config-file.js";
-import { config } from "../config.js";
+import { config, configEnvIssues } from "../config.js";
 import { DaemonDB } from "../db/daemon/index.js";
 import { createServerStateDB } from "../db/state/factory.js";
 import { logger, parseLogLevel } from "../logger.js";
@@ -83,14 +83,12 @@ const intervalArg = args.find((a) => a.startsWith("--interval="));
 const parsedInterval = intervalArg
 	? Number.parseInt(intervalArg.split("=")[1], 10)
 	: Number.NaN;
-const envInterval = process.env.DAEMON_UPLOAD_INTERVAL_SECONDS
-	? Number.parseInt(process.env.DAEMON_UPLOAD_INTERVAL_SECONDS, 10)
-	: Number.NaN;
+// DAEMON_UPLOAD_INTERVAL_SECONDS is parsed once, in config.
 const intervalMs =
 	!Number.isNaN(parsedInterval) && parsedInterval > 0
 		? parsedInterval * 1000
-		: !Number.isNaN(envInterval) && envInterval > 0
-			? envInterval * 1000
+		: config.daemon.uploadIntervalSeconds !== null
+			? config.daemon.uploadIntervalSeconds * 1000
 			: 30 * 60 * 1000; // default: 30 minutes — gives sessions time to reach a natural pause
 
 const onceFlag = args.includes("--once");
@@ -107,6 +105,9 @@ logger.init(
 	parseLogLevel(process.env.LOG_LEVEL),
 	config.logMaxBytes,
 );
+// The daemon does not run validateConfig() (it needs no LLM credentials), so it
+// reports the invalid environment values it parsed itself.
+for (const issue of configEnvIssues()) logger.warn(`[config] ${issue}`);
 
 // Single instance per data directory. Taken before any DB connection. A polling
 // daemon that finds another one running idles and takes over when it exits; it

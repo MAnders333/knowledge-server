@@ -328,7 +328,7 @@ export interface ActivationResult {
 /** How the candidate ordering was produced: cross-encoder, dense-only, or no reranker configured. */
 export type GateMode = "rerank" | "dense" | "off";
 
-export interface ActivationTelemetry {
+interface ActivationTelemetry {
 	cueCount: number;
 	nCandidates: number;
 	gateMode: GateMode;

@@ -70,7 +70,7 @@ function literal(text: string): string {
  * source `sourceEntry` (for example `src/index.ts`). The executable path may
  * contain spaces, so the match is on the whole command line, not on tokens.
  */
-export function isCommandOf(
+function isCommandOf(
 	command: string,
 	binary: string,
 	sourceEntry: string,
@@ -91,7 +91,7 @@ export function isDaemonCommand(command: string): boolean {
 	return isCommandOf(command, "knowledge-daemon", "src/daemon/index.ts");
 }
 
-export type PidFileState =
+type PidFileState =
 	/** The file does not hold a positive PID. */
 	| { kind: "invalid" }
 	/** The PID is gone, or it now belongs to another program. */

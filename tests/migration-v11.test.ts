@@ -169,18 +169,18 @@ describe("v11 SQLite migration chain (v10 → v17)", () => {
 		expect(row.v).toBe(20);
 	});
 
-	it("v3 data migration runs automatically on ServerStateDB init (uses DEFAULT_SQLITE_PATH)", async () => {
-		// The v3 migration copies staging tables from DEFAULT_SQLITE_PATH (knowledge.db)
+	it("v3 data migration runs automatically on ServerStateDB init (uses defaultSqlitePath())", async () => {
+		// The v3 migration copies staging tables from defaultSqlitePath() (knowledge.db)
 		// into state.db automatically during ServerStateDB initialization.
-		// Since DEFAULT_SQLITE_PATH points to the real knowledge.db (not our test fixture),
+		// Since defaultSqlitePath() points to the real knowledge.db (not our test fixture),
 		// we verify the migration mechanism works by testing it directly via runStateMigrations.
-		// The fixture data (session-abc) is in a custom dbPath, not DEFAULT_SQLITE_PATH,
+		// The fixture data (session-abc) is in a custom dbPath, not defaultSqlitePath(),
 		// so we test the idempotency guard and the episode write/read path instead.
 		db = new KnowledgeDB(dbPath);
 		const stateDb = new ServerStateDB(join(tempDir, "state2.db"));
 
 		// Verify state.db is functional — the migration guard runs cleanly even with
-		// no DEFAULT_SQLITE_PATH source to copy from (returns early if file not found).
+		// no defaultSqlitePath() source to copy from (returns early if file not found).
 		await stateDb.recordEpisode(
 			"opencode",
 			"session-abc",

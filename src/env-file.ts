@@ -15,6 +15,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import * as dotenv from "dotenv";
+import { defaultDataDir } from "./home.js";
 
 /**
  * Keys a `.env` file may never set. These change how the process loads code or
@@ -80,7 +81,7 @@ export function envFileCandidates(
 		candidates.push(join(env.KNOWLEDGE_CONFIG_HOME, ".env"));
 	}
 	candidates.push(preferredEnvFile(env, home));
-	candidates.push(join(home, ".local", "share", "knowledge-server", ".env"));
+	candidates.push(join(defaultDataDir(home), ".env"));
 	return candidates;
 }
 
@@ -111,7 +112,7 @@ export function parseEnvText(text: string): Record<string, string> {
 	return splitEnvText(text).values;
 }
 
-export interface LoadEnvResult {
+interface LoadEnvResult {
 	/** Keys assigned from the file (keys already set in the environment are kept). */
 	loaded: string[];
 	/** Keys dropped because a `.env` may not set them. Names only, never values. */

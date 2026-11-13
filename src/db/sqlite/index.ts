@@ -3,8 +3,8 @@ import type { SQLQueryBindings } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { DEFAULT_SQLITE_PATH } from "../../config-file.js";
-import { computeStrength } from "../../consolidation/decay.js";
+import { defaultSqlitePath } from "../../config-file.js";
+import { computeStrength } from "../../domain/strength.js";
 import { logger } from "../../logger.js";
 import { type LockHandle, tryAcquireProcessLock } from "../../process-lock.js";
 import { sqliteConsolidationLockPath } from "../../runtime-files.js";
@@ -72,14 +72,14 @@ export class KnowledgeDB implements IKnowledgeStore {
 	id = "sqlite";
 
 	/**
-	 * @param dbPath Path to the SQLite DB file. Defaults to DEFAULT_SQLITE_PATH
+	 * @param dbPath Path to the SQLite DB file. Defaults to defaultSqlitePath()
 	 *               (~/.local/share/knowledge-server/knowledge.db).
 	 *               Always pass an explicit path — the default exists only as a
 	 *               safety net; production paths are resolved by StoreRegistry
 	 *               via resolveSqlitePath().
 	 */
 	constructor(dbPath?: string) {
-		const path = dbPath ?? DEFAULT_SQLITE_PATH;
+		const path = dbPath ?? defaultSqlitePath();
 		this.dbPath = path;
 		const dir = dirname(path);
 		if (!existsSync(dir)) {

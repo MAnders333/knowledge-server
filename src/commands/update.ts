@@ -26,10 +26,10 @@ const GITHUB_API = "https://api.github.com";
 const SMOKE_TIMEOUT_MS = 20_000;
 const PREV_SUFFIX = ".prev";
 
-export type FetchFn = typeof fetch;
-export type SmokeFn = (path: string, args: string[]) => Promise<boolean>;
+type FetchFn = typeof fetch;
+type SmokeFn = (path: string, args: string[]) => Promise<boolean>;
 
-export interface InstallDeps {
+interface InstallDeps {
 	fetchFn?: FetchFn;
 	/** Runs a staged or installed binary; true when it exits 0. Injectable for tests. */
 	smoke?: SmokeFn;
@@ -54,10 +54,7 @@ export interface ReleaseAsset {
  * Run a binary with `args` and report whether it exits 0. Output is discarded.
  * Never throws: a binary that cannot be executed counts as a failed smoke test.
  */
-export async function smokeTest(
-	path: string,
-	args: string[],
-): Promise<boolean> {
+async function smokeTest(path: string, args: string[]): Promise<boolean> {
 	try {
 		const proc = Bun.spawn([path, ...args], {
 			stdout: "ignore",

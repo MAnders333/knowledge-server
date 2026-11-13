@@ -5,13 +5,21 @@ import { generateText } from "ai";
 import {
 	ANTHROPIC_BETA_HEADERS,
 	ANTHROPIC_OAUTH_USER_AGENT,
+	assertOAuthBaseUrl,
 	getAccessToken,
 	hasOAuthTokens,
 } from "../auth/claude-oauth.js";
-import { config } from "../config.js";
+import { anthropicRouting, config } from "../config.js";
+import type { DomainContext } from "../domain/domain-router.js";
+import {
+	UNTRUSTED_DATA_RULE,
+	escapeUntrusted,
+	untrustedField,
+	untrustedLine,
+	untrustedList,
+} from "../domain/untrusted.js";
 import { logger } from "../logger.js";
 import type { Episode, KnowledgeType } from "../types.js";
-import type { DomainContext } from "./domain-router.js";
 import {
 	type ContradictionConflict,
 	type ContradictionReplyFormat,
@@ -22,13 +30,6 @@ import {
 	parseItems,
 	synthesisItemSchema,
 } from "./llm-output.js";
-import {
-	UNTRUSTED_DATA_RULE,
-	escapeUntrusted,
-	untrustedField,
-	untrustedLine,
-	untrustedList,
-} from "./untrusted.js";
 
 /**
  * LLM interface for consolidation.
@@ -174,19 +175,14 @@ function createModel(modelString: string) {
 	switch (providerName) {
 		case "anthropic": {
 			// Per-provider credentials take precedence over unified endpoint.
-			// baseURL: per-provider override → unified proxy path → undefined (SDK uses api.anthropic.com)
-			const apiKey = config.llm.anthropic.apiKey || config.llm.apiKey;
-			const baseURL =
-				config.llm.anthropic.baseURL ||
-				(config.llm.baseEndpoint
-					? `${config.llm.baseEndpoint}/anthropic/v1`
-					: undefined);
+			const { apiKey, baseURL } = anthropicRouting();
 
 			// When no API key is configured, fall back to Claude subscription OAuth.
 			// The custom fetch wrapper injects Authorization + beta headers and handles
 			// silent token refresh. The placeholder apiKey is never sent (x-api-key is
 			// deleted by the wrapper before every request).
 			if (!apiKey && hasOAuthTokens()) {
+				assertOAuthBaseUrl(baseURL);
 				const provider = createAnthropic({
 					...(baseURL && { baseURL }),
 					apiKey: "oauth-placeholder",

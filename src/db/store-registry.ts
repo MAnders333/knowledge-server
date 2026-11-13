@@ -1,6 +1,6 @@
 import {
 	DEFAULT_CONFIG,
-	DEFAULT_CONFIG_PATH,
+	defaultConfigPath,
 	loadConfigFile,
 	resolveLegacyKnowledgeDbPath,
 	resolvePostgresUri,
@@ -8,7 +8,7 @@ import {
 } from "../config-file.js";
 import type { KnowledgeServerConfig, StoreConfig } from "../config-file.js";
 import { config as appConfig } from "../config.js";
-import { DomainRouter } from "../consolidation/domain-router.js";
+import { DomainRouter } from "../domain/domain-router.js";
 import { logger } from "../logger.js";
 import { redactUriCredentials } from "../redact-uri.js";
 import type { IKnowledgeStore, IServerStateDB } from "./interface.js";
@@ -147,7 +147,7 @@ export class StoreRegistry {
 	 *   single SQLite store at the default paths; tests pass temp paths.
 	 */
 	static async create(
-		configPath = DEFAULT_CONFIG_PATH,
+		configPath = defaultConfigPath(),
 		fallbackConfig: KnowledgeServerConfig = DEFAULT_CONFIG,
 	): Promise<StoreRegistry> {
 		let fileConfig: KnowledgeServerConfig | null;

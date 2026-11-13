@@ -11,7 +11,7 @@ import type { ActivationEventRow } from "../../types.js";
 
 export type ActivationEventValue = string | number | boolean | null;
 
-export interface ActivationEventColumn {
+interface ActivationEventColumn {
 	readonly name: string;
 	/** Schema version that introduced the column. */
 	readonly since: number;

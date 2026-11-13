@@ -37,13 +37,13 @@ import { dirname, join } from "node:path";
 
 // ── OAuth constants (same as opencode plugin) ─────────────────────────────────
 
-export const ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
-export const ANTHROPIC_AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
+const ANTHROPIC_AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
 
-export const ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
+const ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 
-export const ANTHROPIC_OAUTH_SCOPES =
+const ANTHROPIC_OAUTH_SCOPES =
 	"org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
 /** Beta feature flags required on every API call made with OAuth credentials. */
@@ -71,7 +71,7 @@ const CALLBACK_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 // ── Token file ────────────────────────────────────────────────────────────────
 
-export interface OAuthTokens {
+interface OAuthTokens {
 	refresh_token: string;
 	access_token: string;
 	/** Millisecond Unix timestamp when the access token expires. */
@@ -399,4 +399,29 @@ export async function runOAuthFlow(): Promise<OAuthTokens> {
 		refresh_token: data.refresh_token,
 		expires_at: expiresAtFrom(data.expires_in),
 	};
+}
+
+/** The only host a Claude subscription OAuth token may be sent to. */
+const ANTHROPIC_API_HOST = "api.anthropic.com";
+
+/**
+ * Throws unless `baseURL` is the official Anthropic API. A subscription OAuth
+ * token is an Anthropic bearer credential, so it must not reach a proxy or a
+ * gateway. The message names the host only: never the URL's credentials or the
+ * token.
+ */
+export function assertOAuthBaseUrl(baseURL: string | undefined): void {
+	if (!baseURL) return;
+	let url: URL;
+	try {
+		url = new URL(baseURL);
+	} catch {
+		throw new Error(
+			"Claude subscription OAuth is not used: the Anthropic base URL is not a valid URL. Set ANTHROPIC_API_KEY instead.",
+		);
+	}
+	if (url.protocol === "https:" && url.hostname === ANTHROPIC_API_HOST) return;
+	throw new Error(
+		`Claude subscription OAuth is only sent to ${ANTHROPIC_API_HOST}, but the Anthropic base URL is ${url.protocol}//${url.hostname}. Set ANTHROPIC_API_KEY for that endpoint, or unset ANTHROPIC_BASE_URL and LLM_BASE_ENDPOINT.`,
+	);
 }

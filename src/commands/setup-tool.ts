@@ -20,7 +20,7 @@ import { isDeepStrictEqual } from "node:util";
 import pkg from "../../package.json" with { type: "json" };
 import {
 	DEFAULT_CONFIG,
-	DEFAULT_CONFIG_PATH,
+	defaultConfigPath,
 	loadConfigFile,
 } from "../config-file.js";
 import { config } from "../config.js";
@@ -41,7 +41,7 @@ import {
 // Evaluated once at module load — setup-tool is a CLI command, not a long-running server.
 const fileConfig = (() => {
 	try {
-		return loadConfigFile(DEFAULT_CONFIG_PATH) ?? DEFAULT_CONFIG;
+		return loadConfigFile(defaultConfigPath()) ?? DEFAULT_CONFIG;
 	} catch (err) {
 		// Malformed config.jsonc — warn so user knows why defaults are used.
 		console.warn(
@@ -1068,7 +1068,7 @@ function makeVSCodeMcpEntry() {
 	return { name: "knowledge", command: mainBin, args: ["mcp"], env };
 }
 
-export function setupVSCode(): void {
+function setupVSCode(): void {
 	console.log("Setting up VSCode integration...\n");
 
 	const entry = makeVSCodeMcpEntry();

@@ -2,7 +2,7 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { config } from "../../config.js";
-import { stripInjectedKnowledge } from "../../consolidation/untrusted.js";
+import { stripInjectedKnowledge } from "../../domain/untrusted.js";
 import type {
 	Episode,
 	EpisodeMessage,

@@ -45,7 +45,7 @@ import { ensurePrivateFile } from "./utils.js";
  *   logger.error("[llm] Parse failure:", err);
  */
 
-export type LogLevelName = "debug" | "info" | "warn" | "error";
+type LogLevelName = "debug" | "info" | "warn" | "error";
 type LineLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
 
 /** Rotated copies kept beside the active log: `<log>.1` … `<log>.3`. */
@@ -102,7 +102,7 @@ function isSameFile(fd: number, path: string): boolean {
 	}
 }
 
-export interface LoggerOptions {
+interface LoggerOptions {
 	/** Mirror to stdout/stderr. Tests turn this off to keep output quiet. */
 	mirror?: boolean;
 	/** Rotate the active file before it would exceed this size. 0 disables rotation. */

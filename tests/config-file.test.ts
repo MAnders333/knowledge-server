@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	DEFAULT_CONFIG,
-	DEFAULT_SQLITE_PATH,
+	defaultSqlitePath,
 	loadConfigFile,
 	resolveLegacyKnowledgeDbPath,
 	resolvePostgresUri,
@@ -261,13 +261,13 @@ describe("resolveSqlitePath", () => {
 		expect(result).toBe("/custom/path.db");
 	});
 
-	it("falls back to DEFAULT_SQLITE_PATH if path is omitted", () => {
+	it("falls back to defaultSqlitePath() if path is omitted", () => {
 		const result = resolveSqlitePath({
 			id: "main",
 			kind: "sqlite",
 			writable: true,
 		});
-		expect(result).toBe(DEFAULT_SQLITE_PATH);
+		expect(result).toBe(defaultSqlitePath());
 	});
 });
 

@@ -1,17 +1,16 @@
 import { existsSync } from "node:fs";
 import { basename, join } from "node:path";
 import { isPlainHttpRemote } from "./activation/key-transport.js";
-import { hasOAuthTokens } from "./auth/claude-oauth.js";
-import { DEFAULT_CONFIG_PATH, resolveDataDir } from "./config-file.js";
+import { assertOAuthBaseUrl, hasOAuthTokens } from "./auth/claude-oauth.js";
+import { defaultConfigPath, resolveDataDir } from "./config-file.js";
+import { TYPE_HALF_LIFE_DAYS } from "./domain/strength.js";
 import { envFileCandidates, preferredEnvFile } from "./env-file.js";
-import { homeDir } from "./home.js";
+import { FLAG_SPELLINGS, parseFlag } from "./env-flag.js";
+import { defaultDataDir, homeDir } from "./home.js";
 import { DEFAULT_LOG_MAX_BYTES } from "./logger.js";
 
 /** The environment a config is parsed from. */
 type Env = Readonly<Record<string, string | undefined>>;
-
-const TRUE_SPELLINGS = ["true", "1", "on", "yes"];
-const FALSE_SPELLINGS = ["false", "0", "off", "no"];
 
 /**
  * Reads environment variables while the config is parsed. An unset or empty
@@ -96,15 +95,17 @@ class EnvReader {
 
 	/** Boolean flag: true/false, on/off, yes/no or 1/0 (case-insensitive). */
 	flag(name: string, fallback: boolean): boolean {
+		return this.optionalFlag(name) ?? fallback;
+	}
+
+	/** Boolean flag, or undefined when unset. An unknown spelling is an issue. */
+	optionalFlag(name: string): boolean | undefined {
 		const raw = this.raw(name);
-		if (raw === undefined) return fallback;
-		const word = raw.trim().toLowerCase();
-		if (TRUE_SPELLINGS.includes(word)) return true;
-		if (FALSE_SPELLINGS.includes(word)) return false;
-		this.issue(
-			`${name} must be one of ${[...TRUE_SPELLINGS, ...FALSE_SPELLINGS].map((s) => `"${s}"`).join(", ")} (got "${raw}").`,
-		);
-		return fallback;
+		const value = parseFlag(raw);
+		if (value === null) {
+			this.issue(`${name} must be one of ${FLAG_SPELLINGS} (got "${raw}").`);
+		}
+		return value ?? undefined;
 	}
 
 	/** One of `choices`. */
@@ -358,20 +359,14 @@ const EXPLICIT_PATH_VARS = [
  * Parse the environment into the config object. Pure: the same env always gives
  * the same result. The module-level `config` is parseEnv(process.env).config.
  */
-export function parseEnv(env: Env, configPath = DEFAULT_CONFIG_PATH) {
+export function parseEnv(env: Env, configPath = defaultConfigPath()) {
 	const r = new EnvReader(env);
 	const dataDir = resolveDataDir(configPath);
 	const explicitPidPath = env.KNOWLEDGE_PID_PATH;
 	const pidPath = explicitPidPath ?? join(dataDir, "server.pid");
-	const legacyPidDefault = join(
-		homeDir(),
-		".local",
-		"share",
-		"knowledge-server",
-		"server.pid",
-	);
+	const legacyPidDefault = join(defaultDataDir(), "server.pid");
 
-	const rerankEnabled = env.RERANK_ENABLED !== "false";
+	const rerankEnabled = r.flag("RERANK_ENABLED", true);
 	const rerankProvider = rerankProviderFromEnv(env);
 	const rawRerankProvider = env.RERANK_PROVIDER?.trim().toLowerCase();
 	if (
@@ -391,6 +386,9 @@ export function parseEnv(env: Env, configPath = DEFAULT_CONFIG_PATH) {
 		apiKey: remoteEndpoint.apiKey,
 	});
 
+	// DAEMON_AUTO_SPAWN is applied by config-file.ts, which cannot import this module.
+	// It is validated here so an unknown spelling is reported by validateConfig().
+	r.optionalFlag("DAEMON_AUTO_SPAWN");
 	const config = {
 		// Server bind address (port/host) is resolved in config-file.ts (resolveServerAddress).
 		// Optional fixed admin token — set KNOWLEDGE_ADMIN_TOKEN to use a stable token
@@ -402,8 +400,8 @@ export function parseEnv(env: Env, configPath = DEFAULT_CONFIG_PATH) {
 		allowedHosts: parseAllowedHosts(env.KNOWLEDGE_ALLOWED_HOSTS),
 		// Scrub credentials (API keys, tokens, private keys, DB passwords) from
 		// transcript text before it is staged, sent to an LLM/embedding API, or stored.
-		// Set REDACT_SECRETS=false to disable.
-		redactSecrets: env.REDACT_SECRETS !== "false",
+		// Set REDACT_SECRETS=false (or 0, no, off) to disable.
+		redactSecrets: r.flag("REDACT_SECRETS", true),
 
 		// Log file — all operational output is tee'd here in addition to stdout.
 		// Set KNOWLEDGE_LOG_PATH to override; set to "" to disable file logging.
@@ -503,15 +501,15 @@ export function parseEnv(env: Env, configPath = DEFAULT_CONFIG_PATH) {
 		ompSessionsRoot: env.OMP_SESSIONS_ROOT || join(homeDir(), ".omp"),
 
 		// Explicit source enable/disable.
-		// All default to true (auto-detect); set to "false" to hard-disable a source.
-		opencodeEnabled: env.OPENCODE_ENABLED !== "false",
-		claudeEnabled: env.CLAUDE_ENABLED !== "false",
-		cursorEnabled: env.CURSOR_ENABLED !== "false",
-		codexEnabled: env.CODEX_ENABLED !== "false",
-		vscodeEnabled: env.VSCODE_ENABLED !== "false",
-		localFilesEnabled: env.LOCAL_FILES_ENABLED !== "false",
-		piEnabled: env.PI_ENABLED !== "false",
-		ompEnabled: env.OMP_ENABLED !== "false",
+		// All default to true (auto-detect); false, 0, no or off hard-disables a source.
+		opencodeEnabled: r.flag("OPENCODE_ENABLED", true),
+		claudeEnabled: r.flag("CLAUDE_ENABLED", true),
+		cursorEnabled: r.flag("CURSOR_ENABLED", true),
+		codexEnabled: r.flag("CODEX_ENABLED", true),
+		vscodeEnabled: r.flag("VSCODE_ENABLED", true),
+		localFilesEnabled: r.flag("LOCAL_FILES_ENABLED", true),
+		piEnabled: r.flag("PI_ENABLED", true),
+		ompEnabled: r.flag("OMP_ENABLED", true),
 
 		// LLM credentials — three tiers, evaluated per-provider at call time:
 		//
@@ -667,7 +665,7 @@ export function parseEnv(env: Env, configPath = DEFAULT_CONFIG_PATH) {
 		// State database (server-side pending_episodes staging and bookkeeping).
 		// Its location is config.jsonc stateDb (see config-file.ts).
 		postgres: {
-			// Maximum pool connections for each knowledge store on Postgres. Useful for
+			// Maximum pool connections for each Postgres pool (knowledge stores and the state DB). Useful for
 			// hosted services with tight connection limits (Supabase free, Railway, Neon).
 			poolMax: r.int("POSTGRES_POOL_MAX", 10, 1),
 		},
@@ -683,13 +681,7 @@ export function parseEnv(env: Env, configPath = DEFAULT_CONFIG_PATH) {
 			// Set to 0 to disable.
 			intervalMs: r.int("DECAY_INTERVAL_MS", 86_400_000, 0),
 			// Type-specific decay rates (higher = slower decay)
-			typeHalfLife: {
-				fact: 30, // facts go stale in ~30 days
-				principle: 180, // principles last ~6 months
-				pattern: 90, // patterns last ~3 months
-				decision: 120, // decisions last ~4 months
-				procedure: 365, // procedures are very stable
-			} as Record<string, number>,
+			typeHalfLife: TYPE_HALF_LIFE_DAYS,
 		},
 
 		// Consolidation
@@ -1007,7 +999,7 @@ export function remoteRerankIsActive(): boolean {
  * on the parsed config and on the credentials.
  */
 export function validateConfig(): string[] {
-	const errors: string[] = [...parsed.issues];
+	const errors: string[] = configEnvIssues();
 
 	const envPath = resolveEnvFilePath();
 
@@ -1037,6 +1029,15 @@ export function validateConfig(): string[] {
 	// hasOAuthTokens() does a full JSON parse so a corrupt token file does not
 	// suppress the startup error while runtime LLM calls still fail.
 	const hasAnthropicOAuth = hasOAuthTokens();
+	// The OAuth fallback is used only when no Anthropic API key is set, and then its
+	// token goes to the routed base URL. Refuse a non-official URL at startup too.
+	if (hasAnthropicOAuth && !anthropicRouting().apiKey) {
+		try {
+			assertOAuthBaseUrl(anthropicRouting().baseURL);
+		} catch (e) {
+			errors.push(e instanceof Error ? e.message : String(e));
+		}
+	}
 
 	if (
 		!hasAnthropic &&
@@ -1164,4 +1165,32 @@ export function validateConfig(): string[] {
 	}
 
 	return errors;
+}
+
+/**
+ * Invalid environment values found while parsing (the same list validateConfig()
+ * starts with). The daemon reports these; it does not run the credential checks.
+ */
+export function configEnvIssues(): string[] {
+	return [...parsed.issues];
+}
+
+/**
+ * How the anthropic provider authenticates: the API key (per-provider, else the
+ * unified key) and the base URL (per-provider override, else the unified proxy
+ * path). The request path (consolidation/llm.ts) and validateConfig() both use
+ * this, so the startup check cannot drift from what the model call does.
+ */
+export function anthropicRouting(): {
+	apiKey: string;
+	baseURL: string | undefined;
+} {
+	return {
+		apiKey: config.llm.anthropic.apiKey || config.llm.apiKey,
+		baseURL:
+			config.llm.anthropic.baseURL ||
+			(config.llm.baseEndpoint
+				? `${config.llm.baseEndpoint}/anthropic/v1`
+				: undefined),
+	};
 }

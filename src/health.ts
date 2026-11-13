@@ -11,10 +11,10 @@
  *    without a server.
  */
 
-export type HealthLevel = "ok" | "degraded" | "down";
+type HealthLevel = "ok" | "degraded" | "down";
 
 /** Backlog above this many pending sessions degrades health. */
-export const PENDING_BACKLOG_DEGRADED = 500;
+const PENDING_BACKLOG_DEGRADED = 500;
 
 /**
  * LLM outage thresholds, counted in consecutive consolidation runs that made no
@@ -26,7 +26,7 @@ export const LLM_DEGRADED_FAILING_RUNS = 3;
 export const LLM_DOWN_FAILING_RUNS = 10;
 export const LLM_DOWN_AFTER_MS = 60 * 60 * 1000;
 
-export interface OutcomeSnapshot {
+interface OutcomeSnapshot {
 	name: string;
 	lastSuccessAt: number | null;
 	lastErrorAt: number | null;
@@ -40,7 +40,7 @@ export interface OutcomeSnapshot {
 	open: boolean;
 }
 
-export interface OutcomeTrackerOptions {
+interface OutcomeTrackerOptions {
 	openAfter?: number;
 	openMs?: number;
 	now?: () => number;
@@ -153,7 +153,7 @@ export interface HealthInput {
 	};
 }
 
-export interface HealthReport {
+interface HealthReport {
 	health: HealthLevel;
 	reasons: string[];
 }
