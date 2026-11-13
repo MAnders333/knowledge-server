@@ -652,7 +652,10 @@ export class ConsolidationEngine {
 				.join(", ");
 
 			logger.log(
-				`[consolidation/${reader.source}] Chunk ${chunkLabel} (${chunk.length} episodes): ${episodeTitles}`,
+				`[consolidation/${reader.source}] Chunk ${chunkLabel} (${chunk.length} episodes)`,
+			);
+			logger.debug(
+				`[consolidation/${reader.source}] Chunk ${chunkLabel} session titles: ${episodeTitles}`,
 			);
 
 			// Use the first episode's source as the log label — all episodes in a
@@ -1248,7 +1251,7 @@ export class ConsolidationEngine {
 					);
 					created++;
 					contradictionCandidates.add(inserted.id);
-					logger.log(
+					logger.debug(
 						`[consolidation/${source}] + insert [${inserted.type}] ${c.entry.domain ? `domain:${c.entry.domain} ` : ""}${JSON.stringify(inserted.content)}`,
 					);
 					if (inserted.embedding) {
@@ -1259,7 +1262,7 @@ export class ConsolidationEngine {
 					}
 				} catch (err) {
 					logger.error(
-						`[consolidation/${source}] Failed to insert novel entry ${JSON.stringify(c.entry.content ?? "")} — skipping:`,
+						`[consolidation/${source}] Failed to insert novel entry (${c.entry.type}) — skipping:`,
 						err,
 					);
 				}
@@ -1321,13 +1324,13 @@ export class ConsolidationEngine {
 				const decision = mergeDecisions[i];
 				const nearest = c.nearestEntry;
 				try {
-					logger.log(
+					logger.debug(
 						`[consolidation/${source}] Reconsolidation candidate (sim=${c.nearestSimilarity.toFixed(3)}): ${JSON.stringify(c.entry.content)} vs ${JSON.stringify(nearest.content)}`,
 					);
 					switch (decision.action) {
 						case "keep": {
 							await store.reinforceObservation(nearest.id);
-							logger.log(
+							logger.debug(
 								`[consolidation/${source}] Keep existing (reinforced): ${JSON.stringify(nearest.content)}`,
 							);
 							break;
@@ -1358,7 +1361,7 @@ export class ConsolidationEngine {
 								await applyInsert(c);
 								break;
 							}
-							logger.log(
+							logger.debug(
 								`[consolidation/${source}] ${decision.action === "update" ? "Updated" : "Replaced"}: ${JSON.stringify(nearest.content)} → ${JSON.stringify(content)}`,
 							);
 							updated++;
@@ -1390,7 +1393,7 @@ export class ConsolidationEngine {
 					}
 				} catch (err) {
 					logger.error(
-						`[consolidation/${source}] Failed to apply merge decision for ${JSON.stringify(c.entry.content ?? "")} — skipping:`,
+						`[consolidation/${source}] Failed to apply merge decision for an extracted entry (${c.entry.type}) — skipping:`,
 						err,
 					);
 				}
@@ -1472,7 +1475,7 @@ export class ConsolidationEngine {
 					strength: newStrength,
 				});
 				archived++;
-				logger.log(
+				logger.debug(
 					`[decay] Archived: ${JSON.stringify(entry.content)} (strength: ${newStrength.toFixed(3)})`,
 				);
 			}
@@ -1486,7 +1489,7 @@ export class ConsolidationEngine {
 		for (const entry of archivedEntries) {
 			if (entry.updatedAt < tombstoneThreshold) {
 				await db.updateEntry(entry.id, { status: "tombstoned" });
-				logger.log(
+				logger.debug(
 					`[decay] Tombstoned: ${JSON.stringify(entry.content)} (archived for ${config.decay.tombstoneAfterDays}+ days)`,
 				);
 			}

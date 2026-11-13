@@ -164,7 +164,7 @@ export class ContradictionScanner {
 					continue;
 				}
 				detected++;
-				logger.log(
+				logger.debug(
 					`[contradiction] ${logPrefix}${result.resolution}: ${JSON.stringify(entry.content)} vs candidate ${result.candidateId} (sim=${simById.get(result.candidateId)?.toFixed(3)}) — ${JSON.stringify(result.reason)}`,
 				);
 
@@ -307,7 +307,7 @@ export class ContradictionScanner {
 
 			if (midBandCandidates.length === 0) continue;
 
-			logger.log(
+			logger.debug(
 				`[contradiction] Checking ${midBandCandidates.length} candidates for ${JSON.stringify(entry.content)}`,
 			);
 
@@ -373,7 +373,7 @@ export class ContradictionScanner {
 
 			if (intraChunkCandidates.length === 0) continue;
 
-			logger.log(
+			logger.debug(
 				`[contradiction] Intra-chunk: checking ${intraChunkCandidates.length} same-chunk candidates for ${JSON.stringify(entryA.content)}`,
 			);
 
