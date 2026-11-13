@@ -191,6 +191,9 @@ const uploader = new EpisodeUploader(readers, serverStateDb, daemonDb, userId, {
 	initialLookbackDays: parseInitialLookbackDays(
 		process.env.INITIAL_LOOKBACK_DAYS,
 	),
+	// Only the daemon honours reinitialize's full re-ingest request. Other uploaders
+	// (process-inbox) must not clear it, or the daemon would skip its history.
+	fullBackfillRequests: true,
 });
 
 const closeResources = async () => {

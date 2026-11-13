@@ -56,6 +56,7 @@ export class EpisodeUploader {
 	private readonly daemonDb: DaemonDB;
 	private readonly userId: string;
 	private readonly initialLookbackDays: number;
+	private readonly fullBackfillRequests: boolean;
 
 	/**
 	 * @param readers       Episode readers — one per AI tool source.
@@ -67,19 +68,27 @@ export class EpisodeUploader {
 	 * @param options.initialLookbackDays  First-run window in days (0 = all
 	 *                      history, the default). The daemon entry point passes
 	 *                      INITIAL_LOOKBACK_DAYS; other callers keep full history.
+	 * @param options.fullBackfillRequests  Honour the daemon-wide full re-ingest request
+	 *                      (set by reinitialize) and clear it once every source has been
+	 *                      re-read. Only the daemon passes true; process-inbox and other
+	 *                      uploaders leave the request alone.
 	 */
 	constructor(
 		readers: IEpisodeReader[],
 		serverStateDb: IServerStateDB,
 		daemonDb: DaemonDB,
 		userId: string,
-		options: { initialLookbackDays?: number } = {},
+		options: {
+			initialLookbackDays?: number;
+			fullBackfillRequests?: boolean;
+		} = {},
 	) {
 		this.readers = readers;
 		this.serverStateDb = serverStateDb;
 		this.daemonDb = daemonDb;
 		this.userId = userId;
 		this.initialLookbackDays = options.initialLookbackDays ?? 0;
+		this.fullBackfillRequests = options.fullBackfillRequests ?? false;
 	}
 
 	/**
@@ -98,7 +107,10 @@ export class EpisodeUploader {
 		failedSources: Array<{ source: string; error: string }>;
 	}> {
 		// Sources are independent — upload all concurrently.
-		const fullBackfill = await this.daemonDb.hasFullBackfillRequest();
+		// The daemon-wide re-ingest request is read and cleared only when the caller owns it.
+		const fullBackfill =
+			this.fullBackfillRequests &&
+			(await this.daemonDb.hasFullBackfillRequest());
 		const settled = await Promise.allSettled(
 			this.readers.map((reader) => this.uploadSource(reader, fullBackfill)),
 		);
