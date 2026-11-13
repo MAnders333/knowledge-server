@@ -128,21 +128,19 @@ describe("HTTP API boundary", () => {
 			extraAllowedHosts?: string[];
 		} = {},
 	): void {
-		app = createApp(
+		app = createApp({
 			db,
 			serverStateDb,
 			activation,
-			consolidationStub(),
-			TOKEN,
-			options.adminTokenIsStable ?? true,
-			new Set(),
-			options.readDbs ?? [db],
-			options.writableDbs ?? [db],
-			port,
-			undefined,
-			"127.0.0.1",
-			options.extraAllowedHosts ?? [],
-		);
+			consolidation: consolidationStub(),
+			adminToken: TOKEN,
+			adminTokenIsStable: options.adminTokenIsStable ?? true,
+			readDbs: options.readDbs ?? [db],
+			writableDbs: options.writableDbs ?? [db],
+			serverPort: port,
+			bindHost: "127.0.0.1",
+			extraAllowedHosts: options.extraAllowedHosts ?? [],
+		});
 	}
 
 	beforeAll(() => {

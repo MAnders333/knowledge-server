@@ -228,22 +228,16 @@ describe("GET /status health", () => {
 		stateDb: ServerStateDB = serverStateDb,
 		runtime: StatusRuntime = {},
 	) {
-		return createApp(
+		return createApp({
 			db,
-			stateDb,
+			serverStateDb: stateDb,
 			activation,
-			consolidationStub(),
-			TOKEN,
-			false,
-			new Set(),
+			consolidation: consolidationStub(),
+			adminToken: TOKEN,
 			readDbs,
-			[db],
-			undefined,
-			undefined,
-			"127.0.0.1",
-			[],
+			writableDbs: [db],
 			runtime,
-		);
+		});
 	}
 
 	async function status(

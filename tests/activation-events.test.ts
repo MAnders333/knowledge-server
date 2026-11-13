@@ -342,19 +342,17 @@ describe("HTTP activation writes telemetry without prompt text", () => {
 				return false;
 			},
 		} as unknown as ConsolidationEngine;
-		return createApp(
-			{} as IKnowledgeStore,
-			state,
+		return createApp({
+			db: {} as IKnowledgeStore,
+			serverStateDb: state,
 			activation,
 			consolidation,
-			"test-token-for-activation-events",
-			false,
-			new Set(),
-			[],
-			[],
-			8080,
-			recorder,
-		);
+			adminToken: "test-token-for-activation-events",
+			readDbs: [],
+			writableDbs: [],
+			serverPort: 8080,
+			activationEvents: recorder,
+		});
 	}
 
 	it("GET /activate stores client tag and content-free fields; response has no telemetry", async () => {

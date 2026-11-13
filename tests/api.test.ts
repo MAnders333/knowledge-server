@@ -102,13 +102,13 @@ describe("HTTP API", () => {
 			unlock: () => {},
 			close: () => {},
 		} as unknown as ConsolidationEngine;
-		app = createApp(
+		app = createApp({
 			db,
 			serverStateDb,
 			activation,
 			consolidation,
-			TEST_ADMIN_TOKEN,
-		);
+			adminToken: TEST_ADMIN_TOKEN,
+		});
 	});
 
 	afterEach(async () => {
@@ -316,13 +316,13 @@ describe("HTTP API", () => {
 				unlock: () => {},
 				close: () => {},
 			} as unknown as ConsolidationEngine;
-			const busyApp = createApp(
-				busyDb,
-				busyServerLocalDb,
-				busyActivation,
-				busyConsolidation,
-				TEST_ADMIN_TOKEN,
-			);
+			const busyApp = createApp({
+				db: busyDb,
+				serverStateDb: busyServerLocalDb,
+				activation: busyActivation,
+				consolidation: busyConsolidation,
+				adminToken: TEST_ADMIN_TOKEN,
+			});
 			const res = await withHostHeader(busyApp).request("/consolidate", {
 				method: "POST",
 				headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
@@ -837,16 +837,14 @@ describe("HTTP API", () => {
 				close: () => {},
 			} as unknown as ConsolidationEngine;
 
-			const crossStoreApp = createApp(
+			const crossStoreApp = createApp({
 				db,
 				serverStateDb,
 				activation,
-				mockConsolidation,
-				TEST_ADMIN_TOKEN,
-				false,
-				new Set(),
-				[db, db2],
-			);
+				consolidation: mockConsolidation,
+				adminToken: TEST_ADMIN_TOKEN,
+				readDbs: [db, db2],
+			});
 
 			// All resolution types should return 422
 			for (const resolution of [

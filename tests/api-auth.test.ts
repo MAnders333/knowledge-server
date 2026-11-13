@@ -39,14 +39,14 @@ describe("admin token gate", () => {
 	let app: Hono;
 
 	function build(adminTokenIsStable: boolean): void {
-		app = createApp(
+		app = createApp({
 			db,
 			serverStateDb,
 			activation,
-			consolidationStub(),
-			STABLE_TOKEN,
+			consolidation: consolidationStub(),
+			adminToken: STABLE_TOKEN,
 			adminTokenIsStable,
-		);
+		});
 	}
 
 	/** Loopback Host, optional Bearer token, optional socket address (the throttle key). */

@@ -390,22 +390,22 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	activationEvents.start();
 
 	// Create HTTP app
-	const app = createApp(
+	const app = createApp({
 		db,
 		serverStateDb,
 		activation,
 		consolidation,
 		adminToken,
 		adminTokenIsStable,
-		registry.unavailableStoreIds,
-		registry.readStores(),
-		registry.writableStores(),
-		registry.port,
+		unavailableStoreIds: registry.unavailableStoreIds,
+		readDbs: registry.readStores(),
+		writableDbs: registry.writableStores(),
+		serverPort: registry.port,
 		activationEvents,
-		registry.host,
-		config.allowedHosts,
-		{ dataDir, daemonAutoSpawn: registry.daemonAutoSpawn },
-	);
+		bindHost: registry.host,
+		extraAllowedHosts: config.allowedHosts,
+		runtime: { dataDir, daemonAutoSpawn: registry.daemonAutoSpawn },
+	});
 
 	// port/host/daemonAutoSpawn come from the registry (config.jsonc with env var override)
 	// rather than config.ts, so they reflect the config file if one exists.

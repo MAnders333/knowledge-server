@@ -24,6 +24,7 @@ import { REVIEW_STALE_STRENGTH_THRESHOLD, config } from "../config.js";
 import type { ConsolidationEngine } from "../consolidation/consolidate.js";
 import { type DaemonStatus, readDaemonStatus } from "../daemon/status.js";
 import type { IKnowledgeStore } from "../db/index.js";
+import type { IServerStateDB } from "../db/interface.js";
 import { componentHealth, evaluateHealth } from "../health.js";
 import { logger } from "../logger.js";
 import { activateInputSchema } from "../mcp/index.js";
@@ -122,45 +123,62 @@ async function readJsonObject(
 	return body as Record<string, unknown>;
 }
 
-export function createApp(
-	db: IKnowledgeStore,
-	serverStateDb: import("../db/interface.js").IServerStateDB,
-	activation: ActivationEngine,
-	consolidation: ConsolidationEngine,
-	adminToken: string,
-	/** Whether adminToken was explicitly configured (vs randomly generated for local use). */
-	adminTokenIsStable = false,
-	/** Store IDs that failed to connect at startup and are currently unavailable. */
-	unavailableStoreIds: ReadonlySet<string> = new Set(),
+/** Options for createApp. Only the first five fields are required; the rest default as documented. */
+export interface CreateAppOptions {
+	/** Primary writable store. Default for `readDbs` and `writableDbs`; the store /entries reads from. */
+	db: IKnowledgeStore;
+	serverStateDb: IServerStateDB;
+	activation: ActivationEngine;
+	consolidation: ConsolidationEngine;
+	adminToken: string;
+	/** Whether adminToken was explicitly configured (vs randomly generated for local use). Default false. */
+	adminTokenIsStable?: boolean;
+	/** Store IDs that failed to connect at startup and are currently unavailable. Default: none. */
+	unavailableStoreIds?: ReadonlySet<string>;
 	/**
 	 * All stores to fan out read operations across (/entries, /review, /status).
-	 * Defaults to [db] for backwards compatibility (single-store mode).
-	 * In multi-store setups, pass registry.readStores() so entries in secondary
-	 * stores are visible via the API.
+	 * Default [db] (single-store mode). In multi-store setups, pass
+	 * registry.readStores() so entries in secondary stores are visible via the API.
 	 */
-	readDbs: IKnowledgeStore[] = [db],
+	readDbs?: IKnowledgeStore[];
 	/**
-	 * All writable stores for /reinitialize fan-out.
-	 * Defaults to [db]. Pass registry.writableStores() in multi-store setups
-	 * so all domain stores are wiped atomically on reinitialize.
+	 * All writable stores for /reinitialize fan-out. Default [db]. Pass
+	 * registry.writableStores() in multi-store setups so all domain stores are wiped
+	 * atomically on reinitialize.
 	 */
-	writableDbs: IKnowledgeStore[] = [db],
-	/** Port the server is bound to; reported by the admin /status. */
-	serverPort: number = DEFAULT_CONFIG.port,
+	writableDbs?: IKnowledgeStore[];
+	/** Port the server is bound to; reported by the admin /status. Default DEFAULT_CONFIG.port. */
+	serverPort?: number;
 	/**
 	 * Content-free activation telemetry sink. The caller owns its lifecycle
-	 * (start/stop). Defaults to a recorder on serverStateDb with no timers.
+	 * (start/stop). Default: a recorder on serverStateDb with no timers.
 	 */
-	activationEvents: ActivationEventRecorder = new ActivationEventRecorder(
+	activationEvents?: ActivationEventRecorder;
+	/** Address the server is bound to; always accepted in the Host allow-list. Default "127.0.0.1". */
+	bindHost?: string;
+	/** Extra Host values (KNOWLEDGE_ALLOWED_HOSTS), each `name` or `name:port`. Default none. */
+	extraAllowedHosts?: readonly string[];
+	/** Where the daemon's lockfile and status file live; enables the daemon checks in /status. Default none. */
+	runtime?: StatusRuntime;
+}
+
+export function createApp(options: CreateAppOptions): Hono {
+	const {
+		db,
 		serverStateDb,
-	),
-	/** Address the server is bound to; always accepted in the Host allow-list. */
-	bindHost = "127.0.0.1",
-	/** Extra Host values (KNOWLEDGE_ALLOWED_HOSTS), each `name` or `name:port`. */
-	extraAllowedHosts: readonly string[] = [],
-	/** Where the daemon's lockfile and status file live; enables the daemon checks in /status. */
-	runtime: StatusRuntime = {},
-): Hono {
+		activation,
+		consolidation,
+		adminToken,
+		adminTokenIsStable = false,
+		unavailableStoreIds = new Set(),
+		readDbs = [db],
+		writableDbs = [db],
+		serverPort = DEFAULT_CONFIG.port,
+		activationEvents = new ActivationEventRecorder(serverStateDb),
+		bindHost = "127.0.0.1",
+		extraAllowedHosts = [],
+		runtime = {},
+	} = options;
 	const app = new Hono();
 	const allowlist = buildHostAllowlist(bindHost, extraAllowedHosts);
 
