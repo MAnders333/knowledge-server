@@ -18,10 +18,12 @@ interface Step {
 interface Job {
 	needs?: string | string[];
 	if?: string;
+	permissions?: Record<string, string>;
 	steps: Step[];
 	strategy?: { matrix: { include: { suffix: string }[] } };
 }
 interface Workflow {
+	permissions?: Record<string, string>;
 	jobs: Record<string, Job>;
 }
 const workflow = (rel: string): Workflow =>
@@ -253,11 +255,11 @@ describe("workflow job timeouts", () => {
 	}
 });
 
-describe("release build validates the commit it builds", () => {
+describe("release build checks CI for the commit it builds", () => {
 	const wf = workflow(".github/workflows/release-please.yml");
 	const build = wf.jobs["build-binaries"] as Job;
 	const guardIndex = build.steps.findIndex(
-		(s) => s.name === "Refuse to build a commit that CI did not validate",
+		(s) => s.name === "Build only a commit whose CI run succeeded",
 	);
 	const checkoutIndex = build.steps.findIndex((s) =>
 		s.uses?.startsWith("actions/checkout@"),
@@ -269,17 +271,44 @@ describe("release build validates the commit it builds", () => {
 		expect(guardIndex).toBeLessThan(checkoutIndex);
 	});
 
-	it("compares the release commit to the CI-validated head SHA and fails on mismatch", () => {
+	it("asks for the successful push CI run of the release commit, and fails without one", () => {
 		expect(guard?.env).toEqual({
-			VALIDATED_SHA: "${{ github.event.workflow_run.head_sha }}",
+			GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}",
 			RELEASE_SHA: "${{ needs.release-please.outputs.sha }}",
 		});
-		expect(guard?.run).toContain('[ "$RELEASE_SHA" != "$VALIDATED_SHA" ]');
+		expect(guard?.run).toContain("gh run list");
+		expect(guard?.run).toContain('--commit "$RELEASE_SHA"');
+		expect(guard?.run).toContain("--event push");
+		expect(guard?.run).toContain("--status success");
+		expect(guard?.run).toContain('[ "$green" -lt 1 ]');
 		expect(guard?.run).toContain("exit 1");
 	});
 
-	it("checks out the release commit the guard validated", () => {
+	it("does not compare the release commit with the validated head, which main can move past", () => {
+		expect(guard?.run).not.toContain("VALIDATED_SHA");
+		expect(guard?.run).not.toContain("workflow_run.head_sha");
+	});
+
+	it("grants actions: read on the build job only, and nothing more", () => {
+		expect(build.permissions).toMatchObject({ actions: "read" });
+		expect(wf.permissions).toEqual({});
+		for (const [name, job] of Object.entries(wf.jobs)) {
+			if (name !== "build-binaries")
+				expect(job.permissions?.actions).toBeUndefined();
+		}
+	});
+
+	it("checks out the release commit the guard checked", () => {
 		const checkout = build.steps[checkoutIndex];
 		expect(checkout?.with?.ref).toBe("${{ needs.release-please.outputs.sha }}");
+	});
+
+	it("the publish comment says a re-run works once CI is green for the commit", () => {
+		const text = read(".github/workflows/release-please.yml");
+		const comment = text.slice(
+			text.indexOf("\n  publish:"),
+			text.indexOf("name: Publish release"),
+		);
+		expect(comment).toMatch(/CI is green for that\s+#?\s*commit/);
 	});
 });
