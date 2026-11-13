@@ -309,10 +309,13 @@ export function createApp(options: CreateAppOptions): Hono {
 			version: pkg.version,
 		});
 
-		mcpServer.tool(
+		mcpServer.registerTool(
 			"activate",
-			"Activate associated knowledge by providing cues. Returns knowledge entries that are semantically related to the provided cues. Use this when you need to recall what has been learned from prior sessions about a specific topic. Provide descriptive cues — topics, questions, or keywords — and receive relevant knowledge entries ranked by association strength.",
-			activateInputSchema,
+			{
+				description:
+					"Activate associated knowledge by providing cues. Returns knowledge entries that are semantically related to the provided cues. Use this when you need to recall what has been learned from prior sessions about a specific topic. Provide descriptive cues — topics, questions, or keywords — and receive relevant knowledge entries ranked by association strength.",
+				inputSchema: activateInputSchema,
+			},
 			async ({ cues, limit, threshold }) => {
 				try {
 					const started = performance.now();

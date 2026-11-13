@@ -19,16 +19,16 @@
 		"format": "bunx biome format --write src/ tests/ plugin/ bench/ scripts/"
 	},
 	"dependencies": {
-		"@ai-sdk/anthropic": "^3.0.0",
-		"@ai-sdk/google": "^3.0.0",
-		"@ai-sdk/openai-compatible": "^2.0.0",
-		"@modelcontextprotocol/sdk": "^1.12.0",
-		"ai": "^6.0.0",
+		"@ai-sdk/anthropic": "^3.0.142",
+		"@ai-sdk/google": "^3.0.146",
+		"@ai-sdk/openai-compatible": "^2.0.93",
+		"@modelcontextprotocol/sdk": "^1.32.2",
+		"ai": "^6.0.331",
 		"dotenv": "^17.3.1",
 		"hono": "^4.13.18",
 		"onnxruntime-web": "^1.27.0",
 		"postgres": "^3.4.8",
-		"zod": "^3.25.0"
+		"zod": "^4.6.6"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^1.9.0",
@@ -37,5 +37,13 @@
 		"@opencode-ai/plugin": "^1.2.15",
 		"@types/bun": "1.4.4",
 		"typescript": "7.0.2"
+	},
+	"overrides": {
+		"zod": "^4.6.6",
+		"undici": "^8.12.4",
+		"sharp": "^0.35.5",
+		"adm-zip": "^0.6.1",
+		"glob": "^14.0.6",
+		"minimatch": "^11.0.8"
 	}
 }
