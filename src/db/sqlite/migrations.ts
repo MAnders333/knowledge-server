@@ -354,4 +354,27 @@ export const MIGRATIONS: Array<{
 			}
 		},
 	},
+	{
+		version: 20,
+		label:
+			"cluster members joined before their cluster's last synthesis are baseline, not new",
+		up: (db) => {
+			// Older builds rewrote joined_at on every pass, so each existing member
+			// looked newer than its cluster's last synthesis and every such cluster
+			// was re-synthesized once. Clamp those join times to the last synthesis.
+			db.exec(`
+				UPDATE knowledge_cluster_member
+				SET joined_at = MIN(joined_at, (
+					SELECT c.last_synthesized_at FROM knowledge_cluster c
+					WHERE c.id = knowledge_cluster_member.cluster_id
+				))
+				WHERE EXISTS (
+					SELECT 1 FROM knowledge_cluster c
+					WHERE c.id = knowledge_cluster_member.cluster_id
+					  AND c.last_synthesized_at IS NOT NULL
+					  AND knowledge_cluster_member.joined_at > c.last_synthesized_at
+				)
+			`);
+		},
+	},
 ];

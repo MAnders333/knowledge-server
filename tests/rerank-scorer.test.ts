@@ -32,6 +32,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as ort from "onnxruntime-web";
 import { LocalReranker } from "../src/activation/rerank";
+import { RerankSkippedError } from "../src/activation/rerank-remote";
 import { config } from "../src/config";
 
 const SYNTH_MODEL = "test-org/synthetic-reranker"; // not pinned → no checksum
@@ -319,6 +320,108 @@ describe("LocalReranker (stub session)", () => {
 		expect(existsSync(join(modelsDir, DEFAULT_MODEL, "tokenizer.json"))).toBe(
 			false,
 		);
+	});
+
+	it("runs one scoring pass at a time in arrival order and refuses calls beyond two queued", async () => {
+		installSyntheticModel();
+		const log: string[] = [];
+		let inFlight = 0;
+		let maxInFlight = 0;
+		const session = {
+			async run(feeds: Feeds) {
+				// Each call's document is one word w<i> (token 10+i); the query is w999 (1009).
+				const call =
+					Number(
+						Array.from(feeds.input_ids.data).find((t) => t >= 10n && t < 1000n),
+					) - 10;
+				inFlight++;
+				maxInFlight = Math.max(maxInFlight, inFlight);
+				log.push(`start ${call}`);
+				await new Promise((resolve) => setTimeout(resolve, 5));
+				log.push(`end ${call}`);
+				inFlight--;
+				return { logits: { data: new Float32Array([call / 10]) } };
+			},
+		};
+		spyOn(ort.InferenceSession, "create").mockImplementation(
+			async () => session as unknown as ort.InferenceSession,
+		);
+
+		const reranker = synthReranker();
+		const completed: number[] = [];
+		const calls = Array.from({ length: 6 }, (_, i) =>
+			reranker.scoreBatch(words(1, 999), [words(1, i)]).then((scores) => {
+				completed.push(i);
+				return scores;
+			}),
+		);
+		const settled = await Promise.allSettled(calls);
+
+		expect(settled.slice(0, 3).map((r) => r.status)).toEqual([
+			"fulfilled",
+			"fulfilled",
+			"fulfilled",
+		]);
+		for (const r of settled.slice(3)) {
+			expect(r.status).toBe("rejected");
+			expect((r as PromiseRejectedResult).reason).toBeInstanceOf(
+				RerankSkippedError,
+			);
+		}
+		expect(reranker.skipped).toBe(3);
+		expect(completed).toEqual([0, 1, 2]);
+		expect(maxInFlight).toBe(1);
+		expect(log).toEqual([
+			"start 0",
+			"end 0",
+			"start 1",
+			"end 1",
+			"start 2",
+			"end 2",
+		]);
+		for (let i = 0; i < 3; i++) {
+			const value = (settled[i] as PromiseFulfilledResult<number[]>).value;
+			expect(value).toHaveLength(1);
+			expect(value[0]).toBeCloseTo(1 / (1 + Math.exp(-i / 10)), 5);
+		}
+	});
+
+	it("a queued call whose deadline passed fails without starting its scoring pass", async () => {
+		installSyntheticModel();
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let runs = 0;
+		spyOn(ort.InferenceSession, "create").mockImplementation(
+			async () =>
+				({
+					async run() {
+						runs++;
+						started.resolve();
+						await release.promise;
+						return { logits: { data: new Float32Array([0]) } };
+					},
+				}) as unknown as ort.InferenceSession,
+		);
+
+		const reranker = synthReranker(1_000);
+		const first = reranker.scoreBatch(words(1), [words(1)]);
+		await started.promise;
+		const second = reranker.scoreBatch(words(1), [words(1)]);
+		const settled = await Promise.allSettled([first, second]);
+		// Release the held run only after both callers gave up: the queued call
+		// reaches its turn with its deadline already past.
+		release.resolve();
+
+		for (const r of settled) {
+			expect(r.status).toBe("rejected");
+			expect((r as PromiseRejectedResult).reason.message).toMatch(
+				/timeout after 1000ms/,
+			);
+		}
+		// The queue exposes no drain signal; this short wait lets the released run
+		// settle and the queued call's turn check run.
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(runs).toBe(1);
 	});
 });
 

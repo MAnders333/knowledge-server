@@ -335,6 +335,40 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		expect(after).toHaveLength(0);
 	});
 
+	it("migration v20 clamps member join times that older builds rewrote", async () => {
+		await db.insertEntry(makeEntry("v19-member"));
+		await truncSql`DELETE FROM knowledge_cluster_member`;
+		await truncSql`DELETE FROM knowledge_cluster`;
+		await truncSql`
+			INSERT INTO knowledge_cluster (id, centroid, member_count, last_synthesized_at, last_membership_changed_at, created_at)
+			VALUES ('v19-synth', '\\x00'::bytea, 1, 1000, 1000, 0),
+			       ('v19-never', '\\x00'::bytea, 1, NULL, 3000, 0)
+		`;
+		await truncSql`
+			INSERT INTO knowledge_cluster_member (cluster_id, entry_id, joined_at) VALUES
+			  ('v19-synth', 'v19-member', 2000),
+			  ('v19-never', 'v19-member', 2000)
+		`;
+		await truncSql.begin(async (tx) => {
+			await (
+				PG_MIGRATIONS.find(
+					(m) => m.version === 20,
+				) as (typeof PG_MIGRATIONS)[number]
+			).up(tx as never);
+		});
+		const rows = await truncSql<
+			{ cluster_id: string; joined_at: string | number }[]
+		>`
+			SELECT cluster_id, joined_at FROM knowledge_cluster_member ORDER BY cluster_id
+		`;
+		expect(rows.map((r) => [r.cluster_id, Number(r.joined_at)])).toEqual([
+			["v19-never", 2000],
+			["v19-synth", 1000],
+		]);
+		await truncSql`DELETE FROM knowledge_cluster_member`;
+		await truncSql`DELETE FROM knowledge_cluster`;
+	});
+
 	it("filters entries by status", async () => {
 		await db.insertEntry(makeEntry("a1", { status: "active" }));
 		await db.insertEntry(makeEntry("a2", { status: "active" }));
@@ -1698,6 +1732,142 @@ describe.skipIf(!PG_URI)("PostgreSQL migrations v16/v17", () => {
 		expect(await storeVersion()).toBe(SCHEMA_VERSION);
 	});
 });
+
+describe.skipIf(!PG_URI)(
+	"PostgreSQL migration v18 for a non-owner role",
+	() => {
+		const uri = PG_URI as string;
+		const role = "ks_store_nonowner";
+		let admin: ReturnType<typeof postgres>;
+
+		beforeAll(() => {
+			admin = postgres(uri, { max: 1 });
+		});
+
+		/** Create the non-owner login role (once) and grant it the app's DML. */
+		async function grantNonOwner(): Promise<void> {
+			await admin.unsafe(`
+			DO $$ BEGIN
+				IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${role}') THEN
+					CREATE ROLE ${role} LOGIN PASSWORD '${NONOWNER_PW}';
+				END IF;
+			END $$;
+			GRANT USAGE, CREATE ON SCHEMA public TO ${role};
+			GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${role};
+		`);
+		}
+
+		function nonOwnerUrl(): string {
+			const url = new URL(uri);
+			url.username = role;
+			url.password = NONOWNER_PW;
+			return url.toString();
+		}
+
+		/** Put the store at `version` with knowledge_entry.injection_count absent. */
+		async function rewindWithoutInjectionCount(version: number): Promise<void> {
+			await admin.unsafe(`
+			ALTER TABLE knowledge_entry DROP COLUMN IF EXISTS injection_count;
+			DELETE FROM schema_version;
+			INSERT INTO schema_version (version, applied_at) VALUES (${version}, ${Date.now()});
+		`);
+		}
+
+		/** Owner-side: put the column back so later tests see the current schema. */
+		async function restoreInjectionCount(): Promise<void> {
+			await admin.unsafe(
+				"ALTER TABLE knowledge_entry ADD COLUMN IF NOT EXISTS injection_count INTEGER NOT NULL DEFAULT 0",
+			);
+		}
+
+		afterAll(async () => {
+			await restoreInjectionCount();
+			await admin`DELETE FROM schema_version`;
+			await admin`INSERT INTO schema_version (version, applied_at) VALUES (${SCHEMA_VERSION}, ${Date.now()})`;
+			await admin.unsafe(`
+			DROP INDEX IF EXISTS idx_entry_strength;
+			DROP INDEX IF EXISTS idx_entry_accessed;
+		`);
+			await admin.unsafe(`
+			DROP OWNED BY ${role};
+			DROP ROLE IF EXISTS ${role};
+		`);
+			await admin.end();
+		});
+
+		it("a v17 store owned by another role upgrades to v18 with a warning", async () => {
+			// Owner-side setup: a v17 schema that still has the two indexes v18 drops.
+			const seed = new PostgresKnowledgeDB(uri);
+			await seed.initialize();
+			await seed.close();
+			await admin.unsafe(`
+			CREATE INDEX IF NOT EXISTS idx_entry_strength ON knowledge_entry(strength);
+			CREATE INDEX IF NOT EXISTS idx_entry_accessed ON knowledge_entry(last_accessed_at);
+			DELETE FROM schema_version;
+			INSERT INTO schema_version (version, applied_at) VALUES (17, ${Date.now()});
+		`);
+			await grantNonOwner();
+			const url = nonOwnerUrl();
+			const warn = spyOn(logger, "warn");
+			const store = new PostgresKnowledgeDB(url);
+			try {
+				// v18 must not abort the store: the owner-only DDL is skipped with a warning.
+				await store.initialize();
+				expect(warn.mock.calls.some((c) => String(c[0]).includes("v18"))).toBe(
+					true,
+				);
+			} finally {
+				warn.mockRestore();
+				await store.close();
+			}
+			const rows = await admin`SELECT MAX(version) AS v FROM schema_version`;
+			expect(Number((rows[0] as { v: number | string }).v)).toBe(
+				SCHEMA_VERSION,
+			);
+		});
+
+		it("a v18 store without injection_count stops with the owner-only fix named", async () => {
+			await grantNonOwner();
+			await rewindWithoutInjectionCount(18);
+			const store = new PostgresKnowledgeDB(nonOwnerUrl());
+			let error: Error | undefined;
+			try {
+				await store.initialize().catch((err: unknown) => {
+					error = err as Error;
+				});
+			} finally {
+				await store.close();
+				await restoreInjectionCount();
+			}
+			// v19 cannot be skipped: the write path increments injection_count.
+			expect(error?.message).toContain("Owner-only fix");
+			expect(error?.message).toContain(
+				"ALTER TABLE knowledge_entry ADD COLUMN injection_count",
+			);
+			const rows = await admin`SELECT MAX(version) AS v FROM schema_version`;
+			expect(Number((rows[0] as { v: number | string }).v)).toBe(18);
+		});
+
+		it("a non-owner opens the store once the owner runs the named fix", async () => {
+			await grantNonOwner();
+			await rewindWithoutInjectionCount(18);
+			// The owner-only fix from the error message, run as the table owner.
+			await admin.unsafe(
+				"ALTER TABLE knowledge_entry ADD COLUMN injection_count INTEGER NOT NULL DEFAULT 0",
+			);
+			const store = new PostgresKnowledgeDB(nonOwnerUrl());
+			try {
+				await store.initialize();
+			} finally {
+				await store.close();
+			}
+			const rows = await admin`SELECT MAX(version) AS v FROM schema_version`;
+			expect(Number((rows[0] as { v: number | string }).v)).toBe(
+				SCHEMA_VERSION,
+			);
+		});
+	},
+);
 
 // ── PostgresServerStateDB: schema upgrade, dead-lettering, user-scoped reset ──
 

@@ -15,6 +15,7 @@ import {
 	parseContradictionReply,
 } from "../src/consolidation/llm-output";
 import type { IKnowledgeStore } from "../src/db/index";
+import { logger } from "../src/logger";
 import type { KnowledgeEntry } from "../src/types";
 
 type Scanned = KnowledgeEntry & { embedding: number[] };
@@ -196,6 +197,7 @@ interface Recorded {
 	resolution: string;
 	entryId: string;
 	candidateId: string;
+	mergedData?: { content: string };
 }
 
 function fakeStore(pool: Scanned[], applied: Recorded[]): IKnowledgeStore {
@@ -205,8 +207,9 @@ function fakeStore(pool: Scanned[], applied: Recorded[]): IKnowledgeStore {
 			resolution: string,
 			entryId: string,
 			candidateId: string,
+			mergedData?: { content: string },
 		) => {
-			applied.push({ resolution, entryId, candidateId });
+			applied.push({ resolution, entryId, candidateId, mergedData });
 		},
 	} as unknown as IKnowledgeStore;
 }
@@ -299,6 +302,80 @@ describe("ContradictionScanner: candidate cap and batching", () => {
 	});
 });
 
+describe("ContradictionScanner: malformed reply", () => {
+	const malformed = () =>
+		new MalformedLlmOutputError("contradiction", "checked 2 of 3 candidates");
+
+	it("retries a malformed batch once and applies the retry's conflict", async () => {
+		const entry = makeEntry("new", 1);
+		const pool = [makeEntry("c0", 0.7), makeEntry("c1", 0.6)];
+		let attempts = 0;
+		const { calls } = spyLLM((_entry, candidates) => {
+			attempts++;
+			if (attempts === 1) throw malformed();
+			return [
+				{
+					candidateId: candidates[0].id,
+					resolution: "supersede_old",
+					reason: "newer",
+				},
+			];
+		});
+		const applied: Recorded[] = [];
+
+		const result = await new ContradictionScanner(new ConsolidationLLM()).scan(
+			fakeStore(pool, applied),
+			new Map([[entry.id, entry]]),
+			new Set([entry.id]),
+		);
+
+		expect(calls).toHaveLength(2);
+		expect(applied).toEqual([
+			{ resolution: "supersede_old", entryId: "new", candidateId: "c0" },
+		]);
+		expect(result).toEqual({ detected: 1, resolved: 1, malformedBatches: 0 });
+	});
+
+	it("skips a batch that is malformed twice, logs the skip, and scans the next batch", async () => {
+		const entry = makeEntry("new", 1);
+		// 15 candidates: batch 1 holds c00..c09 (most similar), batch 2 holds c10..c14.
+		const pool = Array.from({ length: 15 }, (_, i) =>
+			makeEntry(`c${String(i).padStart(2, "0")}`, 0.9 - i * 0.01),
+		);
+		spyLLM((_entry, candidates) => {
+			if (candidates[0].id === "c00") throw malformed();
+			return [
+				{
+					candidateId: "c10",
+					resolution: "supersede_old",
+					reason: "newer",
+				},
+			];
+		});
+		const applied: Recorded[] = [];
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+
+		const result = await new ContradictionScanner(new ConsolidationLLM()).scan(
+			fakeStore(pool, applied),
+			new Map([[entry.id, entry]]),
+			new Set([entry.id]),
+		);
+
+		expect(applied).toEqual([
+			{ resolution: "supersede_old", entryId: "new", candidateId: "c10" },
+		]);
+		expect(result).toEqual({ detected: 1, resolved: 1, malformedBatches: 1 });
+		expect(
+			warn.mock.calls.some(([msg]) =>
+				String(msg).includes(
+					"batch 1/2 after one retry — batch skipped (1 skipped this scan)",
+				),
+			),
+		).toBe(true);
+		warn.mockRestore();
+	});
+});
+
 describe("ContradictionScanner: intra-chunk path", () => {
 	it("checks two changed entries of one chunk against each other and applies the verdict", async () => {
 		// No pre-existing candidates: the only pair is the two changed entries.
@@ -331,7 +408,7 @@ describe("ContradictionScanner: intra-chunk path", () => {
 				candidateId: "chunk-b",
 			},
 		]);
-		expect(result).toEqual({ detected: 1, resolved: 1 });
+		expect(result).toEqual({ detected: 1, resolved: 1, malformedBatches: 0 });
 	});
 
 	it("ignores an intra-chunk pair outside the band", async () => {
@@ -363,5 +440,41 @@ describe("ContradictionScanner: intra-chunk path", () => {
 		);
 		const first = calls.find((c) => c.entryId === "chunk-a");
 		expect(first?.candidateIds).toEqual(["chunk-0", "chunk-1"]);
+	});
+});
+
+describe("ContradictionScanner: stored merge content is scrubbed", () => {
+	it("redacts a credential the LLM echoes into a merged entry", async () => {
+		const a = makeEntry("merge-a", 1);
+		const b = makeEntry("merge-b", 0.85);
+		const token = ["ghp_", "b".repeat(36)].join("");
+		spyLLM((_entry, candidates) => [
+			{
+				candidateId: candidates[0].id,
+				resolution: "merge",
+				reason: "same fact",
+				mergedContent: `Deploy with token ${token} on Thursdays`,
+				mergedType: "fact",
+				mergedTopics: ["server"],
+				mergedConfidence: 0.8,
+			},
+		]);
+		const applied: Recorded[] = [];
+		const entriesMap = new Map<string, Scanned>([
+			[a.id, a],
+			[b.id, b],
+		]);
+
+		await new ContradictionScanner(new ConsolidationLLM()).scan(
+			fakeStore([], applied),
+			entriesMap,
+			new Set([a.id, b.id]),
+		);
+
+		expect(applied).toHaveLength(1);
+		const stored = applied[0].mergedData?.content ?? "";
+		expect(stored).not.toContain(token);
+		expect(stored).toContain("[REDACTED:github_token]");
+		expect(stored).toContain("on Thursdays");
 	});
 });

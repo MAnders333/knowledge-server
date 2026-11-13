@@ -98,9 +98,12 @@ export class EpisodeUploader {
 		failedSources: Array<{ source: string; error: string }>;
 	}> {
 		// Sources are independent — upload all concurrently.
+		const fullBackfill = await this.daemonDb.hasFullBackfillRequest();
 		const settled = await Promise.allSettled(
-			this.readers.map((reader) => this.uploadSource(reader)),
+			this.readers.map((reader) => this.uploadSource(reader, fullBackfill)),
 		);
+		// A source is exhausted when this cycle reached the end of its candidates.
+		let allExhausted = true;
 
 		let totalEpisodes = 0;
 		let totalSessions = 0;
@@ -121,6 +124,7 @@ export class EpisodeUploader {
 				totalSessions += result.value.sessions;
 				totalSkipped += result.value.skipped;
 				if (result.value.cursorAdvanced) anyCursorAdvanced = true;
+				if (!result.value.exhausted) allExhausted = false;
 				if (result.value.episodes > 0 || result.value.sessions > 0) {
 					sources.push({
 						source: reader.source,
@@ -143,6 +147,7 @@ export class EpisodeUploader {
 						? result.reason.message
 						: String(result.reason);
 				failedSources.push({ source: reader.source, error });
+				allExhausted = false;
 				logger.error(
 					`[daemon/${reader.source}] Upload failed — skipping source this run:`,
 					result.reason,
@@ -154,6 +159,10 @@ export class EpisodeUploader {
 			logger.log(
 				`[daemon] Uploaded ${totalEpisodes} episodes from ${totalSessions} sessions.`,
 			);
+		}
+		if (fullBackfill && allExhausted && failedSources.length === 0) {
+			await this.daemonDb.clearFullBackfillRequest();
+			logger.log("[daemon] Full re-ingest complete for every source.");
 		}
 		if (totalSkipped > 0) {
 			logger.warn(
@@ -171,18 +180,26 @@ export class EpisodeUploader {
 		};
 	}
 
-	private async uploadSource(reader: IEpisodeReader): Promise<{
+	private async uploadSource(
+		reader: IEpisodeReader,
+		fullBackfill: boolean,
+	): Promise<{
 		episodes: number;
 		sessions: number;
 		cursorAdvanced: boolean;
 		skipped: number;
+		/** This cycle read the source to its end (no batch limit hit, nothing aborted). */
+		exhausted: boolean;
 		/** Set when the source could not be read this cycle. */
 		error?: string;
 	}> {
 		// Daemon cursor lives in DaemonDB (always local SQLite).
 		const firstRun = !(await this.daemonDb.hasDaemonCursor(reader.source));
+		// A re-ingest requested by reinitialize reads from the start of history.
 		const since = firstRun
-			? initialCursorMs(this.initialLookbackDays)
+			? fullBackfill
+				? 0
+				: initialCursorMs(this.initialLookbackDays)
 			: (await this.daemonDb.getDaemonCursor(reader.source))
 					.lastMessageTimeCreated;
 
@@ -197,6 +214,7 @@ export class EpisodeUploader {
 				sessions: 0,
 				cursorAdvanced: false,
 				skipped: takeSkipCount(reader.source),
+				exhausted: true,
 			};
 		}
 
@@ -221,11 +239,14 @@ export class EpisodeUploader {
 				sessions: 0,
 				cursorAdvanced: false,
 				skipped: takeSkipCount(reader.source),
+				exhausted: false,
 				error: err instanceof Error ? err.message : String(err),
 			};
 		}
 
-		if (firstRun) this.logBackfillPreview(reader.source, newEpisodes);
+		if (firstRun) {
+			this.logBackfillPreview(reader.source, newEpisodes, fullBackfill);
+		}
 
 		let uploadedCount = 0;
 		const uploadedSessionIds = new Set<string>();
@@ -242,9 +263,21 @@ export class EpisodeUploader {
 			const ep = stripNulFromEpisode(raw);
 			if (ep !== raw) nulStripped++;
 
-			let scrubbed: RedactionResult;
+			// Every free-text field is scrubbed: the title, project and directory are
+			// copied into the staged row and into each extraction prompt, not only the content.
+			let scrubbed: [
+				RedactionResult,
+				RedactionResult,
+				RedactionResult,
+				RedactionResult,
+			];
 			try {
-				scrubbed = redactSecrets(ep.content);
+				scrubbed = [
+					redactSecrets(ep.content),
+					redactSecrets(ep.sessionTitle),
+					redactSecrets(ep.projectName),
+					redactSecrets(ep.directory),
+				];
 			} catch (err) {
 				// Fail closed: an episode that cannot be scrubbed is never uploaded. It
 				// is recorded as handled so it cannot hold the cursor back forever.
@@ -261,9 +294,12 @@ export class EpisodeUploader {
 				progressMax = Math.max(progressMax, ep.maxMessageTime);
 				continue;
 			}
-			for (const [kind, n] of Object.entries(scrubbed.counts)) {
-				redactionCounts[kind] = (redactionCounts[kind] ?? 0) + n;
+			for (const result of scrubbed) {
+				for (const [kind, n] of Object.entries(result.counts)) {
+					redactionCounts[kind] = (redactionCounts[kind] ?? 0) + n;
+				}
 			}
+			const [content, title, project, directory] = scrubbed;
 			const pending: PendingEpisode = {
 				id: randomUUID(),
 				userId: this.userId,
@@ -271,12 +307,12 @@ export class EpisodeUploader {
 				sessionId: ep.sessionId,
 				startMessageId: ep.startMessageId,
 				endMessageId: ep.endMessageId,
-				sessionTitle: ep.sessionTitle,
-				projectName: ep.projectName,
-				directory: ep.directory,
+				sessionTitle: title.text,
+				projectName: project.text,
+				directory: directory.text,
 				timeCreated: ep.timeCreated,
 				maxMessageTime: ep.maxMessageTime,
-				content: scrubbed.text,
+				content: content.text,
 				contentType: ep.contentType,
 				approxTokens: ep.approxTokens,
 				uploadedAt: Date.now(),
@@ -383,6 +419,7 @@ export class EpisodeUploader {
 			sessions: uploadedSessionIds.size,
 			cursorAdvanced: newCursor > since,
 			skipped: takeSkipCount(reader.source),
+			exhausted: !hitBatchLimit && !aborted,
 		};
 	}
 
@@ -418,10 +455,15 @@ export class EpisodeUploader {
 	 * First-run preview (PV-10): episode count and rough token total for this
 	 * batch. No model price is configured here, so the cost is not estimated.
 	 */
-	private logBackfillPreview(source: string, episodes: Episode[]): void {
+	private logBackfillPreview(
+		source: string,
+		episodes: Episode[],
+		fullHistory: boolean,
+	): void {
 		const tokens = episodes.reduce((sum, ep) => sum + ep.approxTokens, 0);
-		const window =
-			this.initialLookbackDays === 0
+		const window = fullHistory
+			? "all history (full re-ingest requested by reinitialize)"
+			: this.initialLookbackDays === 0
 				? "all history (INITIAL_LOOKBACK_DAYS=0)"
 				: `the last ${this.initialLookbackDays} days (INITIAL_LOOKBACK_DAYS; default ${DEFAULT_INITIAL_LOOKBACK_DAYS})`;
 		logger.log(

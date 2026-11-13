@@ -149,6 +149,8 @@ describe("session dedupe in the engine", () => {
 			session: "claude-code\u0000s1",
 		});
 		expect(first.entries.length).toBe(2);
+		// The server commits a response that was delivered; only then is it remembered.
+		e.commitInjections(first.injection);
 		const second = await e.activate("a follow-up question here", {
 			session: "claude-code\u0000s1",
 		});
@@ -177,18 +179,24 @@ describe("session dedupe in the engine", () => {
 		expect(other.entries.length).toBe(2);
 	});
 
-	it("dry runs keep their in-memory dedupe state but write nothing", async () => {
+	it("dry runs write nothing and remember nothing until the plan is committed", async () => {
 		gate.sessionTtlMs = 60_000;
 		const e = engine();
 		const first = await e.activate("a question about things", {
 			session: "k",
 			dryRun: true,
 		});
-		expect(first.injection).toBeUndefined();
+		expect(first.injection?.writes).toEqual([]);
 		const second = await e.activate("a question about things", {
 			session: "k",
 			dryRun: true,
 		});
-		expect(second.entries).toEqual([]);
+		expect(second.entries.length).toBe(2);
+		e.commitInjections(first.injection);
+		const third = await e.activate("a question about things", {
+			session: "k",
+			dryRun: true,
+		});
+		expect(third.entries).toEqual([]);
 	});
 });

@@ -2,8 +2,8 @@ import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { containsInjectedKnowledge } from "../../activation/format.js";
 import { config } from "../../config.js";
+import { stripInjectedKnowledge } from "../../consolidation/untrusted.js";
 import type {
 	Episode,
 	EpisodeMessage,
@@ -469,9 +469,9 @@ export class CursorEpisodeReader implements IEpisodeReader {
 				malformed++;
 				continue;
 			}
-			const text = (rawText ?? "").trim();
+			// Remove our injected context; drop the message only if nothing else remains.
+			const text = stripInjectedKnowledge(rawText ?? "").trim();
 			if (!text) continue;
-			if (containsInjectedKnowledge(text)) continue;
 
 			const messageId = turn.bubbleId ?? `${sessionId}-turn-${i}`;
 			const timestamp =
@@ -601,9 +601,9 @@ export class CursorEpisodeReader implements IEpisodeReader {
 				malformed++;
 				continue;
 			}
-			const text = (rawText ?? "").trim();
+			// Remove our injected context; drop the message only if nothing else remains.
+			const text = stripInjectedKnowledge(rawText ?? "").trim();
 			if (!text) continue;
-			if (containsInjectedKnowledge(text)) continue;
 
 			const timestamp =
 				n <= 1

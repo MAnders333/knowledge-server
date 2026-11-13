@@ -26,6 +26,11 @@ import { episodeKeyId } from "../../types.js";
  * user_id is treated as provenance metadata only: all pending episodes are
  * drained regardless of which daemon wrote them.
  */
+/** Rows fetched per page while looking for episodes that are not blocked. */
+const PREPARE_PAGE_SIZE = 2000;
+/** Upper bound on pages read per prepare(), so a huge blocked backlog cannot stall a run. */
+const PREPARE_MAX_PAGES = 5;
+
 export class PendingEpisodesReader implements IEpisodeReader {
 	readonly source = "pending";
 
@@ -67,9 +72,28 @@ export class PendingEpisodesReader implements IEpisodeReader {
 		this._cachedCandidates = [];
 		this._prepared = false;
 
-		const rows = (
-			await this.db.getPendingEpisodes(afterMessageTimeCreated, 2000)
-		).filter((row) => !isBlocked?.(row));
+		// Blocked rows (their store is unavailable or already attempted) sit at the head
+		// of the queue. Page past them until a healthy row is found, bounded, so a long
+		// outage of one store cannot hide every other store's episodes.
+		const rows: PendingEpisode[] = [];
+		const seen = new Set<string>();
+		let after = afterMessageTimeCreated;
+		for (let page = 0; page < PREPARE_MAX_PAGES; page++) {
+			const batch = await this.db.getPendingEpisodes(after, PREPARE_PAGE_SIZE);
+			let fresh = 0;
+			for (const row of batch) {
+				if (seen.has(row.id)) continue;
+				seen.add(row.id);
+				fresh++;
+				if (!isBlocked?.(row)) rows.push(row);
+			}
+			// A short page is the end of the queue. A page with no new rows cannot advance.
+			if (batch.length < PREPARE_PAGE_SIZE || fresh === 0) break;
+			if (rows.length > 0) break;
+			// Every row before the page's last one is already seen, so resuming at the
+			// last timestamp (inclusive, de-duplicated by id) skips nothing.
+			after = batch[batch.length - 1].maxMessageTime - 1;
+		}
 
 		// Group by session_id, track max_message_time per session.
 		const sessionMap = new Map<string, number>();

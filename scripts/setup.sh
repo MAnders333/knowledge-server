@@ -55,14 +55,27 @@ else
   echo "  ✓ .env already exists"
 fi
 
-# Load .env so we can interpolate values into the MCP config hint below.
-# Silently ignore errors — .env may be missing or have syntax issues.
-if [ -f "$PROJECT_DIR/.env" ]; then
-  set -a
-  # shellcheck source=/dev/null
-  source "$PROJECT_DIR/.env" 2>/dev/null || true
-  set +a
-fi
+# Read the few .env values this script reports. The file is data, never sourced:
+# sourcing would execute any $(...) in a pasted or synced .env. Exported
+# variables win, as before. Missing file or key yields an empty value.
+env_value() {
+  local key="$1" line=""
+  if [ -f "$PROJECT_DIR/.env" ]; then
+    line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$PROJECT_DIR/.env" | tail -n 1 || true)
+  fi
+  line="${line#*=}"
+  line="${line%$'\r'}"
+  case "$line" in
+    \"*) line="${line#\"}"; line="${line%%\"*}" ;;
+    \'*) line="${line#\'}"; line="${line%%\'*}" ;;
+    *) line="${line%%[[:space:]]#*}"; line="${line%"${line##*[![:space:]]}"}" ;;
+  esac
+  printf '%s' "$line"
+}
+LLM_API_KEY="${LLM_API_KEY:-$(env_value LLM_API_KEY)}"
+LLM_BASE_ENDPOINT="${LLM_BASE_ENDPOINT:-$(env_value LLM_BASE_ENDPOINT)}"
+KNOWLEDGE_HOST="${KNOWLEDGE_HOST:-$(env_value KNOWLEDGE_HOST)}"
+KNOWLEDGE_PORT="${KNOWLEDGE_PORT:-$(env_value KNOWLEDGE_PORT)}"
 
 # Detect whether required vars are still at their placeholder values.
 ENV_CONFIGURED=true

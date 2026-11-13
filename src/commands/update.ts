@@ -1,9 +1,15 @@
 import { existsSync } from "node:fs";
 import { rename, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import { resolveDataDir } from "../config-file.js";
+import { homeDir } from "../home.js";
+import { restartDaemonAfterUpdate } from "./daemon-restart.js";
 import {
 	EXTENSION_ASSETS,
+	type ExtensionTarget,
+	findLegacyExtensionCopies,
 	readExtensionTargets,
+	recordExtensionTarget,
 	refreshExtensionTargets,
 } from "./extension-targets.js";
 import {
@@ -13,6 +19,7 @@ import {
 	fetchChecksums,
 	releaseAssetUrl,
 	requireExpectedSha,
+	requireManifestCoverage,
 } from "./release-download.js";
 
 const GITHUB_API = "https://api.github.com";
@@ -26,6 +33,8 @@ export interface InstallDeps {
 	fetchFn?: FetchFn;
 	/** Runs a staged or installed binary; true when it exits 0. Injectable for tests. */
 	smoke?: SmokeFn;
+	/** Restarts or stops the running daemon after the swap. Injectable for tests. */
+	restartDaemon?: () => Promise<unknown>;
 }
 
 /** One release asset to install. `dest` decides the staging directory. */
@@ -290,6 +299,24 @@ export async function downloadAndInstallDaemon(
  * @param currentVersion - the version string of the currently running binary (e.g. "v1.0.1")
  * @param deps - injectable I/O for tests
  */
+/** Restart or stop the running daemon using the real environment. Never throws. */
+async function restartDaemonFromUpdate(): Promise<void> {
+	try {
+		await restartDaemonAfterUpdate({
+			platform: process.platform,
+			home: homeDir(),
+			uid: process.getuid?.() ?? 0,
+			dataDir: resolveDataDir(),
+			log: (line) => console.log(line),
+			warn: (line) => console.warn(line),
+		});
+	} catch (err) {
+		console.warn(
+			`  ⚠ Could not restart the daemon: ${err instanceof Error ? err.message : String(err)}. Restart it manually.`,
+		);
+	}
+}
+
 export async function runUpdate(
 	argv: string[],
 	currentVersion: string,
@@ -407,6 +434,21 @@ export async function runUpdate(
 	// made in a tool's config dir is registered and refreshed too, so registered
 	// assets are fetched even when they are not yet on disk.
 	const targets = readExtensionTargets(inferredInstallDir);
+	// Copies made by releases before the registry (v3.10.3 and earlier) are not
+	// registered. Adopt the ones whose bytes match a known release; the registry
+	// entry is written only after the verified refresh below.
+	const adopted: ExtensionTarget[] = [];
+	for (const copy of findLegacyExtensionCopies(homeDir())) {
+		if (targets.some((t) => t.dst === copy.target.dst)) continue;
+		if (!copy.adoptable) {
+			console.log(
+				`  · Left ${copy.target.dst} unchanged: it is not a known knowledge-server release file. Run \`knowledge-server setup-tool <tool>\` to replace it.`,
+			);
+			continue;
+		}
+		adopted.push(copy.target);
+		targets.push(copy.target);
+	}
 	const refresh = new Set<string>(targets.map((t) => t.asset));
 	for (const name of EXTENSION_ASSETS) {
 		if (existsSync(join(inferredInstallDir, name))) refresh.add(name);
@@ -418,6 +460,17 @@ export async function runUpdate(
 			dest: join(inferredInstallDir, name),
 			gzip: false,
 		});
+	}
+
+	try {
+		requireManifestCoverage(
+			checksums,
+			targetVersion,
+			assets.filter((a) => !a.smokeArgs).map((a) => a.name),
+		);
+	} catch (err) {
+		console.error(`  ✗ ${err instanceof Error ? err.message : err}`);
+		process.exit(1);
 	}
 
 	process.stdout.write("  Verifying, staging and installing... ");
@@ -436,6 +489,15 @@ export async function runUpdate(
 	for (const outcome of refreshExtensionTargets(inferredInstallDir, targets)) {
 		if (outcome.status === "refreshed") {
 			console.log(`  ✓ Refreshed ${outcome.target.dst}`);
+			if (adopted.some((t) => t.dst === outcome.target.dst)) {
+				try {
+					recordExtensionTarget(inferredInstallDir, outcome.target);
+				} catch (err) {
+					console.warn(
+						`  ⚠ Could not register ${outcome.target.dst} for future updates: ${err instanceof Error ? err.message : err}`,
+					);
+				}
+			}
 		} else {
 			console.warn(
 				`  ⚠ Not refreshed ${outcome.target.dst}: ${outcome.reason}`,
@@ -464,6 +526,9 @@ export async function runUpdate(
 	console.log(
 		`  Previous binaries kept as ${basename(execPath)}${PREV_SUFFIX} and knowledge-daemon${PREV_SUFFIX} for rollback.`,
 	);
+
+	// The daemon still running the old binary would upload next to the new one.
+	await (deps.restartDaemon ?? restartDaemonFromUpdate)();
 	console.log("  Restart the server to pick up the new binary.");
 
 	const current = parseVersion(currentVersion);

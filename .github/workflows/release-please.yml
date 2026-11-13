@@ -11,6 +11,13 @@ permissions: {}
 
 jobs:
   release-please:
+    # One release run at a time. cancel-in-progress is false, so a run in progress is
+    # never cancelled. The group is on this job, not the workflow: the job-level `if`
+    # below is evaluated before the group is entered, so skipped runs (PRs, forks,
+    # failed CI) never take the group's pending slot and cancel a pending release.
+    concurrency:
+      group: release-please
+      cancel-in-progress: false
     # Only for CI runs of a direct push to this repository (not PR runs, not forks).
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
@@ -25,11 +32,27 @@ jobs:
       tag_name: ${{ steps.release.outputs.tag_name }}
       sha: ${{ steps.release.outputs.sha }}
     steps:
+      - name: Confirm the CI-validated commit is still main's head
+        id: head
+        # workflow_run.head_sha is the commit CI validated. If main has moved on,
+        # skip this run: the CI run for the newer commit triggers its own release.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VALIDATED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          current="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
+          if [ "$current" = "$VALIDATED_SHA" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::main is at $current, not the validated $VALIDATED_SHA; skipping this release run."
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
       # release-please-config.json sets "draft": true, so this creates a draft
       # release (with its tag, via force-tag-creation). Nothing is installable
       # until the publish job below promotes it.
       - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
         id: release
+        if: ${{ steps.head.outputs.current == 'true' }}
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           release-type: node
@@ -72,8 +95,8 @@ jobs:
 
       - name: Build binaries
         run: |
-          bun build --compile --minify src/index.ts --outfile dist/knowledge-server-${{ matrix.suffix }}
-          bun build --compile --minify src/daemon/index.ts --outfile dist/knowledge-daemon-${{ matrix.suffix }}
+          bun build --compile --minify --no-compile-autoload-dotenv --no-compile-autoload-bunfig src/index.ts --outfile dist/knowledge-server-${{ matrix.suffix }}
+          bun build --compile --minify --no-compile-autoload-dotenv --no-compile-autoload-bunfig src/daemon/index.ts --outfile dist/knowledge-daemon-${{ matrix.suffix }}
 
       - name: Re-sign macOS binaries (ad-hoc)
         if: ${{ matrix.suffix == 'darwin-arm64' }}
@@ -173,6 +196,7 @@ jobs:
       contents: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
       TAG: ${{ needs.release-please.outputs.tag_name }}
     steps:
       - name: Download staged files
@@ -184,7 +208,9 @@ jobs:
       - name: Upload assets to the draft release
         run: |
           cd artifacts
-          gh release upload "$TAG" \
+          # --clobber: a re-run after a partial upload replaces the draft's assets
+          # with this run's identical builds instead of failing on "already exists".
+          gh release upload "$TAG" --clobber \
             release-linux-x64/knowledge-server-linux-x64 \
             release-linux-x64/knowledge-server-linux-x64.gz \
             release-linux-x64/knowledge-daemon-linux-x64 \

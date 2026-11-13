@@ -133,6 +133,30 @@ describe("KnowledgeDB", () => {
 		expect(row.injection_count).toBe(3);
 	});
 
+	it("reads injection_count into injectionCount", async () => {
+		const now = Date.now();
+		await db.insertEntry({
+			id: "test-inj",
+			type: "fact",
+			content: "Injected fact",
+			topics: [],
+			confidence: 0.7,
+			source: "test",
+			status: "active",
+			strength: 1.0,
+			createdAt: now,
+			updatedAt: now,
+			lastAccessedAt: now,
+			accessCount: 0,
+			observationCount: 1,
+			supersededBy: null,
+			derivedFrom: [],
+		});
+		expect((await db.getEntry("test-inj"))?.injectionCount).toBe(0);
+		await db.recordInjections(["test-inj"], now + 1);
+		expect((await db.getEntry("test-inj"))?.injectionCount).toBe(1);
+	});
+
 	it("recordInjections is a no-op for an empty batch", async () => {
 		await db.recordInjections([], Date.now());
 	});

@@ -32,6 +32,28 @@ async function bestEffortVectorStep(
 	}
 }
 
+/**
+ * Run one owner-only statement under its own SAVEPOINT. A role that is not the
+ * table owner gets 42501 (insufficient_privilege) from DROP INDEX / ALTER TABLE.
+ * That is skipped with a warning so the store still opens; any other error stays
+ * fatal. The savepoint keeps the transaction usable for the statements that follow.
+ */
+async function skipWithoutOwnership(
+	outer: TxSql,
+	version: number,
+	statement: string,
+	step: (sql: TxSql) => Promise<unknown>,
+): Promise<void> {
+	try {
+		await outer.savepoint(step);
+	} catch (err) {
+		if ((err as { code?: string }).code !== "42501") throw err;
+		logger.warn(
+			`[pg-db] Migration v${version}: skipped \`${statement}\` — the connecting role does not own the object. Performance tuning stays unapplied until the owner runs it. Error: ${err instanceof Error ? err.message : String(err)}`,
+		);
+	}
+}
+
 /** Create the halfvec HNSW index. Errors propagate to the caller's savepoint. */
 async function createHalfvecIndex(sql: TxSql, dims: number): Promise<void> {
 	await sql.unsafe(`
@@ -535,9 +557,26 @@ export const PG_MIGRATIONS: Array<{
 			// rewritten on each decay pass and access, which is a non-HOT update that
 			// also re-inserts the row into the embedding HNSW index. fillfactor leaves
 			// room on each page so counter updates can be HOT.
-			await sql`DROP INDEX IF EXISTS idx_entry_strength`;
-			await sql`DROP INDEX IF EXISTS idx_entry_accessed`;
-			await sql`ALTER TABLE knowledge_entry SET (fillfactor = 85)`;
+			// Owner-only DDL: a non-owner role (managed Postgres, separate admin) must
+			// still open the store, so each statement is best-effort.
+			await skipWithoutOwnership(
+				sql,
+				18,
+				"DROP INDEX idx_entry_strength",
+				(s) => s`DROP INDEX IF EXISTS idx_entry_strength`,
+			);
+			await skipWithoutOwnership(
+				sql,
+				18,
+				"DROP INDEX idx_entry_accessed",
+				(s) => s`DROP INDEX IF EXISTS idx_entry_accessed`,
+			);
+			await skipWithoutOwnership(
+				sql,
+				18,
+				"ALTER TABLE knowledge_entry SET (fillfactor)",
+				(s) => s`ALTER TABLE knowledge_entry SET (fillfactor = 85)`,
+			);
 		},
 	},
 	{
@@ -552,8 +591,36 @@ export const PG_MIGRATIONS: Array<{
 				  AND a.attname = 'injection_count' AND a.attnum > 0 AND NOT a.attisdropped
 			`;
 			if (present.length === 0) {
-				await sql`ALTER TABLE knowledge_entry ADD COLUMN injection_count INTEGER NOT NULL DEFAULT 0`;
+				try {
+					await sql`ALTER TABLE knowledge_entry ADD COLUMN injection_count INTEGER NOT NULL DEFAULT 0`;
+				} catch (err) {
+					if ((err as { code?: string }).code !== "42501") throw err;
+					// Not skippable: the write path increments injection_count. The
+					// migration aborts, so the store stays at its version until the owner runs the fix.
+					throw new Error(
+						"Migration v19 needs the table owner: the connecting role cannot add knowledge_entry.injection_count. " +
+							"Owner-only fix: as the owner of knowledge_entry, run `ALTER TABLE knowledge_entry ADD COLUMN injection_count INTEGER NOT NULL DEFAULT 0`, then start the server again.",
+						{ cause: err },
+					);
+				}
 			}
+		},
+	},
+	{
+		version: 20,
+		label:
+			"cluster members joined before their cluster's last synthesis are baseline, not new",
+		up: async (sql: TxSql) => {
+			// See the SQLite v19 migration: clamp join times that older builds
+			// rewrote, so existing members do not count as new.
+			await sql`
+				UPDATE knowledge_cluster_member m
+				SET joined_at = LEAST(m.joined_at, c.last_synthesized_at)
+				FROM knowledge_cluster c
+				WHERE c.id = m.cluster_id
+				  AND c.last_synthesized_at IS NOT NULL
+				  AND m.joined_at > c.last_synthesized_at
+			`;
 		},
 	},
 ];

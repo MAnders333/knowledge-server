@@ -147,6 +147,38 @@ describe("version guard on SQLite stores", () => {
 		expect(indexExists("idx_entry_created")).toBe(true);
 	});
 
+	it("v20 clamps member join times that older builds rewrote to the last synthesis", async () => {
+		const path = join(dir, "knowledge.db");
+		await new KnowledgeDB(path).close();
+		const raw = new Database(path);
+		raw.exec(`
+			INSERT INTO knowledge_cluster (id, centroid, member_count, last_synthesized_at, last_membership_changed_at, created_at)
+			VALUES ('synth', x'00', 2, 1000, 1000, 0), ('never', x'00', 1, NULL, 3000, 0);
+			INSERT INTO knowledge_cluster_member (cluster_id, entry_id, joined_at) VALUES
+				('synth', 'old', 500), ('synth', 'rewritten', 2000), ('never', 'pending', 2000);
+		`);
+		raw.close();
+		setVersion(path, 18);
+
+		await new KnowledgeDB(path).close();
+
+		const check = new Database(path, { readonly: true });
+		try {
+			const joined = Object.fromEntries(
+				(
+					check
+						.prepare("SELECT entry_id, joined_at FROM knowledge_cluster_member")
+						.all() as Array<{ entry_id: string; joined_at: number }>
+				).map((r) => [r.entry_id, r.joined_at]),
+			);
+			// Members joined before the last synthesis keep their time. The rewritten
+			// one is clamped, so it is not new. A never-synthesized cluster is untouched.
+			expect(joined).toEqual({ old: 500, rewritten: 1000, pending: 2000 });
+		} finally {
+			check.close();
+		}
+	});
+
 	it("refuses a knowledge.db newer than this build, without dropping tables", async () => {
 		const path = join(dir, "knowledge.db");
 		await new KnowledgeDB(path).close();
@@ -209,10 +241,10 @@ describe("version guard on SQLite stores", () => {
 });
 
 describe("precision gate migrations", () => {
-	it("knowledge.db and Postgres add injection_count as v19, after the v18 registry", () => {
-		expect(MIGRATIONS.map((m) => m.version).slice(-2)).toEqual([18, 19]);
-		expect(PG_MIGRATIONS.map((m) => m.version).slice(-2)).toEqual([18, 19]);
-		expect(SCHEMA_VERSION).toBe(19);
+	it("knowledge.db and Postgres add injection_count as v19 and the joined_at clamp as v20", () => {
+		expect(MIGRATIONS.map((m) => m.version).slice(-3)).toEqual([18, 19, 20]);
+		expect(PG_MIGRATIONS.map((m) => m.version).slice(-3)).toEqual([18, 19, 20]);
+		expect(SCHEMA_VERSION).toBe(20);
 	});
 
 	it("state DB adds the activation_event gate counts as v4", () => {

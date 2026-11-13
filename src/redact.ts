@@ -6,22 +6,39 @@ import { config } from "./config.js";
  * Rules run in a fixed order: provider-specific token formats first, so a token
  * is labelled by its provider, and generic key/value rules last. Every rule
  * replaces only the secret itself with `[REDACTED:<kind>]`. Surrounding context
- * (a header name, an env var name, a URL user) is kept. Prefix-anchored rules use
- * lookbehind so the prefix is never consumed.
+ * (a header name, an env var name, a URL user) is kept.
+ *
+ * Context before a secret is kept in one of two ways. Fixed-width context uses
+ * lookbehind. Context with whitespace or other variable-length runs is captured
+ * as group 1 and re-emitted (`keep`), never matched by a lookbehind: a lookbehind
+ * over a whitespace run is re-evaluated at every index inside the run, which is
+ * quadratic on hostile input.
  */
 
 export type RedactionResult = { text: string; counts: Record<string, number> };
 
-const RULES: ReadonlyArray<{ kind: string; re: RegExp }> = [
+interface RedactionRule {
+	kind: string;
+	re: RegExp;
+	/** Regex group 1 is context to keep; the secret is what follows it. */
+	keep?: boolean;
+}
+
+const RULES: ReadonlyArray<RedactionRule> = [
 	{
 		kind: "pem",
 		re: /-----BEGIN (?:[A-Z0-9 ]*)PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g,
 	},
 	{
 		kind: "bearer",
-		re: /(?<=Authorization:\s*(?:Bearer|Basic|Token)\s+)\S+/gi,
+		re: /(Authorization:\s*(?:Bearer|Basic|Token)\s+)\S+/gi,
+		keep: true,
 	},
-	{ kind: "bearer", re: /(?<=\bBearer\s+)[A-Za-z0-9._~+/=-]{16,}/g },
+	{
+		kind: "bearer",
+		re: /(\bBearer\s+)[A-Za-z0-9._~+/=-]{16,}/g,
+		keep: true,
+	},
 	{ kind: "anthropic_key", re: /(?<![A-Za-z0-9_-])sk-ant-[A-Za-z0-9_-]{20,}/g },
 	{
 		kind: "openai_key",
@@ -41,7 +58,8 @@ const RULES: ReadonlyArray<{ kind: string; re: RegExp }> = [
 	{ kind: "aws_access_key", re: /(?<![A-Za-z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}/g },
 	{
 		kind: "aws_secret",
-		re: /(?<=aws_?secret(?:_?access)?_?key["']?\s*[:=]\s*["']?)[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])/gi,
+		re: /(aws_?secret(?:_?access)?_?key["']?\s*[:=]\s*["']?)[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])/gi,
+		keep: true,
 	},
 	{
 		kind: "jwt",
@@ -49,15 +67,19 @@ const RULES: ReadonlyArray<{ kind: string; re: RegExp }> = [
 	},
 	{
 		kind: "url_credentials",
-		re: /(?<=[a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]+(?=@)/gi,
+		// The user may be empty. The password runs to the LAST `@` before the host
+		// (the host ends at whitespace, `/`, `:` or end), so a password that itself contains `@` is kept whole.
+		re: /(?<=[a-z][a-z0-9+.-]{0,64}:\/\/[^\s:/@]{0,256}:)[^\s/]+(?=@[^\s@/]*(?:[\s/:]|$))/gi,
 	},
 	{
 		kind: "env_secret",
-		re: /(?<=^[ \t]*(?:export[ \t]+)?[A-Za-z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE)[A-Za-z0-9_]*=)(?!\[REDACTED:)[^\r\n]+/gim,
+		re: /^([ \t]*(?:export[ \t]+)?[A-Za-z0-9_]{0,64}(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE)[A-Za-z0-9_]{0,64}=)(?!\[REDACTED:)[^\r\n]+/gim,
+		keep: true,
 	},
 	{
 		kind: "keyed_entropy",
-		re: /(?<=(?:api[_-]?key|secret|token|password|credential|auth)["']?[ \t]*[:=][ \t]*["']?)[A-Za-z0-9+/=_-]{32,}/gi,
+		re: /((?:api[_-]?key|secret|token|password|credential|auth)["']?[ \t]*[:=][ \t]*["']?)[A-Za-z0-9+/=_-]{32,}/gi,
+		keep: true,
 	},
 ];
 
@@ -70,10 +92,10 @@ export function redactSecrets(text: string): RedactionResult {
 	if (!config.redactSecrets) return { text, counts: {} };
 	const counts: Record<string, number> = {};
 	let out = text;
-	for (const { kind, re } of RULES) {
-		out = out.replace(re, () => {
+	for (const { kind, re, keep } of RULES) {
+		out = out.replace(re, (_match: string, context?: string) => {
 			counts[kind] = (counts[kind] ?? 0) + 1;
-			return `[REDACTED:${kind}]`;
+			return `${keep ? context : ""}[REDACTED:${kind}]`;
 		});
 	}
 	return { text: out, counts };

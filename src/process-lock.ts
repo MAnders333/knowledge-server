@@ -178,11 +178,54 @@ export function tryAcquireProcessLock(
 			if (errCode(e) !== "EEXIST") throw e;
 		}
 		if (lockHolder(path, { staleAfterMs }) !== null) return null;
+		if (!removeStaleLock(path, staleAfterMs)) return null;
+	}
+	return null;
+}
+
+/**
+ * Remove a stale lockfile without racing another starter. Two starters can both
+ * see the same stale lock; without this, the slower one would unlink the fresh
+ * lock the faster one just created. The removal runs under a second exclusive
+ * file (`<lock>.takeover`), and the lock is re-checked under it, so only a
+ * starter that still sees the lock as stale removes it. Returns false when
+ * another starter is taking over or the lock turned live; the caller then
+ * reports the lock as held.
+ *
+ * A takeover file older than UNREADABLE_STALE_MS is left by a crashed starter
+ * and is removed so the lock is not stuck. A release that races with a takeover
+ * can still lose one window; the lock file is short-lived and this is narrow.
+ */
+function removeStaleLock(path: string, staleAfterMs: number): boolean {
+	const takeover = `${path}.takeover`;
+	let fd: number;
+	try {
+		fd = openSync(takeover, "wx", 0o600);
+	} catch (e) {
+		if (errCode(e) !== "EEXIST") throw e;
+		try {
+			if (Date.now() - statSync(takeover).mtimeMs > UNREADABLE_STALE_MS) {
+				unlinkSync(takeover);
+			}
+		} catch {
+			// Removed by its owner in the meantime.
+		}
+		return false;
+	}
+	closeSync(fd);
+	try {
+		if (lockHolder(path, { staleAfterMs }) !== null) return false;
 		try {
 			unlinkSync(path);
 		} catch (e) {
 			if (errCode(e) !== "ENOENT") throw e;
 		}
+		return true;
+	} finally {
+		try {
+			unlinkSync(takeover);
+		} catch {
+			// Already gone.
+		}
 	}
-	return null;
 }

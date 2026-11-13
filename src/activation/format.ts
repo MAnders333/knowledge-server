@@ -17,16 +17,6 @@ export const MAX_ENTRY_CHARS = 1000;
 /** Total cap for the injected block's entry lines (characters, before escaping). */
 export const MAX_CONTEXT_CHARS = 6000;
 
-const INJECTED_TAG_PATTERN = new RegExp(
-	`<\\s*/?\\s*${ACTIVATED_KNOWLEDGE_TAG}(?![\\w-])`,
-	"i",
-);
-
-/** True when text contains our injection tag. Readers use this to avoid re-learning injected context. */
-export function containsInjectedKnowledge(text: string): boolean {
-	return INJECTED_TAG_PATTERN.test(scrubUntrusted(text));
-}
-
 const HEADER = "## Recalled Knowledge (from prior sessions)";
 
 const NOTICE =

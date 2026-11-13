@@ -330,6 +330,75 @@ describe("EpisodeUploader — first-run lookback (PV-10)", () => {
 	});
 });
 
+describe("EpisodeUploader — full re-ingest after reinitialize", () => {
+	const OLD_MS = Date.now() - 90 * 24 * HOUR_MS; // outside the 30-day window
+
+	it("a reset reads from the start of history, not the first-run lookback", async () => {
+		await daemonDb.updateDaemonCursor(SOURCE, {
+			lastMessageTimeCreated: 1_700_000_000_000,
+			lastUploadedAt: Date.now(),
+		});
+		await daemonDb.resetDaemonCursors();
+
+		const reader = fakeReader(new Map());
+		const uploader = new EpisodeUploader([reader], db, daemonDb, "alice", {
+			initialLookbackDays: DEFAULT_INITIAL_LOOKBACK_DAYS,
+		});
+		await uploader.upload();
+
+		expect(reader.sinceArgs).toEqual([0]);
+	});
+
+	it("reads old sessions after a reset, and the request is cleared once a full pass completes", async () => {
+		const sessions = new Map<string, FakeSession>([
+			[
+				"old",
+				{
+					id: "old",
+					messages: msgs(["o1", "o2", "o3", "o4", "o5", "o6"], OLD_MS),
+				},
+			],
+		]);
+		await daemonDb.resetDaemonCursors();
+		const reader = fakeReader(sessions);
+		const uploader = new EpisodeUploader([reader], db, daemonDb, "alice", {
+			initialLookbackDays: DEFAULT_INITIAL_LOOKBACK_DAYS,
+		});
+
+		const first = await uploader.upload();
+
+		expect(first.episodesUploaded).toBeGreaterThan(0);
+		expect(await markerCounts(db, ["o1"])).toEqual(new Map([["o1", 1]]));
+		expect(await daemonDb.hasFullBackfillRequest()).toBe(false);
+	});
+
+	it("keeps the request while a source has failed, so the next cycle still reads full history", async () => {
+		await daemonDb.resetDaemonCursors();
+		const reader = fakeReader(
+			new Map([
+				[
+					"recent",
+					{
+						id: "recent",
+						messages: msgs(["r1", "r2", "r3", "r4"], Date.now() - HOUR_MS),
+					},
+				],
+			]),
+		);
+		reader.getNewEpisodes = () => {
+			throw new Error("transient read failure");
+		};
+		const uploader = new EpisodeUploader([reader], db, daemonDb, "alice", {
+			initialLookbackDays: DEFAULT_INITIAL_LOOKBACK_DAYS,
+		});
+
+		const result = await uploader.upload();
+
+		expect(result.failedSources).toHaveLength(1);
+		expect(await daemonDb.hasFullBackfillRequest()).toBe(true);
+	});
+});
+
 describe("DaemonDB — session cursors", () => {
 	it("stores, updates and looks up per-session watermarks", async () => {
 		await daemonDb.setSessionCursor("claude-code", "s1", "m1");
@@ -354,5 +423,46 @@ describe("DaemonDB — session cursors", () => {
 
 		expect((await daemonDb.getSessionCursors(SOURCE, ["s1"])).size).toBe(0);
 		expect(await daemonDb.hasDaemonCursor(SOURCE)).toBe(false);
+	});
+});
+
+describe("EpisodeUploader — free-text fields are scrubbed before staging", () => {
+	it("redacts a credential in the session title, project and directory", async () => {
+		const token = ["ghp_", "d".repeat(36)].join("");
+		const start = Date.now() - 2 * HOUR_MS;
+		const sessions = new Map<string, FakeSession>([
+			[
+				"s1",
+				{
+					id: "s1",
+					messages: msgs(
+						Array.from({ length: MIN + 2 }, (_, i) => `t${i}`),
+						start,
+					),
+				},
+			],
+		]);
+		const base = fakeReader(sessions);
+		const reader = {
+			...base,
+			getNewEpisodes: (ids: string[], ranges: Map<string, ProcessedRange[]>) =>
+				base.getNewEpisodes(ids, ranges).map((ep) => ({
+					...ep,
+					sessionTitle: `Debug ${token}`,
+					projectName: `proj ${token}`,
+					directory: `/work/${token}`,
+				})),
+		};
+		const uploader = new EpisodeUploader([reader], db, daemonDb, "alice", {
+			initialLookbackDays: 0,
+		});
+
+		await uploader.upload();
+
+		const rows = await db.getPendingEpisodes(0);
+		expect(rows.length).toBeGreaterThan(0);
+		const staged = JSON.stringify(rows);
+		expect(staged).not.toContain(token);
+		expect(staged).toContain("[REDACTED:github_token]");
 	});
 });

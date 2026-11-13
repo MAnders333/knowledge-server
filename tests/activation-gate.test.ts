@@ -389,3 +389,49 @@ describe("precision gate in the engine", () => {
 		);
 	});
 });
+
+describe("candidate filters run before the cap", () => {
+	const flaggedFirst = [
+		fact("flagged-0", "alpha knowledge", 1.0, { status: "conflicted" }),
+		fact("flagged-1", "alpha knowledge", 1.0, { status: "conflicted" }),
+		fact("flagged-2", "alpha knowledge", 1.0, { status: "conflicted" }),
+	];
+	const passing = Array.from({ length: 9 }, (_, i) =>
+		fact(`pass-${i}`, `beta knowledge ${i}`, 0.9),
+	);
+
+	it("a flagged entry does not use up the cap: limit 4 returns 4 injectable entries", async () => {
+		const engine = engineFor({ entries: [...flaggedFirst, ...passing] });
+		const result = await engine.activate(CUE, { limit: 4 });
+		expect(ids(result)).toEqual(["pass-0", "pass-1", "pass-2", "pass-3"]);
+	});
+
+	it("an entry deduped in the session does not use up the cap", async () => {
+		gate.sessionTtlMs = 60_000;
+		const engine = engineFor({ entries: passing });
+		const first = await engine.activate(CUE, {
+			limit: 4,
+			session: "claude-code\u0000s1",
+		});
+		engine.commitInjections(first.injection);
+		const second = await engine.activate(CUE, {
+			limit: 4,
+			session: "claude-code\u0000s1",
+		});
+		expect(ids(second)).toEqual(["pass-4", "pass-5", "pass-6", "pass-7"]);
+		expect(second.telemetry?.deduped).toBe(4);
+	});
+});
+
+describe("single candidate", () => {
+	it("is scored by the reranker and gated on its rerank score, not the dense floor", async () => {
+		gate.denseMargin = 0.05;
+		const engine = engineFor(
+			{ entries: [fact("lone-entry", "lone knowledge", 0.44)] },
+			rerankerWith(UNKNOWN_MODEL, { "lone knowledge": 0.9 }),
+		);
+		const result = await engine.activate(CUE, { threshold: 0.42 });
+		expect(result.telemetry?.gateMode).toBe("rerank");
+		expect(ids(result)).toEqual(["lone-entry"]);
+	});
+});

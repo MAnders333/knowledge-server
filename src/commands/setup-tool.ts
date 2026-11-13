@@ -11,7 +11,6 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 // @ts-ignore — Bun supports JSON imports natively
 import pkg from "../../package.json" with { type: "json" };
@@ -21,6 +20,7 @@ import {
 	loadConfigFile,
 } from "../config-file.js";
 import { config } from "../config.js";
+import { homeDir } from "../home.js";
 import { recordExtensionTarget } from "./extension-targets.js";
 import {
 	GITHUB_RELEASES,
@@ -124,7 +124,7 @@ function makeOpenCodeMcpEntry(): { command: string[] } & Record<
 		const projectDir = getProjectDir();
 		const bunBin = process.execPath.endsWith("bun")
 			? process.execPath
-			: join(homedir(), ".bun", "bin", "bun");
+			: join(homeDir(), ".bun", "bin", "bun");
 		return {
 			type: "local",
 			command: [bunBin, "run", join(projectDir, "src", "index.ts"), "mcp"],
@@ -343,7 +343,7 @@ function downloadAssetSync(name: string, dst: string): void {
 }
 
 function setupOpenCode(): void {
-	const configDir = join(homedir(), ".config", "opencode");
+	const configDir = join(homeDir(), ".config", "opencode");
 
 	console.log("Setting up OpenCode integration...\n");
 
@@ -484,7 +484,7 @@ function makeClaudeMcpEntry() {
 		// In source mode, process.execPath is the bun binary itself.
 		const bunBin = process.execPath.endsWith("bun")
 			? process.execPath
-			: join(homedir(), ".bun", "bin", "bun");
+			: join(homeDir(), ".bun", "bin", "bun");
 		return {
 			type: "stdio",
 			command: bunBin,
@@ -538,7 +538,7 @@ function setupClaudeCode(): void {
 	const claudeDir =
 		process.env.CLAUDE_DB_PATH ??
 		process.env.CLAUDE_CONFIG_DIR ??
-		join(homedir(), ".claude");
+		join(homeDir(), ".claude");
 
 	const settingsPath = join(claudeDir, "settings.json");
 
@@ -701,7 +701,7 @@ function makeCursorMcpEntry() {
 		const projectDir = getProjectDir();
 		const bunBin = process.execPath.endsWith("bun")
 			? process.execPath
-			: join(homedir(), ".bun", "bin", "bun");
+			: join(homeDir(), ".bun", "bin", "bun");
 		return {
 			command: bunBin,
 			args: ["run", join(projectDir, "src", "index.ts"), "mcp"],
@@ -717,7 +717,7 @@ function makeCursorMcpEntry() {
 }
 
 export function setupCursor(): void {
-	const cursorDir = process.env.CURSOR_HOME ?? join(homedir(), ".cursor");
+	const cursorDir = process.env.CURSOR_HOME ?? join(homeDir(), ".cursor");
 	const mcpPath = join(cursorDir, "mcp.json");
 
 	console.log("Setting up Cursor integration...\n");
@@ -810,15 +810,24 @@ const CODEX_HOOK_PATH_MARKER = "/hooks/claude-code/user-prompt?client=codex";
 /**
  * Shell command for Codex's UserPromptSubmit hook. Codex writes the hook input
  * ({prompt, session_id, cwd}) to stdin and reads hookSpecificOutput from stdout,
- * which is the same JSON the Claude Code endpoint returns. `--max-time` stays
- * under the hook's 5 s timeout. `|| true` matters: a command hook that exits 2
- * blocks the prompt, so a stopped or slow server must never fail the hook.
+ * which is the same JSON the Claude Code endpoint returns.
+ *
+ * Budgets: the hook's own `timeout` in hooks.json is 5 s. curl gives up
+ * after 4 s, which leaves Codex time to start the process. The server's local
+ * rerank budget is 3 s (RERANK_TIMEOUT_MS) and falls back to unreranked results
+ * on expiry; embedding (EMBEDDING_TIMEOUT_MS, 20 s default) can still exceed the
+ * 4 s curl limit, in which case the prompt goes through without injected context.
+ *
+ * `--noproxy '*'`: loopback must never go through an HTTP proxy from the
+ * environment (the prompt would leave the machine). `--fail`: an error body is
+ * not handed to Codex as hook output. `|| true` matters: a command hook that exits
+ * 2 blocks the prompt, so a stopped or slow server must never fail the hook.
  */
 function codexHookCommand(): string {
 	const url = `http://${resolvedHost}:${resolvedPort}${CODEX_HOOK_PATH_MARKER}`;
 	// POSIX single-quoting: host and port come from config, so the URL is always quoted.
 	const quoted = `'${url.replace(/'/g, "'\\''")}'`;
-	return `curl -s --max-time 4 --data-binary @- ${quoted} || true`;
+	return `curl -s --noproxy '*' --fail --max-time 4 --data-binary @- ${quoted} || true`;
 }
 
 /**
@@ -919,7 +928,7 @@ function setupCodexHook(codexHome: string): void {
  * config.toml typically has user-authored content we don't want to disturb.
  */
 export function setupCodex(): void {
-	const codexHome = process.env.CODEX_HOME ?? join(homedir(), ".codex");
+	const codexHome = process.env.CODEX_HOME ?? join(homeDir(), ".codex");
 	const configPath = join(codexHome, "config.toml");
 
 	console.log("Setting up Codex CLI integration...\n");
@@ -932,7 +941,7 @@ export function setupCodex(): void {
 		const projectDir = getProjectDir();
 		const bunBin = process.execPath.endsWith("bun")
 			? process.execPath
-			: join(homedir(), ".bun", "bin", "bun");
+			: join(homeDir(), ".bun", "bin", "bun");
 		// TOML array: ["bun", "run", "/path/to/src/index.ts", "mcp"]
 		const args = ["run", join(projectDir, "src", "index.ts"), "mcp"];
 		const argsToml = args
@@ -1026,7 +1035,7 @@ function makeVSCodeMcpEntry() {
 		const projectDir = getProjectDir();
 		const bunBin = process.execPath.endsWith("bun")
 			? process.execPath
-			: join(homedir(), ".bun", "bin", "bun");
+			: join(homeDir(), ".bun", "bin", "bun");
 		return {
 			name: "knowledge",
 			command: bunBin,
@@ -1151,7 +1160,7 @@ function forceSymlink(src: string, dst: string): void {
  *    pi settings arrays support absolute paths (documented).
  */
 function setupPi(): void {
-	const piRoot = join(homedir(), ".pi");
+	const piRoot = join(homeDir(), ".pi");
 
 	console.log("Setting up pi integration...\n");
 
@@ -1433,7 +1442,7 @@ function registerPiExtension(
 
 	// pi settings support "~" — normalize both sides before comparing.
 	const normalize = (p: string) =>
-		p.startsWith("~/") ? join(homedir(), p.slice(2)) : p;
+		p.startsWith("~/") ? join(homeDir(), p.slice(2)) : p;
 	if (existing.map((e) => normalize(e as string)).includes(extensionPath)) {
 		console.log(`  ✓ ${settingsPath}: already registered (no change)`);
 		return true;
@@ -1471,8 +1480,7 @@ function maybeSetupDaemon(): void {
 	// systemd service from a test run: it would run this checkout's daemon.
 	if (process.env.NODE_ENV === "test") return;
 	const platform = process.platform;
-	// HOME (not os.homedir(), which Bun fixes at process start) so tests can point service paths at a temp dir.
-	const home = process.env.HOME || homedir();
+	const home = homeDir();
 
 	let serviceFilePath: string;
 	if (platform === "darwin") {
@@ -1522,7 +1530,7 @@ function maybeSetupDaemon(): void {
  */
 function setupDaemon(): void {
 	const platform = process.platform;
-	const home = process.env.HOME || homedir();
+	const home = homeDir();
 
 	// Shown on successful service registration — tells the user to disable auto-spawn.
 	const autoSpawnNoteSuccess =
@@ -1683,6 +1691,7 @@ Available tools:
   opencode      Symlink plugin + commands; register MCP server in opencode.jsonc
   claude-code   Register MCP server + hook; symlink commands into ~/.claude/commands/
   oh-my-pi      Place extension in each oh-my-pi agent layer (no MCP)
+  pi            Place extension in ~/.pi/shared/extensions or ~/.pi/agent/extensions (no MCP)
   cursor        Register MCP server in ~/.cursor/mcp.json
   codex         Register MCP server in ~/.codex/config.toml
   vscode        Register MCP server via \`code --add-mcp\`

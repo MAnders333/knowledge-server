@@ -8,6 +8,7 @@ import { config } from "../config.js";
 import { approxTokens } from "../daemon/readers/shared.js";
 import type { IKnowledgeStore } from "../db/index.js";
 import { logger } from "../logger.js";
+import { redactSecrets } from "../redact.js";
 import { clampKnowledgeType } from "../types.js";
 import type { KnowledgeEntry } from "../types.js";
 import { computeStrength } from "./decay.js";
@@ -320,11 +321,28 @@ export class Reconsolidator {
 					),
 				);
 				// existingDb — nearestEntry lives in whichever store entriesMap was loaded from.
-				await existingDb.mergeEntry(
+				const merged = await existingDb.mergeEntry(
 					nearestEntry.id,
 					mergeUpdates,
 					freshEmbedding,
 				);
+				if (!merged) {
+					// The target was deleted after entriesMap was loaded. Keep the extracted
+					// knowledge as a new entry; the stale id must not stay in the cache.
+					entriesMap.delete(nearestEntry.id);
+					const inserted = await this.insertNewEntry(
+						entry,
+						sessionIds,
+						entryEmbedding,
+						sessionTimestamp,
+						insertDb,
+					);
+					logger.log(
+						`[${logPrefix}] Insert (merge target deleted): ${JSON.stringify(entry.content)}`,
+					);
+					await callbacks.onInsert(inserted);
+					break;
+				}
 				logger.log(
 					`[${logPrefix}] ${decision.action === "update" ? "Updated" : "Replaced"}: ${JSON.stringify(nearestEntry.content)} → ${JSON.stringify(decision.content)}`,
 				);
@@ -582,15 +600,18 @@ export class Reconsolidator {
 
 			let results: Awaited<ReturnType<typeof this.llm.synthesizePrinciple>>;
 			try {
-				results = await this.llm.synthesizePrinciple(
-					sentPeers.map((p) => ({
-						id: p.id,
-						content: p.content,
-						type: p.type,
-						topics: p.topics,
-						isSynthesized: p.isSynthesized,
-					})),
-				);
+				// Principles are stored and embedded: scrub the LLM's text before either.
+				results = (
+					await this.llm.synthesizePrinciple(
+						sentPeers.map((p) => ({
+							id: p.id,
+							content: p.content,
+							type: p.type,
+							topics: p.topics,
+							isSynthesized: p.isSynthesized,
+						})),
+					)
+				).map((r) => ({ ...r, content: redactSecrets(r.content).text }));
 			} catch (err) {
 				logger.warn(
 					`[synthesis] synthesizePrinciple failed for cluster ${cluster.id}: ${err instanceof Error ? err.message : String(err)}`,
@@ -799,6 +820,7 @@ export class Reconsolidator {
 			updatedAt: entryTime,
 			lastAccessedAt: entryTime,
 			accessCount: 0,
+			injectionCount: 0,
 			observationCount: 1,
 			supersededBy: null,
 			derivedFrom: sessionIds,

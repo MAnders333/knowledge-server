@@ -92,6 +92,26 @@ function readDaemonView(dataDir: string): {
  * for local use where the server is only accessible on 127.0.0.1. For hosted/shared
  * deployments, always set KNOWLEDGE_ADMIN_TOKEN so remote MCP clients must authenticate.
  */
+/**
+ * The request's JSON body when it is an object. Null for malformed JSON and for
+ * valid JSON that is not an object (`null`, a string, an array): `in` and
+ * property reads on those would throw and surface as 500.
+ */
+async function readJsonObject(
+	c: Context,
+): Promise<Record<string, unknown> | null> {
+	let body: unknown;
+	try {
+		body = await c.req.json();
+	} catch {
+		return null;
+	}
+	if (body === null || typeof body !== "object" || Array.isArray(body)) {
+		return null;
+	}
+	return body as Record<string, unknown>;
+}
+
 export function createApp(
 	db: IKnowledgeStore,
 	serverStateDb: import("../db/interface.js").IServerStateDB,
@@ -145,6 +165,18 @@ export function createApp(
 		const origin = c.req.header("origin");
 		if (origin !== undefined && !allowlist.matchesOrigin(origin)) {
 			return c.json({ error: "Forbidden: Origin not allowed" }, 403);
+		}
+		// A cross-site page can still issue a no-cors GET (<img>, <script>,
+		// no-cors fetch) with no Origin header, and it would run the activation
+		// and flag side effects. Browsers send Sec-Fetch-Site on every request; only
+		// same-origin and user-initiated navigations (none) are let through.
+		const fetchSite = c.req.header("sec-fetch-site");
+		if (
+			fetchSite !== undefined &&
+			fetchSite.toLowerCase() !== "same-origin" &&
+			fetchSite.toLowerCase() !== "none"
+		) {
+			return c.json({ error: "Forbidden: cross-site request" }, 403);
 		}
 		await next();
 	});
@@ -669,6 +701,7 @@ export function createApp(
 		const providerSnapshots = PROVIDER_NAMES.map((name) =>
 			componentHealth.snapshot(name),
 		);
+		const llmHealth = componentHealth.snapshot("llm");
 		const { health, reasons } = evaluateHealth({
 			stateDbReachable,
 			stores: storeInputs,
@@ -685,6 +718,14 @@ export function createApp(
 				consecutiveFailures: outcome.consecutiveFailures,
 				deadLettered,
 				pendingSessions,
+			},
+			llm: {
+				failingRuns: llmHealth.consecutiveFailures,
+				failingForMs:
+					llmHealth.failingSince === null
+						? 0
+						: Date.now() - llmHealth.failingSince,
+				failureClass: llmHealth.lastError,
 			},
 		});
 
@@ -827,12 +868,8 @@ export function createApp(
 		}
 		const { entry, store: entryStore } = located;
 
-		let body: Record<string, unknown>;
-		try {
-			body = await c.req.json();
-		} catch {
-			return c.json({ error: "Invalid JSON body" }, 400);
-		}
+		const body = await readJsonObject(c);
+		if (!body) return c.json({ error: "Invalid JSON body" }, 400);
 
 		const allowed = ["content", "topics", "confidence", "status"] as const;
 		type AllowedField = (typeof allowed)[number];
@@ -933,12 +970,8 @@ export function createApp(
 		}
 		const { entry, store: entryStore } = located;
 
-		let body: Record<string, unknown>;
-		try {
-			body = await c.req.json();
-		} catch {
-			return c.json({ error: "Invalid JSON body" }, 400);
-		}
+		const body = await readJsonObject(c);
+		if (!body) return c.json({ error: "Invalid JSON body" }, 400);
 		const reasons = ["wrong", "outdated", "irrelevant"];
 		if (typeof body.reason !== "string" || !reasons.includes(body.reason)) {
 			return c.json(
@@ -992,12 +1025,8 @@ export function createApp(
 			);
 		}
 
-		let body: Record<string, unknown>;
-		try {
-			body = await c.req.json();
-		} catch {
-			return c.json({ error: "Invalid JSON body" }, 400);
-		}
+		const body = await readJsonObject(c);
+		if (!body) return c.json({ error: "Invalid JSON body" }, 400);
 
 		const resolution = body.resolution as string;
 		const validResolutions = [

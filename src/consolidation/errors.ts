@@ -28,6 +28,32 @@ export function isDeterministicFailure(err: unknown): boolean {
 	return false;
 }
 
+/**
+ * A short label for a transient provider failure, shown in /status. It names the
+ * failure class and the HTTP status only: never the provider's message or body,
+ * which can echo request ids or credentials.
+ */
+export function providerFailureClass(err: unknown): string {
+	const status = httpStatusOf(err);
+	if (status === 401 || status === 403) {
+		return `authentication rejected (HTTP ${status})`;
+	}
+	if (status === 429) return "rate limited (HTTP 429)";
+	if (status === 400) return "billing or quota rejection (HTTP 400)";
+	if (status !== undefined && status >= 500) {
+		return `provider error (HTTP ${status})`;
+	}
+	if (
+		err instanceof Error &&
+		(err.name === "AbortError" ||
+			err.name === "TimeoutError" ||
+			/timed? ?out|aborted/i.test(err.message))
+	) {
+		return "request timed out";
+	}
+	return "provider unreachable";
+}
+
 /** Find the HTTP status on the error or on the provider error it wraps (Vercel AI SDK). */
 function httpStatusOf(err: unknown): number | undefined {
 	let current: unknown = err;

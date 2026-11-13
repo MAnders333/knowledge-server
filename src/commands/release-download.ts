@@ -86,6 +86,24 @@ export function requireExpectedSha(
 	return hash;
 }
 
+/**
+ * Refuse a release whose manifest has no entry for some of `names`. Releases
+ * published before plugin and command files were checksummed list only the
+ * binaries; `--version` and `update` cannot install those, so the error says so
+ * instead of reporting a bare missing entry.
+ */
+export function requireManifestCoverage(
+	checksums: Map<string, string>,
+	version: string,
+	names: string[],
+): void {
+	const missing = names.filter((name) => !checksums.has(name));
+	if (missing.length === 0) return;
+	throw new Error(
+		`Release ${version} predates checksummed plugin files (its SHA256SUMS has no entry for ${missing.join(", ")}). Pinning or downgrading to such a release is unsupported: use a newer release (omit --version to get the latest).`,
+	);
+}
+
 /** Fetch and parse SHA256SUMS-<platform> for a release. Throws on any failure. */
 export async function fetchChecksums(
 	version: string,

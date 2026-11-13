@@ -19,7 +19,7 @@ import {
 	prepareQuery,
 	storedNorm,
 } from "./embeddings.js";
-import { formatKnowledgeLine } from "./format.js";
+import { MAX_CONTEXT_CHARS, formatKnowledgeLine } from "./format.js";
 import {
 	applyTokenBudget,
 	denseFloor,
@@ -36,6 +36,13 @@ const MAX_SESSIONS = 1000;
 const SESSION_RESCORE_MARGIN = 0.1;
 /** Relation-expanded sources are gated and ranked at this fraction of their parent. */
 const SOURCE_GATE_DISCOUNT = 0.9;
+/**
+ * Token cap of the injected block: the formatter's character cap in the same
+ * estimate the token budget uses. The budget never exceeds it, so every entry the
+ * engine keeps is rendered, and nothing is recorded, remembered or logged that the
+ * formatter would cut.
+ */
+const RENDER_TOKEN_CAP = estimateTokens(MAX_CONTEXT_CHARS);
 
 /** Server-side cap on activation cues per call (see normalizeCues). */
 export const MAX_CUES = 12;
@@ -96,10 +103,10 @@ export function splitIntoCues(prompt: string): string[] {
 	return normalizeCues([...segments, trimmed]);
 }
 
-/** Per-store admission state within one activate() call (see callStore). */
+/** Per store-and-operation admission state within one activate() call (see callStore). */
 interface StoreSlot {
 	inFlight: number;
-	/** The store has returned a result in this activation; the in-flight cap lifts. */
+	/** The operation has returned a result in this activation; the in-flight cap lifts. */
 	answered: boolean;
 	/** Callers parked until one of this store's in-flight calls settles. */
 	waiting: Array<() => void>;
@@ -113,9 +120,18 @@ interface BreakerState {
 }
 
 /**
- * Per-store circuit breaker for the activation fan-out. State is keyed by store
- * id and lives as long as the ActivationEngine (one per process), so it is shared
- * across activations.
+ * Breaker key for one operation kind against one store. A store's ANN search and
+ * its count are separate operations: a fast success must not reset the failures
+ * of a timed-out search.
+ */
+function opKey(store: string, op: string): string {
+	return `${store}\u0000${op}`;
+}
+
+/**
+ * Per-operation circuit breaker for the activation fan-out. State is keyed by
+ * store id and operation label (see opKey) and lives as long as the
+ * ActivationEngine (one per process), so it is shared across activations.
  *
  *   closed    — calls go through; `threshold` consecutive failures open it.
  *   open      — calls are refused (no timeout wait, no pool slot) for `windowMs`.
@@ -140,32 +156,31 @@ export class StoreBreaker {
 		this.now = opts.now ?? Date.now;
 	}
 
-	private stateOf(id: string): BreakerState {
-		let s = this.states.get(id);
+	private stateOf(store: string, op: string): BreakerState {
+		const key = opKey(store, op);
+		let s = this.states.get(key);
 		if (!s) {
 			s = { status: "closed", failures: 0, openedAt: 0 };
-			this.states.set(id, s);
+			this.states.set(key, s);
 		}
 		return s;
 	}
 
-	/** True when a new activation should leave this store out. */
-	isBlocked(id: string): boolean {
-		const s = this.states.get(id);
-		if (!s || s.status === "closed") return false;
-		if (s.status === "half-open") return true;
-		return this.now() - s.openedAt < this.windowMs;
-	}
-
-	/** Max calls in flight for this store before it has answered in an activation. */
-	budget(id: string): number {
-		const s = this.stateOf(id);
-		return s.status === "closed" ? Math.max(1, this.threshold - s.failures) : 1;
+	/**
+	 * Max calls in flight for this operation before it has answered in an
+	 * activation. Only a closed circuit lets callers queue; otherwise admit()
+	 * decides at once.
+	 */
+	budget(store: string, op: string): number {
+		const s = this.stateOf(store, op);
+		return s.status === "closed"
+			? Math.max(1, this.threshold - s.failures)
+			: Number.POSITIVE_INFINITY;
 	}
 
 	/** Admit one call. After the window, the first caller becomes the probe. */
-	admit(id: string): boolean {
-		const s = this.stateOf(id);
+	admit(store: string, op: string): boolean {
+		const s = this.stateOf(store, op);
 		if (s.status === "closed") return true;
 		if (s.status === "open" && this.now() - s.openedAt >= this.windowMs) {
 			s.status = "half-open";
@@ -174,32 +189,36 @@ export class StoreBreaker {
 		return false;
 	}
 
-	/** Record the outcome of an admitted call. `detail` is used in the warning. */
-	record(id: string, ok: boolean, detail: string): void {
-		const s = this.stateOf(id);
-		const windowS = this.windowMs / 1000;
-		if (ok) {
-			if (s.status === "half-open") {
-				s.status = "closed";
-				s.failures = 0;
-				logger.warn(`[activation] Store "${id}" recovered — circuit closed.`);
-			} else if (s.status === "closed") {
-				s.failures = 0;
-			}
-			return;
+	/** An admitted call succeeded. */
+	recordSuccess(store: string, op: string): void {
+		const s = this.stateOf(store, op);
+		if (s.status === "half-open") {
+			s.status = "closed";
+			s.failures = 0;
+			logger.warn(
+				`[activation] Store "${store}" ${op} recovered — circuit closed.`,
+			);
+		} else if (s.status === "closed") {
+			s.failures = 0;
 		}
+	}
+
+	/** An admitted call failed; `reason` goes into the warning. */
+	recordFailure(store: string, op: string, reason: string): void {
+		const s = this.stateOf(store, op);
+		const windowS = this.windowMs / 1000;
 		if (s.status === "closed") {
 			s.failures++;
 			if (s.failures < this.threshold) return;
 			this.open(s);
 			logger.warn(
-				`[activation] Store "${id}" failed ${this.threshold} times in a row ` +
-					`(${detail}) — circuit open, skipping it for ${windowS}s.`,
+				`[activation] Store "${store}" ${op} failed ${this.threshold} times in a row ` +
+					`(${reason}) — circuit open, skipping this call for ${windowS}s.`,
 			);
 		} else if (s.status === "half-open") {
 			this.open(s);
 			logger.warn(
-				`[activation] Store "${id}" probe failed (${detail}) — ` +
+				`[activation] Store "${store}" ${op} probe failed (${reason}) — ` +
 					`circuit re-opened for ${windowS}s.`,
 			);
 		}
@@ -253,6 +272,9 @@ export class ActivationEngine {
 	 */
 	private readonly breaker: StoreBreaker;
 
+	/** Per-call store timeout; a store that does not answer in time counts as a failure. */
+	private readonly storeTimeoutMs: number;
+
 	/** Per-session dedupe of injected entries (see session-dedupe.ts). */
 	private readonly sessions: SessionDedupe;
 
@@ -260,7 +282,13 @@ export class ActivationEngine {
 	private readonly injectionFailing = new Set<string>();
 
 	/**
-	 * Last logged ANN vs full-scan partition of reachable stores. Used to log the
+	 * Scan stores whose rows have an embedding dimension other than the query's,
+	 * keyed by store id. Logged once per streak (see the scan loop).
+	 */
+	private readonly dimMismatchStores = new Set<string>();
+
+	/**
+	 * Last logged ANN vs full-scan partition of read stores. Used to log the
 	 * retrieval path per store only when it changes, not on every activation.
 	 */
 	private lastPathPartition: string | undefined;
@@ -282,18 +310,22 @@ export class ActivationEngine {
 	 *                     If omitted, defaults to [writableDb] (single-store mode).
 	 * @param reranker     Optional cross-encoder scorer for the second rerank
 	 *                     stage. Null/omitted = dense-only ordering.
+	 * @param options      Test seam: `storeTimeoutMs` overrides STORE_TIMEOUT_MS.
 	 */
 	constructor(
 		writableDb: IKnowledgeStore,
 		readDbs?: IKnowledgeStore[],
 		writableDbs?: IKnowledgeStore[],
 		reranker?: RerankScorer | null,
+		options?: { storeTimeoutMs?: number },
 	) {
 		this.db = writableDb;
 		this.readDbs = readDbs ?? [writableDb];
 		this.writableDbs = writableDbs ?? [writableDb];
 		this.embeddings = new EmbeddingClient();
 		this.reranker = reranker ?? null;
+		this.storeTimeoutMs =
+			options?.storeTimeoutMs ?? ActivationEngine.STORE_TIMEOUT_MS;
 		this.breaker = new StoreBreaker({
 			threshold: ActivationEngine.STORE_FAILURE_THRESHOLD,
 			windowMs: ActivationEngine.STORE_RETRY_INTERVAL_MS,
@@ -303,15 +335,6 @@ export class ActivationEngine {
 			maxSessions: MAX_SESSIONS,
 			rescoreMargin: SESSION_RESCORE_MARGIN,
 		});
-	}
-
-	/**
-	 * Read stores that the circuit breaker does not block. A store is left out of
-	 * a new activation while its circuit is open (or its half-open probe is in
-	 * flight); once the window elapses it becomes eligible for one probe call.
-	 */
-	private reachableReadDbs(): IKnowledgeStore[] {
-		return this.readDbs.filter((db) => !this.breaker.isBlocked(db.id));
 	}
 
 	/**
@@ -348,40 +371,39 @@ export class ActivationEngine {
 		label: string,
 		slots: Map<string, StoreSlot>,
 	): Promise<{ ok: true; value: T } | { ok: false }> {
-		const slot: StoreSlot = slots.get(db.id) ?? {
+		const key = opKey(db.id, label);
+		const slot: StoreSlot = slots.get(key) ?? {
 			inFlight: 0,
 			answered: false,
 			waiting: [],
 		};
-		slots.set(db.id, slot);
-		while (!slot.answered && slot.inFlight >= this.breaker.budget(db.id)) {
+		slots.set(key, slot);
+		while (
+			!slot.answered &&
+			slot.inFlight >= this.breaker.budget(db.id, label)
+		) {
 			await new Promise<void>((resolve) => slot.waiting.push(resolve));
 		}
-		if (!this.breaker.admit(db.id)) return { ok: false };
+		if (!this.breaker.admit(db.id, label)) return { ok: false };
 
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const timeout = new Promise<never>((_, reject) => {
 			timer = setTimeout(
-				() =>
-					reject(
-						new Error(
-							`timeout after ${ActivationEngine.STORE_TIMEOUT_MS / 1000}s`,
-						),
-					),
-				ActivationEngine.STORE_TIMEOUT_MS,
+				() => reject(new Error(`timeout after ${this.storeTimeoutMs / 1000}s`)),
+				this.storeTimeoutMs,
 			);
 		});
 		slot.inFlight++;
 		try {
 			const value = await Promise.race([fn(db), timeout]);
 			slot.answered = true;
-			this.breaker.record(db.id, true, label);
+			this.breaker.recordSuccess(db.id, label);
 			return { ok: true, value };
 		} catch (err) {
-			this.breaker.record(
+			this.breaker.recordFailure(
 				db.id,
-				false,
-				`${label}: ${err instanceof Error ? err.message : String(err)}`,
+				label,
+				err instanceof Error ? err.message : String(err),
 			);
 			return { ok: false };
 		} finally {
@@ -416,14 +438,14 @@ export class ActivationEngine {
 			/** Min similarity threshold. Overrides config.activation.similarityThreshold. */
 			threshold?: number;
 			/**
-			 * Read-only: no injection writes (commitInjections never receives a plan),
-			 * so measuring activation never changes the store. Used by the replay harness and the CLI.
+			 * Read-only: no store writes (the plan's writes are empty). Session dedupe
+			 * state is recorded only when the plan is committed. Used by the replay harness and the CLI.
 			 */
 			dryRun?: boolean;
 			/**
 			 * Client-scoped session key (for example `${client}\0${sessionId}`). When set,
-			 * entries already injected in this session are suppressed (session-dedupe.ts).
-			 * Requests without a key are not deduplicated.
+			 * entries already shown in this session are suppressed (session-dedupe.ts),
+			 * once the plan is committed. Requests without a key are not deduplicated.
 			 */
 			session?: string;
 		},
@@ -498,17 +520,16 @@ export class ActivationEngine {
 			};
 		}> = [];
 
-		// Split non-blocked read stores by retrieval path. Circuit-open stores are
-		// already excluded by reachableReadDbs().
-		const reachable = this.reachableReadDbs();
+		// Split read stores by retrieval path. Breaker state is per operation and
+		// is checked per call in callStore, so every store takes part here.
 		const annDbs: IKnowledgeStore[] = [];
 		const scanDbs: IKnowledgeStore[] = [];
-		for (const db of reachable) {
+		for (const db of this.readDbs) {
 			(storeSupportsAnn(db) ? annDbs : scanDbs).push(db);
 		}
 
 		// Log the retrieval path per store, but only when the partition changes
-		// (first activation, store reachability, or vector search readiness flip).
+		// (first activation or a vector search readiness flip).
 		const pathPartition = `ann=${annDbs.map((d) => d.id).join(",")};scan=${scanDbs.map((d) => d.id).join(",")}`;
 		if (pathPartition !== this.lastPathPartition) {
 			this.lastPathPartition = pathPartition;
@@ -578,7 +599,16 @@ export class ActivationEngine {
 			rawSimilarity: number;
 		}> = [];
 		for (const { db, rows } of scanEntriesPerStore) {
+			let mismatchedDims: number | undefined;
 			for (const row of rows) {
+				// Checked before the ID: a row that cannot be scored must not claim its
+				// ID, or a matching copy of the same entry in another store is skipped.
+				if (
+					preparedQueries.some((q) => q.unit.length !== row.embedding.length)
+				) {
+					mismatchedDims ??= row.embedding.length;
+					continue;
+				}
 				if (scanSeenIds.has(row.id)) continue;
 				scanSeenIds.add(row.id);
 				const bNorm = storedNorm(row.embedding);
@@ -590,8 +620,23 @@ export class ActivationEngine {
 					);
 				}
 				// ANN stores filter by threshold in the DB; apply the same cut here.
-				if (rawSimilarity < similarityThreshold) continue;
+				// A non-finite score cannot be ranked, so it is a miss.
+				if (
+					!Number.isFinite(rawSimilarity) ||
+					rawSimilarity < similarityThreshold
+				) {
+					continue;
+				}
 				scanHits.push({ db, id: row.id, rawSimilarity });
+			}
+			// Warn once per streak; a scan with no mismatched rows ends the streak.
+			if (mismatchedDims === undefined) {
+				this.dimMismatchStores.delete(db.id);
+			} else if (!this.dimMismatchStores.has(db.id)) {
+				this.dimMismatchStores.add(db.id);
+				logger.warn(
+					`[activation] Store "${db.id}" has ${mismatchedDims}-dim embeddings but the query is ${preparedQueries[0].unit.length}-dim — skipping those rows until they are re-embedded.`,
+				);
 			}
 		}
 
@@ -665,7 +710,12 @@ export class ActivationEngine {
 					ageDays: Math.round(ageDays),
 					strength: liveStrength,
 					lastAccessedDaysAgo: Math.round(lastAccessedDaysAgo),
-					mayBeStale: ageDays > halfLife && entry.accessCount < 3,
+					mayBeStale: isMayBeStale(
+						entry,
+						ageDays,
+						lastAccessedDaysAgo,
+						halfLife,
+					),
 				},
 			});
 		}
@@ -709,7 +759,7 @@ export class ActivationEngine {
 		const nCandidates = scored.length;
 		let gateDropped = 0;
 		let gateMode: GateMode = this.reranker ? "dense" : "off";
-		if (this.reranker && scored.length > 1) {
+		if (this.reranker && scored.length > 0) {
 			// Bound the rerank input: across multiple cues and stores the pool
 			// can exceed `candidates` — keep the dense-best slice.
 			const maxCandidates = config.activation.rerank.candidates;
@@ -764,8 +814,43 @@ export class ActivationEngine {
 			scored.splice(0, scored.length, ...passing);
 		}
 
-		// Sort and cap.
+		// Sort, then drop what cannot be injected before the cap, so the cap is spent
+		// on entries that can be shown: flagged conflicted entries with no contradicts
+		// partner, and entries already shown in this session (session-dedupe.ts).
 		scored.sort((a, b) => b.similarity - a.similarity);
+		const conflictedIds = scored
+			.filter(({ entry }) => entry.status === "conflicted")
+			.map(({ entry }) => entry.id);
+		const contradictPairs = mergeMaps(
+			await this.fanOutSafe(
+				this.readDbs,
+				(db) => db.getContradictPairsForIds(conflictedIds),
+				"contradict pairs lookup",
+				slots,
+			),
+		);
+		const beforeFlagCheck = scored.length;
+		const unflagged = scored.filter(
+			({ entry }) =>
+				entry.status !== "conflicted" || contradictPairs.has(entry.id),
+		);
+		gateDropped += beforeFlagCheck - unflagged.length;
+		scored.splice(0, scored.length, ...unflagged);
+
+		const sessionKey = options?.session;
+		let deduped = 0;
+		if (sessionKey !== undefined) {
+			const fresh = scored.filter((s) => {
+				const suppressed = this.sessions.isSuppressed(
+					sessionKey,
+					{ id: s.entry.id, rawSimilarity: s.rawSimilarity },
+					now,
+				);
+				if (suppressed) deduped++;
+				return !suppressed;
+			});
+			scored.splice(0, scored.length, ...fresh);
+		}
 		scored.splice(maxResults);
 
 		// ── Relation-aware activation: pull in supports sources ───────────────────
@@ -791,11 +876,11 @@ export class ActivationEngine {
 		const scoredIdSet = new Set(scored.map(({ entry }) => entry.id));
 
 		if (synthesizedIds.length > 0) {
-			// Fan out support sources lookup across reachable stores. A synthesized
+			// Fan out support sources lookup across read stores. A synthesized
 			// entry's sources come from the first store that returns them (the same
 			// precedence as mergeMaps), and each source keeps its owning store.
 			const sourceMaps = await this.fanOutSafe(
-				this.reachableReadDbs(),
+				this.readDbs,
 				async (db) => ({
 					db,
 					map: await db.getSupportSourcesForIds(synthesizedIds),
@@ -820,6 +905,25 @@ export class ActivationEngine {
 			// Snapshot the array before iterating — we push source entries into `scored`
 			// during the loop and don't want to visit newly-added entries (which could
 			// cascade if a source is itself a principle with its own supports relations).
+			// Conflicted sources need their contradicts partners for the flag check.
+			const unfetched = [...sourcesMap.values()]
+				.flat()
+				.filter(
+					({ source }) =>
+						source.status === "conflicted" && !contradictPairs.has(source.id),
+				)
+				.map(({ source }) => source.id);
+			if (unfetched.length > 0) {
+				const more = mergeMaps(
+					await this.fanOutSafe(
+						this.readDbs,
+						(db) => db.getContradictPairsForIds(unfetched),
+						"contradict pairs lookup",
+						slots,
+					),
+				);
+				for (const [id, partner] of more) contradictPairs.set(id, partner);
+			}
 			const snapshot = [...scored];
 			for (const parent of snapshot) {
 				const { entry, rawSimilarity, similarity: synthSimilarity } = parent;
@@ -834,6 +938,26 @@ export class ActivationEngine {
 					const sourceGate = parent.gateScore * SOURCE_GATE_DISCOUNT;
 					if (floor !== null && sourceGate < floor) {
 						gateDropped++;
+						continue;
+					}
+					// Same rules as candidates: a flagged source and a source already shown in
+					// this session are not injected, and do not use up the cap.
+					if (
+						source.status === "conflicted" &&
+						!contradictPairs.has(source.id)
+					) {
+						gateDropped++;
+						continue;
+					}
+					if (
+						sessionKey !== undefined &&
+						this.sessions.isSuppressed(
+							sessionKey,
+							{ id: source.id, rawSimilarity },
+							now,
+						)
+					) {
+						deduped++;
 						continue;
 					}
 
@@ -856,7 +980,12 @@ export class ActivationEngine {
 							ageDays: Math.round(ageDays),
 							strength: liveStrength,
 							lastAccessedDaysAgo: Math.round(lastAccessedDaysAgo),
-							mayBeStale: ageDays > halfLife && source.accessCount < 3,
+							mayBeStale: isMayBeStale(
+								source,
+								ageDays,
+								lastAccessedDaysAgo,
+								halfLife,
+							),
 						},
 					});
 					scoredIdSet.add(source.id);
@@ -867,49 +996,6 @@ export class ActivationEngine {
 			}
 		}
 		// ─────────────────────────────────────────────────────────────────────────
-
-		// Batch-fetch all contradicts relations for conflicted entries in a single query,
-		// avoiding N+1 DB calls. Only fetch for entries with status 'conflicted'.
-		const conflictedIds = scored
-			.filter(({ entry }) => entry.status === "conflicted")
-			.map(({ entry }) => entry.id);
-
-		// Fan out contradiction pairs lookup across reachable stores and merge.
-		const contradictMaps = await this.fanOutSafe(
-			this.reachableReadDbs(),
-			(db) => db.getContradictPairsForIds(conflictedIds),
-			"contradict pairs lookup",
-			slots,
-		);
-		const contradictPairs = mergeMaps(contradictMaps);
-
-		// A conflicted entry with no contradicts partner was flagged for review (not
-		// trustworthy), so it is never injected. Conflicted pairs stay and are annotated below.
-		const beforeFlagCheck = scored.length;
-		const unflagged = scored.filter(
-			({ entry }) =>
-				entry.status !== "conflicted" || contradictPairs.has(entry.id),
-		);
-		gateDropped += beforeFlagCheck - unflagged.length;
-		scored.splice(0, scored.length, ...unflagged);
-
-		// ── Session dedupe ──────────────────────────────────────────────────────
-		// Entries already injected in this session (within the TTL) are suppressed
-		// unless they now score much higher. See session-dedupe.ts.
-		const sessionKey = options?.session;
-		let deduped = 0;
-		if (sessionKey !== undefined) {
-			const fresh = scored.filter((s) => {
-				const suppressed = this.sessions.isSuppressed(
-					sessionKey,
-					{ id: s.entry.id, rawSimilarity: s.rawSimilarity },
-					now,
-				);
-				if (suppressed) deduped++;
-				return !suppressed;
-			});
-			scored.splice(0, scored.length, ...fresh);
-		}
 
 		// Build a map of activated entries for fast lookup during annotation.
 		// Used to determine whether a conflicted entry's counterpart also activated
@@ -940,9 +1026,15 @@ export class ActivationEngine {
 			});
 		}
 
-		// ── Token budget ────────────────────────────────────────────────────────
-		// Greedy prefix in ranking order; the top-ranked entry is always kept. Token
-		// counts are estimates (see gate.ts) of the formatted line of each entry.
+		// ── Token budget and render cap ─────────────────────────────────────────
+		// One cap for everything that is counted, recorded and remembered. The block
+		// cannot exceed RENDER_TOKEN_CAP, the formatter's own cap in the same estimate,
+		// and the token budget is clamped to it. Each line is costed with the
+		// formatter's newline, so the greedy prefix kept here is exactly what
+		// formatActivatedKnowledge renders. The budget applies with the gate off too.
+		const budget = gateOn
+			? Math.min(config.activation.gate.tokenBudget, RENDER_TOKEN_CAP)
+			: RENDER_TOKEN_CAP;
 		const lineTokens = new Map(
 			scored.map((s) => [
 				s,
@@ -951,21 +1043,17 @@ export class ActivationEngine {
 						entry: s.entry,
 						staleness: s.staleness,
 						contradiction: contradictionMap.get(s.entry.id),
-					}).length,
+					}).length + 1,
 				),
 			]),
 		);
-		let final = scored;
-		let budgetDropped = 0;
-		if (gateOn) {
-			final = applyTokenBudget(
-				scored,
-				config.activation.gate.tokenBudget,
-				(s) => lineTokens.get(s) ?? 0,
-				(s) => s.rawSimilarity >= similarityThreshold,
-			);
-			budgetDropped = scored.length - final.length;
-		}
+		const final = applyTokenBudget(
+			scored,
+			budget,
+			(s) => lineTokens.get(s) ?? 0,
+			(s) => s.rawSimilarity >= similarityThreshold,
+		);
+		const budgetDropped = scored.length - final.length;
 		// A counterpart the budget dropped is no longer in the response, so its
 		// annotation would point at nothing. Remove it.
 		const finalIds = new Set(final.map(({ entry }) => entry.id));
@@ -978,17 +1066,6 @@ export class ActivationEngine {
 			(n, s) => n + (lineTokens.get(s) ?? 0),
 			0,
 		);
-
-		if (sessionKey !== undefined) {
-			this.sessions.remember(
-				sessionKey,
-				final.map(({ entry, rawSimilarity }) => ({
-					id: entry.id,
-					rawSimilarity,
-				})),
-				now,
-			);
-		}
 
 		return {
 			entries: final.map(
@@ -1012,29 +1089,49 @@ export class ActivationEngine {
 				deduped,
 				injectedTokens,
 			},
-			injection: dryRun ? undefined : this.injectionPlan(final),
+			injection: this.injectionPlan(final, { dryRun, sessionKey, now }),
 		};
 	}
 
 	/**
-	 * Injection writes for one response, grouped by owning store. Only writable
-	 * stores get a write: entries read from writable:false stores are not recorded.
+	 * What one response showed: injection writes grouped by owning store (writable
+	 * stores only, none for dryRun), and the session dedupe record. Undefined for a
+	 * dryRun without a session, which has nothing to commit.
 	 */
 	private injectionPlan(
-		items: ReadonlyArray<{ entry: KnowledgeEntry; owner: IKnowledgeStore }>,
-	): InjectionPlan {
+		items: ReadonlyArray<{
+			entry: KnowledgeEntry;
+			owner: IKnowledgeStore;
+			rawSimilarity: number;
+		}>,
+		opts: { dryRun: boolean; sessionKey: string | undefined; now: number },
+	): InjectionPlan | undefined {
+		if (opts.dryRun && opts.sessionKey === undefined) return undefined;
 		const byStore = new Map<string, string[]>();
-		for (const { entry, owner } of items) {
-			if (!this.writableDbs.some((db) => db.id === owner.id)) continue;
-			const ids = byStore.get(owner.id);
-			if (ids) ids.push(entry.id);
-			else byStore.set(owner.id, [entry.id]);
+		if (!opts.dryRun) {
+			for (const { entry, owner } of items) {
+				if (!this.writableDbs.some((db) => db.id === owner.id)) continue;
+				const ids = byStore.get(owner.id);
+				if (ids) ids.push(entry.id);
+				else byStore.set(owner.id, [entry.id]);
+			}
 		}
 		return {
 			writes: [...byStore].map(([storeId, entryIds]) => ({
 				storeId,
 				entryIds,
 			})),
+			session:
+				opts.sessionKey === undefined
+					? undefined
+					: {
+							key: opts.sessionKey,
+							at: opts.now,
+							items: items.map(({ entry, rawSimilarity }) => ({
+								id: entry.id,
+								rawSimilarity,
+							})),
+						},
 		};
 	}
 
@@ -1065,13 +1162,22 @@ export class ActivationEngine {
 	}
 
 	/**
-	 * Record one response's injections: one batched write per owning writable
-	 * store. Call it after the response is built. It is not awaited, so it adds no
-	 * latency. A failing store is logged once per failure streak and never reaches
-	 * the caller. The caller skips abandoned requests.
+	 * Record one response's injections: the session dedupe record (in memory) and one
+	 * batched write per owning writable store. Call it once the response has been
+	 * delivered. The caller skips abandoned requests, so an entry the client never
+	 * received is neither counted nor suppressed for the next prompt. Store writes
+	 * are not awaited, so they add no latency. A failing store is logged once per
+	 * failure streak and never reaches the caller.
 	 */
 	commitInjections(plan: InjectionPlan | undefined): void {
 		if (!plan) return;
+		if (plan.session) {
+			this.sessions.remember(
+				plan.session.key,
+				plan.session.items,
+				plan.session.at,
+			);
+		}
 		const now = Date.now();
 		for (const write of plan.writes) {
 			const db = this.writableDbs.find((d) => d.id === write.storeId);
@@ -1328,6 +1434,22 @@ function storeSupportsAnn(db: IKnowledgeStore): boolean {
 		typeof db.findSimilarEntries === "function" &&
 		(typeof db.isVectorSearchReady !== "function" || db.isVectorSearchReady())
 	);
+}
+
+/**
+ * Whether an entry older than its type's half-life may be outdated. Usage is the
+ * retrieval count plus the injection count: access_count no longer moves on
+ * injection, so injection_count is the live signal. An entry used within its
+ * half-life is not flagged, so an entry injected daily stays clean.
+ */
+function isMayBeStale(
+	entry: Pick<KnowledgeEntry, "accessCount" | "injectionCount">,
+	ageDays: number,
+	lastAccessedDaysAgo: number,
+	halfLife: number,
+): boolean {
+	const uses = entry.accessCount + entry.injectionCount;
+	return ageDays > halfLife && lastAccessedDaysAgo > halfLife && uses < 3;
 }
 
 /**

@@ -4,6 +4,7 @@
  * refreshed when a new verified release is installed.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -17,10 +18,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	EXTENSION_TARGETS_FILE,
+	findLegacyExtensionCopies,
 	readExtensionTargets,
 	recordExtensionTarget,
 	refreshExtensionTargets,
 } from "../src/commands/extension-targets";
+
+const sha256 = (data: string) =>
+	createHash("sha256").update(data).digest("hex");
 
 let installDir: string;
 let toolDir: string;
@@ -151,5 +156,102 @@ describe("refreshExtensionTargets", () => {
 			reason: "asset not on disk",
 		});
 		expect(readFileSync(dst, "utf8")).toBe("old release");
+	});
+});
+
+describe("findLegacyExtensionCopies", () => {
+	// Stand-in for a release file: the digest table is injected so the test does
+	// not need the real v3.10.3 bytes.
+	const OLD_PLUGIN = "old opencode plugin";
+	const OLD_PI = "old pi extension";
+	const digests = {
+		"knowledge.ts": [sha256(OLD_PLUGIN)],
+		"pi-knowledge.ts": [sha256(OLD_PI)],
+	};
+	let home: string;
+
+	beforeEach(() => {
+		home = join(installDir, "..", "home");
+		mkdirSync(join(home, ".config", "opencode", "plugins"), {
+			recursive: true,
+		});
+		mkdirSync(join(home, ".pi", "shared", "extensions"), { recursive: true });
+	});
+
+	it("returns nothing when no pre-registry copy exists", () => {
+		expect(findLegacyExtensionCopies(home, digests)).toEqual([]);
+	});
+
+	it("marks copies whose bytes match a known release as adoptable", () => {
+		const opencode = join(
+			home,
+			".config",
+			"opencode",
+			"plugins",
+			"knowledge.ts",
+		);
+		const pi = join(home, ".pi", "shared", "extensions", "knowledge.ts");
+		writeFileSync(opencode, OLD_PLUGIN);
+		writeFileSync(pi, OLD_PI);
+
+		expect(findLegacyExtensionCopies(home, digests)).toEqual([
+			{ target: { asset: "knowledge.ts", dst: opencode }, adoptable: true },
+			{ target: { asset: "pi-knowledge.ts", dst: pi }, adoptable: true },
+		]);
+	});
+
+	it("never adopts an edited copy, but reports where it is", () => {
+		const opencode = join(
+			home,
+			".config",
+			"opencode",
+			"plugins",
+			"knowledge.ts",
+		);
+		writeFileSync(opencode, `${OLD_PLUGIN}\n// my change`);
+
+		expect(findLegacyExtensionCopies(home, digests)).toEqual([
+			{ target: { asset: "knowledge.ts", dst: opencode }, adoptable: false },
+		]);
+	});
+
+	it("does not match a copy against another asset's digests", () => {
+		// The pi digest must not adopt a file placed in the OpenCode location.
+		const opencode = join(
+			home,
+			".config",
+			"opencode",
+			"plugins",
+			"knowledge.ts",
+		);
+		writeFileSync(opencode, OLD_PI);
+
+		expect(findLegacyExtensionCopies(home, digests)[0]?.adoptable).toBe(false);
+	});
+
+	it("ignores symlinks, which are never copies setup-tool made", () => {
+		const source = join(home, "repo-knowledge.ts");
+		writeFileSync(source, OLD_PLUGIN);
+		symlinkSync(
+			source,
+			join(home, ".config", "opencode", "plugins", "knowledge.ts"),
+		);
+
+		expect(findLegacyExtensionCopies(home, digests)).toEqual([]);
+	});
+
+	it("an adopted copy is refreshed and then registered", () => {
+		const dst = join(home, ".config", "opencode", "plugins", "knowledge.ts");
+		writeFileSync(dst, OLD_PLUGIN);
+		writeFileSync(join(installDir, "knowledge.ts"), "new release");
+		const [copy] = findLegacyExtensionCopies(home, digests);
+		expect(copy?.adoptable).toBe(true);
+
+		const outcomes = refreshExtensionTargets(installDir, [copy.target]);
+		expect(outcomes.map((o) => o.status)).toEqual(["refreshed"]);
+		recordExtensionTarget(installDir, copy.target);
+
+		expect(readFileSync(dst, "utf8")).toBe("new release");
+		expect(readExtensionTargets(installDir)).toEqual([copy.target]);
 	});
 });

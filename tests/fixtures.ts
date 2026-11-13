@@ -24,6 +24,7 @@ export function makeEntry(
 		updatedAt: now,
 		lastAccessedAt: now,
 		accessCount: 0,
+		injectionCount: 0,
 		observationCount: 1,
 		isSynthesized: false,
 		supersededBy: null,

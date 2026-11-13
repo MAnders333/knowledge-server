@@ -34,7 +34,7 @@ import { CREATE_TABLES, SCHEMA_VERSION } from "./schema.js";
  * Keep in sync with RawEntryRow.
  */
 const ENTRY_COLUMNS =
-	"id, type, content, topics, confidence, source, status, strength, created_at, updated_at, last_accessed_at, access_count, observation_count, superseded_by, derived_from, is_synthesized";
+	"id, type, content, topics, confidence, source, status, strength, created_at, updated_at, last_accessed_at, access_count, injection_count, observation_count, superseded_by, derived_from, is_synthesized";
 
 /** ENTRY_COLUMNS qualified with a table alias (for joins). */
 function qualifiedEntryColumns(alias: string): string {
@@ -483,13 +483,18 @@ export class KnowledgeDB implements IKnowledgeStore {
 	 * Never called during activation/retrieval.
 	 */
 	async reinforceObservation(id: string): Promise<void> {
-		this.db
+		const result = this.db
 			.prepare(
 				`UPDATE knowledge_entry
          SET observation_count = observation_count + 1, last_accessed_at = ?, updated_at = ?
          WHERE id = ?`,
 			)
 			.run(Date.now(), Date.now(), id);
+		if (result.changes === 0) {
+			logger.warn(
+				`[db] reinforceObservation: entry ${id} was deleted during this run — evidence not recorded.`,
+			);
+		}
 	}
 
 	/**
@@ -984,6 +989,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 			updatedAt: row.updated_at,
 			lastAccessedAt: row.last_accessed_at,
 			accessCount: row.access_count,
+			injectionCount: row.injection_count,
 			observationCount: row.observation_count,
 			supersededBy: row.superseded_by,
 			derivedFrom: JSON.parse(row.derived_from),
@@ -1005,6 +1011,8 @@ export class KnowledgeDB implements IKnowledgeStore {
 	 *   If supplied, it is written atomically in the same UPDATE statement so the
 	 *   entry never passes through a NULL-embedding state. If omitted, embedding
 	 *   is set to NULL and ensureEmbeddings will regenerate it at end of run.
+	 *
+	 * Resolves true when merged, false (writing nothing) when the target is gone.
 	 */
 	async mergeEntry(
 		id: string,
@@ -1016,9 +1024,17 @@ export class KnowledgeDB implements IKnowledgeStore {
 			additionalSources: string[]; // session IDs from the new episode
 		},
 		embedding?: number[],
-	): Promise<void> {
+	): Promise<boolean> {
 		const existing = await this.getEntry(id);
-		if (!existing) return;
+		if (!existing) {
+			// The target was deleted after it was chosen as a merge target (e.g. by
+			// DELETE /entries/:id or another server on a shared store). Writing the
+			// merge would resurrect nothing, so it is skipped, and logged, not silent.
+			logger.warn(
+				`[db] mergeEntry: entry ${id} was deleted during this run — its extracted knowledge was not merged.`,
+			);
+			return false;
+		}
 
 		const mergedSources = [
 			...new Set([...existing.derivedFrom, ...updates.additionalSources]),
@@ -1051,6 +1067,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 				embeddingBlob,
 				id,
 			);
+		return true;
 	}
 
 	/**
@@ -1366,6 +1383,7 @@ interface RawEntryRow {
 	updated_at: number;
 	last_accessed_at: number;
 	access_count: number;
+	injection_count: number;
 	observation_count: number;
 	superseded_by: string | null;
 	derived_from: string;

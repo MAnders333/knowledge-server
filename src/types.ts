@@ -65,6 +65,7 @@ export interface KnowledgeEntry {
 	updatedAt: number;
 	lastAccessedAt: number;
 	accessCount: number; // retrieval-only: incremented on activate, never during consolidation
+	injectionCount: number; // incremented per response that showed the entry (recordInjections); the live usage signal now that access_count is frozen
 	observationCount: number; // evidence-only: incremented on keep/update/insert, never on activate
 
 	// Provenance
@@ -315,7 +316,12 @@ export interface ActivationResult {
 	 * Never sent to clients (the HTTP handler strips it) and carries no content.
 	 */
 	telemetry?: ActivationTelemetry;
-	/** Present for activations that are not dryRun: what to record as injected (see ActivationEngine.commitInjections). Never sent to clients. */
+	/**
+	 * Present unless the activation is a dryRun (then there are no writes, and the
+	 * plan is absent unless a session key was given, see `session`). What to record
+	 * as injected, and what to remember for session dedupe, once the response is
+	 * committed (see ActivationEngine.commitInjections). Never sent to clients.
+	 */
 	injection?: InjectionPlan;
 }
 
@@ -332,9 +338,18 @@ export interface ActivationTelemetry {
 	injectedTokens: number;
 }
 
-/** Entry ids to record as injected, grouped by the writable store that owns them. */
+/**
+ * What a response showed, grouped by the writable store that owns each entry.
+ * `writes` is empty for dryRun. `session` is the dedupe record of the entries
+ * the response carries (only when the request had a session key).
+ */
 export interface InjectionPlan {
 	writes: Array<{ storeId: string; entryIds: string[] }>;
+	session?: {
+		key: string;
+		at: number;
+		items: Array<{ id: string; rawSimilarity: number }>;
+	};
 }
 
 /** One content-free row of the activation_event table (see src/activation/events.ts). */

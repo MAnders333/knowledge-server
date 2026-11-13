@@ -292,6 +292,9 @@ async function main(): Promise<void> {
 				dryRun: true,
 				session,
 			});
+			// Replay shows the entries to nobody, so the session state is committed
+			// explicitly. dryRun plans carry no store writes, only the dedupe record.
+			engine.commitInjections(result.injection);
 			records.push({
 				promptChars: prompt.length,
 				nReturned: result.entries.length,

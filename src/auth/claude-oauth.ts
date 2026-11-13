@@ -23,11 +23,11 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import {
-	chmodSync,
 	existsSync,
 	mkdirSync,
 	readFileSync,
 	renameSync,
+	rmSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -110,12 +110,20 @@ export function saveOAuthTokens(tokens: OAuthTokens): void {
 	const filePath = getOAuthFilePath();
 	mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
 	// Write a sibling temp file, then rename it over the target so a crash or a
-	// full disk never leaves a truncated token file. chmod covers a temp file
-	// left behind by an earlier run (writeFileSync keeps an existing file's mode).
-	const tmpPath = `${filePath}.tmp`;
-	writeFileSync(tmpPath, JSON.stringify(tokens, null, 2), { mode: 0o600 });
-	chmodSync(tmpPath, 0o600);
-	renameSync(tmpPath, filePath);
+	// full disk never leaves a truncated token file. The temp name is unique and
+	// created exclusively (`wx`, mode 0600): the server and `claude-auth` can both
+	// write, and a fixed name would let one writer's rename pull the other's file.
+	const tmpPath = `${filePath}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+	try {
+		writeFileSync(tmpPath, JSON.stringify(tokens, null, 2), {
+			mode: 0o600,
+			flag: "wx",
+		});
+		renameSync(tmpPath, filePath);
+	} catch (err) {
+		rmSync(tmpPath, { force: true });
+		throw err;
+	}
 }
 
 /** Remove stored OAuth tokens. No-op if the file does not exist. */

@@ -18,8 +18,10 @@ Captures knowledge from [OpenCode](https://opencode.ai), [Claude Code](https://d
 Supports **Linux x64** and **macOS arm64** (Apple Silicon). No Bun or Node.js required.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MAnders333/knowledge-server/main/scripts/install.sh | bash
+curl -fsSL https://github.com/MAnders333/knowledge-server/releases/latest/download/install.sh | bash
 ```
+
+The installer is attached to the latest release, so it always matches that release's binaries and checksums.
 
 **After running:**
 
@@ -41,11 +43,13 @@ That's it. The server auto-starts the episode collector alongside itself — not
 **To update:**
 
 ```bash
-knowledge-server update                              # latest release
-knowledge-server update --version v3.10.2 --force    # older release (downgrades need --force)
+knowledge-server update                             # latest release
+knowledge-server update --version vX.Y.Z --force    # an older release (downgrades need --force)
 ```
 
-Every downloaded file is checked against the release's `SHA256SUMS` before anything is replaced. The new binaries must also pass a smoke test. The previous binaries are kept as `*.prev`, and a failed post-install check restores them. `update` also refreshes the copies that `setup-tool` placed in tool directories (the OpenCode plugin and commands, the pi and oh-my-pi extensions), so they stay on the installed version.
+Every downloaded file is checked against the release's `SHA256SUMS` before anything is replaced. The new binaries must also pass a smoke test. The previous binaries are kept as `*.prev`, and a failed post-install check restores them. `update` refreshes the copies that `setup-tool` placed in tool directories (the OpenCode plugin and commands, the pi and oh-my-pi extensions), so they stay on the installed version. Copies made by v3.10.3 or earlier are picked up only when they are byte-identical to a known release; an edited copy is left unchanged and `update` says so. The first `update` from v3.10.3 runs the old updater, so after upgrading re-run `knowledge-server setup-tool opencode`, `setup-tool pi` or `setup-tool oh-my-pi` once to register the copies you use.
+
+Releases published before plugin and command files were checksummed (their `SHA256SUMS` has no `knowledge.ts` entry) cannot be installed with `update --version` or `install.sh --version`; both stop with a message. To roll back an update, use the `*.prev` binaries it kept.
 
 ### From source
 
@@ -174,9 +178,9 @@ Cursor and VSCode are capture-only in practice. Cursor's session-start hook is n
 
 Codex: after `setup-tool codex`, open Codex, run `/hooks`, and trust the knowledge-server hook. Codex does not run a new or changed hook until it is trusted, so trust it again after a port change. Codex limits each hook's output to about 2,500 tokens and saves the rest to a file. The injected block is capped at 6,000 characters, which is usually under that limit.
 
-Each injected entry starts with a short id, for example `(id 1a2b3c4d)`. When an entry is wrong or outdated, the agent can call the `knowledge_flag` MCP tool with that id. The entry is queued for review (status `conflicted`) and is not deleted. The MCP process needs `KNOWLEDGE_ADMIN_TOKEN` in its environment for this.
+Each injected entry starts with a short id, for example `(id 1a2b3c4d)`. When an entry is wrong or outdated, the agent can call the `knowledge_flag` MCP tool with that id. The entry is queued for review (status `conflicted`), is no longer injected into sessions, and is not deleted. The flag reason is written to the server log (`[entries/flag]`), not stored on the entry. The MCP process needs `KNOWLEDGE_ADMIN_TOKEN` in its environment for this.
 
-`knowledge-server status` shows, per source, the episodes captured in the last 7 days next to the activations received, and warns when a source is captured but nothing was injected.
+`knowledge-server status` shows the server's health (`ok`, `degraded` or `down`, with reasons) when the server answers, and, per source, the episodes captured in the last 7 days next to the activations received. It warns when a source is captured but nothing was injected.
 
 ## Components
 
@@ -204,7 +208,7 @@ Hono-based HTTP server. Binds to `127.0.0.1:3179` by default.
 | `/activate?q=...` | GET | — | Activate knowledge entries by query. Optional `client` query param or `x-knowledge-client` header (`opencode`, `claude-code`, `pi`, `omp`, `codex`, `mcp`, `cli`); missing or unknown values are recorded as `unknown`. |
 | `/consolidate` | POST | admin | Run a consolidation batch |
 | `/reinitialize?confirm=yes` | POST | admin | Wipe all entries and reset consolidation state |
-| `/status` | GET | — (config requires admin) | Health check and stats |
+| `/status` | GET | — (config requires admin) | Liveness and stats. `status` is `"ok"` whenever the server answers. `health` is the verdict: `ok`, `degraded` (with `reasons`: a store or provider failing, consolidation errors or dead-lettered episodes, more than 500 pending sessions, or the daemon not running when one is expected) or `down` (state DB unreachable, or every knowledge store unreachable). Config and diagnostics are admin-only. |
 | `/entries` | GET | — | List entries (filter by `status`, `type`, `scope`) |
 | `/entries/:id` | GET | — | Get a specific entry with relations |
 | `/entries/:id` | PATCH | admin | Update content, topics, confidence, status, scope |
@@ -217,7 +221,7 @@ Hono-based HTTP server. Binds to `127.0.0.1:3179` by default.
 
 ### MCP server
 
-Exposes two tools. `activate` recalls knowledge mid-task. `knowledge_flag` reports an entry (by its id) as `wrong`, `outdated` or `irrelevant`; the entry is queued for review and kept, not deleted.
+Exposes two tools. `activate` recalls knowledge mid-task. `knowledge_flag` reports an entry (by its id) as `wrong`, `outdated` or `irrelevant`; the entry is queued for review, stops being injected, and is kept, not deleted.
 
 Two connection modes:
 
@@ -228,7 +232,7 @@ Two connection modes:
 ### Consolidation engine (`src/consolidation/`)
 
 - `readers/pending.ts` — drains `pending_episodes` uploaded by the daemon
-- `consolidate.ts` — full cycle: read → extract → reconsolidate → contradiction scan → decay → embed → synthesis → delete processed rows
+- `consolidate.ts` — full cycle: read → extract → reconsolidate → contradiction scan → embed → synthesis → delete processed rows. Decay runs on its own timer (`DECAY_INTERVAL_MS`).
 - `llm.ts` — four LLM calls: `extractKnowledge` (extraction model), `decideMerge` (merge model), `detectAndResolveContradiction` (contradiction model), `synthesizePrinciple` (synthesis model, fires rarely on ripe clusters)
 - `decay.ts` — forgetting curve with type-specific half-lives
 
@@ -236,7 +240,11 @@ Two connection modes:
 
 Configuration is split across two files:
 
-**`~/.config/knowledge-server/.env`** — credentials and tuning parameters (API keys, model names, thresholds). Loaded by the launcher wrapper at startup.
+**`~/.config/knowledge-server/.env`** — credentials and tuning parameters (API keys, model names, thresholds). Read by the server binary at startup from `$KNOWLEDGE_CONFIG_HOME/.env` or `$XDG_CONFIG_HOME/knowledge-server/.env` (default `~/.config/knowledge-server/.env`; the legacy `~/.local/share/knowledge-server/.env` is used when neither exists). Compiled binaries never read a `.env` from the current directory.
+
+**Keys a `.env` cannot set.** Process-control keys are ignored: `PATH`, `HOME`, `TMPDIR`, `IFS`, `SHELL`, `SHELLOPTS`, `BASHOPTS`, `BASH_ENV`, `ENV`, `PS4`, `PROMPT_COMMAND`, `CDPATH`, `GLOBIGNORE`, `NODE_OPTIONS`, `NODE_PATH`, `NODE_TLS_REJECT_UNAUTHORIZED`, `BUN_OPTIONS`, `SSL_CERT_DIR`, `CURL_HOME`, `SSLKEYLOGFILE`, `KNOWLEDGE_CONFIG_HOME`, and every `LD_*`, `DYLD_*`, `BUN_INSTALL*`, `BUN_CONFIG_*` and `XDG_*` key. Each ignored key is named in a startup warning (`[env] Ignored N key(s) in <file>`); its value is never printed. Set these in the service environment instead (the launchd plist `EnvironmentVariables`, the systemd unit `Environment=`, or the shell that starts the server).
+
+**Proxy and CA variables are read from `.env`.** `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` (and their lowercase forms), `NODE_EXTRA_CA_CERTS`, `CURL_CA_BUNDLE` and `SSL_CERT_FILE` are loaded from this file, so a machine behind a corporate proxy or CA keeps them across binary upgrades.
 
 **`~/.config/knowledge-server/config.jsonc`** — store topology (which databases to use and where). Created automatically on first run (default: local SQLite). Edit this for Postgres or multi-store setups.
 
@@ -423,7 +431,8 @@ Credentials and paths stay in `.env`:
 | `KNOWLEDGE_ALLOWED_HOSTS` | *(empty)* | Extra `Host` names the API accepts, comma-separated (`name` or `name:port`). `localhost`, `127.0.0.1`, `[::1]` and the bind host are always accepted. Needed when a reverse proxy forwards a different hostname. |
 | `REDACT_SECRETS` | `true` | Scrub credentials (private keys, cloud/SaaS/LLM API tokens, JWTs, `Authorization` headers, `*_SECRET`/`*_TOKEN`/`*_PASSWORD`/`*_API_KEY` values, URL passwords, long keyed secrets) from transcript text before it is staged, sent to an LLM or embedding API, or stored. Set `false` to disable. Counts are logged per run; values are never logged. |
 | `KNOWLEDGE_LOG_PATH` | `~/.local/share/knowledge-server/server.log` | Log file. Set to `""` to disable. When stdout or stderr already points at this file (the launchd plist does this), each line is written once. |
-| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. Only `debug` logs query and entry text; `info` logs lengths, ids and similarity scores. |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. `info` logs lengths, ids and similarity scores; consolidation and contradiction decisions at `info` include entry text. `warn` suppresses those lines. |
+| `LOG_MAX_BYTES` | `20971520` (20 MB) | Size at which the active log rotates. Rotation keeps `server.log.1` to `server.log.3` and drops the oldest, so the files total about four times this value. `0` disables rotation. Rotated copies can hold text written by earlier versions, including an old admin token; delete them once you no longer need them. |
 
 ### Session sources
 
@@ -452,7 +461,7 @@ All sources are auto-detected. Override paths or disable sources via environment
 
 | Variable | Default | Description |
 |---|---|---|
-| `INITIAL_LOOKBACK_DAYS` | `30` | First run of each source the daemon reads only ingests sessions (or local Markdown files, by modification time) with activity in the last N days. `0` ingests all history. A session in the window is ingested in full. The `process-inbox` command is not affected. |
+| `INITIAL_LOOKBACK_DAYS` | `30` | First run of each source the daemon reads only ingests sessions (or local Markdown files, by modification time) with activity in the last N days. Set `0` to ingest all history on the first run. A session in the window is ingested in full. The `process-inbox` command is not affected. After `reinitialize` (cursor reset), the next run re-reads all history regardless of this setting. |
 
 - **First run preview.** The daemon logs the episode count and a rough token estimate for each batch of the first run. No LLM cost is estimated, because no model price is configured. Review the count before a large history is consolidated.
 - **Only new content is uploaded.** A session that grows is uploaded from its last uploaded message onward. Earlier chunks are not re-sent.
@@ -487,22 +496,24 @@ All sources are auto-detected. Override paths or disable sources via environment
 |---|---|---|
 | `ACTIVATION_MAX_RESULTS` | `10` | Max entries returned per activation |
 | `ACTIVATION_SIMILARITY_THRESHOLD` | `0.42` | Minimum cosine similarity to activate |
-| `ACTIVATION_PRECISION_GATE` | `on` | `off` disables the floors and the token budget below (dedupe is separate) |
-| `RERANK_FLOOR` | unset | Absolute rerank-score floor for the configured scorer. Unset: relative rule only, since no per-model floor is calibrated yet |
-| `RERANK_REL_FRAC` | `0.35` | A candidate must reach this fraction of the best rerank score |
-| `ACTIVATION_DENSE_MARGIN` | `0` | Used when rerank did not run: raw cosine must clear the threshold by this margin |
-| `ACTIVATION_TOKEN_BUDGET` | `2000` | Estimated tokens (chars / 4) for the injected entries. The top entry is always kept. Codex truncates hook output near 2,500 tokens, so keep this at or below 2,000 |
-| `ACTIVATION_SESSION_TTL_MS` | `1800000` | Per-session dedupe: an entry injected in a session with a client session id is suppressed for this long. `0` disables it. Without a session id there is no dedupe |
+| `ACTIVATION_PRECISION_GATE` | `on` | `off` disables the floors and the token budget below (dedupe is separate). The render cap still applies, so the block never exceeds the formatter's 6,000-character limit |
+| `RERANK_FLOOR` | unset | Absolute rerank-score floor for the configured scorer. Unset: relative rule only, since no per-model floor is calibrated yet. Applies to the top entry too |
+| `RERANK_REL_FRAC` | `0.35` | With rerank, a candidate must reach this fraction of the best rerank score (floor = max of this and `RERANK_FLOOR`) |
+| `ACTIVATION_DENSE_MARGIN` | `0` | Used when rerank did not run (disabled, failed, or timed out): raw cosine must clear the similarity threshold by this margin. At `0` the dense fallback adds no filtering beyond the threshold |
+| `ACTIVATION_TOKEN_BUDGET` | `1500` | Estimated tokens (chars / 4) for the injected entries. The top entry is always kept. Values above `1500` are clamped to it: the formatter caps the block at 6,000 characters, so an entry counted here is always an entry rendered |
+| `ACTIVATION_SESSION_TTL_MS` | `1800000` | Per-session dedupe: an entry injected in a session with a client session id is suppressed for this long after its injection. `0` disables it. Without a session id there is no dedupe |
 | `ACTIVATION_STRENGTH_DAMPENING` | `false` | Rank-time freshness dampening: `rerank × (0.5 + 0.5·strength)` instead of `rerank × strength` |
 
-Injected entries are counted in `injection_count`, and `last_accessed_at` moves at most once per entry per 24 h. `access_count` is no longer incremented by injection and keeps its existing values. Injections are recorded in the store that owns each entry; read-only stores are skipped. Requests the client abandoned are not recorded. Dedupe state lives in server memory: a restart or a compaction in the client can repeat one injection (the TTL is the only reset).
+The gate defaults (`RERANK_REL_FRAC`, `ACTIVATION_DENSE_MARGIN`, `ACTIVATION_TOKEN_BUDGET`, `ACTIVATION_SESSION_TTL_MS`) are conservative placeholders, not calibrated values. They were chosen before any replay measurement on real prompts; use `bun run bench/replay-activation.ts` on your own prompts before relying on them. With `ACTIVATION_DENSE_MARGIN=0` the dense fallback adds no filtering when rerank fails.
+
+Injected entries are counted in `injection_count`, and `last_accessed_at` moves at most once per entry per 24 h. `access_count` is no longer incremented by injection and keeps its existing values. Injections are recorded in the store that owns each entry; read-only stores are skipped. Requests the client abandoned are not recorded, and neither are entries the server remembers for session dedupe: both are committed only after the response is delivered. Dedupe state lives in server memory: a restart or a compaction in the client can repeat one injection (the TTL is the only reset). An entry is marked `[may be outdated]` only when it is older than its type's half-life, was not used within that half-life, and has fewer than 3 uses (retrievals plus injections).
 
 ### Reranking
 
 Dense retrieval overfetches `RERANK_CANDIDATES` entries and a second stage re-scores them. If reranking fails or times out, activation uses dense ordering. Two providers are available:
 
 - `local` (default): an in-process cross-encoder. It runs offline after a one-time model download (~23MB). The default model is pinned to a Hugging Face revision and checksum. Nothing leaves the machine.
-- `remote` (opt-in): one listwise call per activation to a decision model on the LLM gateway (`RERANK_REMOTE_MODEL`, default `clef`). It uses the gateway in `LLM_BASE_ENDPOINT` and `LLM_API_KEY`; per-provider keys are not used. It needs no local model memory and does not block the event loop. After 3 consecutive failures remote reranking pauses for 60 s, and dense ordering is used meanwhile.
+- `remote` (opt-in): one listwise call per activation to a decision model on the LLM gateway (`RERANK_REMOTE_MODEL`). The default `clef` is the model name on the maintainer's gateway; set the name your gateway offers. It uses the gateway in `LLM_BASE_ENDPOINT` and `LLM_API_KEY`; per-provider keys are not used. It needs no local model memory and does not block the event loop. After 3 consecutive failures remote reranking pauses for 60 s, and dense ordering is used meanwhile.
 
 > **Privacy: `RERANK_PROVIDER=remote` sends content off this machine.** On every activation the remote provider sends (1) the query tail, the last `RERANK_MAX_QUERY_TOKENS` tokens of the prompt, and (2) the text of each candidate entry, its first `RERANK_MAX_DOC_TOKENS` tokens with its type and topics. Only the candidates dense retrieval returned for that prompt are sent, never the whole store. The gateway forwards the request to the hosting provider of `RERANK_REMOTE_MODEL`. Retention and processing terms are those of the gateway and the model host, which this project does not control. Keep the default `local` provider unless you accept that.
 
@@ -516,7 +527,7 @@ Dense retrieval overfetches `RERANK_CANDIDATES` entries and a second stage re-sc
 | `RERANK_TIMEOUT_MS` | `3000` | Budget for one local rerank call. On expiry the whole batch falls back to dense ordering (no partial scores) |
 | `RERANK_MAX_QUERY_TOKENS` | `128` | Last N tokens of the prompt used as the rerank query (remote: N × 4 characters) |
 | `RERANK_MAX_DOC_TOKENS` | `256` | First N tokens of each candidate that is scored (remote: N × 4 characters). Shorter caps lowered quality on long documents |
-| `RERANK_REMOTE_MODEL` | `clef` | Gateway decision model for `RERANK_PROVIDER=remote`. Lower-tier models (for example `clef-flash`) scored below BM25 in our evaluation |
+| `RERANK_REMOTE_MODEL` | `clef` | Gateway decision model for `RERANK_PROVIDER=remote`. `clef` exists only on the maintainer's gateway: set the model name your gateway offers. Lower-tier models (for example `clef-flash`) scored below BM25 in the maintainer's evaluation |
 | `RERANK_REMOTE_TIMEOUT_MS` | `4000` | Budget for one gateway call. It sits inside the 5 s plugin budget; on expiry dense ordering is used |
 
 Remote mode needs both `LLM_BASE_ENDPOINT` and `LLM_API_KEY`. If either is missing (or still a template placeholder), the server logs a warning at startup and uses the local reranker.
@@ -596,7 +607,8 @@ The `reinitialize` command resets varying amounts of state depending on which fl
 
 ```bash
 # Default — reset daemon cursor only.
-# The daemon re-uploads all historical episodes on its next tick.
+# The daemon re-reads the full history of every source on its next tick. This is
+# not limited by INITIAL_LOOKBACK_DAYS. Once that pass completes, the lookback applies again.
 # Safe for shared stores (only local state is touched).
 # Use when: connecting to a new or existing store for the first time.
 knowledge-server reinitialize --confirm
@@ -619,7 +631,7 @@ knowledge-server reinitialize --reset-store --store=personal --confirm
 knowledge-server reinitialize --reset-store --dry-run
 ```
 
-**Note:** The server must be stopped before running any reinitialize variant (`knowledge-server stop`). The command checks the PID file and exits with an error if the server is live.
+**Note:** Stop both the server and the daemon before running any reinitialize variant. The command exits with an error if either is live. The server is checked by its PID file: run `knowledge-server stop`. The daemon is checked by its lock file (`daemon.lock` in the data directory): an upload cycle that is in flight writes a fresh `daemon_cursor` after the reset, which defeats the full re-ingest. Stop the daemon with its service command when it is registered as one: `launchctl bootout gui/$(id -u)/com.knowledge-server.daemon` on macOS, or `systemctl --user stop knowledge-daemon` on Linux. Otherwise run `kill <pid>`, using the `pid` field of `daemon.lock`.
 
 `--dry-run` and `--confirm` are mutually exclusive — `--dry-run` previews the action without requiring `--confirm`.
 
@@ -685,8 +697,8 @@ You work across multiple machines and want a single knowledge base that spans al
 **Verifying a release** — Release binaries and `SHA256SUMS` files carry GitHub build-provenance attestations, created by this repository's release workflow. To check a binary, decompress the `.gz` first: attestations cover the uncompressed files.
 
 ```bash
-gh attestation verify ~/.local/share/knowledge-server/libexec/knowledge-server --repo MAnders333/knowledge-server
-gh attestation verify SHA256SUMS-linux-x64 --repo MAnders333/knowledge-server
+gh attestation verify ~/.local/share/knowledge-server/libexec/knowledge-server --repo MAnders333/knowledge-server --signer-workflow MAnders333/knowledge-server/.github/workflows/release-please.yml
+gh attestation verify SHA256SUMS-linux-x64 --repo MAnders333/knowledge-server --signer-workflow MAnders333/knowledge-server/.github/workflows/release-please.yml
 ```
 
 An attestation shows that the file was built from this repository by its release workflow. It does not protect against a compromised maintainer account.

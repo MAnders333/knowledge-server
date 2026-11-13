@@ -265,7 +265,7 @@ describe("ActivationEngine rerank stage", () => {
 		}
 	});
 
-	it("skips the scorer when only one candidate survives retrieval", async () => {
+	it("scores a single surviving candidate, so the gate sees a rerank score", async () => {
 		const store = makeStoreStub(
 			[makeEntries()[0]], // only "high"
 			{ supportAnn: true },
@@ -281,9 +281,11 @@ describe("ActivationEngine rerank stage", () => {
 
 		const result = await activation.activate("test query");
 
-		expect(scorer.calls).toHaveLength(0);
+		// The scorer runs even for one candidate: otherwise the gate would judge it
+		// on the dense floor and report gate_mode=dense as if rerank had failed.
+		expect(scorer.calls).toHaveLength(1);
 		expect(result.entries).toHaveLength(1);
-		expect(result.entries[0].rerankScore).toBeUndefined();
+		expect(result.entries[0].rerankScore).toBeDefined();
 	});
 
 	it("works on the in-process full-scan path (Path B)", async () => {

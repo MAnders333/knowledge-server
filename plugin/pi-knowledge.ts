@@ -89,7 +89,7 @@ const KNOWLEDGE_SERVER_URL_SAFE =
 	_parsedUrl !== null &&
 	(_parsedUrl.hostname === "127.0.0.1" ||
 		_parsedUrl.hostname === "localhost" ||
-		_parsedUrl.hostname === "::1");
+		_parsedUrl.hostname === "[::1]");
 
 /** Response shape of GET /activate (mirrors plugin/knowledge.ts). */
 interface ActivateResponse {
@@ -158,18 +158,33 @@ const UNTRUSTED_TAGS = [
 	"addrl-activated-knowledge",
 ] as const;
 
+// One character class with a star, not a whitespace star, optional slash and another
+// whitespace star: adjacent runs split a whitespace run in O(n²) ways when the name fails.
+// Mirrors src/consolidation/untrusted.ts.
 const GUARDED_TAG_START = new RegExp(
-	`<(?=\\s*/?\\s*(?:${UNTRUSTED_TAGS.join("|")})(?![\\w-]))`,
+	`<(?=[\\s/]*(?:${UNTRUSTED_TAGS.join("|")})(?![\\w-]))`,
 	"gi",
 );
 
-/** Control and format code points kept on purpose: TAB, LF, CR, ZWNJ, ZWJ. */
+/** Control and format code points kept on purpose: TAB, LF, CR, and ZWNJ/ZWJ (see dropJoinersNextToAscii). */
 const KEPT_CONTROL_CODE_POINTS = new Set([0x09, 0x0a, 0x0d, 0x200c, 0x200d]);
 
+/** Drops each ZWNJ/ZWJ run that has an ASCII neighbour. Mirrors src/consolidation/untrusted.ts. */
+const JOINER_RUN = /[\u200C\u200D]+/g;
+
+function dropJoinersNextToAscii(text: string): string {
+	return text.replace(JOINER_RUN, (run, offset: number, whole: string) => {
+		const before = offset > 0 ? whole.charCodeAt(offset - 1) : Number.NaN;
+		const after = whole.charCodeAt(offset + run.length);
+		return before < 0x80 || after < 0x80 ? "" : run;
+	});
+}
+
 function scrubUntrusted(text: string): string {
-	return text.replace(
-		/[\p{Cc}\p{Cf}\p{Co}\p{Cs}\u{E0000}-\u{E007F}]/gu,
-		(ch) => (KEPT_CONTROL_CODE_POINTS.has(ch.codePointAt(0) ?? 0) ? ch : ""),
+	return dropJoinersNextToAscii(
+		text.replace(/[\p{Cc}\p{Cf}\p{Co}\p{Cs}\u{E0000}-\u{E007F}]/gu, (ch) =>
+			KEPT_CONTROL_CODE_POINTS.has(ch.codePointAt(0) ?? 0) ? ch : "",
+		),
 	);
 }
 

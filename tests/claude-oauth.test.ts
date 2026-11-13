@@ -21,6 +21,7 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readFileSync,
 	rmSync,
 	statSync,
 	writeFileSync,
@@ -332,6 +333,24 @@ describe("saveOAuthTokens file handling", () => {
 			expires_at: Date.now() + 120_000,
 		});
 		expect(statSync(filePath).mode & 0o777).toBe(0o600);
+	});
+
+	it("never writes through a pre-existing file at the old fixed temp name", async () => {
+		const { saveOAuthTokens, loadOAuthTokens } = await getOAuth();
+		const dir = join(tempDir, "knowledge-server");
+		mkdirSync(dir, { recursive: true });
+		const filePath = join(dir, "claude-oauth.json");
+		const foreign = `${filePath}.tmp`;
+		writeFileSync(foreign, "another writer's data", { mode: 0o644 });
+
+		saveOAuthTokens({
+			access_token: "at-new",
+			refresh_token: "rt-new",
+			expires_at: Date.now() + 120_000,
+		});
+
+		expect(readFileSync(foreign, "utf8")).toBe("another writer's data");
+		expect(loadOAuthTokens()?.access_token).toBe("at-new");
 	});
 });
 

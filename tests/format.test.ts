@@ -3,7 +3,6 @@ import {
 	ACTIVATED_KNOWLEDGE_TAG,
 	MAX_CONTEXT_CHARS,
 	MAX_ENTRY_CHARS,
-	containsInjectedKnowledge,
 	formatActivatedKnowledge,
 	staleTag,
 } from "../src/activation/format.js";
@@ -134,24 +133,5 @@ describe("formatActivatedKnowledge", () => {
 		const out = formatActivatedKnowledge([item("Port is 8080.")]);
 		expect(out).toContain(`(id ${TEST_ID.slice(0, 8)}) Port is 8080.`);
 		expect(out).not.toContain(TEST_ID);
-	});
-});
-
-describe("containsInjectedKnowledge", () => {
-	it("detects the opening and closing tag", () => {
-		expect(containsInjectedKnowledge(`${OPEN}\nfoo`)).toBe(true);
-		expect(containsInjectedKnowledge(`bar\n${CLOSE}`)).toBe(true);
-	});
-
-	it("detects the tag when invisible characters are inserted", () => {
-		expect(containsInjectedKnowledge("<addrl-activated-\u200Bknowledge>")).toBe(
-			true,
-		);
-	});
-
-	it("ignores unrelated text", () => {
-		expect(containsInjectedKnowledge("knowledge base and <div> tags")).toBe(
-			false,
-		);
 	});
 });

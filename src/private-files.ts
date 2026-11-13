@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, statSync } from "node:fs";
+import { chmodSync, lstatSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
 	DEFAULT_CONFIG,
@@ -74,6 +74,9 @@ export function ownedPrivatePaths(
 /**
  * Best-effort: set each existing path to owner-only when it is readable or
  * writable by group/other. Never throws; a failed chmod is logged and skipped.
+ * Symlinks are never followed, and a path owned by another user is left alone:
+ * a dotfiles-managed `.env`, a log shared with a shipper, or a link planted in a
+ * shared directory must not have its mode changed. Each change is logged.
  * `chmod` is injectable for tests.
  */
 export function tightenPrivatePaths(
@@ -90,11 +93,18 @@ function tighten(
 	chmod: (path: string, mode: number) => void,
 ): void {
 	try {
-		if (!existsSync(path)) return;
-		const current = statSync(path).mode & 0o777;
+		const st = lstatSync(path);
+		if (st.isSymbolicLink()) return;
+		const uid = process.getuid?.();
+		if (uid !== undefined && st.uid !== uid) return;
+		const current = st.mode & 0o777;
 		if ((current & ~mode) === 0) return;
 		chmod(path, mode);
+		logger.log(
+			`[startup] Tightened permissions on ${path} to ${mode.toString(8)}`,
+		);
 	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
 		logger.warn(
 			`[startup] Could not tighten permissions on ${path}: ${err instanceof Error ? err.message : String(err)}`,
 		);

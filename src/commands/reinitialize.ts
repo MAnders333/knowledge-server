@@ -1,9 +1,31 @@
 import { existsSync, readFileSync } from "node:fs";
+import { resolveDataDir } from "../config-file.js";
 import { config } from "../config.js";
 import { DaemonDB } from "../db/daemon/index.js";
 import { StoreRegistry } from "../db/store-registry.js";
+import { lockHolder } from "../process-lock.js";
+import { daemonLockPath } from "../runtime-files.js";
 import { currentUserId } from "../user-id.js";
 import { errCode } from "../utils.js";
+
+/**
+ * Why a reinitialize must not run while a knowledge-daemon holds the lock for
+ * `dataDir`, or null when none does. A holder with pid 0 is a daemon still
+ * starting, and counts as live. An in-flight daemon cycle writes a fresh
+ * daemon_cursor after the reset, which defeats the full re-ingest.
+ */
+export function liveDaemonRefusal(dataDir: string): string | null {
+	const holder = lockHolder(daemonLockPath(dataDir));
+	if (!holder) return null;
+	const who = holder.pid > 0 ? `PID ${holder.pid}` : "still starting";
+	return [
+		`A knowledge-daemon is running (${who}). An in-flight daemon cycle can write a fresh daemon_cursor after the reset, which defeats the full re-ingest.`,
+		"Stop the daemon first, then run this command again:",
+		"  macOS service:  launchctl bootout gui/$(id -u)/com.knowledge-server.daemon",
+		"  Linux service:  systemctl --user stop knowledge-daemon",
+		'  otherwise:      kill <pid>   (the "pid" field of daemon.lock in the data directory)',
+	].join("\n");
+}
 
 /**
  * `knowledge-server reinitialize [--store=<id>] [--reset-state] [--reset-store] [--confirm|--dry-run]`
@@ -14,9 +36,10 @@ import { errCode } from "../utils.js";
  * ── Levels (choose one) ───────────────────────────────────────────────────────
  *
  * (default, no level flag)
- *   Resets the daemon upload cursor only. The daemon will re-upload all
- *   historical episodes on its next tick. Knowledge entries and server state
- *   are untouched. Safe for shared stores.
+ *   Resets the daemon upload cursor only. The daemon re-reads the full history
+ *   of every source on its next tick (INITIAL_LOOKBACK_DAYS does not apply to
+ *   this one re-ingest). Knowledge entries and server state are untouched. Safe
+ *   for shared stores.
  *   Use when: connecting to a new or existing store for the first time.
  *
  * --reset-state
@@ -105,6 +128,14 @@ export async function runReinitialize(args: string[]): Promise<void> {
 		}
 	}
 
+	// Same guard as the server PID above, for the daemon: its cycle would write a
+	// fresh cursor after this reset.
+	const daemonRefusal = liveDaemonRefusal(resolveDataDir());
+	if (daemonRefusal) {
+		console.error(daemonRefusal);
+		process.exit(1);
+	}
+
 	const registry = await StoreRegistry.create();
 	const { serverStateDb } = registry;
 	// Declared here but only instantiated when --confirm is given so that --dry-run
@@ -139,7 +170,7 @@ export async function runReinitialize(args: string[]): Promise<void> {
 
 		// Describe what will happen (entry count fetched lazily, only when confirming)
 		const actions: string[] = [
-			"Reset daemon cursor — daemon re-uploads all historical episodes on next tick",
+			"Reset daemon cursor — daemon re-reads all history (ignores INITIAL_LOOKBACK_DAYS) on next tick",
 		];
 		if (resetState) {
 			actions.push(
@@ -202,7 +233,7 @@ export async function runReinitialize(args: string[]): Promise<void> {
 		try {
 			await daemonDb.resetDaemonCursors();
 			console.log(
-				"  ✓ Reset daemon cursor (all sources) — daemon will re-upload all episodes on next tick",
+				"  ✓ Reset daemon cursor (all sources) — daemon will re-read all history on next tick",
 			);
 
 			if (resetState) {
@@ -230,7 +261,7 @@ export async function runReinitialize(args: string[]): Promise<void> {
 		console.log("\nDone.");
 		if (level === "cursor") {
 			console.log(
-				"  Daemon will re-upload all historical episodes on its next tick.\n" +
+				"  Daemon will re-read all history on its next tick (INITIAL_LOOKBACK_DAYS does not apply).\n" +
 					"  Trigger consolidation when ready: knowledge-server consolidate",
 			);
 		} else if (level === "state") {

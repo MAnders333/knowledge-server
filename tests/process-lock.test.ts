@@ -106,6 +106,58 @@ describe("tryAcquireProcessLock", () => {
 		expect(tryAcquireProcessLock(lockPath)).toBeNull();
 	});
 
+	it("does not remove a stale lock while another starter holds the takeover file", async () => {
+		mkdirSync(dirname(lockPath), { recursive: true });
+		const dead = await deadPid();
+		const now = Date.now();
+		writeFileSync(
+			lockPath,
+			JSON.stringify({ pid: dead, acquiredAt: now, heartbeatAt: now }),
+		);
+		const takeover = `${lockPath}.takeover`;
+		writeFileSync(takeover, "");
+
+		expect(tryAcquireProcessLock(lockPath)).toBeNull();
+		expect(existsSync(lockPath)).toBe(true);
+		expect(existsSync(takeover)).toBe(true);
+	});
+
+	it("removes a takeover file left by a crashed starter, then takes a stale lock", async () => {
+		mkdirSync(dirname(lockPath), { recursive: true });
+		const dead = await deadPid();
+		const now = Date.now();
+		writeFileSync(
+			lockPath,
+			JSON.stringify({ pid: dead, acquiredAt: now, heartbeatAt: now }),
+		);
+		const takeover = `${lockPath}.takeover`;
+		writeFileSync(takeover, "");
+		const longAgo = new Date(Date.now() - 10 * 60_000);
+		utimesSync(takeover, longAgo, longAgo);
+
+		const first = tryAcquireProcessLock(lockPath);
+		expect(first).toBeNull();
+		expect(existsSync(takeover)).toBe(false);
+		const second = tryAcquireProcessLock(lockPath);
+		expect(second).not.toBeNull();
+		second?.release();
+	});
+
+	it("releases the takeover file after a successful takeover", async () => {
+		mkdirSync(dirname(lockPath), { recursive: true });
+		const dead = await deadPid();
+		const now = Date.now();
+		writeFileSync(
+			lockPath,
+			JSON.stringify({ pid: dead, acquiredAt: now, heartbeatAt: now }),
+		);
+
+		const handle = tryAcquireProcessLock(lockPath);
+		expect(handle).not.toBeNull();
+		expect(existsSync(`${lockPath}.takeover`)).toBe(false);
+		handle?.release();
+	});
+
 	it("treats a freshly created but unreadable lockfile as held, a stale one as free", () => {
 		mkdirSync(dirname(lockPath), { recursive: true });
 		writeFileSync(lockPath, "");

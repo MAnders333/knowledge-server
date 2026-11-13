@@ -1,8 +1,8 @@
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
-import { containsInjectedKnowledge } from "../../activation/format.js";
 import { config } from "../../config.js";
+import { stripInjectedKnowledge } from "../../consolidation/untrusted.js";
 import type {
 	Episode,
 	EpisodeMessage,
@@ -465,8 +465,11 @@ export class VSCodeEpisodeReader implements IEpisodeReader {
 			const timestamp = request.timestamp ?? session.lastMessageDate;
 
 			// User message
-			const userText = (request.message?.text ?? "").trim();
-			if (userText && !containsInjectedKnowledge(userText)) {
+			// Our injected context is removed; the message is kept if any text remains.
+			const userText = stripInjectedKnowledge(
+				request.message?.text ?? "",
+			).trim();
+			if (userText) {
 				const messageId =
 					request.requestId ?? `${session.sessionId}-req-${i}-user`;
 				messages.push({
@@ -506,8 +509,10 @@ export class VSCodeEpisodeReader implements IEpisodeReader {
 				}
 			}
 
-			const assistantText = textParts.join("\n\n");
-			if (assistantText && !containsInjectedKnowledge(assistantText)) {
+			const assistantText = stripInjectedKnowledge(
+				textParts.join("\n\n"),
+			).trim();
+			if (assistantText) {
 				const responseId = `${request.requestId ?? `${session.sessionId}-req-${i}`}-response`;
 				messages.push({
 					messageId: responseId,

@@ -1,6 +1,7 @@
 /**
  * Single-instance daemon: a second knowledge-daemon for the same data directory
- * exits cleanly and leaves the first one running; the lock frees when it stops.
+ * idles (it does not exit, so launchd/systemd do not restart it in a loop) and
+ * leaves the first one running; the lock frees when it stops.
  *
  * Runs the real daemon entry point with HOME pointed at a temp dir, so the state
  * DB, lockfiles and status file all live under that dir.
@@ -73,8 +74,9 @@ describe("knowledge-daemon single instance", () => {
 		});
 	}
 
-	it("a second start exits cleanly while the first keeps the lock", async () => {
+	it("a second start idles while the first keeps the lock", async () => {
 		const first = startDaemon(["--interval=3600"]);
+		let second: ReturnType<typeof startDaemon> | undefined;
 		try {
 			const started = await readUntil(
 				first.stdout as ReadableStream,
@@ -83,22 +85,27 @@ describe("knowledge-daemon single instance", () => {
 			expect(started).toContain("Starting.");
 			expect(lockHolder(daemonLockPath(dataDir))?.pid).toBe(first.pid);
 
-			const second = startDaemon(["--interval=3600"]);
-			const [out, code] = await Promise.all([
-				new Response(second.stdout).text(),
-				second.exited,
-			]);
-			expect(code).toBe(0);
-			expect(out).toContain(`already runs for ${dataDir}`);
-			expect(out).toContain(`(PID ${first.pid})`);
-			expect(out).not.toContain("Starting.");
+			second = startDaemon(["--interval=3600"]);
+
+			const waiting = await readUntil(
+				second.stdout as ReadableStream,
+				"Waiting to take over",
+			);
+			expect(waiting).toContain(`already runs for ${dataDir}`);
+			expect(waiting).toContain(`(PID ${first.pid})`);
+			expect(waiting).not.toContain("Starting.");
+
+			// It keeps running instead of exiting: an exit would be restarted by launchd.
+			await new Promise((r) => setTimeout(r, 300));
+			expect(second.exitCode).toBeNull();
 
 			// The first daemon still owns the lock and its status file.
 			expect(readLockRecord(daemonLockPath(dataDir))?.pid).toBe(first.pid);
 			expect(readDaemonStatus(daemonStatusPath(dataDir))?.pid).toBe(first.pid);
 		} finally {
+			second?.kill("SIGTERM");
 			first.kill("SIGTERM");
-			await first.exited;
+			await Promise.all([second?.exited, first.exited]);
 		}
 	}, 60_000);
 

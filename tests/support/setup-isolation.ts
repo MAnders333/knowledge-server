@@ -8,6 +8,19 @@ import {
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 
+/**
+ * Env vars that point setup and reader code at a home-like directory. Each is
+ * redirected under the temp HOME so no run can reach the real user config.
+ */
+const HOME_ENV_VARS = [
+	"HOME",
+	"CURSOR_HOME",
+	"CODEX_HOME",
+	"CLAUDE_CONFIG_DIR",
+	"XDG_CONFIG_HOME",
+	"KNOWLEDGE_CONFIG_HOME",
+] as const;
+
 export interface SetupIsolation {
 	/** Temp HOME that setup-tool resolves its service and config paths under. */
 	home: string;
@@ -17,10 +30,12 @@ export interface SetupIsolation {
 }
 
 /**
- * Points HOME at a temp dir and prepends a PATH dir whose `launchctl` and
- * `systemctl` stubs only record their argv. Setup runs that try to register a
- * background service then leave a call record instead of touching launchd or
- * systemd. Works from any cwd: it needs no bunfig.toml or preload.
+ * Points HOME and every other home-like env var (CURSOR_HOME, CODEX_HOME,
+ * CLAUDE_CONFIG_DIR, XDG_CONFIG_HOME, KNOWLEDGE_CONFIG_HOME) at a temp dir, and
+ * prepends a PATH dir whose `launchctl` and `systemctl` stubs only record their
+ * argv. Setup runs that try to register a background service then leave a call
+ * record instead of touching launchd or systemd. Works from any cwd: it needs no
+ * bunfig.toml or preload.
  */
 export function isolateSetupTool(): SetupIsolation {
 	const root = mkdtempSync(join(tmpdir(), "setup-isolation-"));
@@ -35,17 +50,26 @@ export function isolateSetupTool(): SetupIsolation {
 		chmodSync(stub, 0o755);
 	}
 
-	const savedHome = process.env.HOME;
+	const saved = new Map(
+		HOME_ENV_VARS.map((name) => [name, process.env[name]] as const),
+	);
 	const savedPath = process.env.PATH;
 	process.env.HOME = home;
+	process.env.CURSOR_HOME = join(home, ".cursor");
+	process.env.CODEX_HOME = join(home, ".codex");
+	process.env.CLAUDE_CONFIG_DIR = join(home, ".claude");
+	process.env.XDG_CONFIG_HOME = join(home, ".config");
+	process.env.KNOWLEDGE_CONFIG_HOME = join(home, ".config", "knowledge-server");
 	process.env.PATH = `${bin}${delimiter}${savedPath ?? ""}`;
 
 	return {
 		home,
 		callsLog,
 		restore() {
-			if (savedHome === undefined) Reflect.deleteProperty(process.env, "HOME");
-			else process.env.HOME = savedHome;
+			for (const [name, value] of saved) {
+				if (value === undefined) Reflect.deleteProperty(process.env, name);
+				else process.env[name] = value;
+			}
 			process.env.PATH = savedPath;
 			rmSync(root, { recursive: true, force: true });
 		},

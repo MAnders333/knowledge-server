@@ -52,6 +52,7 @@ interface RawEntryRow {
 	updated_at: number | string;
 	last_accessed_at: number | string;
 	access_count: number | string;
+	injection_count: number | string;
 	observation_count: number | string;
 	superseded_by: string | null;
 	derived_from: string[] | string;
@@ -69,7 +70,7 @@ const SCHEMA_LOCK_NAME = "knowledge-server:schema-migration";
  * Keep in sync with RawEntryRow.
  */
 const ENTRY_COLUMNS =
-	"id, type, content, topics, confidence, source, status, strength, created_at, updated_at, last_accessed_at, access_count, observation_count, superseded_by, derived_from, is_synthesized";
+	"id, type, content, topics, confidence, source, status, strength, created_at, updated_at, last_accessed_at, access_count, injection_count, observation_count, superseded_by, derived_from, is_synthesized";
 
 /** ENTRY_COLUMNS qualified with the `ke` alias used by the ANN and join queries. */
 const KE_ENTRY_COLUMNS = qualifyColumns(ENTRY_COLUMNS, "ke");
@@ -652,6 +653,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			updatedAt: toNum(row.updated_at),
 			lastAccessedAt: toNum(row.last_accessed_at),
 			accessCount: toNum(row.access_count),
+			injectionCount: toNum(row.injection_count),
 			observationCount: toNum(row.observation_count),
 			supersededBy: row.superseded_by,
 			derivedFrom: Array.isArray(derivedFrom) ? derivedFrom : [],
@@ -968,11 +970,16 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 
 	async reinforceObservation(id: string): Promise<void> {
 		const now = Date.now();
-		await this.sql`
+		const result = await this.sql`
 			UPDATE knowledge_entry
 			SET observation_count = observation_count + 1, last_accessed_at = ${now}, updated_at = ${now}
 			WHERE id = ${id}
 		`;
+		if (result.count === 0) {
+			logger.warn(
+				`[pg-db] reinforceObservation: entry ${id} was deleted during this run — evidence not recorded.`,
+			);
+		}
 	}
 
 	async getStats(): Promise<Record<string, number>> {
@@ -1308,6 +1315,8 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	 * entry temporarily invisible to similarity queries — the same trade-off as
 	 * the SQLite backend. Callers that have already computed the new embedding
 	 * should pass it here to avoid the NULL window.
+	 *
+	 * Resolves true when merged, false (writing nothing) when the target is gone.
 	 */
 	async mergeEntry(
 		id: string,
@@ -1319,9 +1328,16 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			additionalSources: string[];
 		},
 		embedding?: number[],
-	): Promise<void> {
+	): Promise<boolean> {
 		const existing = await this.getEntry(id);
-		if (!existing) return;
+		if (!existing) {
+			// The target was deleted after it was chosen as a merge target. Skipped and
+			// logged, not silent (see the SQLite store).
+			logger.warn(
+				`[pg-db] mergeEntry: entry ${id} was deleted during this run — its extracted knowledge was not merged.`,
+			);
+			return false;
+		}
 
 		const mergedSources = [
 			...new Set([...existing.derivedFrom, ...updates.additionalSources]),
@@ -1383,6 +1399,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				] as postgres.ParameterOrJSON<never>[],
 			);
 		}
+		return true;
 	}
 
 	async reinitialize(): Promise<void> {

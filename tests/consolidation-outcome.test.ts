@@ -27,12 +27,16 @@ import { ConsolidationEngine } from "../src/consolidation/consolidate";
 import { DomainRouter } from "../src/consolidation/domain-router";
 import { ConsolidationLLM } from "../src/consolidation/llm";
 import type { ExtractedKnowledge } from "../src/consolidation/llm";
+import { MalformedLlmOutputError } from "../src/consolidation/llm-output";
 import { PendingEpisodesReader } from "../src/consolidation/readers/pending";
 import { PENDING_EPISODE_MAX_ATTEMPTS } from "../src/db/interface";
 import type { IKnowledgeStore } from "../src/db/interface";
 import { KnowledgeDB } from "../src/db/sqlite/index";
 import { ServerStateDB } from "../src/db/state/index";
+import { LLM_DEGRADED_FAILING_RUNS, componentHealth } from "../src/health";
+import { logger } from "../src/logger";
 import type { PendingEpisode as PendingRow } from "../src/types";
+import { makeEntry } from "./fixtures";
 
 // Each distinct text gets its own unit vector, so no two entries are similar and
 // the reconsolidation LLM is never called.
@@ -55,6 +59,12 @@ function entry(content: string, domain?: string): ExtractedKnowledge {
 		source: "test",
 		...(domain ? { domain } : {}),
 	};
+}
+
+/** A distinct entry per episode ("fact N" in the content), so no two are similar. */
+function factFromSummary(summary: string): ExtractedKnowledge {
+	const n = summary.match(/fact (\d+)/)?.[1] ?? "0";
+	return entry(`The fact number ${n} is recorded.`);
 }
 
 function pendingRow(overrides: Partial<PendingRow>): PendingRow {
@@ -159,6 +169,178 @@ describe("store locked by another process", () => {
 
 		expect(result.sessionsProcessed).toBe(1);
 		expect(await state.getPendingEpisodes(0)).toEqual([]);
+	});
+});
+
+describe("store lock contention across two engines", () => {
+	it("a deferred episode is retried later in the same drain, not left for the next poll", async () => {
+		const now = Date.now();
+		for (const i of [1, 2, 3]) {
+			await state.insertPendingEpisode(
+				pendingRow({
+					id: `row-contended-${i}`,
+					sessionId: `session-contended-${i}`,
+					content: `User: fact ${i}.`,
+					maxMessageTime: now - 4000 + i,
+				}),
+			);
+		}
+		// Another process holds the store's consolidation lock for the first chunk only.
+		const holder = new KnowledgeDB(join(tempDir, "knowledge.db"));
+		expect(await holder.tryAcquireConsolidationLock()).toBe(true);
+		const realTryAcquire = db.tryAcquireConsolidationLock.bind(db);
+		let calls = 0;
+		spyOn(db, "tryAcquireConsolidationLock").mockImplementation(async () => {
+			calls++;
+			if (calls === 2) await holder.releaseConsolidationLock();
+			return realTryAcquire();
+		});
+		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockImplementation(
+			async (summary: string) => [factFromSummary(summary)],
+		);
+		try {
+			const drained = await drainConsolidation(engine);
+
+			expect(drained.totalSessions).toBe(3);
+			expect(await state.getPendingEpisodes(0)).toEqual([]);
+		} finally {
+			await holder.close();
+		}
+	});
+});
+
+describe("chunk with one bad episode", () => {
+	it("only the failing episode is counted; healthy episodes in the same chunk complete", async () => {
+		const savedChunkSize = config.consolidation.chunkSize;
+		config.consolidation.chunkSize = 10;
+		try {
+			const now = Date.now();
+			for (const i of [1, 2, 3, 4, 5]) {
+				await state.insertPendingEpisode(
+					pendingRow({
+						id: `row-mixed-${i}`,
+						sessionId: `session-mixed-${i}`,
+						content: i === 3 ? "POISON: oversized" : `User: fact ${i}.`,
+						maxMessageTime: now - 6000 + i,
+					}),
+				);
+			}
+			const extract = spyOn(
+				ConsolidationLLM.prototype,
+				"extractKnowledge",
+			).mockImplementation(async (summary: string) => {
+				if (summary.includes("POISON")) {
+					throw Object.assign(new Error("prompt is too long"), {
+						statusCode: 400,
+					});
+				}
+				return [factFromSummary(summary)];
+			});
+
+			await engine.consolidate();
+
+			const rows = await state.getPendingEpisodes(0);
+			expect(rows.map((r) => r.id)).toEqual(["row-mixed-3"]);
+			expect(rows[0].failedAttempts).toBe(1);
+			expect(await state.countDeadLetteredEpisodes()).toBe(0);
+			// One chunk attempt plus one single-episode attempt per episode.
+			expect(extract).toHaveBeenCalledTimes(1 + 5);
+		} finally {
+			config.consolidation.chunkSize = savedChunkSize;
+		}
+	});
+});
+
+describe("LLM outage tracked as health", () => {
+	beforeEach(() => componentHealth.clear());
+	afterEach(() => componentHealth.clear());
+
+	it("counts runs without progress on transient provider errors, and resets on success", async () => {
+		await state.insertPendingEpisode(
+			pendingRow({ id: "row-outage", sessionId: "session-outage" }),
+		);
+		const extract = spyOn(
+			ConsolidationLLM.prototype,
+			"extractKnowledge",
+		).mockRejectedValue(
+			Object.assign(new Error("Too Many Requests: key sk-test-secret"), {
+				statusCode: 429,
+			}),
+		);
+
+		for (let i = 0; i < LLM_DEGRADED_FAILING_RUNS; i++) {
+			await engine.consolidate();
+		}
+		const failing = componentHealth.snapshot("llm");
+		expect(failing.consecutiveFailures).toBe(LLM_DEGRADED_FAILING_RUNS);
+		expect(failing.failing).toBe(true);
+		expect(failing.failingSince).not.toBeNull();
+		// The status shows the failure class only, never the provider message.
+		expect(failing.lastError).toBe("rate limited (HTTP 429)");
+		expect(extract).toHaveBeenCalledTimes(LLM_DEGRADED_FAILING_RUNS);
+
+		extract.mockResolvedValue([entry("The sky is blue.")]);
+		await engine.consolidate();
+
+		const recovered = componentHealth.snapshot("llm");
+		expect(recovered.consecutiveFailures).toBe(0);
+		expect(recovered.failingSince).toBeNull();
+		expect(await state.getPendingEpisodes(0)).toEqual([]);
+	});
+});
+
+describe("merge target deleted during a run", () => {
+	it("logs and skips the merge instead of dropping it silently", async () => {
+		const id = "merge-target";
+		await db.insertEntry(makeEntry({ id, content: "Old fact." }));
+		expect(await db.deleteEntry(id)).toBe(true);
+		const warn = spyOn(logger, "warn");
+
+		await db.mergeEntry(id, {
+			content: "New fact.",
+			type: "fact",
+			topics: ["test"],
+			confidence: 0.9,
+			additionalSources: ["session-x"],
+		});
+
+		expect(await db.getEntry(id)).toBeNull();
+		expect(
+			warn.mock.calls.some((c) =>
+				String(c[0]).includes("was deleted during this run"),
+			),
+		).toBe(true);
+	});
+});
+
+describe("blocked rows at the head of the queue", () => {
+	it("finds a healthy episode behind more than 2000 blocked rows", async () => {
+		const now = Date.now();
+		for (let i = 0; i < 2100; i++) {
+			await state.insertPendingEpisode(
+				pendingRow({
+					id: `blocked-${i}`,
+					sessionId: `session-blocked-${i}`,
+					directory: "/blocked/store",
+					maxMessageTime: now - 100_000 + i,
+				}),
+			);
+		}
+		await state.insertPendingEpisode(
+			pendingRow({
+				id: "healthy",
+				sessionId: "session-healthy",
+				directory: "/healthy/store",
+				maxMessageTime: now,
+			}),
+		);
+		const reader = new PendingEpisodesReader(state);
+
+		await reader.prepare(0, (ep) => ep.directory.startsWith("/blocked"));
+
+		expect(reader.getCandidateSessions(0, 10).map((c) => c.id)).toEqual([
+			"session-healthy",
+		]);
 	});
 });
 
@@ -303,6 +485,85 @@ describe("entries routed to another store", () => {
 		} finally {
 			await workDb.close();
 		}
+	});
+});
+
+describe("contradiction reply that stays malformed", () => {
+	it("keeps the stored entry and completes the episode without re-extraction", async () => {
+		// Two unit vectors with cosine 0.6: inside the contradiction band
+		// [contradictionMinSimilarity, reconsolidationThreshold), so the second
+		// episode's entry is a candidate-scanned insert rather than a merge.
+		const vec = (x: number, y: number) => {
+			const v = new Array(384).fill(0);
+			v[0] = x;
+			v[1] = y;
+			return v;
+		};
+		const activation = new ActivationEngine(db);
+		spyOn(activation.embeddings, "embed").mockImplementation(async (text) => {
+			if (text.includes("port 8080")) return vec(1, 0);
+			if (text.includes("9090")) return vec(0.6, 0.8);
+			return uniqueEmbedding(seenEmbeddings, text);
+		});
+		const malformedEngine = new ConsolidationEngine(
+			db,
+			state,
+			activation,
+			[new PendingEpisodesReader(state)],
+			null,
+		);
+		const now = Date.now();
+		await state.insertPendingEpisode(
+			pendingRow({
+				id: "row-a",
+				sessionId: "session-a",
+				content: "EPISODE A",
+				maxMessageTime: now - 3000,
+			}),
+		);
+		await state.insertPendingEpisode(
+			pendingRow({
+				id: "row-b",
+				sessionId: "session-b",
+				content: "EPISODE B",
+				maxMessageTime: now - 1000,
+			}),
+		);
+		const extract = spyOn(
+			ConsolidationLLM.prototype,
+			"extractKnowledge",
+		).mockImplementation(async (summary: string) =>
+			summary.includes("EPISODE A")
+				? [entry("The server runs on port 8080.")]
+				: [entry("The server port was changed to 9090.")],
+		);
+		const contradiction = spyOn(
+			ConsolidationLLM.prototype,
+			"detectAndResolveContradiction",
+		).mockRejectedValue(
+			new MalformedLlmOutputError("contradiction", "checked 1 of 1 candidates"),
+		);
+
+		await malformedEngine.consolidate();
+
+		// The scan retried once and then skipped the batch: no throw, so the chunk
+		// completed and both episodes are recorded.
+		expect(contradiction).toHaveBeenCalledTimes(2);
+		expect(await state.getPendingEpisodes(0)).toEqual([]);
+		expect(
+			(await state.getProcessedEpisodeRanges(["session-b"])).get("session-b"),
+		).toHaveLength(1);
+		expect(await state.countDeadLetteredEpisodes()).toBe(0);
+
+		// The entry was written once, and the next run does not re-extract it.
+		const written = (await db.getEntries({ type: "fact" })).filter((e) =>
+			e.content.includes("9090"),
+		);
+		expect(written).toHaveLength(1);
+		expect((await db.getStats()).total).toBe(2);
+
+		await malformedEngine.consolidate();
+		expect(extract).toHaveBeenCalledTimes(2);
 	});
 });
 

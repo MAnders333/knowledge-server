@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import {
 	existsSync,
@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { restartDaemonAfterUpdate } from "../src/commands/daemon-restart";
 import {
 	GITHUB_RELEASES,
 	detectPlatform,
@@ -22,7 +23,10 @@ import {
 	downloadAndInstallDaemon,
 	installVerifiedAssets,
 	isDowngrade,
+	runUpdate,
 } from "../src/commands/update";
+import { tryAcquireProcessLock } from "../src/process-lock";
+import { daemonLockPath } from "../src/runtime-files";
 
 const VERSION = "v9.9.9";
 
@@ -330,5 +334,227 @@ describe("isDowngrade", () => {
 		expect(isDowngrade("v3.10.3", "v3.10.3")).toBe(false);
 		expect(isDowngrade("v3.10.3", "v3.11.0")).toBe(false);
 		expect(isDowngrade("v3.10.3", "v4.0.0")).toBe(false);
+	});
+});
+
+describe("restartDaemonAfterUpdate", () => {
+	const noSleep = async () => {};
+	let home: string;
+	let dataDir: string;
+	const log = () => {};
+	const warn = () => {};
+
+	beforeEach(() => {
+		home = mkdtempSync(join(tmpdir(), "ks-restart-home-"));
+		dataDir = mkdtempSync(join(tmpdir(), "ks-restart-data-"));
+	});
+
+	afterEach(() => {
+		rmSync(home, { recursive: true, force: true });
+		rmSync(dataDir, { recursive: true, force: true });
+	});
+
+	it("kickstarts a registered launchd service instead of signalling the process", async () => {
+		const plistDir = join(home, "Library", "LaunchAgents");
+		mkdirSync(plistDir, { recursive: true });
+		writeFileSync(
+			join(plistDir, "com.knowledge-server.daemon.plist"),
+			"<plist/>",
+		);
+		const calls: Array<[string, string[]]> = [];
+		const signal = () => {
+			throw new Error("must not signal a service-managed daemon");
+		};
+
+		const outcome = await restartDaemonAfterUpdate({
+			platform: "darwin",
+			home,
+			uid: 501,
+			dataDir,
+			run: (cmd, args) => {
+				calls.push([cmd, args]);
+				return 0;
+			},
+			signal,
+			log,
+			warn,
+		});
+
+		expect(outcome).toBe("service-restarted");
+		expect(calls).toEqual([
+			["launchctl", ["kickstart", "-k", "gui/501/com.knowledge-server.daemon"]],
+		]);
+	});
+
+	it("restarts a systemd user unit on Linux and reports a failed restart", async () => {
+		const unitDir = join(home, ".config", "systemd", "user");
+		mkdirSync(unitDir, { recursive: true });
+		writeFileSync(join(unitDir, "knowledge-daemon.service"), "[Unit]");
+		const calls: string[][] = [];
+		const ok = await restartDaemonAfterUpdate({
+			platform: "linux",
+			home,
+			uid: 1000,
+			dataDir,
+			run: (cmd, args) => {
+				calls.push([cmd, ...args]);
+				return 0;
+			},
+			log,
+			warn,
+		});
+		expect(ok).toBe("service-restarted");
+		expect(calls).toEqual([
+			["systemctl", "--user", "restart", "knowledge-daemon"],
+		]);
+
+		const failed = await restartDaemonAfterUpdate({
+			platform: "linux",
+			home,
+			uid: 1000,
+			dataDir,
+			run: () => 1,
+			log,
+			warn,
+		});
+		expect(failed).toBe("failed");
+	});
+
+	it("stops a running auto-spawned daemon with SIGTERM and waits for it to exit", async () => {
+		const lock = tryAcquireProcessLock(daemonLockPath(dataDir));
+		expect(lock).not.toBeNull();
+		const signals: Array<[number, string]> = [];
+		let stopped = false;
+		try {
+			const outcome = await restartDaemonAfterUpdate({
+				platform: "darwin",
+				home,
+				uid: 501,
+				dataDir,
+				run: () => {
+					throw new Error("no service registered");
+				},
+				signal: (pid, sig) => {
+					signals.push([pid, sig]);
+					stopped = true;
+				},
+				alive: () => !stopped,
+				command: () => "/x/libexec/knowledge-daemon --interval=300",
+				sleep: noSleep,
+				log,
+				warn,
+			});
+			expect(outcome).toBe("daemon-stopped");
+			expect(signals).toEqual([[process.pid, "SIGTERM"]]);
+		} finally {
+			lock?.release();
+		}
+	});
+
+	it("does not signal a lock holder that is not a knowledge-daemon", async () => {
+		const lock = tryAcquireProcessLock(daemonLockPath(dataDir));
+		expect(lock).not.toBeNull();
+		const signals: Array<[number, string]> = [];
+		try {
+			const outcome = await restartDaemonAfterUpdate({
+				platform: "darwin",
+				home,
+				uid: 501,
+				dataDir,
+				run: () => {
+					throw new Error("no service registered");
+				},
+				command: () => "/usr/bin/some-other-tool --serve",
+				signal: (pid, sig) => {
+					signals.push([pid, sig]);
+				},
+				alive: () => true,
+				sleep: noSleep,
+				log,
+				warn,
+			});
+			expect(outcome).toBe("not-running");
+			expect(signals).toEqual([]);
+		} finally {
+			lock?.release();
+		}
+	});
+
+	it("reports not-running when no daemon holds the lock", async () => {
+		const outcome = await restartDaemonAfterUpdate({
+			platform: "linux",
+			home,
+			uid: 1000,
+			dataDir,
+			run: () => 1,
+			signal: () => {
+				throw new Error("nothing to signal");
+			},
+			log,
+			warn,
+		});
+		expect(outcome).toBe("not-running");
+	});
+});
+
+describe("runUpdate legacy extension adoption scan", () => {
+	it("scans the HOME it is given, not the account home", async () => {
+		const savedHome = process.env.HOME;
+		const savedExecPath = process.execPath;
+		const platform = detectPlatform();
+		const serverName = `knowledge-server-${platform}`;
+		const daemonName = `knowledge-daemon-${platform}`;
+		const serverBin = Buffer.from("NEW-SERVER");
+		const daemonBin = Buffer.from("NEW-DAEMON");
+		const fakeHome = join(root, "home");
+		const pluginDir = join(fakeHome, ".config", "opencode", "plugins");
+		mkdirSync(pluginDir, { recursive: true });
+		const legacy = join(pluginDir, "knowledge.ts");
+		writeFileSync(legacy, "EDITED-BY-USER");
+		const execPath = join(libexec, "knowledge-server");
+		writeFileSync(execPath, "OLD-SERVER");
+		const sums = [
+			`${sha256(serverBin)}  ${serverName}`,
+			`${sha256(daemonBin)}  ${daemonName}`,
+		].join("\n");
+		const routes = new Map<string, Buffer>([
+			[assetUrl(`SHA256SUMS-${platform}`), Buffer.from(`${sums}\n`)],
+			[assetUrl(`${serverName}.gz`), Bun.gzipSync(serverBin)],
+			[assetUrl(`${daemonName}.gz`), Bun.gzipSync(daemonBin)],
+		]);
+		const logs: string[] = [];
+		const spies = [
+			spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+				logs.push(args.map(String).join(" "));
+			}),
+			spyOn(console, "warn").mockImplementation(() => {}),
+			spyOn(console, "error").mockImplementation(() => {}),
+			spyOn(process, "exit").mockImplementation((() => {
+				throw new Error("process.exit called");
+			}) as never),
+		];
+		try {
+			process.env.HOME = fakeHome;
+			Object.defineProperty(process, "execPath", {
+				value: execPath,
+				configurable: true,
+				writable: true,
+			});
+			await runUpdate(["--version", VERSION], "v9.9.8", {
+				fetchFn: routedFetch(routes),
+				smoke: smokeAll,
+				restartDaemon: async () => {},
+			});
+		} finally {
+			for (const spy of spies) spy.mockRestore();
+			if (savedHome === undefined) Reflect.deleteProperty(process.env, "HOME");
+			else process.env.HOME = savedHome;
+			Object.defineProperty(process, "execPath", {
+				value: savedExecPath,
+				configurable: true,
+				writable: true,
+			});
+		}
+		expect(logs.some((l) => l.includes(legacy))).toBe(true);
 	});
 });

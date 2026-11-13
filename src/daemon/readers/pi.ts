@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { containsInjectedKnowledge } from "../../activation/format.js";
 import { config } from "../../config.js";
+import { stripInjectedKnowledge } from "../../consolidation/untrusted.js";
 import type {
 	Episode,
 	EpisodeMessage,
@@ -674,8 +674,9 @@ export class PiEpisodeReader implements IEpisodeReader {
 
 		if (!content) return null;
 
-		// Drop any message (any role) that carries our injected context, checked before truncation.
-		if (containsInjectedKnowledge(content)) return null;
+		// Remove our injected context (any role) before truncation; drop the message only if nothing else remains.
+		content = stripInjectedKnowledge(content);
+		if (!content.trim()) return null;
 
 		if (content.length > MAX_MESSAGE_CHARS) {
 			content = `${content.slice(0, MAX_MESSAGE_CHARS)}\n[...truncated]`;
