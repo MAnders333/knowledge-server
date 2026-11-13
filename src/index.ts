@@ -23,7 +23,7 @@ import { runStatus } from "./commands/status.js";
 import { runStop } from "./commands/stop.js";
 import { downloadAndInstallDaemon, runUpdate } from "./commands/update.js";
 import { resolveDataDir } from "./config-file.js";
-import { config, validateConfig } from "./config.js";
+import { config, spawnedDaemonIntervalArgs, validateConfig } from "./config.js";
 import { ConsolidationEngine } from "./consolidation/consolidate.js";
 import { runDecayTick, runPollTick } from "./consolidation/poll.js";
 import { PendingEpisodesReader } from "./consolidation/readers/pending.js";
@@ -531,11 +531,11 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		//
 		// Compiled install:   process.execPath = .../libexec/knowledge-server
 		//                     basename starts with "knowledge-server"
-		//                     cmd = [".../libexec/knowledge-daemon", "--interval=300"]
+		//                     cmd = [".../libexec/knowledge-daemon", ...interval args]
 		//
 		// Source install:     process.execPath = .../bun (basename starts with "bun")
 		//                     process.argv[1]  = .../repo/src/index.ts
-		//                     cmd = [".../bun", "run", ".../repo/src/daemon/index.ts", "--interval=300"]
+		//                     cmd = [".../bun", "run", ".../repo/src/daemon/index.ts", ...interval args]
 		//
 		// Uses basename(process.execPath).startsWith("bun") — same convention as
 		// resolveEnvFilePath() and setup-tool.ts for source-vs-compiled detection.
@@ -559,13 +559,11 @@ Run \`knowledge-server help-advanced\` for additional commands.
 			}
 		}
 
-		// The spawned daemon uploads every 5 minutes, unless DAEMON_UPLOAD_INTERVAL_SECONDS
-		// is set. The daemon's --interval flag would override that variable, so the
-		// flag is passed only when the variable is not a positive number.
-		const spawnedIntervalArgs =
-			Number.parseInt(process.env.DAEMON_UPLOAD_INTERVAL_SECONDS ?? "", 10) > 0
-				? []
-				: ["--interval=300"];
+		// Interval arguments for the spawned daemon (--interval=300 unless
+		// DAEMON_UPLOAD_INTERVAL_SECONDS is set); see spawnedDaemonIntervalArgs.
+		const spawnedIntervalArgs = spawnedDaemonIntervalArgs(
+			config.daemon.uploadIntervalSeconds,
+		);
 		const daemonCmd: string[] = isSourceRun
 			? process.argv[1]
 				? [

@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseEnv } from "../src/config";
+import { parseEnv, spawnedDaemonIntervalArgs } from "../src/config";
 import { homeDir } from "../src/home";
 
 /** A config file path that does not exist, so no data-dir override applies. */
@@ -379,5 +379,56 @@ describe("parseEnv — PID file after the data-dir move", () => {
 				customStateDbConfig(),
 			).config.legacyPidPath,
 		).toBeNull();
+	});
+});
+
+describe("daemon upload interval", () => {
+	it("reads DAEMON_UPLOAD_INTERVAL_SECONDS as a positive integer", () => {
+		expect(
+			parse({ DAEMON_UPLOAD_INTERVAL_SECONDS: "600" }).config.daemon
+				.uploadIntervalSeconds,
+		).toBe(600);
+		expect(parse({}).config.daemon.uploadIntervalSeconds).toBeNull();
+	});
+
+	it.each(["0", "-5", "soon"])("reports %s and treats it as unset", (value) => {
+		const parsed = parse({ DAEMON_UPLOAD_INTERVAL_SECONDS: value });
+		expect(parsed.issues).toHaveLength(1);
+		expect(parsed.issues[0]).toContain(
+			"DAEMON_UPLOAD_INTERVAL_SECONDS must be an integer ≥ 1",
+		);
+		expect(parsed.config.daemon.uploadIntervalSeconds).toBeNull();
+	});
+
+	it("passes --interval=300 to the spawned daemon only when the variable is unset", () => {
+		expect(spawnedDaemonIntervalArgs(null)).toEqual(["--interval=300"]);
+		expect(spawnedDaemonIntervalArgs(600)).toEqual([]);
+	});
+});
+
+describe("validateConfig — an invalid value fails startup", () => {
+	it("returns the issue from the process environment, as serve does", () => {
+		const configPath = new URL("../src/config.ts", import.meta.url).pathname;
+		const child = Bun.spawnSync({
+			cmd: [
+				process.execPath,
+				"-e",
+				`import { validateConfig } from ${JSON.stringify(configPath)}; console.log(JSON.stringify(validateConfig()));`,
+			],
+			env: {
+				PATH: process.env.PATH ?? "",
+				HOME: process.env.HOME ?? "",
+				RERANK_TIMEOUT_MS: "50",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(child.exitCode).toBe(0);
+		const errors: string[] = JSON.parse(
+			child.stdout.toString().trim().split("\n").pop() ?? "[]",
+		);
+		expect(errors).toContain(
+			'RERANK_TIMEOUT_MS must be an integer ≥ 100 (got "50").',
+		);
 	});
 });

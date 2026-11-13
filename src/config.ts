@@ -435,6 +435,13 @@ export function parseEnv(env: Env, configPath = DEFAULT_CONFIG_PATH) {
 		// Upper bound on each knowledge store's connect at startup (store-registry.ts).
 		storeInitTimeoutMs: r.int("STORE_INIT_TIMEOUT_MS", 10_000, 1),
 
+		// Upload interval of the daemon the server spawns (DAEMON_UPLOAD_INTERVAL_SECONDS),
+		// or null when unset. Read through spawnedDaemonIntervalArgs().
+		daemon: {
+			uploadIntervalSeconds:
+				r.optionalInt("DAEMON_UPLOAD_INTERVAL_SECONDS", 1) ?? null,
+		},
+
 		// Episode sources
 		// Note: daemonAutoSpawn is resolved by StoreRegistry via config-file.ts
 		// (config.jsonc "daemonAutoSpawn" field with DAEMON_AUTO_SPAWN env var override).
@@ -970,6 +977,18 @@ export function resolveEnvFilePath(): string {
 
 	// Nothing found — return the preferred new location as the hint.
 	return envFileCandidates().find((p) => existsSync(p)) ?? preferredEnvFile();
+}
+
+/**
+ * Arguments the server adds when it spawns the daemon. The spawned daemon uploads
+ * every 5 minutes unless DAEMON_UPLOAD_INTERVAL_SECONDS is set: the daemon's
+ * --interval flag would override that variable, so the flag is passed only when
+ * the variable is not set.
+ */
+export function spawnedDaemonIntervalArgs(
+	uploadIntervalSeconds: number | null,
+): string[] {
+	return uploadIntervalSeconds === null ? ["--interval=300"] : [];
 }
 
 /**
