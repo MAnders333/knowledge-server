@@ -52,13 +52,12 @@ function rerankerWith(
 ): RerankScorer {
 	return {
 		identity,
-		scoreBatch: mock(async (_q: string, docs: string[]) => ({
-			scores: docs.map((d) => {
+		scoreBatch: mock(async (_q: string, docs: string[]) =>
+			docs.map((d) => {
 				const key = Object.keys(scores).find((k) => d.includes(k));
 				return key === undefined ? 0 : (scores[key] ?? 0);
 			}),
-			scorer: identity,
-		})),
+		),
 	};
 }
 
@@ -456,7 +455,7 @@ describe("rerank call order, telemetry and health", () => {
 			identity: UNKNOWN_MODEL,
 			scoreBatch: mock(async (_q: string, docs: string[]) => {
 				seen.push(docs);
-				return { scores: docs.map(() => 0.9), scorer: UNKNOWN_MODEL };
+				return docs.map(() => 0.9);
 			}),
 		};
 		await engineFor(fx, scorer).activate(CUE);
@@ -465,17 +464,16 @@ describe("rerank call order, telemetry and health", () => {
 		expect(order).toEqual(["high", "mid", "low"]);
 	});
 
-	it("reports the model the scorer resolved, as provider/model", async () => {
+	it("reports the configured scorer as provider/model, not a model the endpoint names", async () => {
 		const scorer: RerankScorer = {
 			identity: { provider: "remote", model: "jev-1.14.0" },
-			scoreBatch: mock(async (_q: string, docs: string[]) => ({
-				scores: docs.map(() => 0.9),
-				scorer: { provider: "remote", model: "jev-1.14.1" },
-			})),
+			scoreBatch: mock(async (_q: string, docs: string[]) =>
+				docs.map(() => 0.9),
+			),
 		};
 		const result = await engineFor(fx, scorer).activate(CUE);
 		expect(result.telemetry?.gateMode).toBe("rerank");
-		expect(result.telemetry?.rerankModel).toBe("remote/jev-1.14.1");
+		expect(result.telemetry?.rerankModel).toBe("remote/jev-1.14.0");
 	});
 
 	it("reports no rerank model when the rerank stage did not score", async () => {

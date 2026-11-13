@@ -31,7 +31,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as ort from "onnxruntime-web";
-import { LocalReranker, type RerankBatch } from "../src/activation/rerank";
+import { LocalReranker } from "../src/activation/rerank";
 import { RerankSkippedError } from "../src/activation/rerank-remote";
 import { config } from "../src/config";
 
@@ -151,7 +151,7 @@ describe("LocalReranker (stub session)", () => {
 		installSyntheticModel();
 		const session = await useFakeSession();
 		const docs = [1, 2, 3, 4, 5].map((k) => words(k * 5, 100));
-		const { scores } = await synthReranker().scoreBatch(words(4), docs);
+		const scores = await synthReranker().scoreBatch(words(4), docs);
 
 		expect(session.runs).toHaveLength(5);
 		for (const run of session.runs) expect(run.input_ids.dims[0]).toBe(1);
@@ -203,7 +203,7 @@ describe("LocalReranker (stub session)", () => {
 		installSyntheticModel();
 		await useFakeSession();
 		const docs = [words(5, 0), words(20, 200), words(50, 400)];
-		const { scores } = await synthReranker().scoreBatch(words(600, 0), docs);
+		const scores = await synthReranker().scoreBatch(words(600, 0), docs);
 		expect(new Set(scores).size).toBe(3);
 	});
 
@@ -242,7 +242,7 @@ describe("LocalReranker (stub session)", () => {
 			);
 		}) as typeof fetch);
 
-		const { scores } = await synthReranker().scoreBatch(words(2), [words(2)]);
+		const scores = await synthReranker().scoreBatch(words(2), [words(2)]);
 
 		expect(scores).toHaveLength(1);
 		const urls = fetchSpy.mock.calls.map((c) => String(c[0]));
@@ -380,9 +380,7 @@ describe("LocalReranker (stub session)", () => {
 			"end 2",
 		]);
 		for (let i = 0; i < 3; i++) {
-			const { scores: value } = (
-				settled[i] as PromiseFulfilledResult<RerankBatch>
-			).value;
+			const value = (settled[i] as PromiseFulfilledResult<number[]>).value;
 			expect(value).toHaveLength(1);
 			expect(value[0]).toBeCloseTo(1 / (1 + Math.exp(-i / 10)), 5);
 		}
@@ -447,10 +445,10 @@ describe.skipIf(!HAS_REAL_MODEL)("LocalReranker (real cached model)", () => {
 		const iv = setInterval(() => ticks++, 10);
 		let scores: number[];
 		try {
-			({ scores } = await reranker.scoreBatch(
+			scores = await reranker.scoreBatch(
 				"how does the consolidation daemon handle pending episodes?",
 				SHORT_DOCS,
-			));
+			);
 		} finally {
 			clearInterval(iv);
 		}
@@ -496,7 +494,7 @@ describe.skipIf(!HAS_REAL_MODEL)("LocalReranker (real cached model)", () => {
 			"a longer note about pending episodes and how the daemon drains them into the store every night",
 			"unrelated text about gardening and tomatoes",
 		];
-		const { scores } = await reranker.scoreBatch(query, docs);
+		const scores = await reranker.scoreBatch(query, docs);
 		expect(new Set(scores.map((s) => s.toFixed(6))).size).toBe(3);
 	}, 30_000);
 });

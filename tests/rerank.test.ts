@@ -133,12 +133,11 @@ function makeInvertingScorer(): RerankScorer & { calls: string[][] } {
 		scoreBatch: mock((_query: string, documents: string[]) => {
 			calls.push(documents);
 			// Documents arrive as formatEmbeddingText: "[fact] <content> (topics: ...)"
-			return Promise.resolve({
-				scores: documents.map((d) =>
+			return Promise.resolve(
+				documents.map((d) =>
 					d.includes("dense low") ? 0.99 : d.includes("dense mid") ? 0.5 : 0.1,
 				),
-				scorer: { provider: "local", model: "test/inverting" },
-			});
+			);
 		}),
 	};
 }

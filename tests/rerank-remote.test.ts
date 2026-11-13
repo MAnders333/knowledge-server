@@ -3,11 +3,11 @@
  *
  * Covered:
  *   - Request shape: state (query tail, document heads), one Noul per id, id order
- *   - Happy path, resolved model, partial and malformed answers, out-of-range scores
- *   - Errors: 400 max_tokens_exceeded, 401, 422 (no echo of rejected input), 429 with
- *     and without Retry-After, 529, timeout
+ *   - Happy path, resolved model in the log, partial and malformed answers, out-of-range scores
+ *   - Errors: 400 max_tokens_exceeded (string and object detail), 401, 422 (no echo of
+ *     rejected input), 429 with and without Retry-After, 529, timeout
  *   - Circuit breaker: opens, skips, probe, recovery, failed probe restarts cooldown
- *   - Key scoping and configuration: createRemoteRerankerFromConfig, validateConfig
+ *   - Key scoping and configuration: createRemoteRerankerFromConfig, validateConfig gating
  */
 import {
 	afterAll,
@@ -33,6 +33,7 @@ import {
 	config,
 	validateConfig,
 } from "../src/config";
+import { logger } from "../src/logger";
 
 // Built at runtime so no secret-shaped literal lands in the source.
 const API_KEY = ["stub", "gateway", String(process.pid)].join("-");
@@ -112,19 +113,10 @@ function makeReranker(
 	});
 }
 
-/** Scores only, for tests that do not inspect the scorer identity. */
-async function scoresOf(
-	reranker: RemoteReranker,
-	query: string,
-	documents: string[],
-): Promise<number[]> {
-	return (await reranker.scoreBatch(query, documents)).scores;
-}
-
 describe("RemoteReranker request", () => {
 	it("posts to the System One route with the bearer key, once per call", async () => {
 		respond = () => systemOne({ D00: 0.12, D01: 0.91, D02: 0.5 });
-		const scores = await scoresOf(makeReranker(), "rotate the keys", [
+		const scores = await makeReranker().scoreBatch("rotate the keys", [
 			"alpha doc",
 			"beta doc",
 			"gamma doc",
@@ -138,7 +130,7 @@ describe("RemoteReranker request", () => {
 
 	it("sends the model, a state with the query and documents, and one noul question per id", async () => {
 		respond = () => systemOne({ D00: 0.5, D01: 0.5 });
-		await scoresOf(makeReranker(), "q", ["first", "second"]);
+		await makeReranker().scoreBatch("q", ["first", "second"]);
 
 		const body = requests[0].body;
 		expect(body.model).toBe(MODEL);
@@ -159,7 +151,7 @@ describe("RemoteReranker request", () => {
 
 	it("keeps candidate ids in the order given, so D00 is the first document", async () => {
 		respond = () => systemOne({ D00: 0.9, D01: 0.1 });
-		await scoresOf(makeReranker(), "q", ["best dense", "second dense"]);
+		await makeReranker().scoreBatch("q", ["best dense", "second dense"]);
 
 		expect(requests[0].body.state.documents.D00.text).toBe("best dense");
 		expect(requests[0].body.state.documents.D01.text).toBe("second dense");
@@ -167,8 +159,7 @@ describe("RemoteReranker request", () => {
 
 	it("sends the last maxQueryTokens x 4 characters of the query and the first maxDocTokens x 4 of each document", async () => {
 		respond = () => systemOne({ D00: 0.5 });
-		await scoresOf(
-			makeReranker({ maxDocTokens: 2, maxQueryTokens: 2 }),
+		await makeReranker({ maxDocTokens: 2, maxQueryTokens: 2 }).scoreBatch(
 			"0123456789abcdef",
 			["abcdefghijklmnop"],
 		);
@@ -181,8 +172,7 @@ describe("RemoteReranker request", () => {
 		respond = () => systemOne({ D00: 0.5 });
 		// Head cut: 8 characters would end on the high surrogate of the emoji, so 7 are sent.
 		// Tail cut: the last 8 characters start on the low surrogate, so the tail begins after it.
-		await scoresOf(
-			makeReranker({ maxDocTokens: 2, maxQueryTokens: 2 }),
+		await makeReranker({ maxDocTokens: 2, maxQueryTokens: 2 }).scoreBatch(
 			"abc😀defghij",
 			["aaaaaaa😀"],
 		);
@@ -192,7 +182,7 @@ describe("RemoteReranker request", () => {
 	});
 
 	it("returns no scores and makes no call for an empty candidate list", async () => {
-		expect(await scoresOf(makeReranker(), "q", [])).toEqual([]);
+		expect(await makeReranker().scoreBatch("q", [])).toEqual([]);
 		expect(requests).toHaveLength(0);
 	});
 
@@ -209,24 +199,24 @@ describe("RemoteReranker request", () => {
 });
 
 describe("RemoteReranker response", () => {
-	it("returns the scores in input order and the resolved model as the scorer", async () => {
-		respond = () => systemOne({ D00: 0.2, D01: 0.8 }, "jev-1.14.1");
-		const batch = await makeReranker().scoreBatch("q", ["a", "b"]);
-
-		expect(batch.scores).toEqual([0.2, 0.8]);
-		expect(batch.scorer).toEqual({ provider: "remote", model: "jev-1.14.1" });
-	});
-
-	it("falls back to the configured model when the response does not name one", async () => {
-		respond = () => systemOne({ D00: 0.4 }, null);
-		const batch = await makeReranker().scoreBatch("q", ["a"]);
-
-		expect(batch.scorer).toEqual({ provider: "remote", model: MODEL });
-	});
-
 	it("ignores extra noul answers for ids it did not ask about", async () => {
 		respond = () => systemOne({ D00: 0.3, D09: 0.99 });
-		expect(await scoresOf(makeReranker(), "q", ["a"])).toEqual([0.3]);
+		expect(await makeReranker().scoreBatch("q", ["a"])).toEqual([0.3]);
+	});
+
+	it("logs the model the endpoint resolved next to the configured one", async () => {
+		respond = () => systemOne({ D00: 0.2, D01: 0.8 }, "jev-1.14.1");
+		const log = spyOn(logger, "log").mockImplementation(() => {});
+		try {
+			expect(await makeReranker().scoreBatch("q", ["a", "b"])).toEqual([
+				0.2, 0.8,
+			]);
+			expect(log).toHaveBeenCalledWith(
+				expect.stringContaining("model=jev-1.14.0 resolved_model=jev-1.14.1"),
+			);
+		} finally {
+			log.mockRestore();
+		}
 	});
 
 	it("fails the whole batch when an id has no answer", async () => {
@@ -281,7 +271,7 @@ describe("RemoteReranker response", () => {
 });
 
 describe("RemoteReranker errors", () => {
-	it("reports a 400 max_tokens_exceeded with its detail, without making a retry", async () => {
+	it("reports a 400 max_tokens_exceeded with its string detail, without making a retry", async () => {
 		respond = () =>
 			Response.json(
 				{ detail: "max_tokens_exceeded: request is longer than the context" },
@@ -291,6 +281,29 @@ describe("RemoteReranker errors", () => {
 			"gateway returned HTTP 400: max_tokens_exceeded: request is longer than the context",
 		);
 		expect(requests).toHaveLength(1);
+	});
+
+	it("reduces an object detail to its error type or code, dropping free text", async () => {
+		respond = () =>
+			Response.json(
+				{
+					detail: {
+						type: "max_tokens_exceeded",
+						message: "SECRET-ECHO the request was 61234 tokens",
+					},
+				},
+				{ status: 400 },
+			);
+		const err = await makeReranker()
+			.scoreBatch("q", ["a"])
+			.catch((e: unknown) => e);
+
+		const message = (err as Error).message;
+		expect(message).toBe(
+			"gateway returned HTTP 400 (error: max_tokens_exceeded)",
+		);
+		expect(message).not.toContain("SECRET-ECHO");
+		expect(message).not.toContain("{");
 	});
 
 	it("keeps validation locations and messages from a 422, but not the rejected input they echo", async () => {
@@ -349,7 +362,7 @@ describe("RemoteReranker errors", () => {
 					})
 				: systemOne({ D00: 0.7 });
 		};
-		expect(await scoresOf(makeReranker(), "q", ["a"])).toEqual([0.7]);
+		expect(await makeReranker().scoreBatch("q", ["a"])).toEqual([0.7]);
 		expect(requests).toHaveLength(2);
 	});
 
@@ -440,9 +453,9 @@ describe("RemoteReranker circuit breaker", () => {
 
 		clock = 60_000;
 		respond = () => systemOne({ D00: 0.6 });
-		expect(await scoresOf(reranker, "q", ["a"])).toEqual([0.6]);
+		expect(await reranker.scoreBatch("q", ["a"])).toEqual([0.6]);
 		expect(requests).toHaveLength(4);
-		expect(await scoresOf(reranker, "q", ["a"])).toEqual([0.6]);
+		expect(await reranker.scoreBatch("q", ["a"])).toEqual([0.6]);
 		expect(requests).toHaveLength(5);
 	});
 
@@ -468,7 +481,7 @@ describe("RemoteReranker circuit breaker", () => {
 
 		clock = 120_000;
 		respond = () => systemOne({ D00: 0.2 });
-		expect(await scoresOf(reranker, "q", ["a"])).toEqual([0.2]);
+		expect(await reranker.scoreBatch("q", ["a"])).toEqual([0.2]);
 	});
 });
 
@@ -510,7 +523,7 @@ describe("createRemoteRerankerFromConfig", () => {
 		expect(reranker?.identity).toEqual({ provider: "remote", model: MODEL });
 
 		respond = () => systemOne({ D00: 0.33 });
-		expect(await scoresOf(reranker as RemoteReranker, "q", ["a"])).toEqual([
+		expect(await (reranker as RemoteReranker).scoreBatch("q", ["a"])).toEqual([
 			0.33,
 		]);
 		expect(requests[0].path).toBe(ROUTE);
@@ -519,6 +532,7 @@ describe("createRemoteRerankerFromConfig", () => {
 
 describe("validateConfig: remote reranker", () => {
 	const mutable = config.activation.rerank as unknown as {
+		enabled: boolean;
 		provider: "local" | "remote";
 		candidates: number;
 		maxDocTokens: number;
@@ -526,6 +540,7 @@ describe("validateConfig: remote reranker", () => {
 		remote: { url: string; apiKey: string };
 	};
 	const saved = {
+		enabled: mutable.enabled,
 		provider: mutable.provider,
 		candidates: mutable.candidates,
 		maxDocTokens: mutable.maxDocTokens,
@@ -533,6 +548,8 @@ describe("validateConfig: remote reranker", () => {
 		remote: { ...mutable.remote },
 	};
 	const envNames = [
+		"RERANK_ENABLED",
+		"RERANK_CANDIDATES",
 		"RERANK_REMOTE_URL",
 		"RERANK_REMOTE_API_KEY",
 		"LLM_BASE_ENDPOINT",
@@ -543,6 +560,7 @@ describe("validateConfig: remote reranker", () => {
 	beforeEach(() => {
 		for (const name of envNames) savedEnv[name] = process.env[name];
 		for (const name of envNames) delete process.env[name];
+		mutable.enabled = true;
 		mutable.provider = "remote";
 		mutable.candidates = 16;
 		mutable.maxDocTokens = 256;
@@ -572,22 +590,31 @@ describe("validateConfig: remote reranker", () => {
 		expect(remoteErrors()).toEqual([]);
 	});
 
-	it("needs a dedicated key for an explicit URL on another origin", () => {
-		process.env.LLM_BASE_ENDPOINT = "https://gateway.example.org";
-		process.env.RERANK_REMOTE_URL = "https://api.typesafe.ai/v1/systemone";
-		expect(remoteErrors()).toEqual([
-			expect.stringContaining("different origin than LLM_BASE_ENDPOINT"),
-		]);
-
-		process.env.RERANK_REMOTE_API_KEY = API_KEY;
-		expect(remoteErrors()).toEqual([]);
-	});
-
 	it("accepts a direct TypeSafe URL with its own key and no gateway at all", () => {
 		process.env.RERANK_REMOTE_URL = "https://api.typesafe.ai/v1/systemone";
 		process.env.RERANK_REMOTE_API_KEY = API_KEY;
 		mutable.remote.url = "https://api.typesafe.ai/v1/systemone";
 		mutable.remote.apiKey = API_KEY;
+		expect(remoteErrors()).toEqual([]);
+	});
+
+	it("does not check remote settings when the endpoint key is missing, so the reranker falls back to local", () => {
+		// An explicit URL on another origin without RERANK_REMOTE_API_KEY resolves to
+		// no key (LLM_API_KEY never leaves its origin): the remote reranker is inactive.
+		process.env.LLM_BASE_ENDPOINT = "https://gateway.example.org";
+		process.env.LLM_API_KEY = API_KEY;
+		process.env.RERANK_REMOTE_URL = "https://api.typesafe.ai/v1/systemone";
+		mutable.remote.url = "https://api.typesafe.ai/v1/systemone";
+		mutable.remote.apiKey = "";
+		mutable.candidates = REMOTE_RERANK_MAX_CANDIDATES + 10;
+		expect(remoteErrors()).toEqual([]);
+	});
+
+	it("does not check remote settings when reranking is disabled", () => {
+		process.env.RERANK_ENABLED = "false";
+		process.env.RERANK_CANDIDATES = "50";
+		mutable.enabled = false;
+		mutable.candidates = 50;
 		expect(remoteErrors()).toEqual([]);
 	});
 
