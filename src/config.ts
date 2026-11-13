@@ -93,6 +93,16 @@ export function resolveScopedApiKey(env: {
  */
 const DEFAULT_RERANK_REMOTE_MODEL = "jev-1.14.0";
 
+/** Candidate pool when RERANK_CANDIDATES is unset and the remote reranker is requested. */
+const DEFAULT_REMOTE_RERANK_CANDIDATES = 30;
+
+/** RERANK_PROVIDER as the server runs it: "remote" only when set explicitly. */
+function rerankProviderFromEnv(): "local" | "remote" {
+	return process.env.RERANK_PROVIDER?.trim().toLowerCase() === "remote"
+		? "remote"
+		: "local";
+}
+
 /**
  * Candidates one remote rerank call carries. The remote reranker never splits the
  * pool, so a larger RERANK_CANDIDATES is a startup error (see validateConfig).
@@ -635,10 +645,7 @@ export const config = {
 			// Remote sends the query tail and candidate text off-machine on every
 			// activation, so it runs only when set explicitly. See rerank-remote.ts.
 			// Unknown values are reported by validateConfig() and run as local.
-			provider:
-				process.env.RERANK_PROVIDER?.trim().toLowerCase() === "remote"
-					? "remote"
-					: "local",
+			provider: rerankProviderFromEnv(),
 			// Hugging Face model ID. Default is the classic English MS MARCO
 			// cross-encoder (int8 ONNX, ~23MB, ~40ms/pair on Apple Silicon WASM).
 			// For multilingual knowledge bases use a multilingual ONNX
@@ -650,9 +657,16 @@ export const config = {
 				join(homedir(), ".local", "share", "knowledge-server", "models"),
 			// Candidate pool size fetched by dense retrieval when reranking is
 			// active (overfetch). Must be >= activation.maxResults to be useful.
-			// 16 keeps a pool of 256-token documents inside the timeout on the
-			// hardware measured for this default; raise it where the CPU has room.
-			candidates: parseIntEnv(process.env.RERANK_CANDIDATES, 16, 1),
+			// Local: 16 keeps a pool of 256-token documents inside the timeout on the
+			// hardware measured for this default. Remote: one call carries the whole
+			// pool, and 30 was the benchmark's quality point (40 is allowed; see README).
+			candidates: parseIntEnv(
+				process.env.RERANK_CANDIDATES,
+				rerankProviderFromEnv() === "remote"
+					? DEFAULT_REMOTE_RERANK_CANDIDATES
+					: 16,
+				1,
+			),
 			// Hard timeout per local rerank call; on expiry the result is abandoned
 			// and dense-only ordering is used. Kept well under the 5 s plugin
 			// budget, which also covers the embedding call and store reads.
