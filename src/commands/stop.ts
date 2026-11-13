@@ -1,73 +1,100 @@
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import {
+	type ProcessTable,
+	classifyPidFile,
+	isServerCommand,
+	systemProcessTable,
+} from "../process-identity.js";
 import { errCode } from "../utils.js";
 
 /**
  * `knowledge-server stop`
  *
  * Reads the PID file, sends SIGTERM to the running server, waits for it to
- * exit, then removes the PID file. Handles stale PID files (process already
- * dead) gracefully — removes the file and exits with a clear message.
+ * exit, then removes the PID file. The PID is signalled only when its command
+ * line still shows a knowledge-server: a stale file whose PID was reused by
+ * another program is removed, never signalled.
  *
- * Exit codes:
+ * Returns the exit code:
  *   0 — server stopped (or was not running)
- *   1 — unexpected error (permission denied, etc.)
+ *   1 — unexpected error, or the PID could not be verified (not signalled)
  */
-export async function runStop(pidPath: string): Promise<void> {
+
+export interface StopDeps {
+	table: ProcessTable;
+	signal: (pid: number, sig: NodeJS.Signals) => void;
+	sleep: (ms: number) => Promise<void>;
+}
+
+const defaultDeps: StopDeps = {
+	table: systemProcessTable,
+	signal: (pid, sig) => process.kill(pid, sig),
+	sleep: (ms) => {
+		const { promise, resolve } = Promise.withResolvers<void>();
+		setTimeout(resolve, ms);
+		return promise;
+	},
+};
+
+export async function runStop(
+	pidPath: string,
+	deps: StopDeps = defaultDeps,
+): Promise<number> {
 	if (!pidPath) {
 		console.error(
 			"PID file path is not configured (KNOWLEDGE_PID_PATH is empty). Cannot stop server.",
 		);
-		process.exit(1);
+		return 1;
 	}
 
 	if (!existsSync(pidPath)) {
 		console.log("Knowledge server is not running (no PID file found).");
-		return;
+		return 0;
 	}
 
-	const raw = readFileSync(pidPath, "utf8").trim();
-	const pid = Number.parseInt(raw, 10);
+	const raw = readFileSync(pidPath, "utf8");
+	const state = classifyPidFile(raw, deps.table, isServerCommand);
 
-	if (Number.isNaN(pid) || pid <= 0) {
-		console.error(`PID file contains invalid value: "${raw}". Removing it.`);
-		unlinkSync(pidPath);
-		process.exit(1);
-	}
-
-	// Check if the process is actually alive before signalling.
-	const isAlive = (() => {
-		try {
-			process.kill(pid, 0);
-			return true;
-		} catch (e) {
-			// EPERM = process exists but we can't signal it (still alive).
-			// ESRCH = no such process (truly dead).
-			return errCode(e) === "EPERM";
-		}
-	})();
-
-	if (!isAlive) {
-		console.log(
-			`Knowledge server (PID ${pid}) is not running — removing stale PID file.`,
+	if (state.kind === "invalid") {
+		console.error(
+			`PID file contains invalid value: "${raw.trim()}". Removing it.`,
 		);
 		unlinkSync(pidPath);
-		return;
+		return 1;
+	}
+
+	if (state.kind === "stale") {
+		console.log(
+			state.reason === "dead"
+				? `Knowledge server (PID ${state.pid}) is not running — removing stale PID file.`
+				: `PID ${state.pid} in the PID file is not a knowledge-server process — removing stale PID file.`,
+		);
+		unlinkSync(pidPath);
+		return 0;
+	}
+
+	const pid = state.pid;
+	if (state.kind === "unverified") {
+		console.error(
+			`Cannot verify that PID ${pid} is the knowledge server (its command line is unreadable), so it was not signalled. ` +
+				`If it is the server, stop it manually: kill ${pid}. Otherwise remove ${pidPath}.`,
+		);
+		return 1;
 	}
 
 	// Send SIGTERM and wait for the process to exit.
 	console.log(`Stopping knowledge server (PID ${pid})...`);
 	try {
-		process.kill(pid, "SIGTERM");
+		deps.signal(pid, "SIGTERM");
 	} catch (err: unknown) {
-		const code = errCode(err);
-		if (code === "ESRCH") {
+		if (errCode(err) === "ESRCH") {
 			// Raced — process exited between the liveness check and the kill.
 			console.log("Server already stopped.");
 			if (existsSync(pidPath)) unlinkSync(pidPath);
-			return;
+			return 0;
 		}
 		console.error(`Failed to send SIGTERM to PID ${pid}: ${err}`);
-		process.exit(1);
+		return 1;
 	}
 
 	// Poll until the process is gone, up to STOP_TIMEOUT_MS.
@@ -86,29 +113,26 @@ export async function runStop(pidPath: string): Promise<void> {
 	let noticePrinted = false;
 
 	while (Date.now() < deadline) {
-		await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-		try {
-			process.kill(pid, 0); // still alive — keep waiting
+		await deps.sleep(POLL_INTERVAL_MS);
+		if (deps.table.alive(pid)) {
 			if (!noticePrinted && Date.now() - start >= NOTICE_MS) {
 				console.log(
 					`Server is taking a moment to shut down — draining any in-flight work (up to ${Math.round(STOP_TIMEOUT_MS / 1000)}s)...`,
 				);
 				noticePrinted = true;
 			}
-		} catch (e) {
-			if (errCode(e) === "EPERM") continue; // alive, no permission
-			// ESRCH or other — process is gone.
-			console.log("Knowledge server stopped.");
-			// The server cleans up its own PID file on graceful shutdown.
-			// If it crashed before doing so, clean up here.
-			if (existsSync(pidPath)) unlinkSync(pidPath);
-			return;
+			continue;
 		}
+		console.log("Knowledge server stopped.");
+		// The server cleans up its own PID file on graceful shutdown.
+		// If it crashed before doing so, clean up here.
+		if (existsSync(pidPath)) unlinkSync(pidPath);
+		return 0;
 	}
 
 	console.error(
 		`Server (PID ${pid}) did not exit within ${STOP_TIMEOUT_MS / 1000}s after SIGTERM.`,
 	);
 	console.error(`Try: kill -9 ${pid}`);
-	process.exit(1);
+	return 1;
 }

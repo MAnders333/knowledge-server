@@ -32,6 +32,11 @@ import { StoreRegistry } from "./db/store-registry.js";
 import { logger, parseLogLevel } from "./logger.js";
 import { main as mcpMain } from "./mcp/index.js";
 import { tightenOwnedPrivatePaths } from "./private-files.js";
+import {
+	classifyPidFile,
+	isServerCommand,
+	systemProcessTable,
+} from "./process-identity.js";
 import { lockHolder } from "./process-lock.js";
 import {
 	consolidationLockPath,
@@ -108,8 +113,7 @@ async function main() {
 
 	// `knowledge-server stop`
 	if (subcommand === "stop") {
-		await runStop(config.pidPath);
-		process.exit(0);
+		process.exit(await runStop(config.pidPath));
 	}
 
 	// `knowledge-server status`
@@ -353,35 +357,25 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	const adminToken = config.adminToken ?? randomBytes(24).toString("hex");
 
 	// PID file guard — check before serve() so we never bind the port if another
-	// instance is already running. If the file exists but the PID is dead (crash
-	// without cleanup), treat it as stale and continue. The actual write happens
-	// after serve() succeeds so the file only exists when a port is truly bound.
+	// instance is already running. A PID file counts as a live server only when its
+	// PID still runs knowledge-server; a PID that is dead, reused by another program,
+	// or unreadable is stale and replaced. The actual write happens after serve()
+	// succeeds so the file only exists when a port is truly bound.
 	if (config.pidPath && existsSync(config.pidPath)) {
-		const stalePid = Number.parseInt(
-			readFileSync(config.pidPath, "utf8").trim(),
-			10,
+		const state = classifyPidFile(
+			readFileSync(config.pidPath, "utf8"),
+			systemProcessTable,
+			isServerCommand,
 		);
-		const isAlive =
-			!Number.isNaN(stalePid) &&
-			(() => {
-				try {
-					process.kill(stalePid, 0);
-					return true;
-				} catch (e) {
-					// EPERM = process exists but we can't signal it (still alive).
-					// ESRCH = no such process (truly dead).
-					return errCode(e) === "EPERM";
-				}
-			})();
-		if (isAlive) {
+		if (state.kind === "running") {
 			logger.error(
-				`Server already running at PID ${stalePid}. Run \`knowledge-server stop\` first.`,
+				`Server already running at PID ${state.pid}. Run \`knowledge-server stop\` first.`,
 			);
 			process.exit(1);
 		}
 		// Stale file — remove and continue. Wrapped in try/catch to handle
-		// a TOCTOU race where two concurrent starts both pass the liveness
-		// check and the second unlinkSync hits ENOENT.
+		// a TOCTOU race where two concurrent starts both pass the check and the
+		// second unlinkSync hits ENOENT.
 		try {
 			unlinkSync(config.pidPath);
 		} catch (e) {

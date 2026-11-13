@@ -1,7 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { readDaemonStatus } from "../daemon/status.js";
+import { isDaemonCommand, readCommand } from "../process-identity.js";
 import { isProcessAlive, lockHolder } from "../process-lock.js";
 import { daemonLockPath, daemonStatusPath } from "../runtime-files.js";
 
@@ -10,8 +11,6 @@ const SYSTEMD_UNIT = "knowledge-daemon";
 /** How long a stopped daemon may take to exit before it is reported as still running. */
 const STOP_WAIT_MS = 10_000;
 const STOP_POLL_MS = 100;
-/** Source installs run the daemon as `bun run <repo>/src/daemon/index.ts`. */
-const SOURCE_DAEMON_ENTRY = "/src/daemon/index.ts";
 
 export type DaemonRestartOutcome =
 	| "service-restarted"
@@ -38,29 +37,6 @@ export interface DaemonRestartEnv {
 
 function defaultRun(cmd: string, args: string[]): number | null {
 	return spawnSync(cmd, args, { stdio: "ignore" }).status;
-}
-
-function defaultCommand(pid: number): string | null {
-	const result = spawnSync("ps", ["-p", String(pid), "-o", "command="], {
-		encoding: "utf8",
-		stdio: ["ignore", "pipe", "ignore"],
-	});
-	const out = result.status === 0 ? result.stdout.trim() : "";
-	return out === "" ? null : out;
-}
-
-/**
- * True when a command line is a knowledge-daemon: the compiled `knowledge-daemon`
- * binary, or a `bun ... src/daemon/index.ts` source run.
- */
-function isDaemonCommand(command: string): boolean {
-	const tokens = command.trim().split(/\s+/);
-	const program = basename(tokens[0] ?? "");
-	if (program === SYSTEMD_UNIT) return true;
-	return (
-		program.startsWith("bun") &&
-		tokens.some((t) => t.endsWith(SOURCE_DAEMON_ENTRY))
-	);
 }
 
 /**
@@ -123,7 +99,7 @@ async function stopRunningDaemon(
 	env: DaemonRestartEnv,
 ): Promise<DaemonRestartOutcome> {
 	const alive = env.alive ?? isProcessAlive;
-	const command = env.command ?? defaultCommand;
+	const command = env.command ?? readCommand;
 	// A PID is signalled only when it still runs a knowledge-daemon. Lock and status
 	// files outlive their daemon, and the OS reuses PIDs.
 	const isDaemon = (pid: number): boolean => {
