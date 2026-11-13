@@ -23,7 +23,7 @@ Authorization: Bearer $TOKEN
 EOF
 ```
 
-If the shell was reset, run the load block again before the calls below. Flagging an entry (the `knowledge_flag` MCP tool) needs the same auth as reads: with the default random per-start token it needs no token; with a stable `KNOWLEDGE_ADMIN_TOKEN` the server requires it on every route, so the MCP process must have that variable set. Only the resolve, PATCH and DELETE calls below change the knowledge base.
+If the shell was reset, run the load block again before the calls below. Flagging an entry (the `knowledge_flag` MCP tool) is read-level and needs no admin token; the MCP process needs `KNOWLEDGE_ADMIN_TOKEN` set only when the server runs with `KNOWLEDGE_PROTECT_READS=true`. Only the resolve, PATCH and DELETE calls below change the knowledge base.
 
 ## Step 2 — Work through each section
 

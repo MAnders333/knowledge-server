@@ -27,7 +27,7 @@
  *   Set KNOWLEDGE_SERVER_URL, or KNOWLEDGE_PORT / "port" in
  *   ~/.config/knowledge-server/config.jsonc (default: 3179)
  *   KNOWLEDGE_ADMIN_TOKEN is sent as a Bearer on read calls, only when it is set
- *   (a server with a stable token requires it)
+ *   (with KNOWLEDGE_PROTECT_READS=true the server requires it on every route except /health)
  *
  * Design principle: NEVER throw. All errors are caught and silently swallowed.
  * A broken knowledge extension must never affect pi's core functionality.
@@ -94,8 +94,8 @@ const KNOWLEDGE_SERVER_URL_SAFE =
 		_parsedUrl.hostname === "[::1]");
 
 /**
- * Headers for read calls. A stable KNOWLEDGE_ADMIN_TOKEN makes the server require it
- * on every route except /health, so it is sent when set and never otherwise.
+ * Headers for read calls. The server needs the token on reads only with
+ * KNOWLEDGE_PROTECT_READS=true, so it is sent when set and never otherwise.
  */
 const AUTH_HEADERS: Record<string, string> = process.env.KNOWLEDGE_ADMIN_TOKEN
 	? { Authorization: `Bearer ${process.env.KNOWLEDGE_ADMIN_TOKEN}` }

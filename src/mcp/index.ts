@@ -78,9 +78,9 @@ function serverBaseUrl(): string {
 }
 
 /**
- * Headers for read calls. A stable KNOWLEDGE_ADMIN_TOKEN makes the server require it
- * on every route except /health, so it is sent when set and never otherwise. Flagging
- * is read-level too and sends the same header.
+ * Headers for read calls. The server needs the token on reads only with
+ * KNOWLEDGE_PROTECT_READS=true (it is ignored there otherwise). It is sent when set
+ * and never otherwise. Flagging is read-level too and sends the same header.
  */
 function readCallHeaders(adminToken: string | null): Record<string, string> {
 	return adminToken ? { Authorization: `Bearer ${adminToken}` } : {};

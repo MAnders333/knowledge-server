@@ -67,6 +67,7 @@ Releases published before plugin and command files were checksummed (their `SHA2
 - **Upgrade the server and the daemon together.** The state DB schema is now v6, and older builds refuse a v6 state DB. Upgrade the server and the daemon on every machine, and every machine that shares a Postgres state DB, at the same time. Rolling back with the `*.prev` binaries works only until a v6 state DB is written; after that, roll forward.
 - **Stricter settings.** A value that used to be clamped or ignored now stops startup and names the variable, for example `LOG_MAX_BYTES=-1`, `LLM_MAX_RETRIES=-1`, `LLM_TIMEOUT_*_MS=0`, `RERANK_TIMEOUT_MS=50`, `POSTGRES_POOL_MAX=0` or `DAEMON_UPLOAD_INTERVAL_SECONDS=0`. Empty values count as unset. `ACTIVATION_PRECISION_GATE`, `ACTIVATION_STRENGTH_DAMPENING` and `CONTRADICTION_CONFLICTS_ONLY` accept true/false, on/off, yes/no or 1/0; any other spelling stops startup. Before this change, any value other than `off` enabled the precision gate.
 - **Codex hooks need trust again.** After `knowledge-server setup-tool codex` is re-run, open Codex, run `/hooks` and trust the knowledge-server hook again.
+- **`/mcp` and read protection.** `/mcp` requires the stable `KNOWLEDGE_ADMIN_TOKEN` whenever one is set, as on earlier releases. Other reads (`/activate`, `/entries`, `/status`, the hooks) are open to local clients unless you set `KNOWLEDGE_PROTECT_READS=true`, which requires the token on every route except `/health`. With it set, plugins, hooks and any other client need the token in their own environment, not only in `.env`.
 
 ### From source
 
@@ -220,7 +221,7 @@ The main HTTP server. Drains `pending_episodes` via the consolidation engine, ex
 
 Hono-based HTTP server. Binds to `127.0.0.1:3179` by default.
 
-The Auth column: `—` is open under the Host and Origin checks, unless `KNOWLEDGE_PROTECT_READS=true` with a stable `KNOWLEDGE_ADMIN_TOKEN` is set, which then requires the Bearer token on every route except `/health`. `admin` needs the admin token in every mode (the random per-start token, or the stable one). `read` is read-level: open like `—`, and with `KNOWLEDGE_PROTECT_READS` it takes the same Bearer token. `/health` is always open. Plugins and the Claude Code and Codex hooks read the token only from their own process environment, so with `KNOWLEDGE_PROTECT_READS` it must be exported there, not only written to `.env`.
+The Auth column: `—` is open under the Host and Origin checks, unless `KNOWLEDGE_PROTECT_READS=true` with a stable `KNOWLEDGE_ADMIN_TOKEN` is set, which then requires the Bearer token on every route except `/health`. `stable token` (`/mcp`) needs it whenever a stable `KNOWLEDGE_ADMIN_TOKEN` is set, with or without `KNOWLEDGE_PROTECT_READS`. `admin` needs the admin token in every mode (the random per-start token, or the stable one). `read` is read-level: open like `—`, and with `KNOWLEDGE_PROTECT_READS` it takes the same Bearer token. `/health` is always open. Plugins and the Claude Code and Codex hooks read the token only from their own process environment, so with `KNOWLEDGE_PROTECT_READS` it must be exported there, not only written to `.env`.
 
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
@@ -237,7 +238,7 @@ The Auth column: `—` is open under the Host and Origin checks, unless `KNOWLED
 | `/review` | GET | — | Surface conflicted, stale, and team-relevant entries |
 | `/hooks/claude-code/user-prompt` | POST | — | `UserPromptSubmit` hook endpoint for Claude Code; Codex CLI uses it too, with `?client=codex` |
 | `/entries/:id/flag` | POST | read | Queue an active entry for review (status `conflicted`); accepts the short id shown in injected lines. Reversible, so it needs no admin token of its own |
-| `/mcp` | ALL | — | MCP streamable-http endpoint |
+| `/mcp` | ALL | stable token | MCP streamable-http endpoint |
 
 ### MCP server
 
@@ -247,7 +248,7 @@ Two connection modes:
 
 **stdio** — `knowledge-server mcp` starts a lightweight stdio proxy. Registered automatically by `setup-tool`. Only `KNOWLEDGE_HOST`/`KNOWLEDGE_PORT` needed; no LLM credentials required.
 
-**streamable-http** — `ALL /mcp` on the main HTTP server. MCP clients connect directly at `http://127.0.0.1:3179/mcp`. With `KNOWLEDGE_PROTECT_READS=true` and a stable `KNOWLEDGE_ADMIN_TOKEN`, requires `Authorization: Bearer <token>`. The stdio proxy loads `.env` itself; a client that connects directly needs the token in its own environment.
+**streamable-http** — `ALL /mcp` on the main HTTP server. MCP clients connect directly at `http://127.0.0.1:3179/mcp`. Whenever a stable `KNOWLEDGE_ADMIN_TOKEN` is set, `/mcp` requires `Authorization: Bearer <token>`, with or without `KNOWLEDGE_PROTECT_READS`. The stdio proxy loads `.env` itself and sends the token on its calls; a client that connects directly needs the token in its own environment.
 
 ### Consolidation engine (`src/consolidation/`)
 
@@ -449,7 +450,7 @@ Credentials and paths stay in `.env`:
 
 | Variable | Default | Description |
 |---|---|---|
-| `KNOWLEDGE_ADMIN_TOKEN` | *(random per process)* | Stable admin token, for service or scripted use (`openssl rand -hex 24`; the template placeholder `your-stable-token-here` is rejected). It guards every mutation route. A value under 32 characters, or with fewer than 12 distinct characters, logs a startup warning; the value is never printed |
+| `KNOWLEDGE_ADMIN_TOKEN` | *(random per process)* | Stable admin token, for service or scripted use (`openssl rand -hex 24`). At least 16 characters: startup refuses a shorter value, and so does the template placeholder `your-stable-token-here`. Under 32 characters, or with fewer than 12 distinct characters, logs a warning; the value is never printed. It guards every mutation route and `/mcp` |
 | `KNOWLEDGE_PROTECT_READS` | `false` | With a stable `KNOWLEDGE_ADMIN_TOKEN`, require the Bearer token on every route except `/health`, reads included. Needs the stable token (startup error otherwise). Plugins and the Claude Code and Codex hooks read the token only from their own process environment, so export it there too; a token only in `.env` does not reach them |
 | `KNOWLEDGE_ALLOWED_HOSTS` | *(empty)* | Extra `Host` names the API accepts, comma-separated (`name` or `name:port`). `localhost`, `127.0.0.1`, `[::1]` and the bind host are always accepted. Needed when a reverse proxy forwards a different hostname. |
 | `POSTGRES_POOL_MAX` | `10` | Connections per Postgres pool: each Postgres knowledge store and the state DB |
@@ -734,7 +735,7 @@ You work across multiple machines and want a single knowledge base that spans al
 
 **Host and Origin checks** — Every route, including `/mcp`, rejects a `Host` header that does not name `localhost`, `127.0.0.1`, `[::1]`, the bind host, or an entry in `KNOWLEDGE_ALLOWED_HOSTS` (403). A request carrying an `Origin` header must also name an allowed host over `http` or `https`, so cross-origin browser pages are refused. Clients that send no `Origin` (curl, the hook, MCP stdio proxy) are unaffected.
 
-**Admin token** — Mutation endpoints (`/consolidate`, `/reinitialize`, and `PATCH`, `resolve` and `DELETE` on entries) always require an admin token. A random token is generated at startup. It is printed only when the server's stdout is a terminal; under launchd, systemd or redirected output it is never printed and never written to `server.log`. For service or scripted use, set `KNOWLEDGE_ADMIN_TOKEN` (`openssl rand -hex 24`) for a stable token across restarts. Reads (`/activate`, `/entries`, `/status`, the hooks and `/mcp`) stay open to loopback clients that pass the Host and Origin checks, unless `KNOWLEDGE_PROTECT_READS=true`, which requires the stable token on every route except `/health`. Failed attempts against a stable token are throttled per client address (10 a minute, then 429 with `Retry-After`). The throttle only bounds noise and CPU; it does not make guessing hard. The protection is the token's entropy, so a short or low-variety value is a weak one: startup warns about a value under 32 characters or with fewer than 12 distinct characters, without printing it. A correct token is never refused. `PATCH`, `resolve` and `DELETE` act only on writable stores; an entry that lives only in a read-only store returns 403.
+**Admin token** — Mutation endpoints (`/consolidate`, `/reinitialize`, and `PATCH`, `resolve` and `DELETE` on entries) always require an admin token. A random token is generated at startup. It is printed only when the server's stdout is a terminal; under launchd, systemd or redirected output it is never printed and never written to `server.log`. For service or scripted use, set `KNOWLEDGE_ADMIN_TOKEN` (`openssl rand -hex 24`) for a stable token across restarts. A stable token also guards `/mcp`. Other reads (`/activate`, `/entries`, `/status` and the hooks) stay open to loopback clients that pass the Host and Origin checks, unless `KNOWLEDGE_PROTECT_READS=true`, which requires the stable token on every route except `/health`. Failed attempts against a stable token are throttled per client address (10 a minute, then 429 with `Retry-After`). The throttle only bounds noise and CPU; it does not make guessing hard. The protection is the token's entropy. A token shorter than 16 characters is refused at startup; one under 32 characters, or with fewer than 12 distinct characters, logs a warning without printing the value. A correct token is never refused. `PATCH`, `resolve` and `DELETE` act only on writable stores; an entry that lives only in a read-only store returns 403.
 
 **Input limits** — Request bodies are capped at 1 MB. `/activate`, the MCP `activate` tool and the Claude Code hook keep at most 12 cues: duplicates are removed first, then the first 6 and the last 6 are kept, and the last is the full message. Each query is truncated to head and tail (20k characters for the full query, 2k per segment), and `limit` is clamped to 1–50. Read endpoints still count each returned entry as an injection (`injection_count`); gating that is tracked separately.
 
