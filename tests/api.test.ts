@@ -6,6 +6,7 @@ import { join } from "node:path";
 import pkg from "../package.json" with { type: "json" };
 import { ActivationEngine } from "../src/activation/activate";
 import { createApp } from "../src/api/server";
+import { config } from "../src/config";
 import type { ConsolidationEngine } from "../src/consolidation/consolidate";
 import type { KnowledgeDB } from "../src/db/sqlite/index";
 import { KnowledgeDB as KnowledgeDBImpl } from "../src/db/sqlite/index";
@@ -762,5 +763,159 @@ describe("HTTP API", () => {
 		} finally {
 			await db2?.close();
 		}
+	});
+	// -- Revival guards (issue #103) --
+
+	const revivalEntry = (
+		id: string,
+		status: "active" | "conflicted" | "superseded" | "archived" | "tombstoned",
+		embedding?: number[],
+	) => ({
+		id,
+		type: "fact" as const,
+		content: `Entry ${id}`,
+		topics: [],
+		confidence: 0.8,
+		source: "test",
+		status,
+		strength: 1.0,
+		createdAt: Date.now(),
+		updatedAt: Date.now(),
+		lastAccessedAt: Date.now(),
+		accessCount: 0,
+		observationCount: 1,
+		supersededBy: null,
+		derivedFrom: [],
+		embedding,
+	});
+
+	const contradicts = (id: string, sourceId: string, targetId: string) => ({
+		id,
+		sourceId,
+		targetId,
+		type: "contradicts" as const,
+		createdAt: Date.now(),
+	});
+
+	it("POST /entries/:id/resolve delete does not revive a counterpart that decay archived", async () => {
+		await db.insertEntry(revivalEntry("res-archived-b", "archived"));
+		await db.insertEntry(revivalEntry("res-conflicted-a", "conflicted"));
+		await db.insertRelation(
+			contradicts("res-rel-1", "res-conflicted-a", "res-archived-b"),
+		);
+
+		const res = await app.request("/entries/res-conflicted-a/resolve", {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({ resolution: "delete" }),
+		});
+		expect(res.status).toBe(200);
+		const data = await res.json();
+		expect(data.restoredCounterpart).toBeNull();
+		expect((await db.getEntry("res-archived-b"))?.status).toBe("archived");
+	});
+
+	it("POST /entries/:id/resolve delete restores a counterpart that is still conflicted", async () => {
+		await db.insertEntry(revivalEntry("res-conflicted-b", "conflicted"));
+		await db.insertEntry(revivalEntry("res-conflicted-c", "conflicted"));
+		await db.insertRelation(
+			contradicts("res-rel-2", "res-conflicted-c", "res-conflicted-b"),
+		);
+
+		const res = await app.request("/entries/res-conflicted-c/resolve", {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({ resolution: "delete" }),
+		});
+		expect(res.status).toBe(200);
+		const data = await res.json();
+		expect(data.restoredCounterpart).toBe("res-conflicted-b");
+		expect((await db.getEntry("res-conflicted-b"))?.status).toBe("active");
+	});
+
+	it("DELETE /entries/:id does not revive a counterpart that decay archived", async () => {
+		await db.insertEntry(revivalEntry("del-archived-b", "archived"));
+		await db.insertEntry(revivalEntry("del-conflicted-a", "conflicted"));
+		await db.insertRelation(
+			contradicts("del-rel-1", "del-conflicted-a", "del-archived-b"),
+		);
+
+		const res = await app.request("/entries/del-conflicted-a", {
+			method: "DELETE",
+			headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
+		});
+		expect(res.status).toBe(200);
+		const data = await res.json();
+		expect(data.restoredCounterpart).toBeNull();
+		expect((await db.getEntry("del-archived-b"))?.status).toBe("archived");
+	});
+
+	it("PATCH /entries/:id status=active re-embeds an archived entry whose vector is from another model", async () => {
+		await db.setEmbeddingMetadata("previous-model", 3);
+		await db.insertEntry(revivalEntry("patch-stale", "archived", [9, 9, 9]));
+		embedSpy.mockClear();
+
+		const res = await app.request("/entries/patch-stale", {
+			method: "PATCH",
+			headers: {
+				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({ status: "active" }),
+		});
+		expect(res.status).toBe(200);
+		expect(embedSpy).toHaveBeenCalledTimes(1);
+		const revived = await db.getEntryWithEmbedding("patch-stale");
+		expect(revived?.status).toBe("active");
+		expect(revived?.embedding?.[0]).toBeCloseTo(0.11);
+		expect(revived?.embedding?.[2]).toBeCloseTo(0.33);
+	});
+
+	it("PATCH /entries/:id status=active regenerates a tombstoned entry that has no embedding", async () => {
+		await db.setEmbeddingMetadata(config.embedding.model, 3);
+		await db.insertEntry(revivalEntry("patch-null", "tombstoned"));
+		embedSpy.mockClear();
+
+		const res = await app.request("/entries/patch-null", {
+			method: "PATCH",
+			headers: {
+				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({ status: "active" }),
+		});
+		expect(res.status).toBe(200);
+		expect(embedSpy).toHaveBeenCalledTimes(1);
+		expect(
+			(await db.getEntryWithEmbedding("patch-null"))?.embedding?.[1],
+		).toBeCloseTo(0.22);
+	});
+
+	it("PATCH /entries/:id status=active keeps a current embedding without calling the embedder", async () => {
+		await db.setEmbeddingMetadata(config.embedding.model, 3);
+		await db.insertEntry(
+			revivalEntry("patch-fresh", "superseded", [0.5, 0.25, 0.125]),
+		);
+		embedSpy.mockClear();
+
+		const res = await app.request("/entries/patch-fresh", {
+			method: "PATCH",
+			headers: {
+				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({ status: "active" }),
+		});
+		expect(res.status).toBe(200);
+		expect(embedSpy).not.toHaveBeenCalled();
+		expect(
+			(await db.getEntryWithEmbedding("patch-fresh"))?.embedding?.[0],
+		).toBeCloseTo(0.5);
 	});
 });

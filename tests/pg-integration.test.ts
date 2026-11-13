@@ -24,6 +24,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import postgres from "postgres";
+import { ActivationEngine } from "../src/activation/activate";
+import type { EmbeddingClient } from "../src/activation/embeddings";
+import { config } from "../src/config";
 import type { IKnowledgeStore } from "../src/db/interface";
 import { PENDING_EPISODE_MAX_ATTEMPTS } from "../src/db/interface";
 import {
@@ -35,6 +38,7 @@ import { SCHEMA_VERSION } from "../src/db/postgres/schema";
 import { ServerStateDB } from "../src/db/state/index";
 import { PostgresServerStateDB } from "../src/db/state/postgres";
 import { logger } from "../src/logger";
+import { KnowledgeService } from "../src/services/knowledge-service";
 import type { KnowledgeEntry } from "../src/types";
 
 const PG_URI = process.env.PG_TEST_URI;
@@ -1342,6 +1346,271 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 
 		expect(await db.getClustersWithMembers()).toHaveLength(0);
 	});
+	// ── Embedding model change (issue #103 and H2) ──
+
+	/** Build a vector-length-n test vector with a 1 at `hot`. */
+	const unitVec = (n: number, hot: number) =>
+		Array.from({ length: n }, (_, i) => (i === hot ? 1 : 0));
+
+	const vecColumnType = async () =>
+		String(
+			(
+				await truncSql`
+					SELECT format_type(atttypid, atttypmod) AS t FROM pg_attribute
+					WHERE attrelid = 'knowledge_entry'::regclass AND attname = 'embedding_vec'
+				`
+			)[0].t,
+		);
+
+	it("issue #103: after a model change every stored vector matches the new model", async () => {
+		const pg = db as PostgresKnowledgeDB;
+		const OLD = unitVec(4, 0);
+		const NEW = unitVec(6, 2); // different dimension on purpose
+		const statuses = [
+			"active",
+			"conflicted",
+			"superseded",
+			"archived",
+			"tombstoned",
+		] as const;
+		await pg.setEmbeddingMetadata("old-model", OLD.length);
+		for (const status of statuses) {
+			await pg.insertEntry(
+				makeEntry(status, {
+					status,
+					supersededBy: status === "superseded" ? "active" : null,
+					embedding: OLD,
+				}),
+			);
+		}
+
+		const savedModel = config.embedding.model;
+		config.embedding.model = "new-model";
+		try {
+			const activation = new ActivationEngine(pg);
+			spyOn(activation.embeddings, "embedBatch").mockImplementation(
+				async (texts: string[]) => texts.map(() => NEW),
+			);
+			expect(await activation.checkAndReEmbed()).toBe(true);
+		} finally {
+			config.embedding.model = savedModel;
+		}
+
+		for (const status of statuses) {
+			const entry = await pg.getEntryWithEmbedding(status);
+			if (status === "tombstoned") {
+				expect(entry?.embedding).toBeUndefined();
+			} else {
+				expect(entry?.embedding).toEqual(NEW);
+			}
+		}
+
+		// Every non-tombstoned row has a vector_column entry of the new size and
+		// the same value as its BYTEA, and no row is left on the old model.
+		const stale = await truncSql`
+			SELECT COUNT(*)::int AS n FROM knowledge_entry
+			WHERE status <> 'tombstoned'
+			  AND (embedding_vec IS NULL OR octet_length(embedding) <> ${NEW.length * 4})
+		`;
+		expect(Number((stale[0] as { n: number }).n)).toBe(0);
+		const tomb = await truncSql`
+			SELECT embedding IS NULL AND embedding_vec IS NULL AS cleared
+			FROM knowledge_entry WHERE id = 'tombstoned'
+		`;
+		expect((tomb[0] as { cleared: boolean }).cleared).toBe(true);
+
+		expect(await pg.getEmbeddingMetadata()).toMatchObject({
+			model: "new-model",
+			dimensions: NEW.length,
+		});
+		expect(await pg.isVectorSearchReady()).toBe(true);
+		expect(await vecColumnType()).toBe(`vector(${NEW.length})`);
+		const hits = await pg.findSimilarEntries(NEW, 5, 0.5);
+		expect(hits.map((h) => h.entry.id).sort()).toEqual([
+			"active",
+			"conflicted",
+		]);
+	});
+
+	it("dimension change 3072 -> 1536: ANN is ready without restart and survives two restarts", async () => {
+		const pg = db as PostgresKnowledgeDB;
+		await pg.setEmbeddingMetadata("text-embedding-3-large", 3072);
+		await pg.insertEntry(
+			makeEntry("big-active", { embedding: unitVec(3072, 0) }),
+		);
+		await pg.insertEntry(
+			makeEntry("big-archived", {
+				status: "archived",
+				embedding: unitVec(3072, 0),
+			}),
+		);
+
+		const savedModel = config.embedding.model;
+		config.embedding.model = "text-embedding-3-small";
+		try {
+			const activation = new ActivationEngine(pg);
+			spyOn(activation.embeddings, "embedBatch").mockImplementation(
+				async (texts: string[]) => texts.map(() => unitVec(1536, 5)),
+			);
+			expect(await activation.checkAndReEmbed()).toBe(true);
+		} finally {
+			config.embedding.model = savedModel;
+		}
+
+		expect(await vecColumnType()).toBe("vector(1536)");
+		expect(await pg.isVectorSearchReady()).toBe(true);
+		const q = unitVec(1536, 5);
+		expect(
+			(await pg.findSimilarEntries(q, 5, 0.5)).map((h) => h.entry.id),
+		).toEqual(["big-active"]);
+
+		// Two consecutive restarts: each must initialise without error and keep ANN.
+		for (let i = 0; i < 2; i++) {
+			await db.close();
+			db = new PostgresKnowledgeDB(uri);
+			await (db as PostgresKnowledgeDB).initialize();
+			expect(await (db as PostgresKnowledgeDB).isVectorSearchReady()).toBe(
+				true,
+			);
+		}
+		expect(await vecColumnType()).toBe("vector(1536)");
+	});
+
+	it("a new-size vector can be written before the metadata is stamped (H2)", async () => {
+		const pg = db as PostgresKnowledgeDB;
+		await pg.setEmbeddingMetadata("text-embedding-3-large", 3072);
+		await pg.insertEntry(makeEntry("h2-old", { embedding: unitVec(3072, 0) }));
+
+		await pg.beginEmbeddingModelChange(1536);
+		// Metadata still says 3072 here; this write used to fail against vector(3072).
+		await pg.updateEntry("h2-old", { embedding: unitVec(1536, 1) });
+		await pg.insertEntry(makeEntry("h2-new", { embedding: unitVec(1536, 2) }));
+
+		expect(await pg.isVectorSearchReady()).toBe(false);
+		await pg.setEmbeddingMetadata("text-embedding-3-small", 1536);
+		expect(await pg.isVectorSearchReady()).toBe(true);
+		expect((await pg.findSimilarEntries(unitVec(1536, 1), 5, 0.5)).length).toBe(
+			1,
+		);
+	});
+
+	it("interrupted re-embed keeps the old metadata, leaves ANN off, and resumes on the next run", async () => {
+		const pg = db as PostgresKnowledgeDB;
+		const OLD = unitVec(4, 0);
+		const NEW = unitVec(6, 3);
+		await pg.setEmbeddingMetadata("old-model", OLD.length);
+		for (let i = 0; i < 150; i++) {
+			await pg.insertEntry(
+				makeEntry(`resume-${String(i).padStart(3, "0")}`, { embedding: OLD }),
+			);
+		}
+
+		const savedModel = config.embedding.model;
+		config.embedding.model = "new-model";
+		try {
+			const activation = new ActivationEngine(pg);
+			let calls = 0;
+			const spy = spyOn(activation.embeddings, "embedBatch").mockImplementation(
+				async (texts: string[]) => {
+					calls++;
+					if (calls === 2) throw new Error("rate limit exceeded");
+					return texts.map(() => NEW);
+				},
+			);
+
+			await expect(activation.checkAndReEmbed()).rejects.toThrow(
+				"rate limit exceeded",
+			);
+			expect((await pg.getEmbeddingMetadata())?.model).toBe("old-model");
+			expect(await pg.isVectorSearchReady()).toBe(false);
+
+			spy.mockImplementation(async (texts: string[]) => texts.map(() => NEW));
+			expect(await activation.checkAndReEmbed()).toBe(true);
+		} finally {
+			config.embedding.model = savedModel;
+		}
+
+		expect((await pg.getEmbeddingMetadata())?.model).toBe("new-model");
+		expect(await pg.isVectorSearchReady()).toBe(true);
+		const stale = await truncSql`
+			SELECT COUNT(*)::int AS n FROM knowledge_entry
+			WHERE embedding_vec IS NULL OR octet_length(embedding) <> ${NEW.length * 4}
+		`;
+		expect(Number((stale[0] as { n: number }).n)).toBe(0);
+		expect((await pg.findSimilarEntries(NEW, 500, 0.5)).length).toBe(150);
+	});
+
+	it("reinitialize followed by a new dimension restores ANN without restart (H2)", async () => {
+		const pg = db as PostgresKnowledgeDB;
+		await pg.setEmbeddingMetadata("text-embedding-3-large", 3072);
+		await pg.reinitialize();
+		await pg.setEmbeddingMetadata("text-embedding-3-small", 1536);
+
+		expect(await pg.isVectorSearchReady()).toBe(true);
+		expect(await vecColumnType()).toBe("vector(1536)");
+		await pg.insertEntry(
+			makeEntry("after-reinit", { embedding: unitVec(1536, 4) }),
+		);
+		expect(
+			(await pg.findSimilarEntries(unitVec(1536, 4), 5, 0.5)).map(
+				(h) => h.entry.id,
+			),
+		).toEqual(["after-reinit"]);
+	});
+
+	it("startup does not cast leftover old-size BYTEA into the vector column", async () => {
+		let pg = db as PostgresKnowledgeDB;
+		await pg.setEmbeddingMetadata("text-embedding-3-large", 3072);
+		await pg.insertEntry(makeEntry("ok-row", { embedding: unitVec(3072, 0) }));
+		await pg.insertEntry(makeEntry("leftover", { status: "superseded" }));
+		// A 1536-float BYTEA left behind by an interrupted re-embed.
+		const leftover = Buffer.from(new Float32Array(unitVec(1536, 0)).buffer);
+		await truncSql`UPDATE knowledge_entry SET embedding = ${leftover} WHERE id = 'leftover'`;
+
+		await db.close();
+		db = new PostgresKnowledgeDB(uri);
+		pg = db as PostgresKnowledgeDB;
+		await expect(pg.initialize()).resolves.toBeUndefined();
+
+		const left = await truncSql`
+			SELECT embedding IS NULL AS cleared, embedding_vec IS NULL AS no_vec
+			FROM knowledge_entry WHERE id = 'leftover'
+		`;
+		expect(left[0]).toEqual({ cleared: true, no_vec: true });
+		expect(await pg.isVectorSearchReady()).toBe(true);
+		expect(
+			(await pg.findSimilarEntries(unitVec(3072, 0), 5, 0.5)).map(
+				(h) => h.entry.id,
+			),
+		).toEqual(["ok-row"]);
+	});
+
+	it("reviving an archived entry with a stale vector re-embeds it so ANN finds it", async () => {
+		const pg = db as PostgresKnowledgeDB;
+		await pg.setEmbeddingMetadata("previous-model", 4);
+		await pg.insertEntry(
+			makeEntry("revive-me", { status: "archived", embedding: unitVec(4, 0) }),
+		);
+
+		const NEW = unitVec(4, 3);
+		const embedder = {
+			embed: async () => NEW,
+		} as unknown as EmbeddingClient;
+		const service = new KnowledgeService(pg, embedder);
+		const savedModel = config.embedding.model;
+		config.embedding.model = "current-model";
+		try {
+			await service.updateEntry("revive-me", { status: "active" });
+		} finally {
+			config.embedding.model = savedModel;
+		}
+
+		expect((await pg.getEntryWithEmbedding("revive-me"))?.embedding).toEqual(
+			NEW,
+		);
+		const hits = await pg.findSimilarEntries(NEW, 5, 0.5);
+		expect(hits.map((h) => h.entry.id)).toEqual(["revive-me"]);
+	});
 });
 
 // ── Migrations v16/v17: pgvector setup from a v15 store ──────────────────────
@@ -1400,8 +1669,10 @@ describe.skipIf(!PG_URI)("PostgreSQL migrations v16/v17", () => {
 
 	it("a failing optional ANN index build does not abort the migration transaction", async () => {
 		await rewindToV15();
-		// Make the halfvec index build fail: an integer column has no cast to halfvec.
-		await admin`ALTER TABLE knowledge_entry ADD COLUMN embedding_vec integer`;
+		// Make the optional ANN DDL fail: DROP INDEX IF EXISTS errors on a relation
+		// that is not an index. The column is recreated by the dimension check, so an
+		// integer column no longer reaches the index build.
+		await admin`CREATE VIEW idx_entry_embedding_vec_hnsw AS SELECT 1 AS x`;
 
 		const store = new PostgresKnowledgeDB(uri);
 		try {
@@ -1410,6 +1681,7 @@ describe.skipIf(!PG_URI)("PostgreSQL migrations v16/v17", () => {
 			expect(store.isVectorSearchReady()).toBe(false);
 		} finally {
 			await store.close();
+			await admin`DROP VIEW IF EXISTS idx_entry_embedding_vec_hnsw`;
 		}
 		expect(await storeVersion()).toBe(SCHEMA_VERSION);
 	});

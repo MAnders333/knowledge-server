@@ -160,14 +160,22 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	/**
 	 * True once ensureVectorColumn() has confirmed that:
 	 *   1. The pgvector extension is installed.
-	 *   2. The `embedding_vec vector(N)` column exists on knowledge_entry.
-	 *   3. The ANN index path required by similarity queries is available.
+	 *   2. The `embedding_vec vector(N)` column matches the recorded dimension.
+	 *   3. The HNSW index used by similarity queries is built and valid.
 	 *
 	 * Set to false on construction; lazily set to true by ensureVectorColumn().
 	 * When false, findSimilarEntries falls back gracefully (returns empty so
 	 * callers revert to the in-process full scan) rather than throwing.
 	 */
 	private pgvectorReady = false;
+
+	/**
+	 * Dimension of the `embedding_vec` column, or null when the column is absent.
+	 * Gates vector writes independently of pgvectorReady: a vector is written
+	 * only when its length equals this value (see vecLiteralFor()). This lets
+	 * re-embed fill the column while ANN is still off.
+	 */
+	private vecColumnDims: number | null = null;
 
 	/** Active embedding dimensionality from embedding_metadata.id = 1. */
 	private embeddingDims: number | null = null;
@@ -367,141 +375,80 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	// ── pgvector helpers ──
 
 	/**
-	 * Ensure the pgvector extension, `embedding_vec vector(N)` column, and HNSW
-	 * index all exist.  Idempotent — safe to call on every startup.
-	 *
-	 * Defers silently when no embedding_metadata row exists yet (dimensions
-	 * unknown).  setEmbeddingMetadata() calls this again once dimensions are
-	 * recorded, completing the setup.
-	 *
-	 * Sets this.pgvectorReady = true on success, false when the extension is
-	 * unavailable or dimensions are not yet known.
+	 * Ensure the pgvector extension is installed. Returns false (vector search
+	 * degrades to the in-process scan) when it is not available.
 	 */
-	private async ensureVectorColumn(): Promise<void> {
-		// Check extension availability first — pgvector may not be installed.
+	private async ensureVectorExtension(): Promise<boolean> {
 		try {
 			await this.sql`CREATE EXTENSION IF NOT EXISTS vector`;
+			return true;
 		} catch {
 			// pgvector not installed on this Postgres instance — degrade gracefully.
 			logger.warn(
 				"[pg-db] pgvector extension not available — vector search disabled. " +
 					"Install pgvector to enable ANN search (see https://github.com/pgvector/pgvector).",
 			);
-			this.pgvectorReady = false;
-			return;
+			return false;
 		}
+	}
 
-		// Read dimension from metadata singleton.
-		const meta = await this.sql`
-			SELECT dimensions FROM embedding_metadata WHERE id = 1
+	/** Declared dimension of knowledge_entry.embedding_vec, or null when absent. */
+	private async vectorColumnDimensions(): Promise<number | null> {
+		const rows = await this.sql`
+			SELECT format_type(atttypid, atttypmod) AS declared_type
+			FROM pg_attribute
+			WHERE attrelid = 'knowledge_entry'::regclass
+			  AND attname  = 'embedding_vec'
+			  AND attnum   > 0
 		`;
-		if (meta.length === 0) {
-			// Dimensions not yet known — defer until setEmbeddingMetadata() is called.
-			this.embeddingDims = null;
-			this.pgvectorReady = false;
-			return;
-		}
-		const dims = Number(meta[0].dimensions);
-		this.embeddingDims = dims;
+		if (rows.length === 0) return null;
+		// Parse the declared type text (e.g. "vector(3072)") rather than relying on
+		// atttypmod encoding, which differs across pgvector/Postgres builds.
+		const m = String(
+			(rows[0] as { declared_type: string }).declared_type,
+		).match(/\((\d+)\)/);
+		return m ? Number(m[1]) : null;
+	}
 
-		// Add embedding_vec column if absent.
-		const colExists = await this.sql`
-			SELECT 1 FROM information_schema.columns
-			WHERE table_schema = current_schema()
-			  AND table_name   = 'knowledge_entry'
-			  AND column_name  = 'embedding_vec'
-		`;
-
-		if (colExists.length === 0) {
-			// Add the column (DDL cannot run inside a transaction on some managed
-			// Postgres providers, but ALTER TABLE ADD COLUMN is safe here because
-			// the column did not exist a moment ago — no concurrent writers).
-			await this.sql.unsafe(
+	/**
+	 * Replace embedding_vec with an empty vector(dims) column. Drops the HNSW
+	 * index first: it is sized for the old column and is rebuilt once the column
+	 * is repopulated. Column contents are discarded.
+	 */
+	private async recreateVectorColumn(dims: number): Promise<void> {
+		await this.sql.begin(async (sql: TxSql) => {
+			await sql`DROP INDEX IF EXISTS idx_entry_embedding_halfvec_hnsw`;
+			await sql`DROP INDEX IF EXISTS idx_entry_embedding_vec_hnsw`;
+			await sql.unsafe(
+				"ALTER TABLE knowledge_entry DROP COLUMN IF EXISTS embedding_vec",
+			);
+			await sql.unsafe(
 				`ALTER TABLE knowledge_entry ADD COLUMN embedding_vec vector(${dims})`,
 			);
-			logger.log(`[pg-db] Added embedding_vec vector(${dims}) column.`);
+		});
+	}
 
-			// Backfill embedding_vec from existing BYTEA embeddings via JS.
-			// ::bit(32)::float4 is not a valid cast in standard Postgres 16, so we
-			// fetch BYTEA rows, convert in JS, and write back in a single batched
-			// UNNEST update (one round-trip regardless of row count).
-			const toBackfill = await this.sql<{ id: string; embedding: Buffer }[]>`
-				SELECT id, embedding FROM knowledge_entry WHERE embedding IS NOT NULL
-			`;
-			if (toBackfill.length > 0) {
-				const ids: string[] = [];
-				const vecs: string[] = [];
-				for (const row of toBackfill) {
-					ids.push(row.id);
-					vecs.push(floatsToVectorLiteral(bufferToFloats(row.embedding)));
-				}
-				await this.sql.unsafe(
-					"UPDATE knowledge_entry SET embedding_vec = v.vec::vector " +
-						"FROM (SELECT UNNEST($1::text[]) AS id, UNNEST($2::text[]) AS vec) v " +
-						"WHERE knowledge_entry.id = v.id",
-					[ids, vecs],
-				);
-				logger.log(
-					`[pg-db] Backfilled embedding_vec for ${toBackfill.length} rows.`,
-				);
-			}
-		} else {
-			// Column exists — check its declared dimension matches metadata.
-			// If the model changed (dims changed), drop and recreate the column.
-			// checkAndReEmbed() calls setEmbeddingMetadata() after re-embedding all
-			// rows, which calls ensureVectorColumn() again. We set pgvectorReady=false
-			// here so activations during the re-embed window fall back to Path B
-			// (full scan) rather than returning empty ANN results.
-			const dimRows = await this.sql`
-				SELECT format_type(atttypid, atttypmod) AS declared_type
-				FROM pg_attribute
-				WHERE attrelid = 'knowledge_entry'::regclass
-				  AND attname  = 'embedding_vec'
-				  AND attnum   > 0
-			`;
-			if (dimRows.length > 0) {
-				// Parse declared type text (e.g. "vector(3072)") instead of relying on
-				// atttypmod encoding, which differs across pgvector/Postgres builds.
-				const declared = String(
-					(dimRows[0] as { declared_type: string }).declared_type,
-				);
-				const m = declared.match(/\((\d+)\)/);
-				const storedDim = m ? Number(m[1]) : -1;
-				if (storedDim !== -1 && storedDim !== dims) {
-					logger.log(
-						`[pg-db] embedding_vec dimension mismatch (stored=${storedDim}, expected=${dims}) — recreating column. ANN search disabled until re-embed completes.`,
-					);
-					// Wrap the three DDL statements in a transaction so a crash mid-sequence
-					// leaves the table in a consistent state (either old column present or
-					// new empty column present — never column-absent with data still there).
-					await this.sql.begin(async (sql: TxSql) => {
-						await sql`DROP INDEX IF EXISTS idx_entry_embedding_vec_hnsw`;
-						await sql`DROP INDEX IF EXISTS idx_entry_embedding_halfvec_hnsw`;
-						await sql.unsafe(
-							"ALTER TABLE knowledge_entry DROP COLUMN embedding_vec",
-						);
-						await sql.unsafe(
-							`ALTER TABLE knowledge_entry ADD COLUMN embedding_vec vector(${dims})`,
-						);
-					});
-					logger.log(
-						`[pg-db] Recreated embedding_vec as vector(${dims}). Rows will be backfilled by the re-embed cycle.`,
-					);
-					// Column is empty — set false so Path B is used until re-embed
-					// populates the column via updateEntry() calls.
-					this.pgvectorReady = false;
-					return;
-				}
-			}
+	/**
+	 * Make embedding_vec agree with the BYTEA `embedding` column for `dims`:
+	 *  - A BYTEA of another size is a vector from a different model. It cannot be
+	 *    cast into vector(dims), so it is NULLed. ensureEmbeddings() regenerates
+	 *    active/conflicted rows; other statuses regenerate on revival.
+	 *  - A valid BYTEA with no embedding_vec is backfilled.
+	 */
+	private async syncVectorColumn(dims: number): Promise<void> {
+		const cleared = await this.sql`
+			UPDATE knowledge_entry SET embedding = NULL
+			WHERE embedding IS NOT NULL AND octet_length(embedding) <> ${4 * dims}::int
+		`;
+		if (cleared.count > 0) {
+			logger.warn(
+				`[pg-db] Cleared ${cleared.count} embedding(s) that do not match vector(${dims}); they will be regenerated.`,
+			);
 		}
 
-		// Self-heal: if embedding_vec exists but rows are missing (legacy rollout
-		// edge case), backfill only the NULL subset from BYTEA embedding.
 		const toBackfill = await this.sql<{ id: string; embedding: Buffer }[]>`
-			SELECT id, embedding
-			FROM knowledge_entry
-			WHERE embedding IS NOT NULL
-			  AND embedding_vec IS NULL
+			SELECT id, embedding FROM knowledge_entry
+			WHERE embedding IS NOT NULL AND embedding_vec IS NULL
 		`;
 		if (toBackfill.length > 0) {
 			const ids: string[] = [];
@@ -510,6 +457,9 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				ids.push(row.id);
 				vecs.push(floatsToVectorLiteral(bufferToFloats(row.embedding)));
 			}
+			// Single batched UNNEST update (one round-trip regardless of row count).
+			// ::bit(32)::float4 is not a valid cast in standard Postgres 16, so the
+			// BYTEA is decoded in JS.
 			await this.sql.unsafe(
 				"UPDATE knowledge_entry SET embedding_vec = v.vec::vector " +
 					"FROM (SELECT UNNEST($1::text[]) AS id, UNNEST($2::text[]) AS vec) v " +
@@ -517,11 +467,99 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 				[ids, vecs],
 			);
 			logger.log(
-				`[pg-db] Self-healed embedding_vec backfill for ${toBackfill.length} rows.`,
+				`[pg-db] Backfilled embedding_vec for ${toBackfill.length} rows.`,
 			);
 		}
+	}
 
-		// Create ANN index if absent (idempotent due to IF NOT EXISTS).
+	/** State of the halfvec HNSW index: valid, invalid (failed CONCURRENTLY build) or absent. */
+	private async hnswIndexState(): Promise<"valid" | "invalid" | "absent"> {
+		const rows = await this.sql`
+			SELECT i.indisvalid
+			FROM pg_index i
+			JOIN pg_class c ON c.oid = i.indexrelid
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE c.relname = 'idx_entry_embedding_halfvec_hnsw'
+			  AND n.nspname = current_schema()
+		`;
+		if (rows.length === 0) return "absent";
+		return rows[0].indisvalid ? "valid" : "invalid";
+	}
+
+	/**
+	 * Build the halfvec HNSW index. CREATE INDEX CONCURRENTLY does not block
+	 * writes to knowledge_entry, so it is tried first. If the server refuses it,
+	 * an invalid leftover is dropped and the index is built with a plain build.
+	 * Must not run inside a transaction (CONCURRENTLY forbids it).
+	 */
+	private async buildHnswIndex(dims: number): Promise<void> {
+		const ddl = (concurrently: boolean) => `
+			CREATE INDEX ${concurrently ? "CONCURRENTLY " : ""}IF NOT EXISTS idx_entry_embedding_halfvec_hnsw
+			ON knowledge_entry
+			USING hnsw ((embedding_vec::halfvec(${dims})) halfvec_cosine_ops)
+			WITH (m = 16, ef_construction = 64)
+		`;
+		try {
+			await this.sql.unsafe(ddl(true));
+		} catch (err) {
+			logger.warn(
+				`[pg-db] CREATE INDEX CONCURRENTLY failed (${err instanceof Error ? err.message : String(err)}); retrying as a blocking build.`,
+			);
+			await this.sql`DROP INDEX IF EXISTS idx_entry_embedding_halfvec_hnsw`;
+			await this.sql.unsafe(ddl(false));
+		}
+	}
+
+	/**
+	 * Ensure the pgvector extension, `embedding_vec vector(N)` column, and HNSW
+	 * index all match the recorded embedding dimension. Idempotent — safe to call
+	 * on every startup and after every setEmbeddingMetadata().
+	 *
+	 * Defers silently when no embedding_metadata row exists yet (dimensions
+	 * unknown). setEmbeddingMetadata() calls this again once dimensions are
+	 * recorded, completing the setup.
+	 *
+	 * Sets this.pgvectorReady = true only once the column and index are both
+	 * usable, so ANN is available without a restart after a dimension change.
+	 */
+	private async ensureVectorColumn(): Promise<void> {
+		this.pgvectorReady = false;
+		this.vecColumnDims = null;
+
+		if (!(await this.ensureVectorExtension())) return;
+
+		const meta = await this.sql`
+			SELECT dimensions FROM embedding_metadata WHERE id = 1
+		`;
+		if (meta.length === 0) {
+			// Dimensions not yet known — defer until setEmbeddingMetadata() is called.
+			this.embeddingDims = null;
+			return;
+		}
+		const dims = Number(meta[0].dimensions);
+		this.embeddingDims = dims;
+
+		// The column must match the recorded dimension before any vector is written.
+		// A mismatch means a model change whose re-embed did not finish (or a
+		// reinitialize followed by a new model). The stale column is rebuilt empty;
+		// syncVectorColumn() repopulates it from BYTEA rows of the right size.
+		const declared = await this.vectorColumnDimensions();
+		if (declared !== dims) {
+			if (declared !== null) {
+				logger.log(
+					`[pg-db] embedding_vec dimension mismatch (stored=${declared}, expected=${dims}) — recreating column.`,
+				);
+			}
+			await this.recreateVectorColumn(dims);
+			logger.log(`[pg-db] embedding_vec is vector(${dims}).`);
+		}
+		this.vecColumnDims = dims;
+
+		await this.syncVectorColumn(dims);
+
+		// Create the ANN index if absent (or repair an invalid one left by a failed
+		// CONCURRENTLY build). A valid index is kept: CREATE INDEX needs table
+		// ownership, which managed Postgres may not grant the app role.
 		//
 		// We intentionally use halfvec HNSW + exact rerank to support common large
 		// embedding models (>2000 dims) while keeping ANN. pgvector supports HNSW:
@@ -532,47 +570,27 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		//   1) ANN candidate selection on (embedding_vec::halfvec(N))
 		//   2) exact cosine rerank on embedding_vec
 		//
-		// Executed outside the backfill transaction so a transient index-build
-		// failure (e.g. OOM on a large table) doesn't roll back the backfill.
-		// If index creation fails, we degrade gracefully: pgvectorReady stays
-		// false and activations continue on Path B (full scan) until the next
-		// startup successfully builds the index.
+		// If index creation fails we degrade gracefully: pgvectorReady stays false
+		// and activations use Path B (full scan) until the next successful attempt.
 		if (dims > 4000) {
 			logger.warn(
 				`[pg-db] embedding dimension ${dims} exceeds halfvec HNSW limit (4000). ANN search disabled for this store.`,
 			);
-			this.pgvectorReady = false;
 			return;
 		}
-		// Check whether the HNSW index already exists. CREATE INDEX IF NOT EXISTS
-		// still requires table ownership, so it can fail with "must be owner of
-		// table" on managed Postgres where the schema was bootstrapped by a
-		// different role (e.g. Cloud SQL with a separate admin user). When the
-		// index is already there from a prior run, treat that as success and
-		// keep ANN enabled instead of degrading to Path B.
-		const hnswExists = await this.sql`
-			SELECT 1 FROM pg_class c
-			JOIN pg_namespace n ON n.oid = c.relnamespace
-			WHERE c.relkind = 'i'
-			  AND n.nspname = current_schema()
-			  AND c.relname = 'idx_entry_embedding_halfvec_hnsw'
-		`;
-
 		try {
 			await this.sql`DROP INDEX IF EXISTS idx_entry_embedding_vec_hnsw`;
-			if (hnswExists.length === 0) {
-				await this.sql.unsafe(`
-					CREATE INDEX IF NOT EXISTS idx_entry_embedding_halfvec_hnsw
-					ON knowledge_entry
-					USING hnsw ((embedding_vec::halfvec(${dims})) halfvec_cosine_ops)
-					WITH (m = 16, ef_construction = 64)
-				`);
+			const state = await this.hnswIndexState();
+			if (state !== "valid") {
+				if (state === "invalid") {
+					await this.sql`DROP INDEX IF EXISTS idx_entry_embedding_halfvec_hnsw`;
+				}
+				await this.buildHnswIndex(dims);
 			}
 		} catch (err) {
 			logger.warn(
 				`[pg-db] ANN index creation failed — ANN search disabled. Will retry on next startup. Error: ${err instanceof Error ? err.message : String(err)}`,
 			);
-			this.pgvectorReady = false;
 			return;
 		}
 
@@ -580,6 +598,21 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		logger.log(
 			`[pg-db] pgvector ready (vector(${dims}), halfvec HNSW + exact rerank).`,
 		);
+	}
+
+	/**
+	 * pgvector literal for `embedding` when it fits the embedding_vec column,
+	 * otherwise null. A mis-sized vector is never written to the column.
+	 */
+	private vecLiteralFor(embedding: number[] | null | undefined): string | null {
+		if (
+			!embedding ||
+			this.vecColumnDims === null ||
+			embedding.length !== this.vecColumnDims
+		) {
+			return null;
+		}
+		return floatsToVectorLiteral(embedding);
 	}
 
 	// ── Helpers ──
@@ -630,16 +663,11 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		const embeddingBuf = entry.embedding
 			? floatsToBuffer(entry.embedding)
 			: null;
-		const embeddingVec =
-			this.pgvectorReady && entry.embedding
-				? floatsToVectorLiteral(entry.embedding)
-				: null;
-
-		// Include embedding_vec in the INSERT only when pgvectorReady — the column
-		// does not exist until ensureVectorColumn() creates it (which requires
-		// embedding_metadata to be set first). Referencing a non-existent column
-		// in the column list causes an immediate SQL error regardless of the value.
-		if (this.pgvectorReady && embeddingVec !== null) {
+		// Include embedding_vec in the INSERT only when the column exists — it is
+		// created by ensureVectorColumn() once embedding_metadata is set. Naming a
+		// non-existent column is an immediate SQL error regardless of the value.
+		if (this.vecColumnDims !== null) {
+			const embeddingVec = this.vecLiteralFor(entry.embedding);
 			await this.sql.unsafe(
 				`INSERT INTO knowledge_entry
 				(id, type, content, topics, confidence, source, status, strength,
@@ -739,11 +767,9 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		if (updates.embedding !== undefined) {
 			setClauses.push(`embedding = $${idx++}`);
 			values.push(floatsToBuffer(updates.embedding));
-			if (this.pgvectorReady) {
-				// updates.embedding is always a non-null number[] in this branch
-				// (guarded by `updates.embedding !== undefined` above). Cast directly.
+			if (this.vecColumnDims !== null) {
 				setClauses.push(`embedding_vec = $${idx++}::vector`);
-				values.push(floatsToVectorLiteral(updates.embedding));
+				values.push(this.vecLiteralFor(updates.embedding));
 			}
 		}
 		if (updates.isSynthesized !== undefined) {
@@ -765,6 +791,15 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	async getEntry(id: string): Promise<KnowledgeEntry | null> {
 		const rows = await this.sql.unsafe(
 			`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE id = $1`,
+			[id],
+		);
+		if (rows.length === 0) return null;
+		return this.rowToEntry(rows[0] as unknown as RawEntryRow);
+	}
+
+	async getEntryWithEmbedding(id: string): Promise<KnowledgeEntry | null> {
+		const rows = await this.sql.unsafe(
+			`SELECT ${ENTRY_COLUMNS}, embedding FROM knowledge_entry WHERE id = $1`,
 			[id],
 		);
 		if (rows.length === 0) return null;
@@ -845,6 +880,31 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			ORDER BY updated_at DESC`,
 		);
 		return (rows as unknown as RawEntryRow[]).map((r) => this.rowToEntry(r));
+	}
+
+	async getEntriesForReEmbed(
+		afterId: string | null,
+		limit: number,
+	): Promise<
+		Array<Pick<KnowledgeEntry, "id" | "type" | "content" | "topics">>
+	> {
+		const rows = await this.sql<
+			{ id: string; type: string; content: string; topics: string[] | string }[]
+		>`
+			SELECT id, type, content, topics FROM knowledge_entry
+			WHERE status <> 'tombstoned' AND embedding IS NOT NULL AND id > ${afterId ?? ""}
+			ORDER BY id
+			LIMIT ${limit}
+		`;
+		return rows.map((r) => ({
+			id: r.id,
+			type: r.type as KnowledgeEntry["type"],
+			content: r.content,
+			topics:
+				typeof r.topics === "string"
+					? (JSON.parse(r.topics) as string[])
+					: r.topics,
+		}));
 	}
 
 	async getEntriesByStatus(status: KnowledgeStatus): Promise<KnowledgeEntry[]> {
@@ -1252,16 +1312,14 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		];
 		const safeType = clampKnowledgeType(updates.type);
 		const embeddingBuf = embedding ? floatsToBuffer(embedding) : null;
-		const embeddingVec =
-			this.pgvectorReady && embedding ? floatsToVectorLiteral(embedding) : null;
+		const embeddingVec = this.vecLiteralFor(embedding);
 		const now = Date.now();
 
-		// Three-way branch on pgvectorReady + whether an embedding was provided:
-		//   A) pgvectorReady + embedding provided → set both BYTEA and vector columns
-		//   B) pgvectorReady + no embedding       → null both columns (keeps them in sync)
-		//   C) !pgvectorReady                     → omit embedding_vec (column absent)
-		if (this.pgvectorReady && embeddingVec !== null) {
-			// Case A: write new embedding to both columns.
+		// Two branches, keyed on whether the embedding_vec column exists:
+		//   A) column present → write BYTEA and vector together; a missing or
+		//      mis-sized embedding leaves both NULL (keeps them in sync)
+		//   B) column absent  → omit embedding_vec
+		if (this.vecColumnDims !== null) {
 			await this.sql.unsafe(
 				`UPDATE knowledge_entry
 				SET content = $1, type = $2,
@@ -1285,34 +1343,8 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 					id,
 				] as postgres.ParameterOrJSON<never>[],
 			);
-		} else if (this.pgvectorReady) {
-			// Case B: no embedding provided but column exists — null both to keep in sync.
-			// Without this, embedding (BYTEA) → NULL but embedding_vec retains its old
-			// value, causing ANN queries to return stale results until ensureEmbeddings runs.
-			await this.sql.unsafe(
-				`UPDATE knowledge_entry
-				SET content = $1, type = $2,
-				    topics = $3::jsonb,
-				    confidence = $4,
-				    derived_from = $5::jsonb,
-				    updated_at = $6, last_accessed_at = $6,
-				    observation_count = observation_count + 1,
-				    embedding = $7,
-				    embedding_vec = NULL
-				WHERE id = $8`,
-				[
-					updates.content,
-					safeType,
-					this.sql.json(updates.topics),
-					updates.confidence,
-					this.sql.json(mergedSources),
-					now,
-					embeddingBuf,
-					id,
-				] as postgres.ParameterOrJSON<never>[],
-			);
 		} else {
-			// Case C: embedding_vec column doesn't exist yet — omit it entirely.
+			// embedding_vec column doesn't exist yet — omit it entirely.
 			await this.sql.unsafe(
 				`UPDATE knowledge_entry
 				SET content = $1, type = $2,
@@ -1350,6 +1382,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		// ensureVectorColumn(), preventing dimension-mismatch corruption when
 		// a new model is configured after a knowledge reset.
 		this.pgvectorReady = false;
+		this.vecColumnDims = null;
 		this.embeddingDims = null;
 	}
 
@@ -1385,6 +1418,28 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		// Lazily create (or recreate after a model/dimension change) the vector
 		// column and HNSW index now that the dimension is known.
 		await this.ensureVectorColumn();
+	}
+
+	async beginEmbeddingModelChange(dimensions: number): Promise<void> {
+		this.pgvectorReady = false;
+		this.vecColumnDims = null;
+		if (!(await this.ensureVectorExtension())) return;
+		await this.recreateVectorColumn(dimensions);
+		this.vecColumnDims = dimensions;
+	}
+
+	async clearTombstonedEmbeddings(): Promise<number> {
+		const result =
+			this.vecColumnDims !== null
+				? await this.sql`
+					UPDATE knowledge_entry SET embedding = NULL, embedding_vec = NULL
+					WHERE status = 'tombstoned' AND (embedding IS NOT NULL OR embedding_vec IS NOT NULL)
+				`
+				: await this.sql`
+					UPDATE knowledge_entry SET embedding = NULL
+					WHERE status = 'tombstoned' AND embedding IS NOT NULL
+				`;
+		return result.count;
 	}
 
 	// ── Cluster Management ──
@@ -1530,12 +1585,13 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 
 	async clearAllEmbeddings(): Promise<number> {
 		// Only clear embedding_vec when the column exists.
-		const result = this.pgvectorReady
-			? await this.sql`
+		const result =
+			this.vecColumnDims !== null
+				? await this.sql`
 				UPDATE knowledge_entry SET embedding = NULL, embedding_vec = NULL
 				WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL
 			`
-			: await this.sql`
+				: await this.sql`
 				UPDATE knowledge_entry SET embedding = NULL
 				WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL
 			`;
