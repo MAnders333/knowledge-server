@@ -140,3 +140,15 @@ describe("ownedPrivatePaths", () => {
 		expect(owned.files.some((p) => p.endsWith("server.pid"))).toBe(true);
 	});
 });
+
+describe("ownedPrivatePaths: config file", () => {
+	it("includes config.jsonc, which holds store credentials, so startup tightens it", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ks-owned-"));
+		try {
+			const configPath = join(dir, "config.jsonc");
+			expect(ownedPrivatePaths(configPath).files).toContain(configPath);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});

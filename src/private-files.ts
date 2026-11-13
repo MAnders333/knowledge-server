@@ -58,6 +58,7 @@ export function ownedPrivatePaths(
 	];
 
 	const files = [
+		configPath,
 		config.logPath,
 		config.pidPath,
 		join(dataDir, "daemon.log"),
