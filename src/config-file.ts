@@ -83,7 +83,7 @@ export interface ProjectConfig {
  * Note: daemon_cursor always stays in daemon.db (local SQLite) regardless of
  * this setting — it is per-machine and never shared.
  */
-export interface StateDbConfig {
+interface StateDbConfig {
 	kind: "sqlite" | "postgres";
 	/** SQLite only: path to state.db. Defaults to ~/.local/share/knowledge-server/state.db */
 	path?: string;

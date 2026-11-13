@@ -17,7 +17,7 @@ import type { ConsolidationEngine } from "../consolidation/consolidate.js";
 /**
  * Results from a full consolidation drain (all batches).
  */
-export interface DrainResult {
+interface DrainResult {
 	totalSessions: number;
 	totalCreated: number;
 	totalUpdated: number;

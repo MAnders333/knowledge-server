@@ -5,10 +5,10 @@
  */
 
 /** Maximum characters of a full prompt or query after truncation. */
-export const MAX_PROMPT_CHARS = 20_000;
+const MAX_PROMPT_CHARS = 20_000;
 
 /** Maximum characters of a single segment cue (every cue except the last). */
-export const MAX_CUE_CHARS = 2_000;
+const MAX_CUE_CHARS = 2_000;
 
 /** Maximum JSON body size accepted by POST routes. */
 export const MAX_BODY_BYTES = 1024 * 1024;

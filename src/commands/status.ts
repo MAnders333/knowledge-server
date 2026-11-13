@@ -11,7 +11,7 @@ import {
 } from "../process-identity.js";
 
 /** Window for the per-source capture vs injection check. */
-export const COVERAGE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const COVERAGE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
  * Capture source (reader `source`) -> activation client tag, where they differ.
@@ -25,7 +25,7 @@ const CLIENT_TO_SOURCE = Object.fromEntries(
 	Object.entries(SOURCE_TO_CLIENT).map(([source, client]) => [client, source]),
 );
 
-export interface CoverageRow {
+interface CoverageRow {
 	source: string;
 	captured: number;
 	injected: number;
@@ -63,7 +63,7 @@ export function summarizeCoverage(
 	return { rows, warnings };
 }
 
-export interface ServerHealth {
+interface ServerHealth {
 	health: string;
 	reasons: string[];
 }

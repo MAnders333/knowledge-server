@@ -1068,7 +1068,7 @@ function makeVSCodeMcpEntry() {
 	return { name: "knowledge", command: mainBin, args: ["mcp"], env };
 }
 
-export function setupVSCode(): void {
+function setupVSCode(): void {
 	console.log("Setting up VSCode integration...\n");
 
 	const entry = makeVSCodeMcpEntry();

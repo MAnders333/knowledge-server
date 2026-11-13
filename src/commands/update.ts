@@ -26,10 +26,10 @@ const GITHUB_API = "https://api.github.com";
 const SMOKE_TIMEOUT_MS = 20_000;
 const PREV_SUFFIX = ".prev";
 
-export type FetchFn = typeof fetch;
-export type SmokeFn = (path: string, args: string[]) => Promise<boolean>;
+type FetchFn = typeof fetch;
+type SmokeFn = (path: string, args: string[]) => Promise<boolean>;
 
-export interface InstallDeps {
+interface InstallDeps {
 	fetchFn?: FetchFn;
 	/** Runs a staged or installed binary; true when it exits 0. Injectable for tests. */
 	smoke?: SmokeFn;

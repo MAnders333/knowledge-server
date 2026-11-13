@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { resolveDataDir } from "../config-file.js";
 import { config } from "../config.js";
 import { DaemonDB } from "../db/daemon/index.js";

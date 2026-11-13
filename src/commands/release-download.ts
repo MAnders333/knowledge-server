@@ -19,7 +19,7 @@ export const REPO = "MAnders333/knowledge-server";
 export const GITHUB_RELEASES = `https://github.com/${REPO}/releases/download`;
 
 /** Upper bound on a single decompressed asset. Release binaries are ~100 MB. */
-export const MAX_ASSET_BYTES = 1024 * 1024 * 1024;
+const MAX_ASSET_BYTES = 1024 * 1024 * 1024;
 
 /** Filenames are bare: no path separators, no leading dot. */
 const SAFE_ASSET_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -127,7 +127,7 @@ export function releaseAssetUrl(version: string, name: string): string {
 	return `${GITHUB_RELEASES}/${version}/${name}`;
 }
 
-export interface VerifiedDownload {
+interface VerifiedDownload {
 	/** Release asset URL. */
 	url: string;
 	/** Directory the staged file is written to. Must be the final filesystem. */

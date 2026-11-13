@@ -112,7 +112,7 @@ export function parseEnvText(text: string): Record<string, string> {
 	return splitEnvText(text).values;
 }
 
-export interface LoadEnvResult {
+interface LoadEnvResult {
 	/** Keys assigned from the file (keys already set in the environment are kept). */
 	loaded: string[];
 	/** Keys dropped because a `.env` may not set them. Names only, never values. */

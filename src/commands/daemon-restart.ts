@@ -12,13 +12,13 @@ const SYSTEMD_UNIT = "knowledge-daemon";
 const STOP_WAIT_MS = 10_000;
 const STOP_POLL_MS = 100;
 
-export type DaemonRestartOutcome =
+type DaemonRestartOutcome =
 	| "service-restarted"
 	| "daemon-stopped"
 	| "not-running"
 	| "failed";
 
-export interface DaemonRestartEnv {
+interface DaemonRestartEnv {
 	platform: NodeJS.Platform;
 	home: string;
 	uid: number;
