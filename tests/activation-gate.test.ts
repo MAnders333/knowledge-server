@@ -9,6 +9,7 @@ import {
 	rerankFloor,
 } from "../src/activation/gate";
 import type { RerankScorer } from "../src/activation/rerank";
+import { RerankSkippedError } from "../src/activation/rerank-remote";
 import { config } from "../src/config";
 import type { IKnowledgeStore } from "../src/db/interface";
 import { componentHealth } from "../src/health";
@@ -490,5 +491,42 @@ describe("rerank call order, telemetry and health", () => {
 			rerankerWith(UNKNOWN_MODEL, { "high knowledge": 0.9 }),
 		).activate(CUE);
 		expect(componentHealth.snapshot("rerank").consecutiveFailures).toBe(0);
+	});
+});
+
+describe("dense margin and refused rerank calls", () => {
+	beforeEach(() => {
+		gate.enabled = true;
+		componentHealth.clear();
+	});
+	afterEach(() => componentHealth.clear());
+
+	it("applies the dense margin when rerank is disabled, not only after a failure", async () => {
+		gate.denseMargin = 0.1;
+		const engine = engineFor({
+			entries: [
+				fact("alpha-entry", "alpha knowledge", 1.0),
+				fact("gamma-entry", "gamma knowledge", 0.5),
+			],
+		});
+		const result = await engine.activate(CUE, { threshold: 0.42 });
+		// Dense floor = 0.42 + 0.1 = 0.52: gamma (0.5) is dropped.
+		expect(result.telemetry?.gateMode).toBe("off");
+		expect(ids(result)).toEqual(["alpha-entry"]);
+	});
+
+	it("does not count a refused rerank call as a provider failure", async () => {
+		const refused: RerankScorer = {
+			identity: UNKNOWN_MODEL,
+			scoreBatch: mock(async () => {
+				throw new RerankSkippedError("rerank busy: 2 queued");
+			}),
+		};
+		const fixture = { entries: [fact("high-entry", "high knowledge", 1.0)] };
+		for (let i = 0; i < 5; i++) {
+			await engineFor(fixture, refused).activate(CUE);
+		}
+		expect(componentHealth.snapshot("rerank").consecutiveFailures).toBe(0);
+		expect(componentHealth.snapshot("rerank").open).toBe(false);
 	});
 });

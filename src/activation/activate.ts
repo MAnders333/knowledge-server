@@ -37,6 +37,31 @@ const MAX_SESSIONS = 1000;
 const SESSION_RESCORE_MARGIN = 0.1;
 /** Relation-expanded sources are gated and ranked at this fraction of their parent. */
 const SOURCE_GATE_DISCOUNT = 0.9;
+
+/**
+ * Time budget of one activation request, counted from requestStartedAt. The plugins
+ * abort at 5 s; this leaves room for the response. Rerank gets what is left after
+ * the embedding and store reads, less RERANK_RESERVE_MS for the work after it.
+ */
+const ACTIVATION_BUDGET_MS = 4_500;
+/** Time kept back from the request budget for the work after rerank. */
+const RERANK_RESERVE_MS = 500;
+/** Below this much time left, rerank is not started and dense order is used. */
+const RERANK_MIN_BUDGET_MS = 300;
+
+/**
+ * Milliseconds the rerank call may use at `now`: the request budget less the
+ * reserve. Undefined when the request has no start time, which means no deadline.
+ */
+function rerankBudgetMs(
+	requestStartedAt: number | undefined,
+	now: number,
+): number | undefined {
+	return requestStartedAt === undefined
+		? undefined
+		: requestStartedAt + ACTIVATION_BUDGET_MS - RERANK_RESERVE_MS - now;
+}
+
 /**
  * Token cap of the injected block: the formatter's character cap in the same
  * estimate the token budget uses. The budget never exceeds it, so every entry the
@@ -169,14 +194,16 @@ export class StoreBreaker {
 
 	/**
 	 * Max calls in flight for this operation before it has answered in an
-	 * activation. Only a closed circuit lets callers queue; otherwise admit()
-	 * decides at once.
+	 * activation. A healthy store is not capped, so its cues fan out at once. After
+	 * failures, a closed circuit allows threshold - failures calls at a time. An open
+	 * or half-open circuit admits through admit() alone: one probe per window.
 	 */
 	budget(store: string, op: string): number {
 		const s = this.stateOf(store, op);
-		return s.status === "closed"
-			? Math.max(1, this.threshold - s.failures)
-			: Number.POSITIVE_INFINITY;
+		if (s.status !== "closed" || s.failures === 0) {
+			return Number.POSITIVE_INFINITY;
+		}
+		return Math.max(1, this.threshold - s.failures);
 	}
 
 	/** Admit one call. After the window, the first caller becomes the probe. */
@@ -449,6 +476,12 @@ export class ActivationEngine {
 			 * once the plan is committed. Requests without a key are not deduplicated.
 			 */
 			session?: string;
+			/**
+			 * performance.now() when the request entered the server. Rerank starts only
+			 * with enough of ACTIVATION_BUDGET_MS left, and its timeout is clamped to what
+			 * remains. Omitted: no deadline.
+			 */
+			requestStartedAt?: number;
 		},
 	): Promise<ActivationResult> {
 		const queryList = normalizeCues(
@@ -759,22 +792,71 @@ export class ActivationEngine {
 		// warning and leaves the dense-only ordering intact.
 		const nCandidates = scored.length;
 		let gateDropped = 0;
+		let deduped = 0;
 		let gateMode: GateMode = this.reranker ? "dense" : "off";
 		let rerankModel: string | null = null;
-		if (this.reranker && scored.length > 0) {
+
+		// Drop what cannot be injected before the rerank pool is cut, so the pool and
+		// the reranker's work go to entries that can be shown: flagged conflicted
+		// entries with no contradicts partner, and entries already shown in this
+		// session (session-dedupe.ts). Neither test depends on a score.
+		scored.sort((a, b) => b.rawSimilarity - a.rawSimilarity);
+		const conflictedIds = scored
+			.filter(({ entry }) => entry.status === "conflicted")
+			.map(({ entry }) => entry.id);
+		const contradictPairs = mergeMaps(
+			await this.fanOutSafe(
+				this.readDbs,
+				(db) => db.getContradictPairsForIds(conflictedIds),
+				"contradict pairs lookup",
+				slots,
+			),
+		);
+		const beforeFlagCheck = scored.length;
+		const unflagged = scored.filter(
+			({ entry }) =>
+				entry.status !== "conflicted" || contradictPairs.has(entry.id),
+		);
+		gateDropped += beforeFlagCheck - unflagged.length;
+		scored.splice(0, scored.length, ...unflagged);
+
+		const sessionKey = options?.session;
+		if (sessionKey !== undefined) {
+			const fresh = scored.filter((s) => {
+				const suppressed = this.sessions.isSuppressed(
+					sessionKey,
+					{ id: s.entry.id, rawSimilarity: s.rawSimilarity },
+					now,
+				);
+				if (suppressed) deduped++;
+				return !suppressed;
+			});
+			scored.splice(0, scored.length, ...fresh);
+		}
+
+		// Rerank only when the request has time left for it. Without a start time
+		// there is no deadline, and the scorer's own timeout applies.
+		const rerankBudget = rerankBudgetMs(
+			options?.requestStartedAt,
+			performance.now(),
+		);
+		const rerankInTime =
+			rerankBudget === undefined || rerankBudget >= RERANK_MIN_BUDGET_MS;
+		if (this.reranker && scored.length > 0 && rerankInTime) {
 			// Bound the rerank input: across multiple cues and stores the pool can exceed
 			// `candidates`, so keep the dense-best slice. The order is always dense
 			// similarity, best first: listwise scorers show position bias, and a fixed
 			// order (D00 is the dense best) keeps their output reproducible.
 			const maxCandidates = config.activation.rerank.candidates;
-			scored.sort((a, b) => b.rawSimilarity - a.rawSimilarity);
 			if (scored.length > maxCandidates) scored.length = maxCandidates;
 
 			try {
 				const documents = scored.map((s) =>
 					formatEmbeddingText(s.entry.type, s.entry.content, s.entry.topics),
 				);
-				const scores = await this.reranker.scoreBatch(primaryQuery, documents);
+				const scores = await this.reranker.scoreBatch(primaryQuery, documents, {
+					budgetMs: rerankBudget,
+				});
 				for (let i = 0; i < scored.length; i++) {
 					scored[i].rerankScore = scores[i];
 					scored[i].gateScore = scores[i];
@@ -788,7 +870,11 @@ export class ActivationEngine {
 				rerankModel = scorerKey(this.reranker.identity);
 				componentHealth.recordSuccess("rerank");
 			} catch (err) {
-				componentHealth.recordFailure("rerank", err);
+				// A refusal (full local queue, open remote breaker) is back-pressure, not a
+				// provider failure, so it does not count toward health.
+				if (!(err instanceof RerankSkippedError)) {
+					componentHealth.recordFailure("rerank", err);
+				}
 				const reason = err instanceof Error ? err.message : String(err);
 				const { provider, model } = this.reranker.identity;
 				if (err instanceof RerankSkippedError) {
@@ -817,43 +903,8 @@ export class ActivationEngine {
 			scored.splice(0, scored.length, ...passing);
 		}
 
-		// Sort, then drop what cannot be injected before the cap, so the cap is spent
-		// on entries that can be shown: flagged conflicted entries with no contradicts
-		// partner, and entries already shown in this session (session-dedupe.ts).
+		// The cap is spent on what survived every rule above.
 		scored.sort((a, b) => b.similarity - a.similarity);
-		const conflictedIds = scored
-			.filter(({ entry }) => entry.status === "conflicted")
-			.map(({ entry }) => entry.id);
-		const contradictPairs = mergeMaps(
-			await this.fanOutSafe(
-				this.readDbs,
-				(db) => db.getContradictPairsForIds(conflictedIds),
-				"contradict pairs lookup",
-				slots,
-			),
-		);
-		const beforeFlagCheck = scored.length;
-		const unflagged = scored.filter(
-			({ entry }) =>
-				entry.status !== "conflicted" || contradictPairs.has(entry.id),
-		);
-		gateDropped += beforeFlagCheck - unflagged.length;
-		scored.splice(0, scored.length, ...unflagged);
-
-		const sessionKey = options?.session;
-		let deduped = 0;
-		if (sessionKey !== undefined) {
-			const fresh = scored.filter((s) => {
-				const suppressed = this.sessions.isSuppressed(
-					sessionKey,
-					{ id: s.entry.id, rawSimilarity: s.rawSimilarity },
-					now,
-				);
-				if (suppressed) deduped++;
-				return !suppressed;
-			});
-			scored.splice(0, scored.length, ...fresh);
-		}
 		scored.splice(maxResults);
 
 		// ── Relation-aware activation: pull in supports sources ───────────────────
@@ -1140,14 +1191,15 @@ export class ActivationEngine {
 	}
 
 	/**
-	 * Floor of the precision gate for this ordering mode, or null when no gate
-	 * applies (no reranker configured).
+	 * Floor of the precision gate. A rerank score is gated by the rerank floor. Any
+	 * other ordering (rerank disabled, failed, skipped or out of time) is gated by the
+	 * dense floor, so ACTIVATION_DENSE_MARGIN applies whenever the gate is on.
 	 */
 	private gateFloor(
 		gateMode: GateMode,
 		scored: ReadonlyArray<{ gateScore: number }>,
 		similarityThreshold: number,
-	): number | null {
+	): number {
 		const gate = config.activation.gate;
 		if (gateMode === "rerank" && this.reranker) {
 			let top = 0;
@@ -1159,10 +1211,7 @@ export class ActivationEngine {
 				topScore: top,
 			});
 		}
-		if (gateMode === "dense") {
-			return denseFloor(similarityThreshold, gate.denseMargin);
-		}
-		return null;
+		return denseFloor(similarityThreshold, gate.denseMargin);
 	}
 
 	/**

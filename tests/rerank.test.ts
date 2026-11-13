@@ -326,3 +326,123 @@ describe("ActivationEngine rerank stage", () => {
 		expect(result.entries[0].rerankScore).toBeUndefined();
 	});
 });
+
+describe("rerank time budget and session slots", () => {
+	const gate = config.activation.gate as {
+		enabled: boolean;
+		sessionTtlMs: number;
+	};
+	const rerankCfg = config.activation.rerank as { candidates: number };
+	let saved = { enabled: true, sessionTtlMs: 0, candidates: 16 };
+	beforeEach(() => {
+		saved = {
+			enabled: gate.enabled,
+			sessionTtlMs: gate.sessionTtlMs,
+			candidates: rerankCfg.candidates,
+		};
+		gate.enabled = false;
+		gate.sessionTtlMs = 60_000;
+	});
+	afterEach(() => {
+		gate.enabled = saved.enabled;
+		gate.sessionTtlMs = saved.sessionTtlMs;
+		rerankCfg.candidates = saved.candidates;
+	});
+
+	/** Embedding whose cosine with QUERY_EMB is `cos`. */
+	const withCos = (cos: number) => [
+		cos,
+		Math.sqrt(1 - cos * cos),
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+	];
+
+	type Call = { docs: string[]; budgetMs?: number };
+	/** Scorer that records each call and scores every document 0.9. */
+	function recordingScorer(): RerankScorer & { calls: Call[] } {
+		const calls: Call[] = [];
+		return {
+			identity: { provider: "local", model: "test/recording" },
+			calls,
+			scoreBatch: mock(
+				async (_q: string, docs: string[], options?: { budgetMs?: number }) => {
+					calls.push({ docs, budgetMs: options?.budgetMs });
+					return docs.map(() => 0.9);
+				},
+			),
+		};
+	}
+
+	function engineWith(
+		entries: Array<KnowledgeEntry & { embedding: number[] }>,
+		scorer: RerankScorer,
+	): ActivationEngine {
+		const engine = new ActivationEngine(
+			makeStoreStub(entries, { supportAnn: true }),
+			undefined,
+			undefined,
+			scorer,
+		);
+		spyOn(engine.embeddings, "embedBatch").mockResolvedValue([QUERY_EMB]);
+		return engine;
+	}
+
+	it("skips rerank and keeps dense order when the request has too little time left", async () => {
+		const scorer = recordingScorer();
+		// 4.4 s of the 4.5 s budget are gone: less than the reserve plus the minimum remains.
+		const result = await engineWith(makeEntries(), scorer).activate(
+			"test query",
+			{ requestStartedAt: performance.now() - 4_400 },
+		);
+		expect(scorer.calls).toHaveLength(0);
+		expect(result.telemetry?.gateMode).toBe("dense");
+		expect(result.entries[0].entry.id).toBe("high");
+	});
+
+	it("gives the call the request budget less the reserve", async () => {
+		const scorer = recordingScorer();
+		await engineWith(makeEntries(), scorer).activate("test query", {
+			requestStartedAt: performance.now(),
+		});
+		// 4.5 s less the 0.5 s reserve, less the little time already spent.
+		const budget = scorer.calls[0]?.budgetMs ?? 0;
+		expect(budget).toBeGreaterThan(3_000);
+		expect(budget).toBeLessThanOrEqual(4_000);
+	});
+
+	it("passes no budget when the request has no start time", async () => {
+		const scorer = recordingScorer();
+		await engineWith(makeEntries(), scorer).activate("test query");
+		expect(scorer.calls[0]?.budgetMs).toBeUndefined();
+	});
+
+	it("an entry already shown in this session does not take one of the rerank slots", async () => {
+		rerankCfg.candidates = 3;
+		const entries = [
+			...makeEntries(),
+			makeEntry({ id: "x", content: "dense x", embedding: withCos(0.45) }),
+			makeEntry({ id: "y", content: "dense y", embedding: withCos(0.42) }),
+		] as Array<KnowledgeEntry & { embedding: number[] }>;
+		const store = makeStoreStub(entries, { supportAnn: true });
+		store.recordInjections = mock(() => Promise.resolve());
+		const scorer = recordingScorer();
+		const engine = new ActivationEngine(store, undefined, undefined, scorer);
+		spyOn(engine.embeddings, "embedBatch").mockResolvedValue([QUERY_EMB]);
+
+		const first = await engine.activate("test query", { session: "s-1" });
+		engine.commitInjections(first.injection);
+		await engine.activate("test query", { session: "s-1" });
+
+		expect(scorer.calls[0].docs.some((d) => d.includes("dense high"))).toBe(
+			true,
+		);
+		const second = scorer.calls[1].docs.join("\n");
+		expect(second).toContain("dense x");
+		expect(second).toContain("dense y");
+		expect(second).not.toContain("dense high");
+	});
+});
