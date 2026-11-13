@@ -96,17 +96,26 @@ describe("ServerStateDB legacy staging migration", () => {
 	});
 });
 
-/**
- * state.db as the v3 release wrote it (schema v1-v3). Frozen on purpose: later
- * versions are applied by the migration registry, so this must not track the
- * current schema.
+/*
+ * Fixtures for the upgrade tests below.
+ *
+ * These are reconstructed historical shapes, not shipped files. No release ever
+ * stamped state.db as v3 or v4; the DDL is rebuilt from the git history of the v3
+ * (d0f468d) and v4 (8096c1a) commits so that the upgrade path has a realistic
+ * starting point. Do not edit them to follow the current schema: the upgrade
+ * under test is what brings them there.
  */
-const V3_STATE_DDL = `
+
+/** schema_version table with the given versions stamped. */
+function stampDdl(versions: number[]): string {
+	return `
   CREATE TABLE schema_version (version INTEGER NOT NULL, applied_at INTEGER NOT NULL);
-  INSERT INTO schema_version (version, applied_at) VALUES (1, 0), (2, 0), (3, 0);
+  INSERT INTO schema_version (version, applied_at) VALUES ${versions.map((v) => `(${v}, 0)`).join(", ")};
+`;
+}
 
-  CREATE TABLE applied_migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);
-
+/** The v1 tables, with one staged episode. */
+const V1_TABLES = `
   CREATE TABLE pending_episodes (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL DEFAULT 'default',
@@ -125,6 +134,35 @@ const V3_STATE_DDL = `
     uploaded_at INTEGER NOT NULL
   );
   CREATE INDEX idx_pending_source_time ON pending_episodes(source, max_message_time);
+
+  CREATE TABLE consolidated_episode (
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    start_message_id TEXT NOT NULL,
+    end_message_id TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    processed_at INTEGER NOT NULL,
+    entries_created INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (source, session_id, start_message_id, end_message_id)
+  );
+  CREATE INDEX idx_episode_source_session ON consolidated_episode(source, session_id);
+
+  CREATE TABLE consolidation_state (
+    id INTEGER PRIMARY KEY DEFAULT 1 CHECK(id = 1),
+    last_consolidated_at INTEGER NOT NULL DEFAULT 0,
+    total_sessions_processed INTEGER NOT NULL DEFAULT 0,
+    total_entries_created INTEGER NOT NULL DEFAULT 0,
+    total_entries_updated INTEGER NOT NULL DEFAULT 0
+  );
+  INSERT INTO consolidation_state (id) VALUES (1);
+
+  INSERT INTO pending_episodes (id, source, session_id, start_message_id, end_message_id, content, content_type, max_message_time, uploaded_at)
+    VALUES ('ep-legacy', 'opencode', 's1', 'a', 'b', 'staged text', 'messages', 1, 1);
+`;
+
+/** What the v2 and v3 steps added: applied_migrations, attempts, activation_event (v3 shape). */
+const V3_TABLES = `
+  CREATE TABLE applied_migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);
 
   CREATE TABLE pending_episode_attempts (
     id TEXT PRIMARY KEY,
@@ -151,41 +189,22 @@ const V3_STATE_DDL = `
   CREATE INDEX idx_activation_event_ts ON activation_event(ts);
   CREATE INDEX idx_activation_event_client_ts ON activation_event(client, ts);
 
-  CREATE TABLE consolidated_episode (
-    source TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    start_message_id TEXT NOT NULL,
-    end_message_id TEXT NOT NULL,
-    content_type TEXT NOT NULL,
-    processed_at INTEGER NOT NULL,
-    entries_created INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (source, session_id, start_message_id, end_message_id)
-  );
-  CREATE INDEX idx_episode_source_session ON consolidated_episode(source, session_id);
-
-  CREATE TABLE consolidation_state (
-    id INTEGER PRIMARY KEY DEFAULT 1 CHECK(id = 1),
-    last_consolidated_at INTEGER NOT NULL DEFAULT 0,
-    total_sessions_processed INTEGER NOT NULL DEFAULT 0,
-    total_entries_created INTEGER NOT NULL DEFAULT 0,
-    total_entries_updated INTEGER NOT NULL DEFAULT 0
-  );
-  INSERT INTO consolidation_state (id) VALUES (1);
-
-  INSERT INTO pending_episodes (id, source, session_id, start_message_id, end_message_id, content, content_type, max_message_time, uploaded_at)
-    VALUES ('ep-v3', 'opencode', 's1', 'a', 'b', 'staged text', 'messages', 1, 1);
   INSERT INTO activation_event (ts, client, prompt_chars, cue_count, n_candidates, n_returned, entry_ids, raw_sims, gate_mode, latency_ms)
     VALUES (1000, 'opencode', 42, 2, 5, 1, '["entry-1"]', '[0.5]', 'off', 12);
 `;
 
-/** The v4 release: four activation_event columns, stamped v4. */
-const V4_STATE_DDL = `
+/** What the v4 step added: four activation_event columns, stamped v4. */
+const V4_STEP = `
   ALTER TABLE activation_event ADD COLUMN gate_dropped INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE activation_event ADD COLUMN budget_dropped INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE activation_event ADD COLUMN deduped INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE activation_event ADD COLUMN injected_tokens INTEGER NOT NULL DEFAULT 0;
   INSERT INTO schema_version (version, applied_at) VALUES (4, 0);
 `;
+
+const V1_FILE = stampDdl([1]) + V1_TABLES;
+const V3_FILE = stampDdl([1, 2, 3]) + V1_TABLES + V3_TABLES;
+const V4_FILE = V3_FILE + V4_STEP;
 
 describe("ServerStateDB schema upgrades", () => {
 	let dir: string;
@@ -264,13 +283,13 @@ describe("ServerStateDB schema upgrades", () => {
 		expect(indexNames()).toContain("idx_pending_session");
 	});
 
-	it("a v3 file is upgraded through v6, keeps its rows and history", async () => {
-		writeFixture(V3_STATE_DDL);
+	it("a reconstructed v3 file is upgraded through v6, keeps its rows and history", async () => {
+		writeFixture(V3_FILE);
 
 		const state = new ServerStateDB(statePath);
 		try {
 			expect((await state.getPendingEpisodes(0)).map((e) => e.id)).toEqual([
-				"ep-v3",
+				"ep-legacy",
 			]);
 			await state.insertActivationEvents([
 				{
@@ -334,8 +353,8 @@ describe("ServerStateDB schema upgrades", () => {
 		]);
 	});
 
-	it("a v4 file gains rerank_model and keeps its rows", async () => {
-		writeFixture(V3_STATE_DDL + V4_STATE_DDL);
+	it("a reconstructed v4 file gains rerank_model and keeps its rows", async () => {
+		writeFixture(V4_FILE);
 		expect(activationColumns()).not.toContain("rerank_model");
 
 		const state = new ServerStateDB(statePath);
@@ -349,8 +368,93 @@ describe("ServerStateDB schema upgrades", () => {
 		expect(rows).toEqual([{ ts: 1000, rerank_model: null }]);
 	});
 
+	it("a v1-stamped file without applied_migrations gets the tables and bookkeeping it lacks", async () => {
+		writeFixture(V1_FILE);
+		expect(
+			readRaw((db) =>
+				db
+					.prepare(
+						"SELECT name FROM sqlite_master WHERE name = 'applied_migrations'",
+					)
+					.all(),
+			),
+		).toEqual([]);
+
+		const state = new ServerStateDB(statePath);
+		try {
+			expect((await state.getPendingEpisodes(0)).map((e) => e.id)).toEqual([
+				"ep-legacy",
+			]);
+			await state.insertActivationEvents([
+				{
+					ts: 3000,
+					client: "opencode",
+					sessionHash: null,
+					promptChars: 1,
+					cueCount: 1,
+					nCandidates: 1,
+					nReturned: 1,
+					entryIds: ["e"],
+					rawSims: [0.5],
+					rerankScores: null,
+					rerankModel: null,
+					gateMode: "off",
+					latencyMs: 1,
+					clientDeadlineExceeded: false,
+					gateDropped: 0,
+					budgetDropped: 0,
+					deduped: 0,
+					injectedTokens: 0,
+				},
+			]);
+		} finally {
+			await state.close();
+		}
+
+		expect(storedVersions()).toEqual([1, 2, 3, 4, 5, 6]);
+		expect(
+			readRaw((db) =>
+				db
+					.prepare(
+						"SELECT name FROM sqlite_master WHERE name = 'applied_migrations'",
+					)
+					.all(),
+			),
+		).toHaveLength(1);
+		expect(indexNames()).toContain("idx_pending_session");
+		expect(activationColumns()).toEqual(
+			expect.arrayContaining([...V4_COLUMNS, "rerank_model"]),
+		);
+	});
+
+	it("an unstamped legacy file with the v3 tables is stamped and brought to v6 without losing rows", async () => {
+		// Tables from the v3 shape, but no schema_version table at all.
+		writeFixture(V1_TABLES + V3_TABLES);
+		expect(activationColumns()).not.toContain("gate_dropped");
+
+		const state = new ServerStateDB(statePath);
+		try {
+			expect((await state.getPendingEpisodes(0)).map((e) => e.id)).toEqual([
+				"ep-legacy",
+			]);
+			expect(await state.countActivationsByClient(0)).toEqual({ opencode: 1 });
+		} finally {
+			await state.close();
+		}
+
+		expect(storedVersions()).toEqual([1, 2, 3, 4, 5, 6]);
+		expect(activationColumns()).toEqual(
+			expect.arrayContaining([...V4_COLUMNS, "rerank_model"]),
+		);
+		expect(
+			readRaw((db) =>
+				db.prepare("SELECT ts, rerank_model FROM activation_event").all(),
+			),
+		).toEqual([{ ts: 1000, rerank_model: null }]);
+	});
+
 	it("reopening an upgraded file applies nothing again", async () => {
-		writeFixture(V3_STATE_DDL);
+		writeFixture(V3_FILE);
 		const first = new ServerStateDB(statePath);
 		await first.close();
 		const state = new ServerStateDB(statePath);
