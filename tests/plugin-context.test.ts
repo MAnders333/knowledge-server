@@ -80,6 +80,8 @@ function item(content: string, type = "fact"): Item {
 }
 
 let activateBody: ActivateBody = {};
+/** URL of the last GET /activate the mock served. */
+let lastActivateUrl = "";
 const realFetch = globalThis.fetch;
 
 beforeAll(() => {
@@ -88,7 +90,10 @@ beforeAll(() => {
 		if (pathname === "/status") {
 			return Response.json({ knowledge: { active: 0, conflicted: 0 } });
 		}
-		if (pathname === "/activate") return Response.json(activateBody);
+		if (pathname === "/activate") {
+			lastActivateUrl = String(input);
+			return Response.json(activateBody);
+		}
 		return new Response("not found", { status: 404 });
 	}) as typeof fetch;
 });
@@ -307,5 +312,36 @@ describe("omp-knowledge.ts before_agent_start", () => {
 		expect(seen.some((h) => h.includes('"x-knowledge-client":"omp"'))).toBe(
 			true,
 		);
+	});
+});
+
+describe.each(drivers)("%s activation URL bounds", (_name, driver) => {
+	it("stays far below the 16 KiB request-line limit for a long ASCII prompt", async () => {
+		const prompt = Array.from(
+			{ length: 400 },
+			(_, i) => `line ${i} ${"word ".repeat(9)}`,
+		).join("\n");
+		expect(prompt.length).toBeGreaterThan(20_000);
+		await injected(driver, { entries: [item("Use port 4321.")] }, prompt);
+		expect(lastActivateUrl.length).toBeLessThan(12_000);
+	});
+
+	it("bounds a CJK prompt by its encoded size, not its character count", async () => {
+		const prompt = "日本語のテキストを書きます。".repeat(200);
+		await injected(driver, { entries: [item("Use port 4321.")] }, prompt);
+		expect(lastActivateUrl.length).toBeLessThan(12_000);
+	});
+
+	it("sends at most 12 cues: the segments first, the whole prompt last", async () => {
+		const lines = Array.from(
+			{ length: 30 },
+			(_, i) => `segment number ${i} for testing`,
+		);
+		const prompt = lines.join("\n");
+		await injected(driver, { entries: [item("Use port 4321.")] }, prompt);
+		const queries = new URL(lastActivateUrl).searchParams.getAll("q");
+		expect(queries).toHaveLength(12);
+		expect(queries[0]).toBe(lines[0]);
+		expect(queries[11]).toBe(prompt);
 	});
 });

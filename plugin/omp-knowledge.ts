@@ -275,6 +275,94 @@ function formatActivatedKnowledgeFallback(entries: ActivateEntry[]): string {
 	].join("\n");
 }
 
+/**
+ * Activation queries for one prompt, bounded so the GET /activate URL stays far
+ * below Bun's 16 KiB request-line limit: over it the server answers 431 and the
+ * plugin drops the prompt. Mirrors boundCues in src/api/input-limits.ts: at most
+ * MAX_CUES cues, the first ones plus the holistic prompt last. Limits apply to
+ * characters and to encoded length, the size the URL carries (a CJK character
+ * encodes to 9 characters).
+ */
+const PROMPT_MAX_CHARS = 4000;
+const SEGMENT_MAX_CHARS = 500;
+const PROMPT_MAX_ENCODED = 5000;
+const SEGMENT_MAX_ENCODED = 500;
+const QUERIES_MAX_ENCODED = 10000;
+const MAX_CUES = 12;
+const QUERY_TRUNCATION_MARKER = "\n…\n";
+
+/** Length of `value` as it appears in a query string, without the `q=` prefix. */
+function encodedLength(value: string): number {
+	return new URLSearchParams({ q: value }).toString().length - 2;
+}
+
+/** Keeps the head and tail of `text` around a marker, so its weight is at most `max`. */
+function keepHeadAndTail(
+	text: string,
+	max: number,
+	weight: (ch: string) => number,
+): string {
+	const chars = [...text];
+	if (chars.reduce((sum, ch) => sum + weight(ch), 0) <= max) return text;
+	const markerWeight = [...QUERY_TRUNCATION_MARKER].reduce(
+		(sum, ch) => sum + weight(ch),
+		0,
+	);
+	const room = max - markerWeight;
+	let head = 0;
+	let headWeight = 0;
+	while (head < chars.length && headWeight + weight(chars[head]) <= room / 2) {
+		headWeight += weight(chars[head]);
+		head++;
+	}
+	let tail = chars.length;
+	let tailWeight = 0;
+	while (
+		tail > head &&
+		tailWeight + weight(chars[tail - 1]) <= room - headWeight
+	) {
+		tailWeight += weight(chars[tail - 1]);
+		tail--;
+	}
+	return `${chars.slice(0, head).join("")}${QUERY_TRUNCATION_MARKER}${chars.slice(tail).join("")}`;
+}
+
+/** Activation queries for one prompt: its unique segments, then the whole prompt last. */
+function activationQueries(prompt: string): string[] {
+	const segments = prompt
+		.split("\n")
+		.map((s) => s.trim())
+		.filter((s) => s.length >= 15)
+		.map((s) => keepHeadAndTail(s, SEGMENT_MAX_CHARS, () => 1));
+	const holistic = keepHeadAndTail(prompt.trim(), PROMPT_MAX_CHARS, () => 1);
+
+	// Union: unique segments + full prompt (deduplicated if prompt == single segment).
+	const unique = [...new Set([...segments, holistic])];
+	const bounded =
+		unique.length <= MAX_CUES
+			? unique
+			: [...unique.slice(0, MAX_CUES - 1), unique[unique.length - 1]];
+
+	const last = keepHeadAndTail(
+		bounded[bounded.length - 1],
+		PROMPT_MAX_ENCODED,
+		encodedLength,
+	);
+	let budget = QUERIES_MAX_ENCODED - encodedLength(last);
+	const queries: string[] = [];
+	for (const segment of bounded.slice(0, -1)) {
+		const fitted = keepHeadAndTail(
+			segment,
+			Math.min(SEGMENT_MAX_ENCODED, budget),
+			encodedLength,
+		);
+		if (encodedLength(fitted) > budget) break;
+		queries.push(fitted);
+		budget -= encodedLength(fitted);
+	}
+	return [...queries, last];
+}
+
 export default function knowledgeExtension(pi: ExtensionAPI) {
 	// Refuse to operate if KNOWLEDGE_SERVER_URL points to a non-loopback host.
 	// The extension sends user prompt content to this URL — external hosts are not allowed.
@@ -321,24 +409,11 @@ export default function knowledgeExtension(pi: ExtensionAPI) {
 			// Skip very short prompts (greetings, confirmations, "yes", "continue")
 			if (queryText.length < 15) return;
 
-			// Build a set of activation queries:
-			//   1. Per-line segments — each newline (shift+enter) is a topic boundary.
-			//      Short segments (< 15 chars) are skipped — they're usually connective
-			//      phrases, not substantive cues.
-			//   2. The full prompt as a holistic cue — captures overall intent that
-			//      no individual segment may express on its own.
-			// All queries are embedded in a single batched API call server-side.
-			// No truncation — let the embedding model handle long inputs natively.
-			const segments = queryText
-				.split("\n")
-				.map((s) => s.trim())
-				.filter((s) => s.length >= 15);
-
-			// Union: unique segments + full prompt (deduplicated if prompt == single segment).
-			const allQueries = [...new Set([...segments, queryText.trim()])];
-
+			// Activation queries: each line is a topic boundary (shift+enter) and the
+			// whole prompt is a holistic cue. activationQueries keeps the URL under the
+			// server's request-line limit.
 			const params = new URLSearchParams();
-			for (const q of allQueries) params.append("q", q);
+			for (const q of activationQueries(queryText)) params.append("q", q);
 			params.set("limit", "8"); // passive injection: up from 5 to reduce silent misses
 
 			const response = await fetch(
