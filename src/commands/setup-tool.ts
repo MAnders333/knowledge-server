@@ -137,6 +137,55 @@ function mcpEnvironment(): Record<string, string> {
 	};
 }
 
+/** The environment variables setup writes into an MCP entry. Any other variable is the user's. */
+const OWNED_MCP_ENV = [
+	"KNOWLEDGE_HOST",
+	"KNOWLEDGE_PORT",
+	"KNOWLEDGE_LOAD_ENV",
+] as const;
+
+/**
+ * Merge setup's MCP entry into the one already in a config file. Setup owns the
+ * entry's `command`, `args`, `type` and the variables in OWNED_MCP_ENV. Everything
+ * else the user set is kept: `enabled: false`, `disabled`, and their own environment
+ * variables. `enabled` is filled in only when the entry has none. `changed` is false
+ * when nothing setup owns differs, so the caller can skip the write.
+ */
+function mergeMcpEntry(
+	existing: Record<string, unknown>,
+	entry: Record<string, unknown>,
+	envField: "environment" | "env",
+): { merged: Record<string, unknown>; changed: boolean } {
+	const merged: Record<string, unknown> = { ...existing };
+	let changed = false;
+	for (const [key, value] of Object.entries(entry)) {
+		if (key === envField) continue;
+		if (key === "enabled" && key in existing) continue;
+		if (!isDeepStrictEqual(existing[key], value)) {
+			merged[key] = value;
+			changed = true;
+		}
+	}
+	const ours = entry[envField] as Record<string, string>;
+	const env: Record<string, unknown> = {
+		...((existing[envField] as Record<string, unknown> | undefined) ?? {}),
+	};
+	for (const key of OWNED_MCP_ENV) {
+		const want = ours[key];
+		if (want === undefined) {
+			if (key in env) {
+				Reflect.deleteProperty(env, key);
+				changed = true;
+			}
+		} else if (env[key] !== want) {
+			env[key] = want;
+			changed = true;
+		}
+	}
+	merged[envField] = env;
+	return { merged, changed };
+}
+
 // ── OpenCode MCP config ────────────────────────────────────────────────────────
 
 /**
@@ -255,9 +304,9 @@ export function stripJsoncComments(jsonc: string): string {
 /**
  * Merge `mcp.knowledge` into `~/.config/opencode/opencode.jsonc`.
  *
- * Idempotent: if the key already exists with the same command, prints "no
- * change". If it exists with a different command (e.g. stale path after a
- * reinstall), replaces it and logs the update.
+ * Idempotent: when setup's fields already match, the file is not written. Otherwise
+ * setup updates only what it owns (see mergeMcpEntry), so a user's `enabled: false`
+ * and their own environment variables survive a re-run.
  *
  * Creates a minimal opencode.jsonc with only the mcp.knowledge block if the
  * file does not yet exist.
@@ -285,27 +334,24 @@ export function writeOpenCodeMcpEntry(opencodeConfigDir: string): void {
 	}
 
 	const mcp = (parsed.mcp ?? {}) as Record<string, unknown>;
-	const existing = mcp.knowledge as
-		| ({ command: string[] } & Record<string, unknown>)
-		| undefined;
+	const existing = mcp.knowledge as Record<string, unknown> | undefined;
+	const { merged, changed } = existing
+		? mergeMcpEntry(existing, entry, "environment")
+		: { merged: entry, changed: true };
 
-	if (existing) {
-		if (isDeepStrictEqual(existing, entry)) {
-			console.log(
-				"  ✓ MCP server 'knowledge' already in opencode.jsonc (no change)",
-			);
-			return;
-		}
-		// The command or environment changed (project moved, reinstalled, or a new
-		// variable such as KNOWLEDGE_LOAD_ENV) — update in place.
+	if (existing && !changed) {
 		console.log(
-			"  ✓ MCP server 'knowledge' updated in opencode.jsonc (entry changed)",
+			"  ✓ MCP server 'knowledge' already in opencode.jsonc (no change)",
 		);
-	} else {
-		console.log("  ✓ MCP server 'knowledge' added to opencode.jsonc");
+		return;
 	}
+	console.log(
+		existing
+			? "  ✓ MCP server 'knowledge' updated in opencode.jsonc (entry changed)"
+			: "  ✓ MCP server 'knowledge' added to opencode.jsonc",
+	);
 
-	mcp.knowledge = entry;
+	mcp.knowledge = merged;
 	parsed.mcp = mcp;
 
 	mkdirSync(opencodeConfigDir, { recursive: true });
@@ -781,26 +827,24 @@ export function setupCursor(): void {
 	const existing = mcpConfig.mcpServers.knowledge as
 		| Record<string, unknown>
 		| undefined;
+	const { merged, changed } = existing
+		? mergeMcpEntry(existing, entry, "env")
+		: { merged: entry, changed: true };
 
-	let needsWrite = true;
-	if (existing) {
-		if (isDeepStrictEqual(existing, entry)) {
-			console.log(
-				"  ✓ MCP server 'knowledge' already in ~/.cursor/mcp.json (no change)",
-			);
-			needsWrite = false;
-		} else {
-			mcpConfig.mcpServers.knowledge = entry;
-			console.log(
-				"  ✓ MCP server 'knowledge' updated in ~/.cursor/mcp.json (entry changed)",
-			);
-		}
+	if (existing && !changed) {
+		console.log(
+			"  ✓ MCP server 'knowledge' already in ~/.cursor/mcp.json (no change)",
+		);
 	} else {
-		mcpConfig.mcpServers.knowledge = entry;
-		console.log("  ✓ MCP server 'knowledge' added to ~/.cursor/mcp.json");
+		mcpConfig.mcpServers.knowledge = merged;
+		console.log(
+			existing
+				? "  ✓ MCP server 'knowledge' updated in ~/.cursor/mcp.json (entry changed)"
+				: "  ✓ MCP server 'knowledge' added to ~/.cursor/mcp.json",
+		);
 	}
 
-	if (needsWrite) {
+	if (!existing || changed) {
 		replaceConfigFile(mcpPath, `${JSON.stringify(mcpConfig, null, 2)}\n`);
 		console.log(`  ✓ Wrote ${mcpPath}`);
 	}

@@ -790,3 +790,158 @@ describe("source-install MCP entries load .env", () => {
 		expect(cursorEnv().KNOWLEDGE_LOAD_ENV).toBe("1");
 	});
 });
+
+// ── MCP entries keep what the user set ───────────────────────────────────────
+
+describe("setup merges MCP entries instead of replacing them", () => {
+	const STALE_COMMAND = ["/old/bun", "run", "/old/src/index.ts", "mcp"];
+	const openCodeDir = () => join(isolation.home, ".config", "opencode");
+	const openCodePath = () => join(openCodeDir(), "opencode.jsonc");
+	const cursorDir = () => join(isolation.home, ".cursor");
+	const cursorPath = () => join(cursorDir(), "mcp.json");
+	type Knowledge = Record<string, unknown>;
+	type Environment = Record<string, string>;
+
+	/** The entry setup writes into an empty config: the baseline for user edits. */
+	const freshOpenCode = (): Knowledge => {
+		writeOpenCodeMcpEntry(openCodeDir());
+		return (
+			JSON.parse(readFileSync(openCodePath(), "utf8")) as {
+				mcp: { knowledge: Knowledge };
+			}
+		).mcp.knowledge;
+	};
+	const seedOpenCode = (knowledge: Knowledge, mode?: number) => {
+		mkdirSync(openCodeDir(), { recursive: true });
+		writeFileSync(
+			openCodePath(),
+			JSON.stringify({ mcp: { knowledge } }, null, 2),
+		);
+		if (mode !== undefined) chmodSync(openCodePath(), mode);
+	};
+	const readOpenCode = (): Knowledge =>
+		(
+			JSON.parse(readFileSync(openCodePath(), "utf8")) as {
+				mcp: { knowledge: Knowledge };
+			}
+		).mcp.knowledge;
+
+	const freshCursor = (): Knowledge => {
+		setupCursor();
+		return (
+			JSON.parse(readFileSync(cursorPath(), "utf8")) as {
+				mcpServers: { knowledge: Knowledge };
+			}
+		).mcpServers.knowledge;
+	};
+	const seedCursor = (knowledge: Knowledge, mode?: number) => {
+		mkdirSync(cursorDir(), { recursive: true });
+		writeFileSync(
+			cursorPath(),
+			JSON.stringify({ mcpServers: { knowledge } }, null, 2),
+		);
+		if (mode !== undefined) chmodSync(cursorPath(), mode);
+	};
+	const readCursor = (): Knowledge =>
+		(
+			JSON.parse(readFileSync(cursorPath(), "utf8")) as {
+				mcpServers: { knowledge: Knowledge };
+			}
+		).mcpServers.knowledge;
+
+	it("keeps enabled: false when the command is refreshed (OpenCode)", () => {
+		const fresh = freshOpenCode();
+		seedOpenCode({ ...fresh, command: STALE_COMMAND, enabled: false });
+		writeOpenCodeMcpEntry(openCodeDir());
+		expect(readOpenCode()).toMatchObject({
+			enabled: false,
+			command: fresh.command,
+		});
+	});
+
+	it("keeps environment variables the user added (OpenCode)", () => {
+		const fresh = freshOpenCode();
+		const env = fresh.environment as Environment;
+		seedOpenCode({ ...fresh, environment: { ...env, MY_SETTING: "kept" } });
+		writeOpenCodeMcpEntry(openCodeDir());
+		expect(readOpenCode().environment).toEqual({ ...env, MY_SETTING: "kept" });
+	});
+
+	it("replaces a stale command and a stale KNOWLEDGE_* value (OpenCode)", () => {
+		const fresh = freshOpenCode();
+		const env = fresh.environment as Environment;
+		seedOpenCode({
+			...fresh,
+			command: STALE_COMMAND,
+			environment: { ...env, KNOWLEDGE_PORT: "1111" },
+		});
+		writeOpenCodeMcpEntry(openCodeDir());
+		expect(readOpenCode()).toMatchObject({
+			command: fresh.command,
+			environment: env,
+		});
+	});
+
+	it("a second run leaves opencode.jsonc byte-identical", () => {
+		seedOpenCode({ ...freshOpenCode(), command: STALE_COMMAND });
+		writeOpenCodeMcpEntry(openCodeDir());
+		const first = readFileSync(openCodePath(), "utf8");
+		writeOpenCodeMcpEntry(openCodeDir());
+		expect(readFileSync(openCodePath(), "utf8")).toBe(first);
+	});
+
+	it("keeps the mode of opencode.jsonc when it changes", () => {
+		seedOpenCode({ ...freshOpenCode(), command: STALE_COMMAND }, 0o640);
+		writeOpenCodeMcpEntry(openCodeDir());
+		expect(statSync(openCodePath()).mode & 0o777).toBe(0o640);
+	});
+
+	it("keeps a disabled flag the user set (Cursor)", () => {
+		const fresh = freshCursor();
+		seedCursor({ ...fresh, command: STALE_COMMAND, disabled: true });
+		setupCursor();
+		expect(readCursor()).toMatchObject({
+			disabled: true,
+			command: fresh.command,
+		});
+	});
+
+	it("keeps environment variables the user added (Cursor)", () => {
+		const fresh = freshCursor();
+		const env = fresh.env as Environment;
+		seedCursor({ ...fresh, env: { ...env, MY_SETTING: "kept" } });
+		setupCursor();
+		expect(readCursor().env).toEqual({ ...env, MY_SETTING: "kept" });
+	});
+
+	it("replaces a stale command and a stale KNOWLEDGE_* value (Cursor)", () => {
+		const fresh = freshCursor();
+		const env = fresh.env as Environment;
+		seedCursor({
+			...fresh,
+			command: STALE_COMMAND[0],
+			args: STALE_COMMAND.slice(1),
+			env: { ...env, KNOWLEDGE_PORT: "1111" },
+		});
+		setupCursor();
+		expect(readCursor()).toMatchObject({
+			command: fresh.command,
+			args: fresh.args,
+			env,
+		});
+	});
+
+	it("a second run leaves mcp.json byte-identical (Cursor)", () => {
+		seedCursor({ ...freshCursor(), command: STALE_COMMAND[0] });
+		setupCursor();
+		const first = readFileSync(cursorPath(), "utf8");
+		setupCursor();
+		expect(readFileSync(cursorPath(), "utf8")).toBe(first);
+	});
+
+	it("keeps the mode of mcp.json when it changes (Cursor)", () => {
+		seedCursor({ ...freshCursor(), command: STALE_COMMAND[0] }, 0o640);
+		setupCursor();
+		expect(statSync(cursorPath()).mode & 0o777).toBe(0o640);
+	});
+});
