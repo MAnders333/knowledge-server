@@ -72,6 +72,24 @@ const PG_STATE_MIGRATIONS: Array<{
 			}
 		},
 	},
+	{
+		version: 5,
+		label: "activation_event rerank model (scorer of rerank_scores)",
+		up: async (tx: TxSql) => {
+			// Same guard as v4: add the column only when missing. pg_attribute, so a
+			// non-owner role sees columns another role created.
+			const [row] = await tx`SELECT EXISTS (
+				SELECT 1 FROM pg_attribute a
+				WHERE a.attrelid = to_regclass('activation_event')
+				  AND a.attname = 'rerank_model' AND a.attnum > 0 AND NOT a.attisdropped
+			) AS present`;
+			if (!row.present) {
+				await tx.unsafe(
+					"ALTER TABLE activation_event ADD COLUMN rerank_model TEXT",
+				);
+			}
+		},
+	},
 ];
 const STATE_SCHEMA_VERSION = latestVersion(PG_STATE_MIGRATIONS);
 
@@ -98,6 +116,7 @@ const PG_ACTIVATION_EVENT_TABLE = `
     entry_ids                TEXT      NOT NULL,
     raw_sims                 TEXT      NOT NULL,
     rerank_scores            TEXT,
+    rerank_model             TEXT,
     gate_mode                TEXT      NOT NULL CHECK (gate_mode IN ('rerank', 'dense', 'off')),
     latency_ms               INTEGER   NOT NULL,
     client_deadline_exceeded BOOLEAN   NOT NULL DEFAULT FALSE,
@@ -199,6 +218,7 @@ function activationEventColumns(r: ActivationEventRow) {
 		raw_sims: JSON.stringify(r.rawSims),
 		rerank_scores:
 			r.rerankScores === null ? null : JSON.stringify(r.rerankScores),
+		rerank_model: r.rerankModel,
 		gate_mode: r.gateMode,
 		latency_ms: r.latencyMs,
 		client_deadline_exceeded: r.clientDeadlineExceeded,

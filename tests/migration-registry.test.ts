@@ -247,10 +247,10 @@ describe("precision gate migrations", () => {
 		expect(SCHEMA_VERSION).toBe(20);
 	});
 
-	it("state DB adds the activation_event gate counts as v4", () => {
-		expect(SERVER_LOCAL_MIGRATIONS.map((m) => m.version).slice(-1)).toEqual([
-			4,
+	it("state DB adds the activation_event gate counts as v4 and the rerank model as v5", () => {
+		expect(SERVER_LOCAL_MIGRATIONS.map((m) => m.version).slice(-2)).toEqual([
+			4, 5,
 		]);
-		expect(SERVER_LOCAL_SCHEMA_VERSION).toBe(4);
+		expect(SERVER_LOCAL_SCHEMA_VERSION).toBe(5);
 	});
 });

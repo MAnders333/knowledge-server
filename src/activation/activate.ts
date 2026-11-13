@@ -25,6 +25,7 @@ import {
 	denseFloor,
 	estimateTokens,
 	rerankFloor,
+	scorerKey,
 } from "./gate.js";
 import { RerankSkippedError } from "./rerank-remote.js";
 import type { RerankScorer } from "./rerank.js";
@@ -759,14 +760,15 @@ export class ActivationEngine {
 		const nCandidates = scored.length;
 		let gateDropped = 0;
 		let gateMode: GateMode = this.reranker ? "dense" : "off";
+		let rerankModel: string | null = null;
 		if (this.reranker && scored.length > 0) {
-			// Bound the rerank input: across multiple cues and stores the pool
-			// can exceed `candidates` — keep the dense-best slice.
+			// Bound the rerank input: across multiple cues and stores the pool can exceed
+			// `candidates`, so keep the dense-best slice. The order is always dense
+			// similarity, best first: listwise scorers show position bias, and a fixed
+			// order (D00 is the dense best) keeps their output reproducible.
 			const maxCandidates = config.activation.rerank.candidates;
-			if (scored.length > maxCandidates) {
-				scored.sort((a, b) => b.rawSimilarity - a.rawSimilarity);
-				scored.length = maxCandidates;
-			}
+			scored.sort((a, b) => b.rawSimilarity - a.rawSimilarity);
+			if (scored.length > maxCandidates) scored.length = maxCandidates;
 
 			try {
 				const documents = scored.map((s) =>
@@ -783,6 +785,7 @@ export class ActivationEngine {
 							: scored[i].staleness.strength);
 				}
 				gateMode = "rerank";
+				rerankModel = scorerKey(this.reranker.identity);
 				componentHealth.recordSuccess("rerank");
 			} catch (err) {
 				componentHealth.recordFailure("rerank", err);
@@ -1084,6 +1087,7 @@ export class ActivationEngine {
 				cueCount: queryList.length,
 				nCandidates,
 				gateMode,
+				rerankModel,
 				gateDropped,
 				budgetDropped,
 				deduped,

@@ -11,6 +11,7 @@ import {
 import type { RerankScorer } from "../src/activation/rerank";
 import { config } from "../src/config";
 import type { IKnowledgeStore } from "../src/db/interface";
+import { componentHealth } from "../src/health";
 import type { KnowledgeEntry } from "../src/types";
 import { makeEntry } from "./fixtures";
 
@@ -433,5 +434,61 @@ describe("single candidate", () => {
 		const result = await engine.activate(CUE, { threshold: 0.42 });
 		expect(result.telemetry?.gateMode).toBe("rerank");
 		expect(ids(result)).toEqual(["lone-entry"]);
+	});
+});
+
+describe("rerank call order, telemetry and health", () => {
+	const fx: Fixture = {
+		entries: [
+			fact("low-entry", "low knowledge", 0.5),
+			fact("high-entry", "high knowledge", 1.0),
+			fact("mid-entry", "mid knowledge", 0.8),
+		],
+	};
+
+	beforeEach(() => componentHealth.clear());
+	afterEach(() => componentHealth.clear());
+
+	it("sends candidates best dense first, so the first document is the dense best", async () => {
+		const seen: string[][] = [];
+		const scorer: RerankScorer = {
+			identity: UNKNOWN_MODEL,
+			scoreBatch: mock(async (_q: string, docs: string[]) => {
+				seen.push(docs);
+				return docs.map(() => 0.9);
+			}),
+		};
+		await engineFor(fx, scorer).activate(CUE);
+		expect(seen).toHaveLength(1);
+		const order = seen[0].map((d) => d.match(/(high|mid|low) knowledge/)?.[1]);
+		expect(order).toEqual(["high", "mid", "low"]);
+	});
+
+	it("reports the configured scorer as provider/model, not a model the endpoint names", async () => {
+		const scorer: RerankScorer = {
+			identity: { provider: "remote", model: "jev-1.14.0" },
+			scoreBatch: mock(async (_q: string, docs: string[]) =>
+				docs.map(() => 0.9),
+			),
+		};
+		const result = await engineFor(fx, scorer).activate(CUE);
+		expect(result.telemetry?.gateMode).toBe("rerank");
+		expect(result.telemetry?.rerankModel).toBe("remote/jev-1.14.0");
+	});
+
+	it("reports no rerank model when the rerank stage did not score", async () => {
+		const result = await engineFor(fx, failingReranker()).activate(CUE);
+		expect(result.telemetry?.gateMode).toBe("dense");
+		expect(result.telemetry?.rerankModel).toBeNull();
+	});
+
+	it("records rerank health once per activation, so a scorer's own breaker is not counted twice", async () => {
+		await engineFor(fx, failingReranker()).activate(CUE);
+		expect(componentHealth.snapshot("rerank").consecutiveFailures).toBe(1);
+		await engineFor(
+			fx,
+			rerankerWith(UNKNOWN_MODEL, { "high knowledge": 0.9 }),
+		).activate(CUE);
+		expect(componentHealth.snapshot("rerank").consecutiveFailures).toBe(0);
 	});
 });

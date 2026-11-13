@@ -93,8 +93,8 @@ export interface RerankScorer {
 	/** Provider and model that produced the scores. */
 	readonly identity: RerankIdentity;
 	/**
-	 * Score each document's relevance to the query.
-	 * Returns one score per document (same order), normalized to [0, 1].
+	 * Score each document's relevance to the query, in input order, normalized to
+	 * [0, 1].
 	 */
 	scoreBatch(query: string, documents: string[]): Promise<number[]>;
 }
@@ -461,12 +461,12 @@ export function createRerankerFromConfig(): RerankScorer | null {
 		const remote = createRemoteRerankerFromConfig();
 		if (remote) {
 			logger.log(
-				`[rerank] Enabled: provider "remote", model "${remote.identity.model}" via LLM_BASE_ENDPOINT. Each activation sends the query tail and candidate text to the gateway. Timeout ${rerank.remote.timeoutMs}ms; candidates ${rerank.candidates}; document ≤${rerank.maxDocTokens} tokens.`,
+				`[rerank] Enabled: provider "remote", model "${remote.identity.model}" via RERANK_REMOTE_URL or LLM_BASE_ENDPOINT. Each activation sends the query tail and candidate text to that endpoint. Timeout ${rerank.remote.timeoutMs}ms; candidates ${rerank.candidates}; document ≤${rerank.maxDocTokens} tokens.`,
 			);
 			return remote;
 		}
 		logger.warn(
-			"[rerank] RERANK_PROVIDER=remote needs LLM_BASE_ENDPOINT and LLM_API_KEY (unset or still the template placeholder) — using the local reranker.",
+			"[rerank] RERANK_PROVIDER=remote needs an endpoint (RERANK_REMOTE_URL, or LLM_BASE_ENDPOINT) and a key (RERANK_REMOTE_API_KEY, or LLM_API_KEY on the gateway); unset or still a template placeholder — using the local reranker.",
 		);
 	}
 	const pin = PINNED_MODELS[rerank.model];

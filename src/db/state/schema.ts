@@ -24,6 +24,10 @@ export const SERVER_LOCAL_MIGRATIONS = [
 	{ version: 2, label: "pending_episode_attempts table" },
 	{ version: 3, label: "activation_event table (content-free measurement)" },
 	{ version: 4, label: "activation_event gate and budget counts" },
+	{
+		version: 5,
+		label: "activation_event rerank model (scorer of rerank_scores)",
+	},
 ] as const;
 
 /** activation_event columns added in v4. Existing state.db files get them via ALTER (see state/index.ts). */
@@ -100,6 +104,7 @@ export const SERVER_LOCAL_CREATE_TABLES = `
     entry_ids                TEXT    NOT NULL,
     raw_sims                 TEXT    NOT NULL,
     rerank_scores            TEXT,
+    rerank_model             TEXT,
     gate_mode                TEXT    NOT NULL CHECK(gate_mode IN ('rerank', 'dense', 'off')),
     latency_ms               INTEGER NOT NULL,
     client_deadline_exceeded INTEGER NOT NULL DEFAULT 0,
