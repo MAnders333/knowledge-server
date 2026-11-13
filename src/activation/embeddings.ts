@@ -1,7 +1,8 @@
-import { config } from "../config.js";
+import { config, resolveScopedApiKey } from "../config.js";
 import { componentHealth } from "../health.js";
 import { logger } from "../logger.js";
 import type { KnowledgeType } from "../types.js";
+import { assertKeyTransport } from "./key-transport.js";
 
 /** Texts per /embeddings request. */
 const CHUNK_SIZE = 100;
@@ -10,7 +11,7 @@ export const BULK_EMBED_MIN_TIMEOUT_MS = 60_000;
 const DEFAULT_RETRY_BASE_DELAY_MS = 1_000;
 const MAX_RETRY_DELAY_MS = 30_000;
 
-export interface EmbedBatchOptions {
+interface EmbedBatchOptions {
 	/** Additional attempts per chunk after a retryable failure. Default 0 (interactive). */
 	maxRetries?: number;
 	/** Per-attempt timeout in ms. Default: the client's timeout (EMBEDDING_TIMEOUT_MS). */
@@ -220,7 +221,13 @@ export class EmbeddingClient {
 		} else if (config.llm.openai.baseURL) {
 			// Reuse OpenAI-compatible provider base URL + key.
 			this.endpoint = config.llm.openai.baseURL;
-			this.apiKey = config.llm.openai.apiKey || config.llm.apiKey;
+			// LLM_API_KEY is forwarded only when LLM_BASE_ENDPOINT is this same origin.
+			this.apiKey = resolveScopedApiKey({
+				endpointUrl: config.llm.openai.baseURL,
+				dedicatedApiKey: config.llm.openai.apiKey,
+				llmBaseEndpoint: config.llm.baseEndpoint,
+				llmApiKey: config.llm.apiKey,
+			});
 		} else if (config.llm.baseEndpoint) {
 			// Unified proxy fallback — append OpenAI-compatible path.
 			this.endpoint = `${config.llm.baseEndpoint}/openai/v1`;
@@ -229,7 +236,13 @@ export class EmbeddingClient {
 			// No base URL configured at all — fall back to OpenAI's public API.
 			// This covers the case where OPENAI_API_KEY is set without OPENAI_BASE_URL.
 			this.endpoint = "https://api.openai.com/v1";
-			this.apiKey = config.llm.openai.apiKey || config.llm.apiKey;
+			// LLM_API_KEY is forwarded only when LLM_BASE_ENDPOINT is this same origin.
+			this.apiKey = resolveScopedApiKey({
+				endpointUrl: this.endpoint,
+				dedicatedApiKey: config.llm.openai.apiKey,
+				llmBaseEndpoint: config.llm.baseEndpoint,
+				llmApiKey: config.llm.apiKey,
+			});
 		}
 		this.model = config.embedding.model;
 		this.dimensions = config.embedding.dimensions;
@@ -259,6 +272,7 @@ export class EmbeddingClient {
 		};
 		// Local endpoints (Ollama, llama.cpp) run without a key: send none rather than "Bearer ".
 		if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
+		assertKeyTransport(this.endpoint, this.apiKey);
 		const response = await fetch(`${this.endpoint}/embeddings`, {
 			method: "POST",
 			headers,
@@ -273,6 +287,7 @@ export class EmbeddingClient {
 			// embedding proxy causes the fetch to hang indefinitely and
 			// holds the TCP connection open - silently breaking /activate
 			// (HTTP route + MCP tool) for the duration. See config.embedding.timeoutMs.
+			redirect: "error",
 			signal: AbortSignal.timeout(timeoutMs),
 		});
 
@@ -447,7 +462,7 @@ export function storedNorm(v: Float32Array): number {
 }
 
 /** A query vector normalised once, for scoring against many stored vectors. */
-export interface PreparedQuery {
+interface PreparedQuery {
 	/** Unit-length copy of the query (Float64, so scores match cosineSimilarity). */
 	readonly unit: Float64Array;
 	readonly zero: boolean;

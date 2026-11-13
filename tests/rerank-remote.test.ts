@@ -714,3 +714,50 @@ describe("default candidate pool", () => {
 		expect(candidatesWith({})).toBe(16);
 	});
 });
+
+describe("RemoteReranker transport and privacy", () => {
+	it("clamps the call to the budget the caller passes", async () => {
+		// Real clock on purpose: the abort comes from AbortSignal.timeout, which fake
+		// timers cannot drive. The stub answers after the budget has run out.
+		respond = async () => {
+			await Bun.sleep(500);
+			return systemOne({ D00: 0.5 });
+		};
+		await expect(
+			makeReranker({ timeoutMs: 2_000 }).scoreBatch("q", ["a"], {
+				budgetMs: 100,
+			}),
+		).rejects.toThrow("timed out after 100ms");
+	});
+
+	it("scrubs secrets from the query and the documents before the call", async () => {
+		const secret = "a".repeat(40);
+		respond = () => systemOne({ D00: 0.5 });
+		await makeReranker().scoreBatch(`check api_key = ${secret} please`, [
+			`doc with api_key=${secret}`,
+		]);
+		const sent = JSON.stringify(requests[0].body);
+		expect(sent).not.toContain(secret);
+		expect(sent).toContain("[REDACTED:keyed_entropy]");
+	});
+
+	it("refuses to send the key over plain http to a non-loopback host, and makes no call", async () => {
+		await expect(
+			makeReranker({
+				url: "http://gateway.example.net/v1/systemone",
+			}).scoreBatch("q", ["a"]),
+		).rejects.toThrow("plain http");
+		expect(requests).toHaveLength(0);
+	});
+
+	it("does not follow a redirect, so the key is not sent to the redirect target", async () => {
+		respond = () =>
+			new Response(null, {
+				status: 307,
+				headers: { Location: `http://127.0.0.1:${server.port}/elsewhere` },
+			});
+		await expect(makeReranker().scoreBatch("q", ["a"])).rejects.toThrow();
+		expect(requests).toHaveLength(1);
+		expect(requests[0].path).toBe(ROUTE);
+	});
+});

@@ -5,6 +5,8 @@ import {
 	remoteRerankIsActive,
 } from "../config.js";
 import { logger } from "../logger.js";
+import { redactSecrets } from "../redact.js";
+import { assertKeyTransport } from "./key-transport.js";
 import type { RerankIdentity, RerankScorer } from "./rerank.js";
 
 /**
@@ -18,8 +20,9 @@ import type { RerankIdentity, RerankScorer } from "./rerank.js";
  * probability that it is relevant.
  *
  * Privacy: each call sends the query tail and the head of every candidate to the
- * endpoint, which forwards them to the hosting provider of the model. This backend
- * runs only when RERANK_PROVIDER=remote is set explicitly.
+ * endpoint, which forwards them to the hosting provider of the model. Both are
+ * scrubbed with the REDACT_SECRETS rules first. This backend runs only when
+ * RERANK_PROVIDER=remote is set explicitly.
  *
  * Failure philosophy matches the local reranker: any failure throws from
  * scoreBatch() and the caller keeps dense ordering. Retries: at most one, and only
@@ -74,6 +77,12 @@ interface RemoteResult {
 	inputTokens: number | null;
 }
 
+/** A scoreBatch call's time: the absolute deadline, and the timeout it came from for messages. */
+interface CallBudget {
+	deadline: number;
+	timeoutMs: number;
+}
+
 /** The System One body: one state with the query and the documents, one Noul per document. */
 function buildRequestBody(
 	model: string,
@@ -87,7 +96,9 @@ function buildRequestBody(
 	const docs: Record<string, { text: string }> = {};
 	const questions: Record<string, unknown> = {};
 	ids.forEach((id, i) => {
-		docs[id] = { text: headChars(documents[i], maxDocChars) };
+		docs[id] = {
+			text: headChars(redactSecrets(documents[i]).text, maxDocChars),
+		};
 		questions[id] = {
 			type: "noul",
 			instructions: QUESTION_TEMPLATE.replace("{id}", id),
@@ -98,7 +109,10 @@ function buildRequestBody(
 		ids,
 		body: {
 			model,
-			state: { query: tailChars(query, maxQueryChars), documents: docs },
+			state: {
+				query: tailChars(redactSecrets(query).text, maxQueryChars),
+				documents: docs,
+			},
 			questions,
 		},
 	};
@@ -220,7 +234,7 @@ async function summarizeErrorBody(response: Response): Promise<string> {
 	return label ? ` (error: ${label})` : "";
 }
 
-export interface RemoteRerankerOptions {
+interface RemoteRerankerOptions {
 	/** Full System One URL, as in RERANK_REMOTE_URL. Defaults to config. */
 	url?: string;
 	apiKey?: string;
@@ -269,9 +283,14 @@ export class RemoteReranker implements RerankScorer {
 	/**
 	 * Score every document in one call. Returns probabilities in input order. Throws
 	 * on timeout, HTTP error, malformed or partial response, and while the breaker is
-	 * open (RerankSkippedError).
+	 * open (RerankSkippedError). `budgetMs` caps the call; the configured timeout still
+	 * applies when it is shorter.
 	 */
-	async scoreBatch(query: string, documents: string[]): Promise<number[]> {
+	async scoreBatch(
+		query: string,
+		documents: string[],
+		options?: { budgetMs?: number },
+	): Promise<number[]> {
 		if (documents.length === 0) return [];
 		if (documents.length > REMOTE_RERANK_MAX_CANDIDATES) {
 			throw new Error(
@@ -289,13 +308,17 @@ export class RemoteReranker implements RerankScorer {
 			this.breakerOpenUntil = now + BREAKER_COOLDOWN_MS;
 		}
 
+		// The configured timeout, lowered to the caller's budget when that is shorter.
+		const timeoutMs = Math.min(
+			this.timeoutMs,
+			options?.budgetMs ?? this.timeoutMs,
+		);
 		const started = performance.now();
 		try {
-			const result = await this.request(
-				query,
-				documents,
-				started + this.timeoutMs,
-			);
+			const result = await this.request(query, documents, {
+				deadline: started + timeoutMs,
+				timeoutMs,
+			});
 			this.recordSuccess();
 			logger.log(
 				`[rerank] provider=remote model=${this.identity.model} resolved_model=${result.model ?? "unknown"} gate_mode=rerank candidates=${documents.length} input_tokens=${result.inputTokens ?? "unknown"} elapsed_ms=${Math.round(performance.now() - started)}`,
@@ -311,7 +334,7 @@ export class RemoteReranker implements RerankScorer {
 	private async request(
 		query: string,
 		documents: string[],
-		deadline: number,
+		budget: CallBudget,
 	): Promise<RemoteResult> {
 		const { ids, body } = buildRequestBody(
 			this.identity.model,
@@ -321,18 +344,18 @@ export class RemoteReranker implements RerankScorer {
 			this.maxDocChars,
 		);
 		try {
-			let response = await this.post(body, deadline);
+			let response = await this.post(body, budget);
 			if (response.status === 429) {
 				const waitMs = parseRetryAfterMs(
 					response.headers.get("retry-after"),
 					this.now(),
 				);
-				if (waitMs !== null && waitMs < deadline - performance.now()) {
+				if (waitMs !== null && waitMs < budget.deadline - performance.now()) {
 					await response.text().catch(() => "");
 					const { promise, resolve } = Promise.withResolvers<void>();
 					setTimeout(resolve, waitMs);
 					await promise;
-					response = await this.post(body, deadline);
+					response = await this.post(body, budget);
 				}
 			}
 			if (!response.ok) {
@@ -353,16 +376,21 @@ export class RemoteReranker implements RerankScorer {
 				err instanceof Error &&
 				(err.name === "TimeoutError" || err.name === "AbortError")
 			) {
-				throw new Error(`timed out after ${this.timeoutMs}ms`);
+				throw new Error(`timed out after ${budget.timeoutMs}ms`);
 			}
 			throw err;
 		}
 	}
 
 	/** One POST. The budget is whatever remains of the call's deadline. */
-	private async post(body: unknown, deadline: number): Promise<Response> {
-		const remaining = deadline - performance.now();
-		if (remaining <= 0) throw new Error(`timed out after ${this.timeoutMs}ms`);
+	private async post(body: unknown, budget: CallBudget): Promise<Response> {
+		const remaining = budget.deadline - performance.now();
+		if (remaining <= 0) {
+			throw new Error(`timed out after ${budget.timeoutMs}ms`);
+		}
+		// The key goes in a header, so it is sent only over https or to loopback, and
+		// a redirect is an error rather than a second request with the key.
+		assertKeyTransport(this.url, this.apiKey);
 		return fetch(this.url, {
 			method: "POST",
 			headers: {
@@ -370,6 +398,7 @@ export class RemoteReranker implements RerankScorer {
 				Authorization: `Bearer ${this.apiKey}`,
 			},
 			body: JSON.stringify(body),
+			redirect: "error",
 			signal: AbortSignal.timeout(remaining),
 		});
 	}
