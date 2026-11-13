@@ -24,6 +24,12 @@ import {
 	assertNotNewerThanCode,
 	pendingMigrations,
 } from "../migration-registry.js";
+import {
+	type ContradictionMergedData,
+	type ContradictionOp,
+	type ContradictionResolution,
+	planContradictionResolution,
+} from "../shared/contradiction-plan.js";
 import { SQLITE_BUSY_TIMEOUT_MS } from "../sqlite-busy.js";
 import { MIGRATIONS } from "./migrations.js";
 import { CREATE_TABLES, SCHEMA_VERSION } from "./schema.js";
@@ -183,9 +189,9 @@ export class KnowledgeDB implements IKnowledgeStore {
 			.prepare(
 				`INSERT INTO knowledge_entry 
          (id, type, content, topics, confidence, source, status, strength,
-          created_at, updated_at, last_accessed_at, access_count, observation_count,
-          superseded_by, derived_from, is_synthesized, embedding)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          created_at, updated_at, last_accessed_at, access_count, injection_count,
+          observation_count, superseded_by, derived_from, is_synthesized, embedding)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			)
 			.run(
 				entry.id,
@@ -200,6 +206,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 				entry.updatedAt,
 				entry.lastAccessedAt,
 				entry.accessCount,
+				entry.injectionCount ?? 0,
 				entry.observationCount,
 				entry.supersededBy,
 				JSON.stringify(entry.derivedFrom),
@@ -589,216 +596,44 @@ export class KnowledgeDB implements IKnowledgeStore {
 	}
 
 	/**
-	 * Record the outcome of a contradiction resolution between two entries.
+	 * Record the outcome of a contradiction resolution between two entries. The
+	 * decision is planContradictionResolution (src/db/shared/contradiction-plan.ts);
+	 * this runs its ops in one transaction.
 	 *
 	 * - "supersede_old": newEntryId wins — mark existingEntryId as superseded
 	 * - "supersede_new": existingEntryId wins — mark newEntryId as superseded
 	 * - "merge":         replace newEntryId content with merged, mark existingEntryId as superseded
 	 * - "irresolvable":  insert a contradicts relation, mark BOTH entries as conflicted for human review
 	 *
-	 * For supersede/merge resolutions: if the winning entry was previously 'conflicted'
-	 * (i.e. it was one half of an irresolvable pair), its contradicts relation is deleted
-	 * and its status is restored to 'active'. This enables automatic re-resolution when
-	 * a new entry clearly settles a previously unresolvable conflict.
+	 * A winner that was conflicted is settled and its partner restored, which lets a
+	 * new entry clearly resolve a previously unresolvable conflict.
 	 */
 	async applyContradictionResolution(
-		resolution: "supersede_old" | "supersede_new" | "merge" | "irresolvable",
+		resolution: ContradictionResolution,
 		newEntryId: string,
 		existingEntryId: string,
-		mergedData?: {
-			content: string;
-			type: string;
-			topics: string[];
-			confidence: number;
-		},
+		mergedData?: ContradictionMergedData,
 	): Promise<void> {
 		const now = Date.now();
-
 		this.db.transaction(() => {
-			switch (resolution) {
-				case "supersede_old": {
-					// Resolve any prior conflicts on BOTH entries BEFORE status changes.
-					const loserConflictPartner1 =
-						this.findConflictCounterpart(existingEntryId);
-					const winnerConflictPartner1 =
-						this.findConflictCounterpart(newEntryId);
-					// New entry wins — mark existing as superseded
-					this.db
-						.prepare(
-							`UPDATE knowledge_entry
-               SET status = 'superseded', superseded_by = ?, updated_at = ?
-               WHERE id = ?`,
-						)
-						.run(newEntryId, now, existingEntryId);
-					// Record the supersedes relation
-					this.db
-						.prepare(
-							`INSERT OR IGNORE INTO knowledge_relation
-               (id, source_id, target_id, type, created_at)
-               VALUES (?, ?, ?, 'supersedes', ?)`,
-						)
-						.run(randomUUID(), newEntryId, existingEntryId, now);
-					// If the loser was half of an irresolvable pair, its counterpart is now orphaned.
-					// Restore the counterpart to 'active' and clean up the contradicts relation.
-					if (loserConflictPartner1)
-						this.restoreConflictCounterpart(
-							loserConflictPartner1,
-							existingEntryId,
-							now,
-						);
-					// If the winner was also conflicted, the new entry decisively settles it —
-					// restore the winner to active and clean up its conflict counterpart too.
-					if (winnerConflictPartner1) {
-						this.db
-							.prepare(
-								"UPDATE knowledge_entry SET status = 'active', updated_at = ? WHERE id = ? AND status = 'conflicted'",
-							)
-							.run(now, newEntryId);
-						this.restoreConflictCounterpart(
-							winnerConflictPartner1,
-							newEntryId,
-							now,
-						);
-					}
-					break;
-				}
-
-				case "supersede_new": {
-					// Resolve any prior conflicts on BOTH entries before status changes.
-					const loserConflictPartner2 =
-						this.findConflictCounterpart(newEntryId);
-					const winnerConflictPartner2 =
-						this.findConflictCounterpart(existingEntryId);
-					// Existing entry wins — mark new entry as superseded
-					this.db
-						.prepare(
-							`UPDATE knowledge_entry
-               SET status = 'superseded', superseded_by = ?, updated_at = ?
-               WHERE id = ?`,
-						)
-						.run(existingEntryId, now, newEntryId);
-					this.db
-						.prepare(
-							`INSERT OR IGNORE INTO knowledge_relation
-               (id, source_id, target_id, type, created_at)
-               VALUES (?, ?, ?, 'supersedes', ?)`,
-						)
-						.run(randomUUID(), existingEntryId, newEntryId, now);
-					// Restore the loser's orphaned conflict counterpart if any.
-					if (loserConflictPartner2)
-						this.restoreConflictCounterpart(
-							loserConflictPartner2,
-							newEntryId,
-							now,
-						);
-					// If the winner was also conflicted, the new entry decisively settles it —
-					// restore the winner to active and clean up its conflict counterpart too.
-					if (winnerConflictPartner2) {
-						this.db
-							.prepare(
-								"UPDATE knowledge_entry SET status = 'active', updated_at = ? WHERE id = ? AND status = 'conflicted'",
-							)
-							.run(now, existingEntryId);
-						this.restoreConflictCounterpart(
-							winnerConflictPartner2,
-							existingEntryId,
-							now,
-						);
-					}
-					break;
-				}
-
-				case "merge": {
-					// Resolve any prior conflicts on both entries BEFORE status changes.
-					const existingConflictPartner =
-						this.findConflictCounterpart(existingEntryId);
-					const newConflictPartner = this.findConflictCounterpart(newEntryId);
-					// Merge into the new entry, supersede the old one.
-					// If mergedData is absent (LLM truncation), newEntryId keeps its
-					// original content — still a valid state, just unrefined.
-					if (!mergedData) {
-						logger.warn(
-							`[db] merge resolution missing mergedData — existingEntryId ${existingEntryId} ` +
-								`will be superseded but newEntryId ${newEntryId} content unchanged`,
-						);
-					} else {
-						const safeType = clampKnowledgeType(mergedData.type);
-						this.db
-							.prepare(
-								`UPDATE knowledge_entry
-                 SET content = ?, type = ?, topics = ?, confidence = ?,
-                     embedding = NULL, updated_at = ?
-                 WHERE id = ?`,
-							)
-							.run(
-								mergedData.content,
-								safeType,
-								JSON.stringify(mergedData.topics),
-								mergedData.confidence,
-								now,
-								newEntryId,
-							);
-					}
-					this.db
-						.prepare(
-							`UPDATE knowledge_entry
-               SET status = 'superseded', superseded_by = ?, updated_at = ?
-               WHERE id = ?`,
-						)
-						.run(newEntryId, now, existingEntryId);
-					this.db
-						.prepare(
-							`INSERT OR IGNORE INTO knowledge_relation
-               (id, source_id, target_id, type, created_at)
-               VALUES (?, ?, ?, 'supersedes', ?)`,
-						)
-						.run(randomUUID(), newEntryId, existingEntryId, now);
-					// Restore orphaned conflict counterparts for both entries if applicable.
-					// For the loser (existingEntryId): restore its counterpart.
-					if (existingConflictPartner)
-						this.restoreConflictCounterpart(
-							existingConflictPartner,
-							existingEntryId,
-							now,
-						);
-					// For the winner (newEntryId): if it was conflicted AND the merge content actually
-					// landed (mergedData present), the conflict is decisively resolved — restore it and
-					// its counterpart to active. If mergedData is absent (LLM truncation), the entry
-					// retains its original unrefined content and should stay under review.
-					if (newConflictPartner && mergedData) {
-						this.db
-							.prepare(
-								"UPDATE knowledge_entry SET status = 'active', updated_at = ? WHERE id = ? AND status = 'conflicted'",
-							)
-							.run(now, newEntryId);
-						this.restoreConflictCounterpart(
-							newConflictPartner,
-							newEntryId,
-							now,
-						);
-					}
-					break;
-				}
-
-				case "irresolvable":
-					// Genuine tie — insert contradicts relation, mark BOTH entries as conflicted.
-					// The /review endpoint surfaces all conflicted entries, so both halves of the
-					// conflict must be visible there.
-					this.db
-						.prepare(
-							`INSERT OR IGNORE INTO knowledge_relation
-               (id, source_id, target_id, type, created_at)
-               VALUES (?, ?, ?, 'contradicts', ?)`,
-						)
-						.run(randomUUID(), newEntryId, existingEntryId, now);
-					this.db
-						.prepare(
-							`UPDATE knowledge_entry SET status = 'conflicted', updated_at = ?
-               WHERE id IN (?, ?)`,
-						)
-						.run(now, newEntryId, existingEntryId);
-					break;
+			const plan = planContradictionResolution(
+				resolution,
+				newEntryId,
+				existingEntryId,
+				{
+					newPartner: this.findConflictCounterpart(newEntryId),
+					existingPartner: this.findConflictCounterpart(existingEntryId),
+				},
+				mergedData,
+				now,
+			);
+			if (plan.missingMergedData) {
+				logger.warn(
+					`[db] merge resolution missing mergedData — existingEntryId ${existingEntryId} ` +
+						`will be superseded but newEntryId ${newEntryId} content unchanged`,
+				);
 			}
+			for (const op of plan.ops) this.applyContradictionOp(op);
 		})();
 	}
 
@@ -824,34 +659,77 @@ export class KnowledgeDB implements IKnowledgeStore {
 		return rel.source_id === entryId ? rel.target_id : rel.source_id;
 	}
 
-	/**
-	 * Restore a conflict counterpart to 'active' after its paired entry has been
-	 * superseded/resolved. Deletes the contradicts relation between them.
-	 *
-	 * @param counterpartId  The entry to restore (was orphaned when its partner was resolved)
-	 * @param resolvedId     The entry that was just superseded (used to target the relation delete)
-	 * @param now            Timestamp for updated_at
-	 */
-	private restoreConflictCounterpart(
-		counterpartId: string,
-		resolvedId: string,
-		now: number,
-	): void {
-		this.db
-			.prepare(
-				"UPDATE knowledge_entry SET status = 'active', updated_at = ? WHERE id = ? AND status = 'conflicted'",
-			)
-			.run(now, counterpartId);
-
-		// Scope the delete to the specific pair (not all contradicts relations touching resolvedId)
-		// to avoid accidentally orphaning unrelated conflicts if resolvedId has multiple pairs.
-		this.db
-			.prepare(
-				`DELETE FROM knowledge_relation
-         WHERE type = 'contradicts'
-           AND ((source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?))`,
-			)
-			.run(resolvedId, counterpartId, counterpartId, resolvedId);
+	/** Run one op of a contradiction plan (see planContradictionResolution). */
+	private applyContradictionOp(op: ContradictionOp): void {
+		switch (op.kind) {
+			case "mergeContent":
+				this.db
+					.prepare(
+						`UPDATE knowledge_entry
+						 SET content = ?, type = ?, topics = ?, confidence = ?,
+						     embedding = NULL, updated_at = ?
+						 WHERE id = ?`,
+					)
+					.run(
+						op.content,
+						op.type,
+						JSON.stringify(op.topics),
+						op.confidence,
+						op.at,
+						op.id,
+					);
+				return;
+			case "supersede":
+				this.db
+					.prepare(
+						"UPDATE knowledge_entry SET status = 'superseded', superseded_by = ?, updated_at = ? WHERE id = ?",
+					)
+					.run(op.supersededBy, op.at, op.id);
+				return;
+			case "link":
+				this.db
+					.prepare(
+						`INSERT OR IGNORE INTO knowledge_relation
+						 (id, source_id, target_id, type, created_at)
+						 VALUES (?, ?, ?, ?, ?)`,
+					)
+					.run(randomUUID(), op.sourceId, op.targetId, op.relation, op.at);
+				return;
+			case "restoreCounterpart":
+				this.db
+					.prepare(
+						"UPDATE knowledge_entry SET status = 'active', updated_at = ? WHERE id = ? AND status = 'conflicted'",
+					)
+					.run(op.at, op.counterpartId);
+				// Scope the delete to the specific pair (not all contradicts relations touching resolvedId).
+				this.db
+					.prepare(
+						`DELETE FROM knowledge_relation
+						 WHERE type = 'contradicts'
+						   AND ((source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?))`,
+					)
+					.run(
+						op.resolvedId,
+						op.counterpartId,
+						op.counterpartId,
+						op.resolvedId,
+					);
+				return;
+			case "activateIfConflicted":
+				this.db
+					.prepare(
+						"UPDATE knowledge_entry SET status = 'active', updated_at = ? WHERE id = ? AND status = 'conflicted'",
+					)
+					.run(op.at, op.id);
+				return;
+			case "markConflicted":
+				this.db
+					.prepare(
+						"UPDATE knowledge_entry SET status = 'conflicted', updated_at = ? WHERE id IN (?, ?)",
+					)
+					.run(op.at, op.ids[0], op.ids[1]);
+				return;
+		}
 	}
 
 	/**

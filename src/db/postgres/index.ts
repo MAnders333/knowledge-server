@@ -19,6 +19,12 @@ import {
 	pendingMigrations,
 } from "../migration-registry.js";
 import {
+	type ContradictionMergedData,
+	type ContradictionOp,
+	type ContradictionResolution,
+	planContradictionResolution,
+} from "../shared/contradiction-plan.js";
+import {
 	bufferToFloats,
 	byteaToFloat32,
 	floatsToBuffer,
@@ -670,74 +676,46 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		const embeddingBuf = entry.embedding
 			? floatsToBuffer(entry.embedding)
 			: null;
-		// Include embedding_vec in the INSERT only when the column exists — it is
-		// created by ensureVectorColumn() once embedding_metadata is set. Naming a
-		// non-existent column is an immediate SQL error regardless of the value.
+		// embedding_vec is named only when the column exists (ensureVectorColumn() creates
+		// it once embedding_metadata is set). Naming a missing column is an SQL error
+		// regardless of the value.
+		const cols: Array<
+			[name: string, value: unknown, cast?: "jsonb" | "vector"]
+		> = [
+			["id", entry.id],
+			["type", entry.type],
+			["content", entry.content],
+			["topics", this.sql.json(entry.topics), "jsonb"],
+			["confidence", entry.confidence],
+			["source", entry.source],
+			["status", entry.status],
+			["strength", entry.strength],
+			["created_at", entry.createdAt],
+			["updated_at", entry.updatedAt],
+			["last_accessed_at", entry.lastAccessedAt],
+			["access_count", entry.accessCount],
+			["injection_count", entry.injectionCount ?? 0],
+			["observation_count", entry.observationCount],
+			["superseded_by", entry.supersededBy],
+			["derived_from", this.sql.json(entry.derivedFrom), "jsonb"],
+			["is_synthesized", entry.isSynthesized ? 1 : 0],
+			["embedding", embeddingBuf],
+		];
 		if (this.vecColumnDims !== null) {
-			const embeddingVec = this.vecLiteralFor(entry.embedding);
-			await this.sql.unsafe(
-				`INSERT INTO knowledge_entry
-				(id, type, content, topics, confidence, source, status, strength,
-				 created_at, updated_at, last_accessed_at, access_count, observation_count,
-				 superseded_by, derived_from, is_synthesized, embedding, embedding_vec)
-				VALUES (
-					$1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-					$14, $15::jsonb, $16, $17, $18::vector
-				)`,
-				[
-					entry.id,
-					entry.type,
-					entry.content,
-					this.sql.json(entry.topics),
-					entry.confidence,
-					entry.source,
-					entry.status,
-					entry.strength,
-					entry.createdAt,
-					entry.updatedAt,
-					entry.lastAccessedAt,
-					entry.accessCount,
-					entry.observationCount,
-					entry.supersededBy,
-					this.sql.json(entry.derivedFrom),
-					entry.isSynthesized ? 1 : 0,
-					embeddingBuf,
-					embeddingVec,
-				] as postgres.ParameterOrJSON<never>[],
-			);
-		} else {
-			await this.sql.unsafe(
-				`INSERT INTO knowledge_entry
-				(id, type, content, topics, confidence, source, status, strength,
-				 created_at, updated_at, last_accessed_at, access_count, observation_count,
-				 superseded_by, derived_from, is_synthesized, embedding)
-				VALUES (
-					$1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-					$14, $15::jsonb, $16, $17
-				)`,
-				[
-					entry.id,
-					entry.type,
-					entry.content,
-					this.sql.json(entry.topics),
-					entry.confidence,
-					entry.source,
-					entry.status,
-					entry.strength,
-					entry.createdAt,
-					entry.updatedAt,
-					entry.lastAccessedAt,
-					entry.accessCount,
-					entry.observationCount,
-					entry.supersededBy,
-					this.sql.json(entry.derivedFrom),
-					entry.isSynthesized ? 1 : 0,
-					embeddingBuf,
-				] as postgres.ParameterOrJSON<never>[],
-			);
+			cols.push([
+				"embedding_vec",
+				this.vecLiteralFor(entry.embedding),
+				"vector",
+			]);
 		}
+		await this.sql.unsafe(
+			`INSERT INTO knowledge_entry (${cols.map(([name]) => name).join(", ")})
+			VALUES (${cols
+				.map(([, , cast], i) => (cast ? `$${i + 1}::${cast}` : `$${i + 1}`))
+				.join(", ")})`,
+			cols.map(([, value]) => value) as postgres.ParameterOrJSON<never>[],
+		);
 	}
-
 	async updateEntry(
 		id: string,
 		updates: Partial<KnowledgeEntry>,
@@ -1052,181 +1030,36 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	}
 
 	async applyContradictionResolution(
-		resolution: "supersede_old" | "supersede_new" | "merge" | "irresolvable",
+		resolution: ContradictionResolution,
 		newEntryId: string,
 		existingEntryId: string,
-		mergedData?: {
-			content: string;
-			type: string;
-			topics: string[];
-			confidence: number;
-		},
+		mergedData?: ContradictionMergedData,
 	): Promise<void> {
 		const now = Date.now();
-
 		await this.sql.begin(async (sql: TxSql) => {
-			switch (resolution) {
-				case "supersede_old": {
-					const loserPartner = await this.findConflictCounterpart(
+			// Partners are read before any status changes; the plan decides the writes
+			// (src/db/shared/contradiction-plan.ts).
+			const plan = planContradictionResolution(
+				resolution,
+				newEntryId,
+				existingEntryId,
+				{
+					newPartner: await this.findConflictCounterpart(sql, newEntryId),
+					existingPartner: await this.findConflictCounterpart(
 						sql,
 						existingEntryId,
-					);
-					const winnerPartner = await this.findConflictCounterpart(
-						sql,
-						newEntryId,
-					);
-					await sql`
-						UPDATE knowledge_entry
-						SET status = 'superseded', superseded_by = ${newEntryId}, updated_at = ${now}
-						WHERE id = ${existingEntryId}
-					`;
-					await sql`
-						INSERT INTO knowledge_relation (id, source_id, target_id, type, created_at)
-						VALUES (${randomUUID()}, ${newEntryId}, ${existingEntryId}, 'supersedes', ${now})
-						ON CONFLICT DO NOTHING
-					`;
-					if (loserPartner)
-						await this.restoreConflictCounterpart(
-							sql,
-							loserPartner,
-							existingEntryId,
-							now,
-						);
-					if (winnerPartner) {
-						await sql`
-							UPDATE knowledge_entry SET status = 'active', updated_at = ${now}
-							WHERE id = ${newEntryId} AND status = 'conflicted'
-						`;
-						await this.restoreConflictCounterpart(
-							sql,
-							winnerPartner,
-							newEntryId,
-							now,
-						);
-					}
-					break;
-				}
-
-				case "supersede_new": {
-					const loserPartner = await this.findConflictCounterpart(
-						sql,
-						newEntryId,
-					);
-					const winnerPartner = await this.findConflictCounterpart(
-						sql,
-						existingEntryId,
-					);
-					await sql`
-						UPDATE knowledge_entry
-						SET status = 'superseded', superseded_by = ${existingEntryId}, updated_at = ${now}
-						WHERE id = ${newEntryId}
-					`;
-					await sql`
-						INSERT INTO knowledge_relation (id, source_id, target_id, type, created_at)
-						VALUES (${randomUUID()}, ${existingEntryId}, ${newEntryId}, 'supersedes', ${now})
-						ON CONFLICT DO NOTHING
-					`;
-					if (loserPartner)
-						await this.restoreConflictCounterpart(
-							sql,
-							loserPartner,
-							newEntryId,
-							now,
-						);
-					if (winnerPartner) {
-						await sql`
-							UPDATE knowledge_entry SET status = 'active', updated_at = ${now}
-							WHERE id = ${existingEntryId} AND status = 'conflicted'
-						`;
-						await this.restoreConflictCounterpart(
-							sql,
-							winnerPartner,
-							existingEntryId,
-							now,
-						);
-					}
-					break;
-				}
-
-				case "merge": {
-					const existingPartner = await this.findConflictCounterpart(
-						sql,
-						existingEntryId,
-					);
-					const newPartner = await this.findConflictCounterpart(
-						sql,
-						newEntryId,
-					);
-					if (!mergedData) {
-						logger.warn(
-							`[pg-db] merge resolution missing mergedData — existingEntryId ${existingEntryId} ` +
-								`will be superseded but newEntryId ${newEntryId} content unchanged`,
-						);
-					} else {
-						const safeType = clampKnowledgeType(mergedData.type);
-						// Clear both vectors, as clearTombstonedEmbeddings() does. ANN search reads
-						// embedding_vec, so a stale copy would keep matching the old content.
-						const vecClause =
-							this.vecColumnDims !== null ? ", embedding_vec = NULL" : "";
-						await sql.unsafe(
-							`UPDATE knowledge_entry
-							SET content = $1, type = $2, topics = $3::jsonb, confidence = $4,
-							    embedding = NULL${vecClause}, updated_at = $5
-							WHERE id = $6`,
-							[
-								mergedData.content,
-								safeType,
-								sql.json(mergedData.topics),
-								mergedData.confidence,
-								now,
-								newEntryId,
-							] as postgres.ParameterOrJSON<never>[],
-						);
-					}
-					await sql`
-						UPDATE knowledge_entry
-						SET status = 'superseded', superseded_by = ${newEntryId}, updated_at = ${now}
-						WHERE id = ${existingEntryId}
-					`;
-					await sql`
-						INSERT INTO knowledge_relation (id, source_id, target_id, type, created_at)
-						VALUES (${randomUUID()}, ${newEntryId}, ${existingEntryId}, 'supersedes', ${now})
-						ON CONFLICT DO NOTHING
-					`;
-					if (existingPartner)
-						await this.restoreConflictCounterpart(
-							sql,
-							existingPartner,
-							existingEntryId,
-							now,
-						);
-					if (newPartner && mergedData) {
-						await sql`
-							UPDATE knowledge_entry SET status = 'active', updated_at = ${now}
-							WHERE id = ${newEntryId} AND status = 'conflicted'
-						`;
-						await this.restoreConflictCounterpart(
-							sql,
-							newPartner,
-							newEntryId,
-							now,
-						);
-					}
-					break;
-				}
-
-				case "irresolvable":
-					await sql`
-						INSERT INTO knowledge_relation (id, source_id, target_id, type, created_at)
-						VALUES (${randomUUID()}, ${newEntryId}, ${existingEntryId}, 'contradicts', ${now})
-						ON CONFLICT DO NOTHING
-					`;
-					await sql`
-						UPDATE knowledge_entry SET status = 'conflicted', updated_at = ${now}
-						WHERE id IN (${newEntryId}, ${existingEntryId})
-					`;
-					break;
+					),
+				},
+				mergedData,
+				now,
+			);
+			if (plan.missingMergedData) {
+				logger.warn(
+					`[pg-db] merge resolution missing mergedData — existingEntryId ${existingEntryId} ` +
+						`will be superseded but newEntryId ${newEntryId} content unchanged`,
+				);
 			}
+			for (const op of plan.ops) await this.applyContradictionOp(sql, op);
 		});
 	}
 
@@ -1245,22 +1078,72 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			: rows[0].source_id;
 	}
 
-	private async restoreConflictCounterpart(
+	/** Run one op of a contradiction plan inside the resolution's transaction. */
+	private async applyContradictionOp(
 		sql: TxSql,
-		counterpartId: string,
-		resolvedId: string,
-		now: number,
+		op: ContradictionOp,
 	): Promise<void> {
-		await sql`
-			UPDATE knowledge_entry SET status = 'active', updated_at = ${now}
-			WHERE id = ${counterpartId} AND status = 'conflicted'
-		`;
-		await sql`
-			DELETE FROM knowledge_relation
-			WHERE type = 'contradicts'
-			  AND ((source_id = ${resolvedId} AND target_id = ${counterpartId})
-			       OR (source_id = ${counterpartId} AND target_id = ${resolvedId}))
-		`;
+		switch (op.kind) {
+			case "mergeContent": {
+				// Clear both vectors, as clearTombstonedEmbeddings() does. ANN search reads
+				// embedding_vec, so a stale copy would keep matching the old content.
+				const vecClause =
+					this.vecColumnDims !== null ? ", embedding_vec = NULL" : "";
+				await sql.unsafe(
+					`UPDATE knowledge_entry
+					SET content = $1, type = $2, topics = $3::jsonb, confidence = $4,
+					    embedding = NULL${vecClause}, updated_at = $5
+					WHERE id = $6`,
+					[
+						op.content,
+						op.type,
+						sql.json(op.topics),
+						op.confidence,
+						op.at,
+						op.id,
+					] as postgres.ParameterOrJSON<never>[],
+				);
+				return;
+			}
+			case "supersede":
+				await sql`
+					UPDATE knowledge_entry
+					SET status = 'superseded', superseded_by = ${op.supersededBy}, updated_at = ${op.at}
+					WHERE id = ${op.id}
+				`;
+				return;
+			case "link":
+				await sql`
+					INSERT INTO knowledge_relation (id, source_id, target_id, type, created_at)
+					VALUES (${randomUUID()}, ${op.sourceId}, ${op.targetId}, ${op.relation}, ${op.at})
+					ON CONFLICT DO NOTHING
+				`;
+				return;
+			case "restoreCounterpart":
+				await sql`
+					UPDATE knowledge_entry SET status = 'active', updated_at = ${op.at}
+					WHERE id = ${op.counterpartId} AND status = 'conflicted'
+				`;
+				await sql`
+					DELETE FROM knowledge_relation
+					WHERE type = 'contradicts'
+					  AND ((source_id = ${op.resolvedId} AND target_id = ${op.counterpartId})
+					       OR (source_id = ${op.counterpartId} AND target_id = ${op.resolvedId}))
+				`;
+				return;
+			case "activateIfConflicted":
+				await sql`
+					UPDATE knowledge_entry SET status = 'active', updated_at = ${op.at}
+					WHERE id = ${op.id} AND status = 'conflicted'
+				`;
+				return;
+			case "markConflicted":
+				await sql`
+					UPDATE knowledge_entry SET status = 'conflicted', updated_at = ${op.at}
+					WHERE id IN (${op.ids[0]}, ${op.ids[1]})
+				`;
+				return;
+		}
 	}
 
 	async deleteEntry(id: string): Promise<boolean> {
@@ -1386,58 +1269,33 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		const embeddingVec = this.vecLiteralFor(embedding);
 		const now = Date.now();
 
-		// Two branches, keyed on whether the embedding_vec column exists:
-		//   A) column present → write BYTEA and vector together; a missing or
-		//      mis-sized embedding leaves both NULL (keeps them in sync)
-		//   B) column absent  → omit embedding_vec
-		if (this.vecColumnDims !== null) {
-			await this.sql.unsafe(
-				`UPDATE knowledge_entry
-				SET content = $1, type = $2,
-				    topics = $3::jsonb,
-				    confidence = $4,
-				    derived_from = $5::jsonb,
-				    updated_at = $6, last_accessed_at = $6,
-				    observation_count = observation_count + 1,
-				    embedding = $7,
-				    embedding_vec = $8::vector
-				WHERE id = $9`,
-				[
-					updates.content,
-					safeType,
-					this.sql.json(updates.topics),
-					updates.confidence,
-					this.sql.json(mergedSources),
-					now,
-					embeddingBuf,
-					embeddingVec,
-					id,
-				] as postgres.ParameterOrJSON<never>[],
-			);
-		} else {
-			// embedding_vec column doesn't exist yet — omit it entirely.
-			await this.sql.unsafe(
-				`UPDATE knowledge_entry
-				SET content = $1, type = $2,
-				    topics = $3::jsonb,
-				    confidence = $4,
-				    derived_from = $5::jsonb,
-				    updated_at = $6, last_accessed_at = $6,
-				    observation_count = observation_count + 1,
-				    embedding = $7
-				WHERE id = $8`,
-				[
-					updates.content,
-					safeType,
-					this.sql.json(updates.topics),
-					updates.confidence,
-					this.sql.json(mergedSources),
-					now,
-					embeddingBuf,
-					id,
-				] as postgres.ParameterOrJSON<never>[],
-			);
-		}
+		// embedding_vec is written only when the column exists (see insertEntry). A
+		// missing or mis-sized embedding leaves both vector columns NULL, so they stay in sync.
+		const params: unknown[] = [
+			updates.content,
+			safeType,
+			this.sql.json(updates.topics),
+			updates.confidence,
+			this.sql.json(mergedSources),
+			now,
+			embeddingBuf,
+		];
+		const vecSet =
+			this.vecColumnDims !== null ? ", embedding_vec = $8::vector" : "";
+		if (this.vecColumnDims !== null) params.push(embeddingVec);
+		params.push(id);
+		await this.sql.unsafe(
+			`UPDATE knowledge_entry
+			SET content = $1, type = $2,
+			    topics = $3::jsonb,
+			    confidence = $4,
+			    derived_from = $5::jsonb,
+			    updated_at = $6, last_accessed_at = $6,
+			    observation_count = observation_count + 1,
+			    embedding = $7${vecSet}
+			WHERE id = $${params.length}`,
+			params as postgres.ParameterOrJSON<never>[],
+		);
 		return true;
 	}
 
