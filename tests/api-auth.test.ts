@@ -277,8 +277,8 @@ describe("admin token gate", () => {
 			expect(res.status).toBe(status);
 		});
 
-		it("answers /mcp without a token", async () => {
-			const res = await call("/mcp", {
+		it("requires the token for /mcp in default mode, as on earlier releases", async () => {
+			const options = {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
@@ -294,8 +294,11 @@ describe("admin token gate", () => {
 						clientInfo: { name: "auth-test", version: "1.0.0" },
 					},
 				}),
-			});
-			expect(res.status).toBe(200);
+			};
+			expect((await call("/mcp", options)).status).toBe(401);
+			expect(
+				(await call("/mcp", { ...options, token: STABLE_TOKEN })).status,
+			).toBe(200);
 		});
 
 		it.each([

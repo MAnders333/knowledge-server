@@ -100,8 +100,8 @@ function clientAddressOf(c: Context): string {
  * - Random token (default, per process): printed to the console once, and only when
  *   stdout is a terminal. Mutation routes require `Authorization: Bearer <token>`.
  *   Reads stay open to loopback clients that pass the Host and Origin checks.
- * - Stable token (KNOWLEDGE_ADMIN_TOKEN): mutation routes require the Bearer token.
- *   With KNOWLEDGE_PROTECT_READS, every route except /health requires it. Failed
+ * - Stable token (KNOWLEDGE_ADMIN_TOKEN): mutation routes and /mcp require the Bearer
+ *   token. With KNOWLEDGE_PROTECT_READS, every route except /health requires it. Failed
  *   attempts are throttled per client address (429, Retry-After). The throttle only
  *   bounds noise; the token's entropy is what protects it.
  */
@@ -240,10 +240,9 @@ export function createApp(options: CreateAppOptions): Hono {
 	}
 
 	// Stable admin token. With readsProtected, every route except /health needs its Bearer
-	// token, reads included. Otherwise only the admin routes do: mutations need the token in
-	// both modes, and reads stay open under the Host/Origin checks. A correct token always
-	// passes. Only failed attempts are counted, and a client over its limit gets 429 until
-	// its window ends.
+	// token, reads included. Otherwise /mcp and the admin routes need it, and reads stay
+	// open under the Host/Origin checks. A correct token always passes. Only failed
+	// attempts are counted, and a client over its limit gets 429 until its window ends.
 	const adminRoutes = [
 		{ method: "POST", path: /^\/(consolidate|reinitialize)$/ },
 		{ method: "PATCH", path: /^\/entries\/[^/]+$/ },
@@ -256,7 +255,8 @@ export function createApp(options: CreateAppOptions): Hono {
 			const path = c.req.path;
 			const needsToken = readsProtected
 				? path !== "/health"
-				: adminRoutes.some(
+				: path === "/mcp" ||
+					adminRoutes.some(
 						(r) => r.method === c.req.method && r.path.test(path),
 					);
 			if (!needsToken || requireAdminToken(c)) return next();
@@ -383,9 +383,9 @@ export function createApp(options: CreateAppOptions): Hono {
 		return mcpServer;
 	};
 
-	// Auth: with a stable admin token, the gate near the top already required Bearer
-	// auth. In random-token mode /mcp is open; the server binds to loopback and the
-	// Host/Origin checks above apply.
+	// Auth: with a stable admin token, the gate near the top requires its Bearer token on
+	// /mcp in both read modes. In random-token mode /mcp is open; the server binds to
+	// loopback and the Host/Origin checks above apply.
 	const mcpHostHeaders = allowlist.sdkHostHeaders(serverPort);
 	app.all("/mcp", jsonBodyLimit, async (c) => {
 		const transport = new WebStandardStreamableHTTPServerTransport({
@@ -827,10 +827,11 @@ export function createApp(options: CreateAppOptions): Hono {
 			},
 		});
 
-		// Config block (model names, port) and diagnostics are admin-only. In
-		// random-token mode, unauthenticated callers still get version, stats and
-		// health, and the blocks are omitted. With a stable token the gate near the
-		// top has already required the token, so every caller here is admin.
+		// Config block (model names, port) and diagnostics are admin-only. In random-token
+		// mode, unauthenticated callers still get version, stats and health, and the blocks
+		// are omitted. With KNOWLEDGE_PROTECT_READS and a stable token, the gate near the
+		// top has already required the token, so every caller here is admin; otherwise the
+		// check below decides.
 		const isAdmin = requireAdminToken(c);
 
 		// Use primary store's embedding metadata (model is shared across all stores).
