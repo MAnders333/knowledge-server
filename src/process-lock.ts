@@ -3,16 +3,22 @@
  *
  * The lockfile holds `{pid, acquiredAt, heartbeatAt}` as JSON. Acquisition is an
  * exclusive create (`wx`), so at most one process wins. The holder refreshes
- * `heartbeatAt` on a timer. A lock is stale, and may be taken over, when either:
- *   - its PID is no longer alive (crash, reboot, kill -9), or
- *   - its PID is alive but the heartbeat has not moved for LOCK_STALE_AFTER_MS.
- *     That bound only guards against a PID reused by an unrelated process after a
- *     crash. It is long on purpose: a live holder whose machine slept, or whose
- *     timers lagged, keeps its lock. A waiter must not take over a running holder.
+ * `heartbeatAt` on a timer. A record is stale, and may be taken over, when any of:
+ *   - its PID is no longer alive (crash, reboot, kill -9);
+ *   - it names this process's PID but this process holds no handle for the path:
+ *     an earlier process that had the same PID crashed while holding it;
+ *   - it was acquired before this boot, and its heartbeat is also stale: the PID
+ *     was handed out again by the reboot. A fresh heartbeat on such a record means
+ *     the wall clock was stepped, not a crash, so it stays held;
+ *   - its PID is alive, the record is from this boot, but the heartbeat has not
+ *     moved for LOCK_STALE_AFTER_MS. That bound is long on purpose: a live holder
+ *     whose machine slept, or whose timers lagged, keeps its lock.
  *
- * A holder whose lockfile was replaced by another process has lost the lock. It
- * logs an error, sets `lost` on its handle, calls `onLost`, and never writes the
- * lockfile again. Callers stop their work when they see `lost`.
+ * A holder whose lockfile is removed, or replaced by a record naming another PID,
+ * has lost the lock. It logs an error, sets `lost` on its handle, calls `onLost`,
+ * and never writes the lockfile again. A lockfile that cannot be read right now
+ * (torn by a concurrent write, transient I/O error) is not a loss: the next beat
+ * decides. Callers stop their work when they see `lost`.
  *
  * Used for: the single knowledge-daemon per data dir (`daemon.lock`), the
  * consolidation run lock shared by the server and the CLI (`consolidate.lock`),
@@ -35,6 +41,7 @@ import {
 	writeFileSync,
 	writeSync,
 } from "node:fs";
+import { uptime } from "node:os";
 import { dirname } from "node:path";
 import { logger } from "./logger.js";
 import { errCode } from "./utils.js";
@@ -60,13 +67,21 @@ export interface LockOptions {
 	onLost?: () => void;
 	/** PID liveness check. Defaults to isProcessAlive; tests inject one. */
 	isAlive?: (pid: number) => boolean;
+	/** Milliseconds since boot. Defaults to the OS uptime; tests inject one. */
+	uptimeMs?: number;
 }
 
-/** Heartbeat age after which a live holder is presumed to be a reused PID (24 h). */
+/** Heartbeat age after which a live holder from this boot is presumed to be a reused PID (24 h). */
 const LOCK_STALE_AFTER_MS = 24 * 60 * 60_000;
 const LOCK_HEARTBEAT_MS = 30_000;
 /** An unreadable lockfile (created but not yet written, or torn) is held this long. */
 const UNREADABLE_STALE_MS = 60_000;
+
+/**
+ * Lockfile paths this process holds right now. A record that names this PID but
+ * is not in this set was left by an earlier process that had the same PID.
+ */
+const heldPaths = new Set<string>();
 
 /** True when `pid` names a live process (EPERM means it exists but is not ours). */
 export function isProcessAlive(pid: number): boolean {
@@ -79,23 +94,40 @@ export function isProcessAlive(pid: number): boolean {
 	}
 }
 
-/** Parse the lockfile, or null when it is missing or not a lock record. */
-export function readLockRecord(path: string): LockRecord | null {
+type LockFileState =
+	| { kind: "missing" }
+	| { kind: "unreadable" }
+	| { kind: "record"; record: LockRecord };
+
+/** What the lockfile holds right now. Only a missing file or a parsed record is decisive. */
+function readLockState(path: string): LockFileState {
+	let text: string;
 	try {
-		const parsed = JSON.parse(
-			readFileSync(path, "utf8"),
-		) as Partial<LockRecord>;
+		text = readFileSync(path, "utf8");
+	} catch (e) {
+		return errCode(e) === "ENOENT"
+			? { kind: "missing" }
+			: { kind: "unreadable" };
+	}
+	try {
+		const parsed = JSON.parse(text) as Partial<LockRecord>;
 		if (
 			Number.isInteger(parsed.pid) &&
 			typeof parsed.acquiredAt === "number" &&
 			typeof parsed.heartbeatAt === "number"
 		) {
-			return parsed as LockRecord;
+			return { kind: "record", record: parsed as LockRecord };
 		}
-		return null;
 	} catch {
-		return null;
+		// Torn or partial: handled below.
 	}
+	return { kind: "unreadable" };
+}
+
+/** Parse the lockfile, or null when it is missing or not a lock record. */
+export function readLockRecord(path: string): LockRecord | null {
+	const state = readLockState(path);
+	return state.kind === "record" ? state.record : null;
 }
 
 /**
@@ -108,8 +140,9 @@ export function lockHolder(
 	now = Date.now(),
 ): LockRecord | null {
 	const isAlive = options.isAlive ?? isProcessAlive;
-	const record = readLockRecord(path);
-	if (record === null) {
+	const state = readLockState(path);
+	if (state.kind === "missing") return null;
+	if (state.kind === "unreadable") {
 		try {
 			const mtime = statSync(path).mtimeMs;
 			return now - mtime < UNREADABLE_STALE_MS
@@ -119,7 +152,16 @@ export function lockHolder(
 			return null;
 		}
 	}
+	const record = state.record;
 	if (!isAlive(record.pid)) return null;
+	if (record.pid === process.pid && !heldPaths.has(path)) return null;
+	const bootMs = now - (options.uptimeMs ?? uptime() * 1000);
+	if (
+		record.acquiredAt < bootMs &&
+		now - record.heartbeatAt > 2 * LOCK_HEARTBEAT_MS
+	) {
+		return null;
+	}
 	if (now - record.heartbeatAt > LOCK_STALE_AFTER_MS) return null;
 	return record;
 }
@@ -138,19 +180,23 @@ function makeHandle(
 	let released = false;
 	let lost = false;
 	const timer = setInterval(() => {
-		if (readLockRecord(path)?.pid !== process.pid) {
-			// Another process replaced or removed the lockfile. Never write it back:
-			// the lock now belongs to someone else, and this holder must stop.
-			lost = true;
-			clearInterval(timer);
-			logger.error(
-				`[lock] ${path} was taken over by another process; this process no longer holds the lock.`,
-			);
-			options.onLost?.();
+		const state = readLockState(path);
+		// A torn read (another process is writing its record) is not a loss.
+		if (state.kind === "unreadable") return;
+		if (state.kind === "record" && state.record.pid === process.pid) {
+			record.heartbeatAt = Date.now();
+			writeRecord(path, record);
 			return;
 		}
-		record.heartbeatAt = Date.now();
-		writeRecord(path, record);
+		// Removed, or replaced by another process's record. Never write it back: the
+		// lock now belongs to someone else, and this holder must stop.
+		lost = true;
+		heldPaths.delete(path);
+		clearInterval(timer);
+		logger.error(
+			`[lock] ${path} was taken over by another process; this process no longer holds the lock.`,
+		);
+		options.onLost?.();
 	}, options.heartbeatMs);
 	timer.unref?.();
 	return {
@@ -162,7 +208,10 @@ function makeHandle(
 			if (released) return;
 			released = true;
 			clearInterval(timer);
-			if (!lost && readLockRecord(path)?.pid === process.pid) {
+			heldPaths.delete(path);
+			// Unlink only a file that names this PID; another holder's file is left alone.
+			const state = readLockState(path);
+			if (state.kind === "record" && state.record.pid === process.pid) {
 				try {
 					unlinkSync(path);
 				} catch (e) {
@@ -198,6 +247,7 @@ export function tryAcquireProcessLock(
 			} finally {
 				closeSync(fd);
 			}
+			heldPaths.add(path);
 			return makeHandle(path, record, {
 				heartbeatMs,
 				onLost: options.onLost,

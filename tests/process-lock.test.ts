@@ -26,6 +26,18 @@ async function deadPid(): Promise<number> {
 	return child.pid;
 }
 
+const HOUR_MS = 60 * 60_000;
+/** Uptime for tests that touch the real lock path: the machine booted ten hours ago. */
+const UPTIME_MS = 10 * HOUR_MS;
+
+/**
+ * Poll a condition every 20 ms, up to 2 s. The heartbeat under test is a real
+ * setInterval, so only the platform clock fires it.
+ */
+async function waitUntil(condition: () => boolean): Promise<void> {
+	for (let i = 0; i < 100 && !condition(); i++) await Bun.sleep(20);
+}
+
 describe("tryAcquireProcessLock", () => {
 	let dir: string;
 	let lockPath: string;
@@ -88,17 +100,21 @@ describe("tryAcquireProcessLock", () => {
 		writeFileSync(
 			lockPath,
 			JSON.stringify({
-				pid: process.pid,
+				pid: process.ppid,
 				acquiredAt: now,
-				heartbeatAt: now - 60 * 60_000,
+				heartbeatAt: now - HOUR_MS,
 			}),
 		);
 		// An hour without a heartbeat (a sleeping machine, a lagging timer) does not
 		// free a holder that is still running.
-		expect(lockHolder(lockPath, {}, now)?.pid).toBe(process.pid);
-		expect(tryAcquireProcessLock(lockPath)).toBeNull();
+		expect(lockHolder(lockPath, { uptimeMs: UPTIME_MS }, now)?.pid).toBe(
+			process.ppid,
+		);
+		expect(tryAcquireProcessLock(lockPath, { uptimeMs: UPTIME_MS })).toBeNull();
 		// Only a heartbeat older than the long bound marks a reused PID as stale.
-		expect(lockHolder(lockPath, {}, now + 25 * 60 * 60_000)).toBeNull();
+		expect(
+			lockHolder(lockPath, { uptimeMs: UPTIME_MS }, now + 25 * HOUR_MS),
+		).toBeNull();
 	});
 
 	it("treats a holder whose pid is not alive as gone, even with a fresh heartbeat", () => {
@@ -117,10 +133,103 @@ describe("tryAcquireProcessLock", () => {
 		const now = Date.now();
 		writeFileSync(
 			lockPath,
+			JSON.stringify({ pid: process.ppid, acquiredAt: now, heartbeatAt: now }),
+		);
+		expect(lockHolder(lockPath, { uptimeMs: UPTIME_MS })?.pid).toBe(
+			process.ppid,
+		);
+		expect(tryAcquireProcessLock(lockPath, { uptimeMs: UPTIME_MS })).toBeNull();
+	});
+
+	it("treats a record from before this boot as stale, even when its pid is alive", () => {
+		mkdirSync(dirname(lockPath), { recursive: true });
+		const now = Date.now();
+		const twoHoursAgo = now - 2 * HOUR_MS;
+		writeFileSync(
+			lockPath,
+			JSON.stringify({
+				pid: process.ppid,
+				acquiredAt: twoHoursAgo,
+				heartbeatAt: twoHoursAgo,
+			}),
+		);
+		// Booted an hour ago: the record predates the boot, and its heartbeat is old.
+		expect(lockHolder(lockPath, { uptimeMs: HOUR_MS }, now)).toBeNull();
+		// Booted three hours ago: the record is from this boot, so the holder stands.
+		expect(lockHolder(lockPath, { uptimeMs: 3 * HOUR_MS }, now)?.pid).toBe(
+			process.ppid,
+		);
+	});
+
+	it("keeps a record from before this boot when its heartbeat is fresh (clock stepped)", () => {
+		mkdirSync(dirname(lockPath), { recursive: true });
+		const now = Date.now();
+		writeFileSync(
+			lockPath,
+			JSON.stringify({
+				pid: process.ppid,
+				acquiredAt: now - 2 * HOUR_MS,
+				heartbeatAt: now - 1000,
+			}),
+		);
+		expect(lockHolder(lockPath, { uptimeMs: HOUR_MS }, now)?.pid).toBe(
+			process.ppid,
+		);
+	});
+
+	it("treats a record naming this pid as stale unless this process holds the lock", () => {
+		mkdirSync(dirname(lockPath), { recursive: true });
+		const now = Date.now();
+		writeFileSync(
+			lockPath,
 			JSON.stringify({ pid: process.pid, acquiredAt: now, heartbeatAt: now }),
 		);
-		expect(lockHolder(lockPath)?.pid).toBe(process.pid);
-		expect(tryAcquireProcessLock(lockPath)).toBeNull();
+		// Left by an earlier process that had this PID: nothing here holds the path.
+		expect(lockHolder(lockPath, { uptimeMs: UPTIME_MS }, now)).toBeNull();
+		const handle = tryAcquireProcessLock(lockPath, { uptimeMs: UPTIME_MS });
+		expect(handle).not.toBeNull();
+		expect(lockHolder(lockPath, { uptimeMs: UPTIME_MS })?.pid).toBe(
+			process.pid,
+		);
+		handle?.release();
+	});
+
+	it("reports the lock as lost when its lockfile is removed", async () => {
+		let lostCalls = 0;
+		const handle = tryAcquireProcessLock(lockPath, {
+			heartbeatMs: 20,
+			onLost: () => {
+				lostCalls++;
+			},
+		});
+		expect(handle).not.toBeNull();
+		rmSync(lockPath);
+		await waitUntil(() => handle?.lost === true);
+		expect(handle?.lost).toBe(true);
+		expect(lostCalls).toBe(1);
+		handle?.release();
+		expect(existsSync(lockPath)).toBe(false);
+	});
+
+	it("does not report the lock lost while its lockfile is unreadable for a moment", async () => {
+		let lostCalls = 0;
+		const handle = tryAcquireProcessLock(lockPath, {
+			heartbeatMs: 20,
+			onLost: () => {
+				lostCalls++;
+			},
+		});
+		expect(handle).not.toBeNull();
+		const ours = readLockRecord(lockPath);
+		// A torn write, as another process's record can look while it is being written.
+		writeFileSync(lockPath, '{"pid": ');
+		// Real timer on purpose: the heartbeat is a setInterval. Several beats run here.
+		await Bun.sleep(100);
+		expect(handle?.lost).toBe(false);
+		expect(lostCalls).toBe(0);
+		writeFileSync(lockPath, JSON.stringify(ours));
+		handle?.release();
+		expect(existsSync(lockPath)).toBe(false);
 	});
 
 	it("does not remove a stale lock while another starter holds the takeover file", async () => {

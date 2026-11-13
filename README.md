@@ -657,7 +657,7 @@ knowledge-server reinitialize --reset-store --store=personal --confirm
 knowledge-server reinitialize --reset-store --dry-run
 ```
 
-**Note:** Stop both the server and the daemon before running any reinitialize variant. The command exits with an error if either is live. The server is checked by its PID file: run `knowledge-server stop`. The daemon is checked by its lock file (`daemon.lock` in the data directory): an upload cycle that is in flight writes a fresh `daemon_cursor` after the reset, which defeats the full re-ingest. Stop the daemon with its service command when it is registered as one: `launchctl bootout gui/$(id -u)/com.knowledge-server.daemon` on macOS, or `systemctl --user stop knowledge-daemon` on Linux. Otherwise run `kill <pid>`, using the `pid` field of `daemon.lock`.
+**Note:** Stop both the server and the daemon before running any reinitialize variant. The command exits with an error if either is live. The server is checked by its PID file: run `knowledge-server stop`. The daemon is checked by its lock file (`daemon.lock` in the data directory): an upload cycle that is in flight writes a fresh `daemon_cursor` after the reset, which defeats the full re-ingest. Stop the daemon with its service command when it is registered as one: `launchctl bootout gui/$(id -u)/com.knowledge-server.daemon` on macOS, or `systemctl --user stop knowledge-daemon` on Linux. Otherwise, check the PID first: `ps -p <pid> -o command=` must show `knowledge-daemon`, because a lock left by a crashed daemon can name a PID that another process now uses. Then run `kill <pid>`, using the `pid` field of `daemon.lock`.
 
 `--dry-run` and `--confirm` are mutually exclusive — `--dry-run` previews the action without requiring `--confirm`.
 
