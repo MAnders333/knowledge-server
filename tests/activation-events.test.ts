@@ -286,6 +286,27 @@ describe("ActivationEventRecorder", () => {
 		expect(readFileSync(logPath, "utf8")).toContain("Dropped 1 rows");
 	});
 
+	it("a failing store is retried on the timer, not on every record past the batch size", async () => {
+		const insert = mock(async () => {
+			throw new Error("disk gone");
+		});
+		const recorder = new ActivationEventRecorder(
+			{ insertActivationEvents: insert, pruneActivationEvents: async () => 0 },
+			{ batchSize: 2, flushDelayMs: 60_000 },
+		);
+		recorder.record(row());
+		recorder.record(row());
+		await recorder.flush();
+		// The second record sees an empty store (not yet failing) and flushes; the
+		// explicit flush is the second attempt.
+		expect(insert).toHaveBeenCalledTimes(2);
+		const before = insert.mock.calls.length;
+		for (let i = 0; i < 4; i++) recorder.record(row());
+		await recorder.flush();
+		// Once failing, records wait for the timer: only the explicit flush tries.
+		expect(insert.mock.calls.length - before).toBe(1);
+	});
+
 	it("hashes session ids and never returns the raw id", () => {
 		expect(hashSessionId(null)).toBeNull();
 		expect(hashSessionId("")).toBeNull();

@@ -69,7 +69,9 @@ export class ActivationEventRecorder {
 			this.droppedRows++;
 		}
 		this.queue.push(row);
-		if (this.queue.length >= this.batchSize) {
+		// While the store is failing, rows wait for the timer instead: a flush per record
+		// would retry a dead store on every activation.
+		if (this.queue.length >= this.batchSize && !this.failing) {
 			void this.flush();
 		} else {
 			this.scheduleFlush();
