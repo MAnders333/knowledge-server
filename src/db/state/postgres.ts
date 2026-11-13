@@ -45,34 +45,68 @@ function pgActivationEventTable(version?: number): string {
 `;
 }
 
-// CREATE INDEX checks table ownership before IF NOT EXISTS skips, so an
-// upgrade run by a role that does not own the table would fail. Create the
-// indexes only when missing.
-const PG_ACTIVATION_EVENT_INDEXES = `
+/**
+ * CREATE INDEX checks table ownership before IF NOT EXISTS skips, so an index is
+ * created only when it is missing from the table's own schema. The table is found
+ * through pg_class, not assumed to live in current_schema().
+ */
+function createIndexIfMissing(
+	table: string,
+	index: string,
+	columns: string,
+): string {
+	return `
   DO $$
+  DECLARE table_schema name;
   BEGIN
+    SELECT n.nspname INTO table_schema
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.oid = to_regclass('${table}');
     IF NOT EXISTS (SELECT 1 FROM pg_indexes
-                   WHERE schemaname = current_schema() AND indexname = 'idx_activation_event_ts') THEN
-      CREATE INDEX idx_activation_event_ts ON activation_event(ts);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes
-                   WHERE schemaname = current_schema() AND indexname = 'idx_activation_event_client_ts') THEN
-      CREATE INDEX idx_activation_event_client_ts ON activation_event(client, ts);
+                   WHERE schemaname = table_schema AND indexname = '${index}') THEN
+      CREATE INDEX ${index} ON ${table}(${columns});
     END IF;
   END $$;
 `;
+}
 
-// Same guard as the activation_event indexes: the duplicate check and queryRanges
-// both filter pending_episodes by session_id.
-const PG_PENDING_SESSION_INDEX = `
-  DO $$
-  BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes
-                   WHERE schemaname = current_schema() AND indexname = 'idx_pending_session') THEN
-      CREATE INDEX idx_pending_session ON pending_episodes(session_id);
-    END IF;
-  END $$;
-`;
+const PG_ACTIVATION_EVENT_INDEXES =
+	createIndexIfMissing("activation_event", "idx_activation_event_ts", "ts") +
+	createIndexIfMissing(
+		"activation_event",
+		"idx_activation_event_client_ts",
+		"client, ts",
+	);
+
+// Serves the duplicate check on staged episodes and queryRanges (both filter by session_id).
+const PG_PENDING_SESSION_INDEX = createIndexIfMissing(
+	"pending_episodes",
+	"idx_pending_session",
+	"session_id",
+);
+
+/**
+ * Run an index step under its own SAVEPOINT. A role that does not own the table
+ * gets 42501 (insufficient_privilege) from CREATE INDEX, and without a savepoint
+ * that error aborts the whole upgrade transaction. An index is only a performance
+ * aid, so the error is logged and the step skipped; the version is still stamped.
+ * Any other error stays fatal.
+ */
+async function skipWithoutOwnership(
+	tx: TxSql,
+	version: number,
+	statement: string,
+	step: (sql: TxSql) => Promise<unknown>,
+): Promise<void> {
+	try {
+		await tx.savepoint(step);
+	} catch (err) {
+		if ((err as { code?: string }).code !== "42501") throw err;
+		logger.warn(
+			`[pg-state-db] Migration v${version}: skipped \`${statement}\` — the connecting role does not own the table. Lookups stay unindexed until the owner creates the index. Error: ${err instanceof Error ? err.message : String(err)}`,
+		);
+	}
+}
 
 const PG_CREATE_STATE_TABLES = `
   CREATE TABLE IF NOT EXISTS state_schema_version (
@@ -162,7 +196,12 @@ const PG_STATE_MIGRATIONS: Array<{
 		label: "activation_event table (content-free measurement)",
 		up: async (tx: TxSql) => {
 			await tx.unsafe(pgActivationEventTable(3));
-			await tx.unsafe(PG_ACTIVATION_EVENT_INDEXES);
+			await skipWithoutOwnership(
+				tx,
+				3,
+				"CREATE INDEX idx_activation_event_ts, idx_activation_event_client_ts",
+				(sql) => sql.unsafe(PG_ACTIVATION_EVENT_INDEXES),
+			);
 		},
 	},
 	{
@@ -178,9 +217,10 @@ const PG_STATE_MIGRATIONS: Array<{
 	{
 		version: 6,
 		label: "pending_episodes session_id index (duplicate check, queryRanges)",
-		up: async (tx: TxSql) => {
-			await tx.unsafe(PG_PENDING_SESSION_INDEX);
-		},
+		up: (tx: TxSql) =>
+			skipWithoutOwnership(tx, 6, "CREATE INDEX idx_pending_session", (sql) =>
+				sql.unsafe(PG_PENDING_SESSION_INDEX),
+			),
 	},
 ];
 const STATE_SCHEMA_VERSION = latestVersion(PG_STATE_MIGRATIONS);

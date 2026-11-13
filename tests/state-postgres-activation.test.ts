@@ -17,11 +17,13 @@ import {
 	describe,
 	expect,
 	it,
+	spyOn,
 } from "bun:test";
 import { randomUUID } from "node:crypto";
 import postgres from "postgres";
 import { PostgresServerStateDB } from "../src/db/state/postgres";
-import type { ActivationEventRow } from "../src/types";
+import { logger } from "../src/logger";
+import type { ActivationEventRow, PendingEpisode } from "../src/types";
 
 const PG_URI = process.env.PG_TEST_URI;
 
@@ -50,8 +52,10 @@ function row(overrides: Partial<ActivationEventRow> = {}): ActivationEventRow {
 }
 
 /**
- * state DB as the v3 release wrote it (schema v1-v3). Frozen on purpose: the
- * upgrade under test is what brings it to the current version.
+ * Reconstructed historical shape of the state DB at v1-v3. No release ever stamped
+ * state.db as v3 or v4. This DDL is rebuilt from the git history of the v3 commit
+ * (d0f468d) so that the upgrade has a realistic starting point. Frozen on purpose:
+ * the upgrade under test is what brings it to the current version.
  */
 const V3_STATE_SQL = `
   CREATE TABLE state_schema_version (
@@ -130,7 +134,7 @@ const V3_STATE_SQL = `
     VALUES (1000, 'opencode', 42, 2, 5, 1, '["entry-1"]', '[0.5]', 'off', 12);
 `;
 
-/** The v4 release: four activation_event columns, stamped v4. */
+/** The v4 step, reconstructed like the v3 fixture above (commit 8096c1a): four activation_event columns, stamped v4. */
 const V4_STATE_SQL = `
   ALTER TABLE activation_event ADD COLUMN gate_dropped INTEGER NOT NULL DEFAULT 0;
   ALTER TABLE activation_event ADD COLUMN budget_dropped INTEGER NOT NULL DEFAULT 0;
@@ -140,8 +144,8 @@ const V4_STATE_SQL = `
 `;
 
 const LEGACY_FIXTURES = [
-	{ label: "v3", sql: V3_STATE_SQL },
-	{ label: "v4", sql: V3_STATE_SQL + V4_STATE_SQL },
+	{ label: "reconstructed v3", sql: V3_STATE_SQL },
+	{ label: "reconstructed v4", sql: V3_STATE_SQL + V4_STATE_SQL },
 ] as const;
 
 // Each test gets its own database, so the fresh-install and upgrade paths run
@@ -150,6 +154,7 @@ describe.skipIf(!PG_URI)("PostgresServerStateDB activation_event", () => {
 	let admin: postgres.Sql;
 	let dbName = "";
 	let testUri = "";
+	let roleName = "";
 
 	beforeAll(() => {
 		admin = postgres(PG_URI as string, { max: 1 });
@@ -169,6 +174,10 @@ describe.skipIf(!PG_URI)("PostgresServerStateDB activation_event", () => {
 
 	afterEach(async () => {
 		await admin.unsafe(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`);
+		if (roleName) {
+			await admin.unsafe(`DROP ROLE IF EXISTS "${roleName}"`);
+			roleName = "";
+		}
 	});
 
 	/** Run a check against the test database over its own short-lived handle. */
@@ -195,6 +204,15 @@ describe.skipIf(!PG_URI)("PostgresServerStateDB activation_event", () => {
 				SELECT to_regclass('public.activation_event') IS NOT NULL AS ok
 			`;
 			return r.ok === true;
+		});
+	}
+
+	async function indexExists(name: string): Promise<boolean> {
+		return withDb(async (sql) => {
+			const rows = await sql`
+				SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() AND indexname = ${name}
+			`;
+			return rows.length > 0;
 		});
 	}
 
@@ -467,4 +485,75 @@ describe.skipIf(!PG_URI)("PostgresServerStateDB activation_event", () => {
 			expect(index.length).toBe(1);
 		});
 	}
+
+	it("a role that does not own the state DB upgrades from v2 without the session index", async () => {
+		// Owner-side setup: a v2 store with no session index. The role must not be able to create it.
+		const seed = new PostgresServerStateDB(testUri);
+		try {
+			await seed.initialize();
+		} finally {
+			await seed.close();
+		}
+		roleName = `ks_state_nonowner_${randomUUID().replaceAll("-", "")}`;
+		const password = randomUUID();
+		await withDb(async (sql) => {
+			await sql.unsafe("DROP INDEX idx_pending_session");
+			await sql.unsafe("DROP TABLE activation_event");
+			await sql`DELETE FROM state_schema_version`;
+			await sql`INSERT INTO state_schema_version (version, applied_at) VALUES (2, 0)`;
+			await sql.unsafe(
+				`CREATE ROLE "${roleName}" LOGIN PASSWORD '${password}'`,
+			);
+			await sql.unsafe(`GRANT USAGE, CREATE ON SCHEMA public TO "${roleName}"`);
+			await sql.unsafe(
+				`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "${roleName}"`,
+			);
+		});
+
+		const url = new URL(testUri);
+		url.username = roleName;
+		url.password = password;
+		const warn = spyOn(logger, "warn");
+		let skipped: string[] = [];
+		const state = new PostgresServerStateDB(url.toString());
+		try {
+			await state.initialize();
+			skipped = warn.mock.calls
+				.map((call) => call.join(" "))
+				.filter((line) => line.includes("idx_pending_session"));
+			const episode: PendingEpisode = {
+				id: "np-1",
+				userId: "alice",
+				source: "opencode",
+				sessionId: "s1",
+				startMessageId: "a",
+				endMessageId: "b",
+				sessionTitle: "",
+				projectName: "",
+				directory: "",
+				content: "c",
+				contentType: "messages",
+				timeCreated: 1,
+				maxMessageTime: 1,
+				approxTokens: 1,
+				uploadedAt: 1,
+			};
+			await state.insertPendingEpisode(episode);
+			await state.insertActivationEvents([row({ ts: 2_000 })]);
+			expect((await state.getPendingEpisodes(0)).map((e) => e.id)).toEqual([
+				"np-1",
+			]);
+			expect(await state.countActivationsByClient(0)).toEqual({
+				"claude-code": 1,
+			});
+		} finally {
+			await state.close();
+			warn.mockRestore();
+		}
+
+		// The upgrade completed: the step was skipped with a warning, not rolled back.
+		expect(skipped).toHaveLength(1);
+		expect(await schemaVersions()).toEqual([2, 3, 4, 5, 6]);
+		expect(await indexExists("idx_pending_session")).toBe(false);
+	});
 });
