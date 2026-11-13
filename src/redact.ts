@@ -81,6 +81,21 @@ const RULES: ReadonlyArray<RedactionRule> = [
 		re: /((?:api[_-]?key|secret|token|password|credential|auth)["']?[ \t]*[:=][ \t]*["']?)[A-Za-z0-9+/=_-]{32,}/gi,
 		keep: true,
 	},
+	{
+		// Credential assignments the rules above miss: mid-line, lowercase, or in
+		// `key: value` form. The key is a `_`/`-` joined name ending in a credential
+		// word. The `=` form redacts any value of 4+ characters. The `:` form redacts
+		// only values that look like secrets (a digit or symbol, or 16+ characters),
+		// so prose such as `api_key: none` is kept.
+		kind: "keyed_secret",
+		re: /((?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9]*[_-](?:password|passwd|secret|token|key)["']?[ \t]*=[ \t]*["']?)(?!\[REDACTED:)[^\s"'`,;&]{4,}/gi,
+		keep: true,
+	},
+	{
+		kind: "keyed_secret",
+		re: /((?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9]*[_-](?:password|passwd|secret|token|key)["']?[ \t]*:[ \t]*["']?)(?!\[REDACTED:)(?:(?=[^\s"'`,;&]{0,64}[0-9+/=_~!@#$%^*])|(?=[^\s"'`,;&]{16}))[^\s"'`,;&]{4,}/gi,
+		keep: true,
+	},
 ];
 
 /**

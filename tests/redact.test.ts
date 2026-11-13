@@ -313,3 +313,53 @@ describe("redactSecrets: context kept after the move to captured prefixes", () =
 		);
 	});
 });
+
+describe("redactSecrets: lowercase and mid-line credential assignments", () => {
+	// Fixtures are assembled at runtime, as in the rest of this file.
+	const positives: Array<[string, string]> = [
+		[
+			`connect with ${["db_password", "hunter2"].join("=")} now`,
+			"connect with db_password=[REDACTED:keyed_secret] now",
+		],
+		[
+			`{"auth_token": "${["a1b2c3d4", "e5f6"].join("")}"}`,
+			'{"auth_token": "[REDACTED:keyed_secret]"}',
+		],
+		[
+			`my-api-key: ${["xK9", "42pQ"].join("-")}`,
+			"my-api-key: [REDACTED:keyed_secret]",
+		],
+		[
+			`https://h.example/x?${["api_key", "abcd1234"].join("=")}&v=2`,
+			"https://h.example/x?api_key=[REDACTED:keyed_secret]&v=2",
+		],
+	];
+	for (const [input, expected] of positives) {
+		it(`redacts the value of: ${input}`, () => {
+			const result = redactSecrets(input);
+			expect(result.text).toBe(expected);
+			expect(result.counts).toEqual({ keyed_secret: 1 });
+		});
+	}
+
+	for (const [input] of positives) {
+		it(`is idempotent on: ${input}`, () => {
+			const once = redactSecrets(input).text;
+			expect(redactSecrets(once)).toEqual({ text: once, counts: {} });
+		});
+	}
+
+	const prose = [
+		"the auth_token: none",
+		"api_key: see the docs",
+		"primary_key = id",
+		"password_reset: enabled",
+		"set db_password to the new value",
+		"pass_rate=0.5",
+	];
+	for (const input of prose) {
+		it(`keeps ordinary prose unchanged: ${input}`, () => {
+			expect(redactSecrets(input)).toEqual({ text: input, counts: {} });
+		});
+	}
+});
