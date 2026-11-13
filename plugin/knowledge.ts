@@ -23,6 +23,8 @@ import type { Plugin } from "@opencode-ai/plugin";
  * Configuration:
  *   Set KNOWLEDGE_SERVER_URL, or KNOWLEDGE_PORT / "port" in
  *   ~/.config/knowledge-server/config.jsonc (default: 3179)
+ *   KNOWLEDGE_ADMIN_TOKEN is sent as a Bearer on read calls, only when it is set
+ *   (a server with a stable token requires it)
  *
  * Design principle: NEVER throw. All errors are caught and silently swallowed.
  * A broken knowledge plugin must never affect OpenCode's core functionality.
