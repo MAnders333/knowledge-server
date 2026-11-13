@@ -34,6 +34,10 @@ import {
 	CodexEpisodeReader,
 	resolveCodexSessionsDir,
 } from "../src/daemon/readers/codex";
+import {
+	SESSION_IDLE_FLUSH_MS,
+	takeSkipCount,
+} from "../src/daemon/readers/shared";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -977,5 +981,199 @@ describe("CodexEpisodeReader — injected knowledge guard", () => {
 		expect(episodes).toHaveLength(1);
 		expect(episodes[0].content).toContain("  user: plain first message");
 		expect(episodes[0].content).toContain("  assistant: answer one");
+	});
+});
+
+// ── ARC-07: incremental growth, hold-back, poison pills ──────────────────────
+
+const CX_SOURCE = "codex";
+const FULL = config.consolidation.minSessionMessages; // a full-size tail
+const SHORT = FULL - 1; // a tail that is held while the session is active
+
+/**
+ * Message lines for turns `from`..`from+count-1`. Turn i has body `[m<i>] body`
+ * and timestamp baseMs + i seconds.
+ */
+function turnLines(from: number, count: number, baseMs = BASE_TS): string[] {
+	const lines: string[] = [];
+	for (let i = from; i < from + count; i++) {
+		lines.push(
+			msgRecord({
+				timestamp: ts(baseMs, i * 1000),
+				role: i % 2 === 0 ? "user" : "assistant",
+				text: `[m${i}] body`,
+			}),
+		);
+	}
+	return lines;
+}
+
+/** Message id of turn `i` in SESSION_UUID's rollout (session_meta is line 0). */
+function turnId(i: number): string {
+	return `${SESSION_UUID}:${i + 1}`;
+}
+
+/** Processed ranges for the given episodes, as the consolidation engine records them. */
+function rangesOf(
+	episodes: Array<{ startMessageId: string; endMessageId: string }>,
+): Array<{ source: string; startMessageId: string; endMessageId: string }> {
+	return episodes.map((e) => ({
+		source: CX_SOURCE,
+		startMessageId: e.startMessageId,
+		endMessageId: e.endMessageId,
+	}));
+}
+
+/** Number of non-overlapping occurrences of `needle` in `haystack`. */
+function countOf(haystack: string, needle: string): number {
+	return haystack.split(needle).length - 1;
+}
+
+describe("CodexEpisodeReader — ARC-07 growth", () => {
+	it("re-emits only the new tail when a rollout grows, then returns nothing", () => {
+		// BASE_TS-relative fixtures are idle, so each tail flushes at any size.
+		const meta = metaRecord({
+			timestamp: ts(BASE_TS),
+			id: SESSION_UUID,
+			cwd: CWD,
+		});
+		writeRollout(SESSION_UUID, [meta, ...turnLines(0, FULL)]);
+		reader.getCandidateSessions(0);
+		const first = reader.getNewEpisodes([SESSION_UUID], new Map());
+		expect(first).toHaveLength(1);
+
+		writeRollout(SESSION_UUID, [
+			meta,
+			...turnLines(0, FULL),
+			...turnLines(FULL, FULL),
+		]);
+		reader.getCandidateSessions(0);
+		const second = reader.getNewEpisodes(
+			[SESSION_UUID],
+			new Map([[SESSION_UUID, rangesOf(first)]]),
+		);
+		expect(second).toHaveLength(1);
+		expect(second[0].startMessageId).toBe(turnId(FULL));
+		expect(second[0].endMessageId).toBe(turnId(2 * FULL - 1));
+		for (let i = 0; i < 2 * FULL; i++) {
+			expect(countOf(second[0].content, `[m${i}] body`)).toBe(i < FULL ? 0 : 1);
+		}
+
+		reader.getCandidateSessions(0);
+		const third = reader.getNewEpisodes(
+			[SESSION_UUID],
+			new Map([[SESSION_UUID, rangesOf([...first, ...second])]]),
+		);
+		expect(third).toEqual([]);
+	});
+});
+
+describe("CodexEpisodeReader — ARC-07 hold-back", () => {
+	it("holds a short tail of an active rollout and flushes it once idle", () => {
+		const now = Date.now();
+		const active = now - 60_000;
+		const meta = metaRecord({
+			timestamp: ts(active),
+			id: SESSION_UUID,
+			cwd: CWD,
+		});
+		writeRollout(SESSION_UUID, [meta, ...turnLines(0, FULL, active)]);
+		reader.getCandidateSessions(0);
+		const first = reader.getNewEpisodes([SESSION_UUID], new Map());
+		expect(first).toHaveLength(1);
+
+		writeRollout(SESSION_UUID, [
+			meta,
+			...turnLines(0, FULL, active),
+			...turnLines(FULL, SHORT, active),
+		]);
+		reader.getCandidateSessions(0);
+		const held = reader.getNewEpisodes(
+			[SESSION_UUID],
+			new Map([[SESSION_UUID, rangesOf(first)]]),
+		);
+		expect(held).toEqual([]);
+
+		const idle = now - 2 * SESSION_IDLE_FLUSH_MS;
+		writeRollout(SESSION_UUID, [
+			meta,
+			...turnLines(0, FULL, idle),
+			...turnLines(FULL, SHORT, idle),
+		]);
+		reader.getCandidateSessions(0);
+		const flushed = reader.getNewEpisodes(
+			[SESSION_UUID],
+			new Map([[SESSION_UUID, rangesOf(first)]]),
+		);
+		expect(flushed).toHaveLength(1);
+		expect(flushed[0].startMessageId).toBe(turnId(FULL));
+		expect(flushed[0].endMessageId).toBe(turnId(FULL + SHORT - 1));
+	});
+});
+
+describe("CodexEpisodeReader — ARC-07 poison pills", () => {
+	it("skips null, non-object, malformed and null-payload items without stalling other sessions", () => {
+		takeSkipCount(CX_SOURCE);
+		writeRollout(SESSION_UUID, [
+			"null",
+			metaRecord({ timestamp: ts(BASE_TS), id: SESSION_UUID, cwd: CWD }),
+			"{not json",
+			...turnLines(0, FULL),
+			JSON.stringify({
+				timestamp: ts(BASE_TS, 50_000),
+				type: "response_item",
+				payload: null,
+			}),
+			JSON.stringify({
+				timestamp: ts(BASE_TS, 51_000),
+				type: "response_item",
+				payload: {
+					type: "message",
+					role: "user",
+					content: [null, { type: "input_text", text: "part survives" }],
+				},
+			}),
+		]);
+		writeRollout(SESSION_UUID_2, [
+			metaRecord({ timestamp: ts(BASE_TS), id: SESSION_UUID_2, cwd: CWD }),
+			...turnLines(0, FULL),
+		]);
+
+		reader.getCandidateSessions(0);
+		const episodes = reader.getNewEpisodes(
+			[SESSION_UUID, SESSION_UUID_2],
+			new Map(),
+		);
+
+		const healthy = episodes.filter((e) => e.sessionId === SESSION_UUID_2);
+		expect(healthy).toHaveLength(1);
+		expect(healthy[0].content).toContain("[m0] body");
+
+		const poisoned = episodes.filter((e) => e.sessionId === SESSION_UUID);
+		expect(poisoned).toHaveLength(1);
+		expect(poisoned[0].content).toContain("[m0] body");
+		expect(poisoned[0].content).toContain("part survives");
+		expect(takeSkipCount(CX_SOURCE)).toBeGreaterThan(0);
+	});
+
+	it("counts an unreadable rollout as a skip and still returns the healthy ones", () => {
+		takeSkipCount(CX_SOURCE);
+		writeRollout(SESSION_UUID_2, [
+			metaRecord({ timestamp: ts(BASE_TS), id: SESSION_UUID_2, cwd: CWD }),
+			...turnLines(0, FULL),
+		]);
+		// A directory named like a rollout: stat succeeds, reading it fails (EISDIR).
+		mkdirSync(
+			join(sessionsDir, DATE_PATH, `rollout-broken-${SESSION_UUID}.jsonl`),
+			{
+				recursive: true,
+			},
+		);
+
+		const candidates = reader.getCandidateSessions(0);
+		expect(candidates.map((c) => c.id)).toEqual([SESSION_UUID_2]);
+		const episodes = reader.getNewEpisodes([SESSION_UUID_2], new Map());
+		expect(episodes).toHaveLength(1);
+		expect(takeSkipCount(CX_SOURCE)).toBeGreaterThan(0);
 	});
 });

@@ -1,8 +1,10 @@
 import { ActivationEngine } from "../activation/activate.js";
+import { resolveDataDir } from "../config-file.js";
 import { ConsolidationEngine } from "../consolidation/consolidate.js";
 import { PendingEpisodesReader } from "../consolidation/readers/pending.js";
 import { StoreRegistry } from "../db/store-registry.js";
 import { logger } from "../logger.js";
+import { consolidationLockPath } from "../runtime-files.js";
 import {
 	drainConsolidation,
 	runEmbeddingCheck,
@@ -21,7 +23,7 @@ export async function runConsolidate(
 	// Log to both stdout and the server log file so all consolidation activity
 	// (whether triggered via HTTP, polling, or CLI) appears in one place.
 	const { config } = await import("../config.js");
-	logger.init(config.logPath);
+	logger.init(config.logPath, "info", config.logMaxBytes);
 
 	const registry = await StoreRegistry.create();
 	const db = registry.writableStore();
@@ -37,6 +39,7 @@ export async function runConsolidate(
 		activation,
 		[new PendingEpisodesReader(serverStateDb)],
 		registry.domainRouter,
+		{ lockPath: consolidationLockPath(resolveDataDir()) },
 	);
 
 	try {

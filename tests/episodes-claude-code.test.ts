@@ -21,6 +21,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { config } from "../src/config";
 import { ClaudeCodeEpisodeReader } from "../src/daemon/readers/claude-code";
+import {
+	SESSION_IDLE_FLUSH_MS,
+	takeSkipCount,
+} from "../src/daemon/readers/shared";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -1132,5 +1136,212 @@ describe("ClaudeCodeEpisodeReader — tool-only user records", () => {
 		} finally {
 			config.consolidation.includeToolOutputs = originalAllowlist;
 		}
+	});
+});
+
+// ── ARC-07: incremental growth, hold-back, poison pills ──────────────────────
+
+const CC_SOURCE = "claude-code";
+const HEALTHY_UUID = "11111111-aaaa-bbbb-cccc-dddddddddddd";
+const FULL = config.consolidation.minSessionMessages; // a full-size tail
+const SHORT = FULL - 1; // a tail that is held while the session is active
+
+/**
+ * Plain user/assistant records numbered `from`..`from+count-1`. Message i has
+ * uuid `<prefix>-<i>`, body `[m<i>] body`, and timestamp baseMs + i seconds.
+ */
+function messageLines(
+	from: number,
+	count: number,
+	baseMs = BASE,
+	prefix = "g",
+): string[] {
+	const lines: string[] = [];
+	for (let i = from; i < from + count; i++) {
+		lines.push(
+			msgRecord({
+				uuid: `${prefix}-${i}`,
+				role: i % 2 === 0 ? "user" : "assistant",
+				timestamp: ts(baseMs, i * 1000),
+				content: `[m${i}] body`,
+			}),
+		);
+	}
+	return lines;
+}
+
+/** Processed ranges for the given episodes, as the consolidation engine records them. */
+function rangesOf(
+	episodes: Array<{ startMessageId: string; endMessageId: string }>,
+): Array<{ source: string; startMessageId: string; endMessageId: string }> {
+	return episodes.map((e) => ({
+		source: CC_SOURCE,
+		startMessageId: e.startMessageId,
+		endMessageId: e.endMessageId,
+	}));
+}
+
+/** Number of non-overlapping occurrences of `needle` in `haystack`. */
+function countOf(haystack: string, needle: string): number {
+	return haystack.split(needle).length - 1;
+}
+
+describe("ClaudeCodeEpisodeReader — ARC-07 growth", () => {
+	it("re-emits only the new tail when a session grows, then returns nothing", () => {
+		// BASE-relative fixtures are idle, so each tail flushes at any size.
+		writeSession(messageLines(0, FULL));
+		reader.getCandidateSessions(0);
+		const first = reader.getNewEpisodes([SESSION_UUID], new Map());
+		expect(first).toHaveLength(1);
+
+		writeSession([...messageLines(0, FULL), ...messageLines(FULL, FULL)]);
+		reader.getCandidateSessions(0);
+		const second = reader.getNewEpisodes(
+			[SESSION_UUID],
+			new Map([[SESSION_UUID, rangesOf(first)]]),
+		);
+		expect(second).toHaveLength(1);
+		expect(second[0].startMessageId).toBe(`g-${FULL}`);
+		expect(second[0].endMessageId).toBe(`g-${2 * FULL - 1}`);
+		for (let i = 0; i < 2 * FULL; i++) {
+			expect(countOf(second[0].content, `[m${i}] body`)).toBe(i < FULL ? 0 : 1);
+		}
+
+		reader.getCandidateSessions(0);
+		const third = reader.getNewEpisodes(
+			[SESSION_UUID],
+			new Map([[SESSION_UUID, rangesOf([...first, ...second])]]),
+		);
+		expect(third).toEqual([]);
+	});
+
+	it("re-emits only the new tail after a compaction summary", () => {
+		const head = [
+			compactionRecord({ uuid: "compact-1", timestamp: ts(BASE, -500) }),
+			msgRecord({
+				uuid: "summary-1",
+				role: "user",
+				timestamp: ts(BASE, -100),
+				content: "Compaction summary of prior work.",
+			}),
+		];
+		writeSession([...head, ...messageLines(0, FULL)]);
+		reader.getCandidateSessions(0);
+		const first = reader.getNewEpisodes([SESSION_UUID], new Map());
+		expect(first.map((e) => e.contentType)).toEqual([
+			"compaction_summary",
+			"messages",
+		]);
+
+		writeSession([
+			...head,
+			...messageLines(0, FULL),
+			...messageLines(FULL, FULL),
+		]);
+		reader.getCandidateSessions(0);
+		const second = reader.getNewEpisodes(
+			[SESSION_UUID],
+			new Map([[SESSION_UUID, rangesOf(first)]]),
+		);
+		// The summary episode is already uploaded and must not come back.
+		expect(second).toHaveLength(1);
+		expect(second[0].contentType).toBe("messages");
+		expect(second[0].startMessageId).toBe(`g-${FULL}`);
+		expect(countOf(second[0].content, "[m0] body")).toBe(0);
+		expect(countOf(second[0].content, `[m${FULL}] body`)).toBe(1);
+	});
+});
+
+describe("ClaudeCodeEpisodeReader — ARC-07 hold-back", () => {
+	it("holds a short tail of an active session and flushes it once idle", () => {
+		const now = Date.now();
+		const active = now - 60_000;
+		writeSession(messageLines(0, FULL, active));
+		reader.getCandidateSessions(0);
+		const first = reader.getNewEpisodes([SESSION_UUID], new Map());
+		expect(first).toHaveLength(1);
+
+		writeSession([
+			...messageLines(0, FULL, active),
+			...messageLines(FULL, SHORT, active),
+		]);
+		reader.getCandidateSessions(0);
+		const held = reader.getNewEpisodes(
+			[SESSION_UUID],
+			new Map([[SESSION_UUID, rangesOf(first)]]),
+		);
+		expect(held).toEqual([]);
+
+		const idle = now - 2 * SESSION_IDLE_FLUSH_MS;
+		writeSession([
+			...messageLines(0, FULL, idle),
+			...messageLines(FULL, SHORT, idle),
+		]);
+		reader.getCandidateSessions(0);
+		const flushed = reader.getNewEpisodes(
+			[SESSION_UUID],
+			new Map([[SESSION_UUID, rangesOf(first)]]),
+		);
+		expect(flushed).toHaveLength(1);
+		expect(flushed[0].startMessageId).toBe(`g-${FULL}`);
+		expect(flushed[0].endMessageId).toBe(`g-${FULL + SHORT - 1}`);
+	});
+});
+
+describe("ClaudeCodeEpisodeReader — ARC-07 poison pills", () => {
+	it("skips null, non-object, malformed and null-part items without stalling other sessions", () => {
+		takeSkipCount(CC_SOURCE);
+		const partRecord = JSON.stringify({
+			type: "user",
+			uuid: "g-part",
+			parentUuid: null,
+			timestamp: ts(BASE, 99_000),
+			sessionId: "test-session",
+			cwd: CWD,
+			slug: "test-slug",
+			message: {
+				role: "user",
+				content: [null, { type: "text", text: "part survives" }],
+			},
+		});
+		writeSession(["null", ...messageLines(0, FULL), "{not json", partRecord]);
+		writeFileSync(
+			join(projectPath, `${HEALTHY_UUID}.jsonl`),
+			`${messageLines(0, FULL, BASE, "h").join("\n")}\n`,
+		);
+
+		reader.getCandidateSessions(0);
+		const episodes = reader.getNewEpisodes(
+			[SESSION_UUID, HEALTHY_UUID],
+			new Map(),
+		);
+
+		const healthy = episodes.filter((e) => e.sessionId === HEALTHY_UUID);
+		expect(healthy).toHaveLength(1);
+		expect(healthy[0].startMessageId).toBe("h-0");
+
+		const poisoned = episodes.filter((e) => e.sessionId === SESSION_UUID);
+		expect(poisoned).toHaveLength(1);
+		expect(poisoned[0].content).toContain("[m0] body");
+		expect(poisoned[0].content).toContain("part survives");
+		expect(takeSkipCount(CC_SOURCE)).toBeGreaterThan(0);
+	});
+
+	it("counts an unreadable session as a skip and still returns the healthy ones", () => {
+		takeSkipCount(CC_SOURCE);
+		// A directory named like a session file: stat succeeds, reading it fails (EISDIR).
+		mkdirSync(sessionFilePath);
+		writeFileSync(
+			join(projectPath, `${HEALTHY_UUID}.jsonl`),
+			`${messageLines(0, FULL, BASE, "h").join("\n")}\n`,
+		);
+
+		expect(() => reader.getCandidateSessions(0)).not.toThrow();
+		const episodes = reader.getNewEpisodes(
+			[SESSION_UUID, HEALTHY_UUID],
+			new Map(),
+		);
+		expect(episodes.map((e) => e.sessionId)).toEqual([HEALTHY_UUID]);
+		expect(takeSkipCount(CC_SOURCE)).toBeGreaterThan(0);
 	});
 });

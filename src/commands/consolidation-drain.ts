@@ -93,8 +93,11 @@ export async function drainConsolidation(
 
 		const acquired = await tryAcquireLock(consolidation, lockTimeoutMs);
 		if (!acquired) {
+			const holder = consolidation.crossProcessLockHolder();
 			console.error(
-				"Could not acquire consolidation lock after 10 s — is the server running? Stop it first.",
+				holder && holder.pid > 0
+					? `Consolidation is already running in another process (PID ${holder.pid}). Wait for it to finish, or stop the server first.`
+					: "Could not acquire consolidation lock after 10 s — is the server running? Stop it first.",
 			);
 			process.exit(1);
 		}

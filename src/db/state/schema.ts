@@ -29,10 +29,8 @@ export const SERVER_LOCAL_SCHEMA_VERSION = latestVersion(
 	SERVER_LOCAL_MIGRATIONS,
 );
 
-// Schema is always additive (CREATE TABLE IF NOT EXISTS), so column-manifest
-// drift detection is not used for state.db. See KnowledgeDB (knowledge.db)
-// for the EXPECTED_TABLE_COLUMNS pattern used when the schema has a more
-// complex migration history requiring column-presence assertions.
+// Schema is always additive (CREATE TABLE IF NOT EXISTS), so no column-manifest
+// drift check is kept for state.db.
 
 export const SERVER_LOCAL_CREATE_TABLES = `
   CREATE TABLE IF NOT EXISTS schema_version (

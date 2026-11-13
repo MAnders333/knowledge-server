@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { KnowledgeDB } from "../src/db/sqlite/index";
-import { CREATE_TABLES, EXPECTED_TABLE_COLUMNS } from "../src/db/sqlite/schema";
+import { CREATE_TABLES } from "../src/db/sqlite/schema";
 import { ServerStateDB } from "../src/db/state/index";
 
 describe("KnowledgeDB", () => {
@@ -510,93 +510,6 @@ describe("KnowledgeDB", () => {
 		expect(meta?.dimensions).toBe(3072);
 	});
 
-	// ── clearAllEmbeddings ──
-
-	it("clearAllEmbeddings NULLs embeddings on active and conflicted entries", async () => {
-		const now = Date.now();
-		const emb = [0.1, 0.2, 0.3];
-		await db.insertEntry({
-			id: "e1",
-			type: "fact",
-			content: "Active entry",
-			topics: ["t"],
-			confidence: 0.8,
-			source: "test",
-			status: "active",
-			strength: 1.0,
-			createdAt: now,
-			updatedAt: now,
-			lastAccessedAt: now,
-			accessCount: 0,
-			observationCount: 1,
-			supersededBy: null,
-			derivedFrom: [],
-			embedding: emb,
-		});
-		await db.insertEntry({
-			id: "e2",
-			type: "fact",
-			content: "Conflicted entry",
-			topics: ["t"],
-			confidence: 0.8,
-			source: "test",
-			status: "conflicted",
-			strength: 1.0,
-			createdAt: now,
-			updatedAt: now,
-			lastAccessedAt: now,
-			accessCount: 0,
-			observationCount: 1,
-			supersededBy: null,
-			derivedFrom: [],
-			embedding: emb,
-		});
-		await db.insertEntry({
-			id: "e3",
-			type: "fact",
-			content: "Superseded entry",
-			topics: ["t"],
-			confidence: 0.8,
-			source: "test",
-			status: "superseded",
-			strength: 1.0,
-			createdAt: now,
-			updatedAt: now,
-			lastAccessedAt: now,
-			accessCount: 0,
-			observationCount: 1,
-			supersededBy: "e1",
-			derivedFrom: [],
-			embedding: emb,
-		});
-
-		const cleared = await db.clearAllEmbeddings();
-		expect(cleared).toBe(2); // only active + conflicted
-
-		const embeddingBlobs = new Database(join(tempDir, "test.db"), {
-			readonly: true,
-		});
-		const hasBlob = (id: string) =>
-			(
-				embeddingBlobs
-					.prepare("SELECT embedding FROM knowledge_entry WHERE id = ?")
-					.get(id) as { embedding: Uint8Array | null }
-			).embedding !== null;
-		try {
-			expect(hasBlob("e1")).toBe(false);
-			expect(hasBlob("e2")).toBe(false);
-			// Superseded entry should retain its embedding
-			expect(hasBlob("e3")).toBe(true);
-		} finally {
-			embeddingBlobs.close();
-		}
-	});
-
-	it("clearAllEmbeddings returns 0 when no embeddings exist", async () => {
-		const cleared = await db.clearAllEmbeddings();
-		expect(cleared).toBe(0);
-	});
-
 	// ── getEntriesMissingEmbeddings ──
 
 	it("getEntriesMissingEmbeddings returns only active/conflicted entries without embeddings", async () => {
@@ -932,67 +845,5 @@ describe("KnowledgeDB — cluster CRUD", () => {
 		await db.reinitialize();
 
 		expect(await db.getClustersWithMembers()).toHaveLength(0);
-	});
-});
-
-describe("EXPECTED_TABLE_COLUMNS sync with CREATE_TABLES DDL", () => {
-	it("every column in EXPECTED_TABLE_COLUMNS exists in the DDL schema", () => {
-		// Spin up an in-memory DB, apply CREATE_TABLES, then PRAGMA each table.
-		// If a column is listed in EXPECTED_TABLE_COLUMNS but absent from the
-		// schema, this test fails — catching the sync mistake at test time rather
-		// than at production startup (where it would silently invert the drift check).
-		const memDb = new Database(":memory:");
-		memDb.exec(CREATE_TABLES);
-
-		const missing: string[] = [];
-
-		for (const [table, expectedCols] of Object.entries(
-			EXPECTED_TABLE_COLUMNS,
-		)) {
-			const actualCols = new Set(
-				(
-					memDb.prepare(`PRAGMA table_info("${table}")`).all() as Array<{
-						name: string;
-					}>
-				).map((c) => c.name),
-			);
-			for (const col of expectedCols) {
-				if (!actualCols.has(col)) {
-					missing.push(`${table}.${col}`);
-				}
-			}
-		}
-
-		memDb.close();
-		expect(missing).toEqual([]); // empty = all expected columns present in DDL
-	});
-
-	it("every column in the DDL schema is listed in EXPECTED_TABLE_COLUMNS", () => {
-		// Reverse check: catches columns added to the DDL but forgotten in EXPECTED_TABLE_COLUMNS.
-		// Without this, new columns would silently bypass the drift check.
-		const memDb = new Database(":memory:");
-		memDb.exec(CREATE_TABLES);
-
-		const extra: string[] = [];
-
-		for (const [table, expectedCols] of Object.entries(
-			EXPECTED_TABLE_COLUMNS,
-		)) {
-			const expectedSet = new Set(expectedCols);
-			const actualCols = (
-				memDb.prepare(`PRAGMA table_info("${table}")`).all() as Array<{
-					name: string;
-				}>
-			).map((c) => c.name);
-
-			for (const col of actualCols) {
-				if (!expectedSet.has(col)) {
-					extra.push(`${table}.${col}`);
-				}
-			}
-		}
-
-		memDb.close();
-		expect(extra).toEqual([]); // empty = no DDL columns missing from EXPECTED_TABLE_COLUMNS
 	});
 });

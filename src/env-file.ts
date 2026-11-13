@@ -1,0 +1,110 @@
+/**
+ * The single `.env` parser for knowledge-server.
+ *
+ * Parsing is delegated to `dotenv`, which strips inline `# comments` from
+ * unquoted values the same way the documented templates describe. The shell
+ * launchers do not parse `.env`; they exec the binary, which loads it here.
+ *
+ * Search order (first existing file wins):
+ *   1. $KNOWLEDGE_CONFIG_HOME/.env
+ *   2. $XDG_CONFIG_HOME/knowledge-server/.env  (default: ~/.config/...)
+ *   3. ~/.local/share/knowledge-server/.env    (legacy location)
+ */
+
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import * as dotenv from "dotenv";
+
+/**
+ * Keys a `.env` file may never set. These change how the process loads code or
+ * runs its shell, so a `.env` (even one a user pasted in) must not control them.
+ */
+const DENIED_KEYS: Record<string, true> = {
+	PATH: true,
+	HOME: true,
+	IFS: true,
+	SHELL: true,
+	BASH_ENV: true,
+	ENV: true,
+	NODE_OPTIONS: true,
+	BUN_OPTIONS: true,
+};
+const DENIED_PREFIXES = ["LD_", "DYLD_"];
+
+/** The preferred (XDG) `.env` location. Reported when no file exists yet. */
+export function preferredEnvFile(
+	env: NodeJS.ProcessEnv = process.env,
+	home: string = homedir(),
+): string {
+	const xdgConfigHome = env.XDG_CONFIG_HOME || join(home, ".config");
+	return join(xdgConfigHome, "knowledge-server", ".env");
+}
+
+/** Candidate `.env` paths in priority order, whether or not they exist. */
+export function envFileCandidates(
+	env: NodeJS.ProcessEnv = process.env,
+	home: string = homedir(),
+): string[] {
+	const candidates: string[] = [];
+	if (env.KNOWLEDGE_CONFIG_HOME) {
+		candidates.push(join(env.KNOWLEDGE_CONFIG_HOME, ".env"));
+	}
+	candidates.push(preferredEnvFile(env, home));
+	candidates.push(join(home, ".local", "share", "knowledge-server", ".env"));
+	return candidates;
+}
+
+/** First existing `.env` from {@link envFileCandidates}, or null. */
+export function findEnvFile(
+	env: NodeJS.ProcessEnv = process.env,
+	home: string = homedir(),
+): string | null {
+	return envFileCandidates(env, home).find((p) => existsSync(p)) ?? null;
+}
+
+/** Parse `.env` text. Denied process-control keys are dropped. */
+export function parseEnvText(text: string): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const [key, value] of Object.entries(dotenv.parse(text))) {
+		const denied =
+			DENIED_KEYS[key] === true ||
+			DENIED_PREFIXES.some((p) => key.startsWith(p));
+		if (!denied) out[key] = value;
+	}
+	return out;
+}
+
+export interface LoadEnvResult {
+	/** Keys assigned from the file (keys already set in the environment are kept). */
+	loaded: string[];
+	/** Read error, if the file could not be read. */
+	error?: string;
+}
+
+/**
+ * Load a `.env` file into `env`. Explicit environment variables always win
+ * (same as dotenv's `override: false`).
+ */
+export function loadEnvFile(
+	path: string,
+	env: NodeJS.ProcessEnv = process.env,
+): LoadEnvResult {
+	let text: string;
+	try {
+		text = readFileSync(path, "utf8");
+	} catch (err) {
+		return {
+			loaded: [],
+			error: err instanceof Error ? err.message : String(err),
+		};
+	}
+	const loaded: string[] = [];
+	for (const [key, value] of Object.entries(parseEnvText(text))) {
+		if (env[key] === undefined) {
+			env[key] = value;
+			loaded.push(key);
+		}
+	}
+	return { loaded };
+}

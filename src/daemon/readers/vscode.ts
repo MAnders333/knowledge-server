@@ -11,10 +11,9 @@ import type {
 } from "../../types.js";
 import {
 	MAX_MESSAGE_CHARS,
-	MAX_TOKENS_PER_EPISODE,
-	approxTokens,
-	chunkByTokenBudget,
-	formatMessages,
+	dropProcessed,
+	episodesFromMessages,
+	recordSkip,
 } from "./shared.js";
 
 // ── VSCode / GitHub Copilot Chat storage schema ────────────────────────────────
@@ -102,6 +101,73 @@ interface ParsedSession {
 	requests: VSCodeRequest[];
 }
 
+function isObject(value: unknown): boolean {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function errorMessage(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
+
+/** Percent-decode a token. A bare `%` that is not an escape keeps the raw token. */
+function decodeToken(token: string): string {
+	try {
+		return decodeURIComponent(token);
+	} catch {
+		return token;
+	}
+}
+
+/** An array field: [] when absent; a present non-array value is recorded as a skip. */
+function arrayField<T>(
+	source: string,
+	item: string,
+	field: string,
+	value: unknown,
+): T[] {
+	if (value === undefined || value === null) return [];
+	if (Array.isArray(value)) return value as T[];
+	recordSkip(source, item, `non-array ${field}`);
+	return [];
+}
+
+/**
+ * A request usable by extraction, or null when a field has the wrong shape.
+ * A malformed request is skipped whole rather than read partially.
+ */
+function usableRequest(raw: unknown): VSCodeRequest | null {
+	if (!isObject(raw)) return null;
+	// Each field is re-checked below before use; the cast only types them as unknown.
+	const value = raw as Partial<Record<keyof VSCodeRequest, unknown>>;
+	if (value.requestId != null && typeof value.requestId !== "string") {
+		return null;
+	}
+	if (
+		value.timestamp != null &&
+		(typeof value.timestamp !== "number" || !Number.isFinite(value.timestamp))
+	) {
+		return null;
+	}
+	const message: unknown = value.message;
+	if (message != null) {
+		if (typeof message !== "object" || Array.isArray(message)) return null;
+		if (
+			"text" in message &&
+			message.text != null &&
+			typeof message.text !== "string"
+		) {
+			return null;
+		}
+	}
+	const response = value.response;
+	if (response != null) {
+		if (!Array.isArray(response) || response.some((part) => !isObject(part))) {
+			return null;
+		}
+	}
+	return value as VSCodeRequest;
+}
+
 // ── VSCodeEpisodeReader ───────────────────────────────────────────────────────
 
 /**
@@ -177,7 +243,11 @@ export class VSCodeEpisodeReader implements IEpisodeReader {
 			const session = this._sessionCache.get(sessionId);
 			if (!session) continue;
 			const sessionProcessed = processedRanges.get(sessionId) ?? [];
-			episodes.push(...this.segmentSession(session, sessionProcessed));
+			try {
+				episodes.push(...this.segmentSession(session, sessionProcessed));
+			} catch (err) {
+				recordSkip(this.source, sessionId, `unreadable: ${errorMessage(err)}`);
+			}
 		}
 		return episodes;
 	}
@@ -199,7 +269,12 @@ export class VSCodeEpisodeReader implements IEpisodeReader {
 		let workspaceDirs: string[];
 		try {
 			workspaceDirs = readdirSync(workspaceStorageDir);
-		} catch {
+		} catch (err) {
+			recordSkip(
+				this.source,
+				workspaceStorageDir,
+				`unreadable: ${errorMessage(err)}`,
+			);
 			return [];
 		}
 
@@ -212,25 +287,34 @@ export class VSCodeEpisodeReader implements IEpisodeReader {
 
 			// Read workspace.json to get the project directory
 			let workspaceDir = "";
-			try {
-				const wsJsonPath = join(wsDir, "workspace.json");
-				if (existsSync(wsJsonPath)) {
-					const wsJson = JSON.parse(readFileSync(wsJsonPath, "utf8")) as {
-						folder?: string;
-					};
-					if (wsJson.folder) {
+			const wsJsonPath = join(wsDir, "workspace.json");
+			if (existsSync(wsJsonPath)) {
+				try {
+					const wsJson: unknown = JSON.parse(readFileSync(wsJsonPath, "utf8"));
+					if (
+						typeof wsJson === "object" &&
+						wsJson !== null &&
+						"folder" in wsJson &&
+						typeof wsJson.folder === "string"
+					) {
 						workspaceDir = resolveWorkspaceFolder(wsJson.folder);
 					}
+				} catch (err) {
+					// Non-fatal — we can still read sessions without workspace info
+					recordSkip(
+						this.source,
+						wsJsonPath,
+						`unreadable workspace.json: ${errorMessage(err)}`,
+					);
 				}
-			} catch {
-				// Non-fatal — we can still read sessions without workspace info
 			}
 
 			// Read all session JSON files in this workspace
 			let sessionFiles: string[];
 			try {
 				sessionFiles = readdirSync(chatDir).filter((f) => f.endsWith(".json"));
-			} catch {
+			} catch (err) {
+				recordSkip(this.source, chatDir, `unreadable: ${errorMessage(err)}`);
 				continue;
 			}
 
@@ -257,17 +341,25 @@ export class VSCodeEpisodeReader implements IEpisodeReader {
 		let raw: string;
 		try {
 			raw = readFileSync(filePath, "utf8");
-		} catch {
+		} catch (err) {
+			recordSkip(this.source, filePath, `unreadable: ${errorMessage(err)}`);
 			return null;
 		}
 
 		let data: VSCodeSessionFile;
 		try {
 			const parsed: unknown = JSON.parse(raw);
-			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+			if (!isObject(parsed)) {
+				recordSkip(this.source, filePath, "not a JSON object");
 				return null;
+			}
 			data = parsed as VSCodeSessionFile;
-		} catch {
+		} catch (err) {
+			recordSkip(
+				this.source,
+				filePath,
+				`unreadable: malformed JSON (${errorMessage(err)})`,
+			);
 			return null;
 		}
 
@@ -275,13 +367,35 @@ export class VSCodeEpisodeReader implements IEpisodeReader {
 		if (data.isEmpty) return null;
 
 		const sessionId = data.sessionId;
-		if (!sessionId) return null;
+		if (typeof sessionId !== "string" || !sessionId) {
+			recordSkip(this.source, filePath, "missing sessionId");
+			return null;
+		}
 
 		const creationDate = data.creationDate ?? 0;
 		const lastMessageDate = data.lastMessageDate ?? creationDate;
+		if (!Number.isFinite(creationDate) || !Number.isFinite(lastMessageDate)) {
+			recordSkip(this.source, filePath, "non-numeric timestamp");
+			return null;
+		}
 		if (lastMessageDate === 0) return null;
 
-		const requests = data.requests ?? [];
+		const requestValues = arrayField<unknown>(
+			this.source,
+			filePath,
+			"requests",
+			data.requests,
+		);
+		const requests: VSCodeRequest[] = [];
+		let malformed = 0;
+		for (const value of requestValues) {
+			const request = usableRequest(value);
+			if (request) requests.push(request);
+			else malformed++;
+		}
+		if (malformed > 0) {
+			recordSkip(this.source, filePath, "malformed request(s)", malformed);
+		}
 		if (requests.length === 0) return null;
 
 		// Check if any request has actual text content
@@ -290,7 +404,9 @@ export class VSCodeEpisodeReader implements IEpisodeReader {
 		);
 		if (!hasContent) return null;
 
-		const title = data.customTitle || `VSCode Chat ${sessionId.slice(0, 8)}`;
+		const title =
+			(typeof data.customTitle === "string" && data.customTitle) ||
+			`VSCode Chat ${sessionId.slice(0, 8)}`;
 
 		return {
 			sessionId,
@@ -310,45 +426,23 @@ export class VSCodeEpisodeReader implements IEpisodeReader {
 		session: ParsedSession,
 		processedRanges: ProcessedRange[],
 	): Episode[] {
-		const messages = this.extractMessages(session);
-		if (messages.length < config.consolidation.minSessionMessages) return [];
-
-		const chunks = chunkByTokenBudget(messages, MAX_TOKENS_PER_EPISODE);
-		const processedSet = new Set(
-			processedRanges.map((r) => `${r.startMessageId}::${r.endMessageId}`),
-		);
-		const episodes: Episode[] = [];
-
-		for (const chunk of chunks) {
-			const startId = chunk[0].messageId;
-			const endId = chunk[chunk.length - 1].messageId;
-			if (processedSet.has(`${startId}::${endId}`)) continue;
-
-			const content = formatMessages(chunk);
-			if (!content.trim()) continue;
-
-			// Derive project name from workspace directory
-			const projectName = session.workspaceDir
-				? (session.workspaceDir.split("/").pop() ?? "")
-				: "";
-
-			episodes.push({
+		// Derive project name from workspace directory
+		const projectName = session.workspaceDir
+			? (session.workspaceDir.split("/").pop() ?? "")
+			: "";
+		const episodes = episodesFromMessages(
+			{
 				source: this.source,
 				sessionId: session.sessionId,
-				startMessageId: startId,
-				endMessageId: endId,
 				sessionTitle: session.title || "Untitled",
 				projectName,
 				directory: session.workspaceDir,
 				timeCreated: session.creationDate,
-				maxMessageTime: chunk[chunk.length - 1].timestamp,
-				content,
-				contentType: "messages",
-				approxTokens: approxTokens(content),
-			});
-		}
-
-		return episodes;
+			},
+			this.extractMessages(session),
+			{ processedRanges },
+		);
+		return dropProcessed(episodes, processedRanges);
 	}
 
 	/**
@@ -464,7 +558,7 @@ export class VSCodeEpisodeReader implements IEpisodeReader {
 export function resolveWorkspaceFolder(folderUri: string): string {
 	// Case 1: file:// URI — strip scheme, decode percent-encoding
 	if (folderUri.startsWith("file://")) {
-		return decodeURIComponent(folderUri.replace(/^file:\/\//, ""));
+		return decodeToken(folderUri.replace(/^file:\/\//, ""));
 	}
 
 	// Case 2 & 3: vscode-remote:// URI
@@ -472,11 +566,16 @@ export function resolveWorkspaceFolder(folderUri: string): string {
 		let url: URL;
 		try {
 			url = new URL(folderUri);
-		} catch {
+		} catch (err) {
+			recordSkip(
+				"vscode",
+				folderUri,
+				`unparseable workspace URI: ${errorMessage(err)}`,
+			);
 			return "";
 		}
 
-		const authority = decodeURIComponent(url.hostname);
+		const authority = decodeToken(url.hostname);
 
 		// Case 3: Dev Container — authority is "dev-container+<hex-encoded-json>"
 		// The JSON payload contains a `hostPath` field with the local project directory.
@@ -496,15 +595,20 @@ export function resolveWorkspaceFolder(folderUri: string): string {
 				) {
 					return (containerConfig as Record<string, string>).hostPath;
 				}
-			} catch {
+			} catch (err) {
 				// Hex decode or JSON parse failed — return "" (container-internal
 				// path would be useless for domain routing on the host machine)
+				recordSkip(
+					"vscode",
+					folderUri,
+					`unreadable dev-container URI: ${errorMessage(err)}`,
+				);
 			}
 			return "";
 		}
 
 		// Case 2: SSH Remote — use the pathname which is the remote filesystem path.
-		const remotePath = decodeURIComponent(url.pathname);
+		const remotePath = decodeToken(url.pathname);
 		return remotePath || "";
 	}
 

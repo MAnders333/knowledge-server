@@ -9,6 +9,9 @@
  * extracted knowledge to the appropriate knowledge store (SQLite or Postgres)
  * based on domain configuration.
  *
+ * Only one daemon may run per data directory: the process takes daemon.lock
+ * at startup and exits cleanly when another live daemon already holds it.
+ *
  * This entry point imports ONLY what the daemon needs:
  *   - Episode readers (file parsers for OpenCode, Claude Code, etc.)
  *   - EpisodeUploader (the upload loop)
@@ -31,12 +34,22 @@
 // Load .env from default config location for binary installs — must be first.
 import "../env.js";
 import pkg from "../../package.json" with { type: "json" };
+import { resolveDataDir } from "../config-file.js";
+import { config } from "../config.js";
 import { DaemonDB } from "../db/daemon/index.js";
 import { createServerStateDB } from "../db/state/factory.js";
-import { logger } from "../logger.js";
+import { logger, parseLogLevel } from "../logger.js";
 import { tightenOwnedPrivatePaths } from "../private-files.js";
+import { lockHolder, tryAcquireProcessLock } from "../process-lock.js";
+import {
+	daemonLockPath,
+	daemonLogPath,
+	daemonStatusPath,
+} from "../runtime-files.js";
 import { currentUserId } from "../user-id.js";
+import { parseInitialLookbackDays } from "./lookback.js";
 import { createEpisodeReaders } from "./readers/index.js";
+import { type DaemonStatus, writeDaemonStatus } from "./status.js";
 import { EpisodeUploader } from "./uploader.js";
 
 // Parse CLI args
@@ -80,6 +93,29 @@ const onceFlag = args.includes("--once");
 // Upgraded installs may have group/other-readable state, DB or log files.
 tightenOwnedPrivatePaths();
 
+// Data directory: state.db, the lockfiles and the status file live here.
+const dataDir = resolveDataDir();
+// KNOWLEDGE_DAEMON_LOG_PATH="" keeps daemon lines on stdout only; the server sets
+// it when it auto-spawns the daemon and forwards those lines into server.log.
+logger.init(
+	process.env.KNOWLEDGE_DAEMON_LOG_PATH ?? daemonLogPath(dataDir),
+	parseLogLevel(process.env.LOG_LEVEL),
+	config.logMaxBytes,
+);
+
+// Single instance per data directory. Taken before any DB connection, so a
+// second start (launchd restart, manual run, auto-spawn race) exits here.
+const daemonLock = tryAcquireProcessLock(daemonLockPath(dataDir));
+if (!daemonLock) {
+	const holder = lockHolder(daemonLockPath(dataDir));
+	const who = holder && holder.pid > 0 ? ` (PID ${holder.pid})` : "";
+	logger.warn(
+		`[daemon] Another knowledge-daemon${who} already runs for ${dataDir}. Exiting: only one daemon may run per data directory.`,
+	);
+	process.exit(0);
+}
+const releaseDaemonLock = () => daemonLock.release();
+
 // No validateConfig() call here — the daemon does not use LLM or embedding.
 // It only needs state.db (SQLite or Postgres), which createServerStateDB()
 // resolves from config.jsonc. Connection failures surface naturally at runtime.
@@ -98,6 +134,7 @@ try {
 	console.error(
 		"  Check stateDb config in config.jsonc (or STATE_DB_URI env var for Postgres).",
 	);
+	releaseDaemonLock();
 	process.exit(1);
 }
 
@@ -116,7 +153,17 @@ if (readers.length === 0) {
 	);
 }
 
-const uploader = new EpisodeUploader(readers, serverStateDb, daemonDb, userId);
+const uploader = new EpisodeUploader(readers, serverStateDb, daemonDb, userId, {
+	initialLookbackDays: parseInitialLookbackDays(
+		process.env.INITIAL_LOOKBACK_DAYS,
+	),
+});
+
+const closeResources = async () => {
+	for (const reader of readers) reader.close();
+	await serverStateDb.close();
+	daemonDb.close();
+};
 
 if (onceFlag) {
 	// One-shot mode: upload once and exit. Useful for cron / launchd OnDemand.
@@ -127,16 +174,46 @@ if (onceFlag) {
 			`[daemon] Done. ${result.episodesUploaded} episodes uploaded from ${result.sessionsProcessed} sessions.`,
 		);
 	} finally {
-		for (const reader of readers) reader.close();
-		await serverStateDb.close();
-		daemonDb.close();
+		await closeResources();
+		releaseDaemonLock();
 	}
 	process.exit(0);
 } else {
-	// Polling mode: run until SIGTERM/SIGINT.
-	await uploader.runPolling(intervalMs, async () => {
-		for (const reader of readers) reader.close();
-		await serverStateDb.close();
-		daemonDb.close();
-	});
+	// Polling mode: run until SIGTERM/SIGINT. Each cycle updates the status file the
+	// server reads for /status.
+	const statusPath = daemonStatusPath(dataDir);
+	const status: DaemonStatus = {
+		pid: process.pid,
+		startedAt: Date.now(),
+		intervalMs,
+		lastCycleAt: null,
+		consecutiveFailures: 0,
+		lastError: null,
+		lastUploadAt: null,
+	};
+	const publish = (patch: Partial<DaemonStatus>) => {
+		Object.assign(status, patch);
+		try {
+			writeDaemonStatus(statusPath, status);
+		} catch (err) {
+			logger.warn("[daemon] Could not write status file:", err);
+		}
+	};
+	publish({});
+	await uploader.runPolling(
+		intervalMs,
+		async () => {
+			await closeResources();
+			releaseDaemonLock();
+		},
+		(outcome) => {
+			const now = Date.now();
+			publish({
+				lastCycleAt: now,
+				consecutiveFailures: outcome.ok ? 0 : status.consecutiveFailures + 1,
+				lastError: outcome.ok ? null : (outcome.error ?? "unknown error"),
+				...(outcome.uploaded > 0 && { lastUploadAt: now }),
+			});
+		},
+	);
 }

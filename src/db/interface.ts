@@ -370,8 +370,6 @@ export interface IKnowledgeStore {
 
 	markClusterSynthesized(clusterId: string): Promise<void>;
 
-	clearAllEmbeddings(): Promise<number>;
-
 	// ── Vector Search (optional — Postgres + pgvector only) ─────────────────
 	//
 	// When present, callers use DB-side approximate nearest-neighbour (ANN) search

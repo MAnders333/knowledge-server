@@ -93,6 +93,12 @@ describe("HTTP API", () => {
 				return false;
 			},
 			tryLock: () => true,
+			consolidationOutcome: () => ({
+				consecutiveFailures: 0,
+				lastError: null,
+				lastErrorAt: null,
+				lastSuccessAt: null,
+			}),
 			unlock: () => {},
 			close: () => {},
 		} as unknown as ConsolidationEngine;
@@ -741,6 +747,12 @@ describe("HTTP API", () => {
 					return false;
 				},
 				tryLock: () => true,
+				consolidationOutcome: () => ({
+					consecutiveFailures: 0,
+					lastError: null,
+					lastErrorAt: null,
+					lastSuccessAt: null,
+				}),
 				unlock: () => {},
 				close: () => {},
 			} as unknown as ConsolidationEngine;

@@ -439,30 +439,6 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		expect(missing[0].id).toBe("no-emb");
 	});
 
-	it("clearAllEmbeddings NULLs embeddings on active/conflicted entries only", async () => {
-		const emb = [0.1, 0.2, 0.3];
-		await db.insertEntry(makeEntry("e1", { status: "active", embedding: emb }));
-		await db.insertEntry(
-			makeEntry("e2", { status: "conflicted", embedding: emb }),
-		);
-		await db.insertEntry(
-			makeEntry("e3", {
-				status: "superseded",
-				supersededBy: "e1",
-				embedding: emb,
-			}),
-		);
-
-		const cleared = await db.clearAllEmbeddings();
-		expect(cleared).toBe(2);
-
-		const withBlob = await truncSql`
-			SELECT id FROM knowledge_entry WHERE id IN ('e1', 'e2', 'e3') AND embedding IS NOT NULL
-		`;
-		// Superseded entry should retain its embedding; active and conflicted ones lost theirs.
-		expect(withBlob.map((r) => r.id)).toEqual(["e3"]);
-	});
-
 	// ── Stats ──
 
 	it("returns correct stats", async () => {

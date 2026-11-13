@@ -21,18 +21,48 @@ import { formatActivatedKnowledge } from "../activation/format.js";
 import { DEFAULT_CONFIG } from "../config-file.js";
 import { REVIEW_STALE_STRENGTH_THRESHOLD, config } from "../config.js";
 import type { ConsolidationEngine } from "../consolidation/consolidate.js";
+import { type DaemonStatus, readDaemonStatus } from "../daemon/status.js";
 import type { IKnowledgeStore } from "../db/index.js";
+import { componentHealth, evaluateHealth } from "../health.js";
 import { logger } from "../logger.js";
 import { activateInputSchema } from "../mcp/index.js";
+import { lockHolder } from "../process-lock.js";
+import { daemonLockPath, daemonStatusPath } from "../runtime-files.js";
 import { KnowledgeService } from "../services/knowledge-service.js";
 import type {
 	ActivationResult,
+	ConsolidationState,
 	KnowledgeEntry,
 	KnowledgeStatus,
 } from "../types.js";
 import { withTimeout } from "../utils.js";
 import { buildHostAllowlist } from "./host-allowlist.js";
 import { MAX_BODY_BYTES, boundCues, capText } from "./input-limits.js";
+
+/** Process context /status needs beyond the stores: the data dir and the daemon setting. */
+export interface StatusRuntime {
+	/** Data directory holding daemon.lock and daemon.status.json. Omit to skip daemon checks. */
+	dataDir?: string;
+	/** The server auto-spawns the daemon (DAEMON_AUTO_SPAWN), so a daemon is expected. */
+	daemonAutoSpawn?: boolean;
+}
+
+/** Providers whose circuit state /status reports. */
+const PROVIDER_NAMES = ["embedding", "rerank"] as const;
+
+/** Daemon liveness as /status reports it: the lock holder plus the status file. */
+function readDaemonView(dataDir: string): {
+	running: boolean;
+	pid: number;
+	status: DaemonStatus | null;
+} {
+	const holder = lockHolder(daemonLockPath(dataDir));
+	return {
+		running: holder !== null,
+		pid: holder?.pid ?? 0,
+		status: readDaemonStatus(daemonStatusPath(dataDir)),
+	};
+}
 
 /**
  * HTTP API for the knowledge server.
@@ -98,6 +128,8 @@ export function createApp(
 	bindHost = "127.0.0.1",
 	/** Extra Host values (KNOWLEDGE_ALLOWED_HOSTS), each `name` or `name:port`. */
 	extraAllowedHosts: readonly string[] = [],
+	/** Where the daemon's lockfile and status file live; enables the daemon checks in /status. */
+	runtime: StatusRuntime = {},
 ): Hono {
 	const app = new Hono();
 	const allowlist = buildHostAllowlist(bindHost, extraAllowedHosts);
@@ -527,7 +559,8 @@ export function createApp(
 	app.get("/status", async (c) => {
 		// Fan out stats across all stores and sum counts.
 		// fanOutReads tolerates per-store failures — a dead store is skipped
-		// and its counts simply omitted from the sum.
+		// and its counts simply omitted from the sum. Each store's outcome is
+		// recorded, so `health` below reflects this request's reads.
 		const allStats = await fanOutReads(
 			readDbs,
 			(s) => s.getStats(),
@@ -552,13 +585,58 @@ export function createApp(
 			},
 		);
 
-		const consolidationState = await serverStateDb.getConsolidationState();
+		// The state DB is the one dependency every path needs. If it does not answer,
+		// the server is down; the response still carries what is known.
+		let stateDbReachable = true;
+		let consolidationState: ConsolidationState | null = null;
+		let pendingSessions = 0;
+		let deadLettered = 0;
+		try {
+			consolidationState = await serverStateDb.getConsolidationState();
+			pendingSessions = await serverStateDb.countPendingSessions();
+			deadLettered = await serverStateDb.countDeadLetteredEpisodes();
+		} catch (err) {
+			stateDbReachable = false;
+			logger.error("[status] State DB unreachable:", err);
+		}
 
-		// No per-source cursors in daemon-only mode — pending_episodes is self-draining.
+		const outcome = consolidation.consolidationOutcome();
+		const daemon = runtime.dataDir ? readDaemonView(runtime.dataDir) : null;
+		const daemonExpected =
+			runtime.daemonAutoSpawn === true || daemon?.status != null;
+
+		const storeInputs = [
+			...readDbs.map((s) => ({
+				id: s.id,
+				failing: componentHealth.snapshot(`store:${s.id}`).failing,
+			})),
+			...[...unavailableStoreIds].map((id) => ({ id, failing: true })),
+		];
+		const providerSnapshots = PROVIDER_NAMES.map((name) =>
+			componentHealth.snapshot(name),
+		);
+		const { health, reasons } = evaluateHealth({
+			stateDbReachable,
+			stores: storeInputs,
+			providers: providerSnapshots.map((p) => ({
+				name: p.name,
+				open: p.open,
+			})),
+			daemon: {
+				expected: daemonExpected,
+				running: daemon?.running ?? false,
+				consecutiveFailures: daemon?.status?.consecutiveFailures ?? 0,
+			},
+			consolidation: {
+				consecutiveFailures: outcome.consecutiveFailures,
+				deadLettered,
+				pendingSessions,
+			},
+		});
 
 		// Config block (model names, port) is gated behind the admin token.
 		// Unauthenticated callers (e.g. healthcheck scripts) still get version +
-		// knowledge stats, but don't learn which models / endpoint are in use.
+		// knowledge stats and health, but don't learn which models / endpoint are in use.
 		// Intentional: non-blocking — unauthenticated callers still receive a 200
 		// with partial data; the config block is simply omitted.
 		const isAdmin = requireAdminToken(c);
@@ -567,16 +645,30 @@ export function createApp(
 		const embeddingMeta = await db.getEmbeddingMetadata();
 
 		return c.json({
+			// Liveness: the server answered. `health` is the operational verdict.
 			status: "ok",
+			health,
+			reasons,
 			version: pkg.version,
 			knowledge: stats,
 			consolidation: {
-				lastRun: consolidationState.lastConsolidatedAt
+				lastRun: consolidationState?.lastConsolidatedAt
 					? new Date(consolidationState.lastConsolidatedAt).toISOString()
 					: null,
-				totalSessionsProcessed: consolidationState.totalSessionsProcessed,
-				totalEntriesCreated: consolidationState.totalEntriesCreated,
+				totalSessionsProcessed:
+					consolidationState?.totalSessionsProcessed ?? null,
+				totalEntriesCreated: consolidationState?.totalEntriesCreated ?? null,
+				consecutiveFailures: outcome.consecutiveFailures,
+				deadLettered,
+				pendingSessions,
 			},
+			daemon: daemon
+				? {
+						running: daemon.running,
+						lastUploadAt: daemon.status?.lastUploadAt ?? null,
+						lastCycleAt: daemon.status?.lastCycleAt ?? null,
+					}
+				: null,
 			embedding: embeddingMeta
 				? {
 						model: embeddingMeta.model,
@@ -594,6 +686,30 @@ export function createApp(
 					extractionModel: config.llm.extractionModel,
 					mergeModel: config.llm.mergeModel,
 					contradictionModel: config.llm.contradictionModel,
+				},
+				// Admin-only detail: raw error text and process ids stay off the public view.
+				diagnostics: {
+					daemon: daemon
+						? {
+								pid: daemon.pid,
+								startedAt: daemon.status?.startedAt ?? null,
+								lastError: daemon.status?.lastError ?? null,
+							}
+						: null,
+					consolidation: {
+						lastError: outcome.lastError,
+						lastErrorAt: outcome.lastErrorAt
+							? new Date(outcome.lastErrorAt).toISOString()
+							: null,
+						lastSuccessAt: outcome.lastSuccessAt
+							? new Date(outcome.lastSuccessAt).toISOString()
+							: null,
+					},
+					stores: readDbs.map((s) => ({
+						id: s.id,
+						...componentHealth.snapshot(`store:${s.id}`),
+					})),
+					providers: providerSnapshots,
 				},
 			}),
 		});
@@ -1080,9 +1196,12 @@ async function fanOutReads<T>(
 	const ok: T[] = [];
 	for (let i = 0; i < results.length; i++) {
 		const r = results[i];
+		const name = `store:${stores[i].id}`;
 		if (r.status === "fulfilled") {
+			componentHealth.recordSuccess(name);
 			ok.push(r.value);
 		} else {
+			componentHealth.recordFailure(name, r.reason);
 			logger.warn(
 				`[api] Store "${stores[i].id}" failed during ${label} — skipping. ` +
 					`Reason: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`,

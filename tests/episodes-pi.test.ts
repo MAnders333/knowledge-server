@@ -21,7 +21,13 @@
  *   - title fallback (session_info name → first user message → sessionId)
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+	appendFileSync,
+	mkdirSync,
+	mkdtempSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { config } from "../src/config";
@@ -29,6 +35,10 @@ import {
 	PiEpisodeReader,
 	resolvePiSessionsDirs,
 } from "../src/daemon/readers/pi";
+import {
+	SESSION_IDLE_FLUSH_MS,
+	takeSkipCount,
+} from "../src/daemon/readers/shared";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -766,5 +776,170 @@ describe("PiEpisodeReader — injected knowledge guard", () => {
 		expect(episodes).toHaveLength(1);
 		expect(episodes[0].content).toContain("  user: plain first message");
 		expect(episodes[0].content).toContain("  assistant: answer one");
+	});
+});
+
+// ── ARC-07: chunk growth, tail hold-back, poison pills ───────────────────────
+
+/** Entry id of a JSONL line built by msgRecord / headerRecord. */
+function idOf(line: string): string {
+	const record: unknown = JSON.parse(line);
+	if (
+		typeof record === "object" &&
+		record !== null &&
+		"id" in record &&
+		typeof record.id === "string"
+	) {
+		return record.id;
+	}
+	throw new Error(`fixture line has no string id: ${line}`);
+}
+
+/** `count` plain messages numbered from `first`: user on even turns, assistant on odd. */
+function turnMessages(first: number, count: number, startMs: number): string[] {
+	const lines: string[] = [];
+	for (let i = 0; i < count; i++) {
+		const n = first + i;
+		const timestamp = ts(startMs, i * 1000);
+		lines.push(
+			n % 2 === 0
+				? msgRecord({ role: "user", timestamp, content: `turn ${n}` })
+				: msgRecord({
+						role: "assistant",
+						timestamp,
+						content: [{ type: "text", text: `turn ${n}` }],
+					}),
+		);
+	}
+	return lines;
+}
+
+/** getNewEpisodes over the fixture session's candidates. */
+function episodesNow(
+	r: PiEpisodeReader,
+	processed: Map<
+		string,
+		Array<{ source: string; startMessageId: string; endMessageId: string }>
+	> = new Map(),
+) {
+	return r.getNewEpisodes(
+		r.getCandidateSessions(BASE - 1).map((c) => c.id),
+		processed,
+	);
+}
+
+/** processedRanges for the fixture session, one range per produced episode. */
+function rangesFrom(
+	episodes: Array<{ startMessageId: string; endMessageId: string }>,
+) {
+	return new Map([
+		[
+			SESSION_UUID,
+			episodes.map((ep) => ({
+				source: "pi",
+				startMessageId: ep.startMessageId,
+				endMessageId: ep.endMessageId,
+			})),
+		],
+	]);
+}
+
+describe("PiEpisodeReader — chunk growth (ARC-07)", () => {
+	it("emits only the appended tail, and nothing when unchanged", () => {
+		const k = config.consolidation.minSessionMessages;
+		writeSession([
+			headerRecord({ id: SESSION_UUID, timestamp: ts(BASE, 0) }),
+			...turnMessages(0, 4, BASE),
+		]);
+
+		const first = episodesNow(reader);
+		expect(first).toHaveLength(1);
+
+		const added = turnMessages(4, k, BASE + 10_000);
+		appendFileSync(sessionFilePath, `${added.join("\n")}\n`);
+		const second = episodesNow(reader, rangesFrom(first));
+		expect(second).toHaveLength(1);
+		expect(second[0].startMessageId).toBe(idOf(added[0]));
+		expect(second[0].endMessageId).toBe(idOf(added[k - 1]));
+		expect(second[0].content.split("turn ").length - 1).toBe(k);
+		expect(second[0].content).not.toContain("turn 0");
+
+		expect(episodesNow(reader, rangesFrom([...first, ...second]))).toEqual([]);
+	});
+});
+
+describe("PiEpisodeReader — tail hold-back (ARC-07)", () => {
+	it("holds back a small tail while the session is active", () => {
+		const now = Date.now();
+		writeSession([
+			headerRecord({ id: SESSION_UUID, timestamp: ts(now, -7_200_000) }),
+			...turnMessages(0, 4, now - 7_200_000),
+		]);
+		const first = episodesNow(reader);
+		expect(first).toHaveLength(1);
+
+		appendFileSync(
+			sessionFilePath,
+			`${turnMessages(4, 2, now - 1_000).join("\n")}\n`,
+		);
+		expect(episodesNow(reader, rangesFrom(first))).toEqual([]);
+	});
+
+	it("flushes a small tail once the session is idle", () => {
+		const now = Date.now();
+		writeSession([
+			headerRecord({ id: SESSION_UUID, timestamp: ts(now, -7_200_000) }),
+			...turnMessages(0, 4, now - 7_200_000),
+		]);
+		const first = episodesNow(reader);
+
+		appendFileSync(
+			sessionFilePath,
+			`${turnMessages(4, 2, now - SESSION_IDLE_FLUSH_MS - 60_000).join("\n")}\n`,
+		);
+		const flushed = episodesNow(reader, rangesFrom(first));
+		expect(flushed).toHaveLength(1);
+		expect(flushed[0].content).toContain("turn 5");
+	});
+});
+
+describe("PiEpisodeReader — poison pills (ARC-07)", () => {
+	it("skips null, non-object and malformed lines without dropping other sessions", () => {
+		takeSkipCount("pi");
+		const healthyId = "11111111-2222-3333-4444-555555555555";
+		writeSession([
+			headerRecord({ id: SESSION_UUID, timestamp: ts(BASE, 0) }),
+			"null",
+			...fourMessages(0),
+			"42",
+			"{not json",
+		]);
+		writeFileSync(
+			join(projectPath, `2026-08-04T09-00-00-000Z_${healthyId}.jsonl`),
+			`${[
+				headerRecord({ id: healthyId, timestamp: ts(BASE, 1000) }),
+				...fourMessages(1000),
+			].join("\n")}\n`,
+		);
+
+		const episodes = episodesNow(reader);
+		expect(episodes.map((ep) => ep.sessionId).sort()).toEqual(
+			[SESSION_UUID, healthyId].sort(),
+		);
+		expect(takeSkipCount("pi")).toBeGreaterThan(0);
+	});
+
+	it("counts an unreadable session file as a skip and keeps the others", () => {
+		takeSkipCount("pi");
+		// Listed as *.jsonl and stat-able, but reading it as a file fails.
+		mkdirSync(join(projectPath, "2026-08-04T08-00-00-000Z_broken.jsonl"));
+		writeSession([
+			headerRecord({ id: SESSION_UUID, timestamp: ts(BASE, 0) }),
+			...fourMessages(0),
+		]);
+
+		const episodes = episodesNow(reader);
+		expect(episodes.map((ep) => ep.sessionId)).toEqual([SESSION_UUID]);
+		expect(takeSkipCount("pi")).toBeGreaterThan(0);
 	});
 });

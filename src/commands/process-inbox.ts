@@ -20,6 +20,7 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { ActivationEngine } from "../activation/activate.js";
+import { resolveDataDir } from "../config-file.js";
 import { ConsolidationEngine } from "../consolidation/consolidate.js";
 import { PendingEpisodesReader } from "../consolidation/readers/pending.js";
 import { LocalFilesEpisodeReader } from "../daemon/readers/local-files.js";
@@ -27,6 +28,7 @@ import { EpisodeUploader } from "../daemon/uploader.js";
 import { DaemonDB } from "../db/daemon/index.js";
 import { StoreRegistry } from "../db/store-registry.js";
 import { logger } from "../logger.js";
+import { consolidationLockPath } from "../runtime-files.js";
 import { currentUserId } from "../user-id.js";
 import {
 	drainConsolidation,
@@ -40,7 +42,7 @@ import {
  */
 export async function runProcessInbox(args: string[]): Promise<void> {
 	const { config } = await import("../config.js");
-	logger.init(config.logPath);
+	logger.init(config.logPath, "info", config.logMaxBytes);
 
 	// ── Resolve inbox directory ──────────────────────────────────────────────
 	const inboxDir = args[0] ? resolve(args[0]) : config.localFilesDir;
@@ -104,6 +106,7 @@ export async function runProcessInbox(args: string[]): Promise<void> {
 		activation,
 		[new PendingEpisodesReader(serverStateDb)],
 		registry.domainRouter,
+		{ lockPath: consolidationLockPath(resolveDataDir()) },
 	);
 
 	try {

@@ -6,6 +6,12 @@ import { approxTokens } from "../daemon/readers/shared.js";
 import type { IKnowledgeStore, IServerStateDB } from "../db/index.js";
 import { logger } from "../logger.js";
 import {
+	type LockHandle,
+	type LockRecord,
+	lockHolder,
+	tryAcquireProcessLock,
+} from "../process-lock.js";
+import {
 	formatRedactionCounts,
 	redactSecrets,
 	totalRedactions,
@@ -62,6 +68,14 @@ interface ChunkResult {
 
 /** Thrown when another process holds a store's consolidation lock. The chunk is deferred, not failed. */
 class StoreLockHeldError extends Error {}
+
+/** Consolidation health as seen by this process (exposed through /status). */
+export interface ConsolidationOutcome {
+	consecutiveFailures: number;
+	lastError: string | null;
+	lastErrorAt: number | null;
+	lastSuccessAt: number | null;
+}
 
 type EmbeddedEntry = KnowledgeEntry & { embedding: number[] };
 
@@ -152,6 +166,18 @@ export class ConsolidationEngine {
 	 */
 	private _isConsolidating = false;
 
+	/** Cross-process lock file, when configured (server and CLI share it). */
+	private readonly lockPath: string | undefined;
+	/** Lock held by this process while it consolidates. */
+	private processLock: LockHandle | null = null;
+	/** Success/failure of recent consolidate() calls, for /status. */
+	private outcome: ConsolidationOutcome = {
+		consecutiveFailures: 0,
+		lastError: null,
+		lastErrorAt: null,
+		lastSuccessAt: null,
+	};
+
 	get isConsolidating(): boolean {
 		return this._isConsolidating;
 	}
@@ -159,19 +185,37 @@ export class ConsolidationEngine {
 	/**
 	 * Atomically claim the consolidation lock.
 	 * Returns true if the lock was acquired (caller should proceed),
-	 * false if another run is already in progress (caller should abort).
+	 * false if another run is already in progress in this process or, when a
+	 * lock path is configured, in another process (the server or the CLI).
 	 *
-	 * Must be called synchronously (no await before this call) to be race-free
-	 * under Node/Bun's single-threaded event loop.
+	 * Synchronous on purpose (lock file creation is a sync syscall), so the claim
+	 * is race-free under Bun's single-threaded event loop.
 	 */
 	tryLock(): boolean {
 		if (this._isConsolidating) return false;
+		if (this.lockPath !== undefined) {
+			const lock = tryAcquireProcessLock(this.lockPath);
+			if (lock === null) return false;
+			this.processLock = lock;
+		}
 		this._isConsolidating = true;
 		return true;
 	}
 
 	unlock(): void {
 		this._isConsolidating = false;
+		this.processLock?.release();
+		this.processLock = null;
+	}
+
+	/** Live lock holder in another process, or null when the lock is free. */
+	crossProcessLockHolder(): LockRecord | null {
+		return this.lockPath === undefined ? null : lockHolder(this.lockPath);
+	}
+
+	/** Recent consolidate() outcomes, for /status. */
+	consolidationOutcome(): ConsolidationOutcome {
+		return { ...this.outcome };
 	}
 
 	/**
@@ -182,6 +226,9 @@ export class ConsolidationEngine {
 	 * @param activation    ActivationEngine (provides shared EmbeddingClient)
 	 * @param readers       Episode readers, one per source.
 	 * @param domainRouter  Optional domain router for multi-store routing.
+	 * @param options.lockPath  Cross-process consolidation lock file. Production passes
+	 *                      consolidationLockPath(dataDir) so the server and the CLI never
+	 *                      consolidate at the same time. Omit only in tests.
 	 */
 	constructor(
 		db: IKnowledgeStore,
@@ -189,7 +236,9 @@ export class ConsolidationEngine {
 		activation: ActivationEngine,
 		readers: IEpisodeReader[] = [],
 		domainRouter: DomainRouter | null = null,
+		options: { lockPath?: string } = {},
 	) {
+		this.lockPath = options.lockPath;
 		this.db = db;
 		this.serverStateDb = serverStateDb;
 		this.activation = activation;
@@ -248,7 +297,17 @@ export class ConsolidationEngine {
 	async consolidate(
 		options: { attempted?: Set<string> } = {},
 	): Promise<ConsolidationResult> {
-		return await this._consolidate(options.attempted ?? new Set());
+		try {
+			const result = await this._consolidate(options.attempted ?? new Set());
+			this.outcome.consecutiveFailures = 0;
+			this.outcome.lastSuccessAt = Date.now();
+			return result;
+		} catch (err) {
+			this.outcome.consecutiveFailures++;
+			this.outcome.lastErrorAt = Date.now();
+			this.outcome.lastError = err instanceof Error ? err.message : String(err);
+			throw err;
+		}
 	}
 
 	/**
@@ -1309,6 +1368,8 @@ export class ConsolidationEngine {
 	}
 
 	close(): void {
+		this.processLock?.release();
+		this.processLock = null;
 		for (const reader of this.readers) {
 			reader.close();
 		}
