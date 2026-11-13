@@ -242,12 +242,14 @@ for (const backend of BACKENDS) {
 			);
 			const before = Date.now();
 			await store.updateEntry("upd", {
-				status: "archived",
+				status: "superseded",
+				supersededBy: "newer",
 				confidence: 0.3,
 				isSynthesized: true,
 			});
 			const read = await store.getEntry("upd");
-			expect(read?.status).toBe("archived");
+			expect(read?.status).toBe("superseded");
+			expect(read?.supersededBy).toBe("newer");
 			expect(read?.confidence).toBe(0.3);
 			expect(read?.isSynthesized).toBe(true);
 			expect(read?.content).toBe("Test content");
@@ -303,6 +305,11 @@ for (const backend of BACKENDS) {
 			expect(
 				(await store.getEntries({ type: "fact" })).map((e) => e.id),
 			).toEqual(["g-c", "g-a"]);
+			expect(
+				(await store.getEntries({ status: "active", type: "fact" })).map(
+					(e) => e.id,
+				),
+			).toEqual(["g-a"]);
 		});
 
 		it("getEntriesByStatus returns that status, most recently updated first", async () => {
@@ -339,10 +346,12 @@ for (const backend of BACKENDS) {
 			await store.insertEntry(entry({ id: "st-1", status: "active" }));
 			await store.insertEntry(entry({ id: "st-2", status: "active" }));
 			await store.insertEntry(entry({ id: "st-3", status: "archived" }));
+			await store.insertEntry(entry({ id: "st-4", status: "superseded" }));
 			expect(await store.getStats()).toMatchObject({
-				total: 3,
+				total: 4,
 				active: 2,
 				archived: 1,
+				superseded: 1,
 			});
 		});
 
@@ -354,6 +363,30 @@ for (const backend of BACKENDS) {
 				await ids(await store.getEntriesByIds(["bi-1", "bi-2", "bi-3"])),
 			).toEqual(["bi-1", "bi-2"]);
 			expect(await store.getEntriesByIds([])).toEqual([]);
+		});
+
+		it("plain reads never carry the embedding, even for an entry that has one", async () => {
+			await store.insertEntry(
+				entry({ id: "pl", status: "active", embedding: [1, 0, 0, 0] }),
+			);
+			await store.insertEntry(
+				entry({ id: "pl-c", status: "conflicted", embedding: [0, 1, 0, 0] }),
+			);
+			const reads = [
+				await store.getActiveEntries(),
+				await store.getActiveAndConflictedEntries(),
+				await store.getEntriesByStatus("active"),
+				await store.getEntries({}),
+				await store.getEntriesByIds(["pl", "pl-c"]),
+			];
+			for (const batch of reads) {
+				const found = batch.filter((e) => e.id.startsWith("pl"));
+				expect(found.length).toBeGreaterThan(0);
+				for (const e of found) expect(e.embedding).toBeUndefined();
+			}
+			expect((await store.getEntryWithEmbedding("pl"))?.embedding).toEqual([
+				1, 0, 0, 0,
+			]);
 		});
 
 		it("getEntriesMissingEmbeddings lists active and conflicted entries without a vector", async () => {
@@ -401,6 +434,7 @@ for (const backend of BACKENDS) {
 			);
 			const scanned = await store.scanEmbeddings();
 			expect(scanned.map((s) => s.id)).toEqual(["sc-1"]);
+			expect(scanned[0].embedding).toBeInstanceOf(Float32Array);
 			expect(Array.from(scanned[0].embedding)).toEqual([0.5, 0.25, 0, 0]);
 		});
 
@@ -514,12 +548,15 @@ for (const backend of BACKENDS) {
 				["ov-ex"],
 			);
 			expect(await ids(overlapping)).toEqual(["ov-a", "ov-b"]);
+			expect(overlapping.find((e) => e.id === "ov-b")?.embedding).toEqual([
+				0, 1, 0, 0,
+			]);
 			expect(await store.getEntriesWithOverlappingTopics([], [])).toEqual([]);
 		});
 
 		// ── Vectors, prefixes, and model metadata ──
 
-		it("setEmbedding replaces the vector and leaves updated_at alone, for any status", async () => {
+		it("setEmbedding replaces the vector in every store index, leaves updated_at alone, and works for any status", async () => {
 			await store.setEmbeddingMetadata("conformance", DIMS);
 			await store.insertEntry(
 				entry({
@@ -529,10 +566,27 @@ for (const backend of BACKENDS) {
 					embedding: [1, 0, 0],
 				}),
 			);
+			await store.insertEntry(
+				entry({
+					id: "sea",
+					status: "active",
+					updatedAt: 1_000,
+					embedding: [1, 0, 0],
+				}),
+			);
+
 			await store.setEmbedding("se", [0, 1, 0]);
-			const read = await store.getEntryWithEmbedding("se");
-			expect(read?.embedding).toEqual([0, 1, 0]);
-			expect(read?.updatedAt).toBe(1_000);
+			await store.setEmbedding("sea", [0, 1, 0]);
+
+			const archived = await store.getEntryWithEmbedding("se");
+			expect(archived?.embedding).toEqual([0, 1, 0]);
+			expect(archived?.updatedAt).toBe(1_000);
+			const active = await store.getEntryWithEmbedding("sea");
+			expect(active?.embedding).toEqual([0, 1, 0]);
+			expect(active?.updatedAt).toBe(1_000);
+			// Vector search (ANN on Postgres) must see the new vector, not the old one.
+			await expectNearest(store, [0, 1, 0], 5, 0.5, ["sea"]);
+			await expectNearest(store, [1, 0, 0], 5, 0.5, []);
 		});
 
 		it("findIdsByPrefix returns ids of any status with the prefix, ascending, up to the limit", async () => {
@@ -641,10 +695,9 @@ for (const backend of BACKENDS) {
 		it("getEmbeddingMetadata is null until set, is overwritten by a second set, and reinitialize clears it", async () => {
 			expect(await store.getEmbeddingMetadata()).toBeNull();
 			await store.setEmbeddingMetadata("model-x", DIMS);
-			expect(await store.getEmbeddingMetadata()).toMatchObject({
-				model: "model-x",
-				dimensions: DIMS,
-			});
+			const stamped = await store.getEmbeddingMetadata();
+			expect(stamped).toMatchObject({ model: "model-x", dimensions: DIMS });
+			expect(stamped?.recordedAt).toBeGreaterThan(0);
 			await store.setEmbeddingMetadata("model-y", 2);
 			expect(await store.getEmbeddingMetadata()).toMatchObject({
 				model: "model-y",
@@ -792,6 +845,26 @@ for (const backend of BACKENDS) {
 					type: "supersedes",
 				}),
 			]);
+		});
+
+		it("supersede_new with a conflicted pair on each side restores each partner and leaves no contradicts link", async () => {
+			await seedPair();
+			await store.insertEntry(entry({ id: "m", content: "rival of n" }));
+			await store.insertEntry(entry({ id: "p", content: "rival of e" }));
+			await store.applyContradictionResolution("irresolvable", "n", "m");
+			await store.applyContradictionResolution("irresolvable", "e", "p");
+
+			// n is the loser: its partner m is restored against n. e wins: it is settled
+			// and its partner p is restored against e.
+			await store.applyContradictionResolution("supersede_new", "n", "e");
+
+			expect((await store.getEntry("n"))?.status).toBe("superseded");
+			expect((await store.getEntry("e"))?.status).toBe("active");
+			expect((await store.getEntry("m"))?.status).toBe("active");
+			expect((await store.getEntry("p"))?.status).toBe("active");
+			expect(
+				await store.getContradictPairsForIds(["n", "e", "m", "p"]),
+			).toEqual(new Map());
 		});
 
 		it("irresolvable marks both entries conflicted and links them as contradicting", async () => {
@@ -952,6 +1025,7 @@ for (const backend of BACKENDS) {
 			]);
 			const [first] = await store.getClustersWithMembers();
 			const joinedB = first.memberJoinedAt.get("k-b");
+			await Bun.sleep(5);
 
 			await store.persistClusters([
 				{
@@ -968,9 +1042,44 @@ for (const backend of BACKENDS) {
 			expect(second.memberCount).toBe(2);
 			expect(second.centroid).toEqual([0, 1, 0]);
 			expect(second.memberJoinedAt.get("k-b")).toBe(joinedB);
-			expect(second.lastMembershipChangedAt).toBeGreaterThanOrEqual(
+			expect(second.memberJoinedAt.get("k-c")).toBeGreaterThan(joinedB ?? 0);
+			expect(second.lastMembershipChangedAt).toBeGreaterThan(
 				first.lastMembershipChangedAt,
 			);
+		});
+
+		it("persistClusters without a membership change updates the centroid and leaves lastMembershipChangedAt alone", async () => {
+			for (const id of ["k-a", "k-b"]) {
+				await store.insertEntry(entry({ id }));
+			}
+			await store.persistClusters([
+				{
+					id: "c1",
+					centroid: [1, 0, 0],
+					memberIds: ["k-a", "k-b"],
+					isNew: true,
+					membershipChanged: true,
+				},
+			]);
+			const [first] = await store.getClustersWithMembers();
+			await Bun.sleep(5);
+
+			await store.persistClusters([
+				{
+					id: "c1",
+					centroid: [0, 0, 1],
+					memberIds: ["k-a", "k-b"],
+					isNew: false,
+					membershipChanged: false,
+				},
+			]);
+
+			const [second] = await store.getClustersWithMembers();
+			expect(second.centroid).toEqual([0, 0, 1]);
+			expect(second.lastMembershipChangedAt).toBe(
+				first.lastMembershipChangedAt,
+			);
+			expect(second.memberJoinedAt).toEqual(first.memberJoinedAt);
 		});
 
 		it("persistClusters removes clusters that are no longer in the pass", async () => {

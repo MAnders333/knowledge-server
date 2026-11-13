@@ -67,6 +67,43 @@ describe("planContradictionResolution", () => {
 		});
 	});
 
+	it("supersede_new with both partners: each partner is restored against the entry it was conflicted with", () => {
+		// n (new) is the loser, so its partner "l" is restored against n; e (existing) wins,
+		// so its partner "w" is restored against e and e is settled first.
+		expect(
+			planContradictionResolution(
+				"supersede_new",
+				"n",
+				"e",
+				{ newPartner: "l", existingPartner: "w" },
+				undefined,
+				7,
+			).ops,
+		).toEqual([
+			{ kind: "supersede", id: "n", supersededBy: "e", at: 7 },
+			{
+				kind: "link",
+				relation: "supersedes",
+				sourceId: "e",
+				targetId: "n",
+				at: 7,
+			},
+			{
+				kind: "restoreCounterpart",
+				counterpartId: "l",
+				resolvedId: "n",
+				at: 7,
+			},
+			{ kind: "activateIfConflicted", id: "e", at: 7 },
+			{
+				kind: "restoreCounterpart",
+				counterpartId: "w",
+				resolvedId: "e",
+				at: 7,
+			},
+		]);
+	});
+
 	it("restores the loser's partner before the winner's, and settles a conflicted winner", () => {
 		const plan = planContradictionResolution(
 			"supersede_old",
