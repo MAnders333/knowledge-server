@@ -1,9 +1,8 @@
 import { z } from "zod";
 import {
-	PLACEHOLDER_API_KEY,
-	PLACEHOLDER_ENDPOINT,
 	REMOTE_RERANK_MAX_CANDIDATES,
 	config,
+	remoteRerankIsActive,
 } from "../config.js";
 import { logger } from "../logger.js";
 import type { RerankIdentity, RerankScorer } from "./rerank.js";
@@ -385,19 +384,9 @@ export class RemoteReranker implements RerankScorer {
 }
 
 /**
- * Remote reranker from the resolved settings (RERANK_REMOTE_URL, or the gateway route
- * on LLM_BASE_ENDPOINT, and its key). Returns null when the URL or key is missing or
- * still a template placeholder.
+ * Remote reranker from the resolved settings, or null when the remote reranker is not
+ * the active scorer (see remoteRerankIsActive).
  */
 export function createRemoteRerankerFromConfig(): RemoteReranker | null {
-	const { url, apiKey } = config.activation.rerank.remote;
-	if (
-		!url ||
-		!apiKey ||
-		url.startsWith(PLACEHOLDER_ENDPOINT) ||
-		apiKey === PLACEHOLDER_API_KEY
-	) {
-		return null;
-	}
-	return new RemoteReranker();
+	return remoteRerankIsActive() ? new RemoteReranker() : null;
 }

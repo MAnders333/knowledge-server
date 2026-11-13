@@ -757,6 +757,24 @@ export const PLACEHOLDER_API_KEY = "your-api-key-here";
 export const PLACEHOLDER_ENDPOINT = "https://your-llm-endpoint.example.com";
 const PLACEHOLDER_ADMIN_TOKEN = "your-stable-token-here";
 
+/**
+ * True when the remote reranker is the scorer the server will use: reranking is on,
+ * RERANK_PROVIDER=remote, and the endpoint and key are set and not template
+ * placeholders. A missing endpoint or key falls back to local, so remote-only checks
+ * do not apply then.
+ */
+export function remoteRerankIsActive(): boolean {
+	const { enabled, provider, remote } = config.activation.rerank;
+	return (
+		enabled &&
+		provider === "remote" &&
+		remote.url !== "" &&
+		remote.apiKey !== "" &&
+		!remote.url.startsWith(PLACEHOLDER_ENDPOINT) &&
+		remote.apiKey !== PLACEHOLDER_API_KEY
+	);
+}
+
 export function validateConfig(): string[] {
 	const errors: string[] = [];
 
@@ -892,23 +910,13 @@ export function validateConfig(): string[] {
 	}
 
 	// Remote reranking sends the query tail and candidate text to its endpoint, so its
-	// settings are checked only when it is the active provider.
-	if (config.activation.rerank.provider === "remote") {
+	// settings are checked only when the remote reranker is the active scorer.
+	if (remoteRerankIsActive()) {
 		const { remote, candidates, maxDocTokens, maxQueryTokens } =
 			config.activation.rerank;
-		const explicitUrl = process.env.RERANK_REMOTE_URL?.trim();
 		if (remote.url && !isHttpUrl(remote.url)) {
 			errors.push(
 				"The remote reranker URL (RERANK_REMOTE_URL, or LLM_BASE_ENDPOINT + /decisions/v1/systemone) must be an absolute http or https URL.",
-			);
-		}
-		if (
-			explicitUrl &&
-			!process.env.RERANK_REMOTE_API_KEY?.trim() &&
-			originOf(explicitUrl) !== originOf(process.env.LLM_BASE_ENDPOINT)
-		) {
-			errors.push(
-				"RERANK_REMOTE_URL is on a different origin than LLM_BASE_ENDPOINT, so LLM_API_KEY is not sent to it. Set RERANK_REMOTE_API_KEY for that endpoint.",
 			);
 		}
 		if (remote.url && isPlainHttpRemote(remote.url)) {

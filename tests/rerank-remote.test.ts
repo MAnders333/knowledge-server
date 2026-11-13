@@ -491,10 +491,17 @@ describe("createRemoteRerankerFromConfig", () => {
 		apiKey: string;
 		model: string;
 	};
+	const rerank = config.activation.rerank as unknown as { provider: string };
 	const saved = { ...mutable };
+	const savedProvider = rerank.provider;
+
+	beforeEach(() => {
+		rerank.provider = "remote";
+	});
 
 	afterEach(() => {
 		Object.assign(mutable, saved);
+		rerank.provider = savedProvider;
 	});
 
 	it("is null without a URL, without a key, or with template placeholders", () => {
