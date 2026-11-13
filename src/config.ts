@@ -395,6 +395,12 @@ export function parseEnv(env: Env, configPath = defaultConfigPath()) {
 		// instead of a random one generated at startup. Useful for scripted/automated use.
 		// Leave unset in production for better security (random token per process lifetime).
 		adminToken: env.KNOWLEDGE_ADMIN_TOKEN || null,
+		// KNOWLEDGE_PROTECT_READS=true: with a stable KNOWLEDGE_ADMIN_TOKEN, every route
+		// except /health needs it as a Bearer token, reads included. Off by default: reads
+		// stay open under the Host/Origin checks and only the admin routes need the token.
+		// Plugins and hooks send the token only from their own environment, so a token
+		// kept only in .env does not reach them.
+		protectReads: r.flag("KNOWLEDGE_PROTECT_READS", false),
 		// Extra Host names accepted by the HTTP API (comma-separated, optional :port).
 		// localhost, 127.0.0.1, [::1] and KNOWLEDGE_HOST are always accepted.
 		allowedHosts: parseAllowedHosts(env.KNOWLEDGE_ALLOWED_HOSTS),
@@ -1120,6 +1126,23 @@ export function validateConfig(): string[] {
 				"KNOWLEDGE_ADMIN_TOKEN is still the template placeholder. Replace it with a long random value (e.g. openssl rand -hex 24).",
 			);
 		}
+	}
+	// Protecting reads hands every client the token; without a stable token there is
+	// nothing for them to send.
+	if (config.protectReads && config.adminToken === null) {
+		errors.push(
+			"KNOWLEDGE_PROTECT_READS=true needs KNOWLEDGE_ADMIN_TOKEN: without a stable token, clients have nothing to send. Set KNOWLEDGE_ADMIN_TOKEN (e.g. openssl rand -hex 24) or leave KNOWLEDGE_PROTECT_READS unset.",
+		);
+	}
+	// The token is the only protection for a stable setup, so a short or low-variety one
+	// is worth a warning. The value itself is never printed.
+	if (
+		config.adminToken !== null &&
+		(config.adminToken.length < 32 || new Set(config.adminToken).size < 12)
+	) {
+		console.warn(
+			"[config] KNOWLEDGE_ADMIN_TOKEN is weak (under 32 characters, or fewer than 12 distinct characters). Use a random value, for example `openssl rand -hex 24`.",
+		);
 	}
 
 	// Note: loopback-host validation is done post-registry in index.ts because
