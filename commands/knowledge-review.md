@@ -7,11 +7,10 @@ Review the knowledge graph and resolve entries that need human attention.
 ## Step 1 — Fetch review data
 
 ```bash
-curl -s http://127.0.0.1:3179/review | python3 -m json.tool
+curl -s ${KNOWLEDGE_ADMIN_TOKEN:+-H "Authorization: Bearer $KNOWLEDGE_ADMIN_TOKEN"} http://127.0.0.1:3179/review | python3 -m json.tool
 ```
 
-Also load the admin token into a shell variable — this keeps it out of shell history while
-allowing the curl commands below to reference it:
+Flagging an entry as wrong or outdated uses the `knowledge_flag` MCP tool, which needs no admin token, so do not load one for it. Only the resolve, PATCH and DELETE calls below change the knowledge base. Load the token into a shell variable just before the first of those, which keeps it out of shell history:
 
 ```bash
 # Load token from .env (preferred — token never appears in history)

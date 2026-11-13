@@ -178,7 +178,7 @@ Cursor and VSCode are capture-only in practice. Cursor's session-start hook is n
 
 Codex: after `setup-tool codex`, open Codex, run `/hooks`, and trust the knowledge-server hook. Codex does not run a new or changed hook until it is trusted, so trust it again after a port change. Codex limits each hook's output to about 2,500 tokens and saves the rest to a file. The injected block is capped at 6,000 characters, which is usually under that limit.
 
-Each injected entry starts with a short id, for example `(id 1a2b3c4d)`. When an entry is wrong or outdated, the agent can call the `knowledge_flag` MCP tool with that id. The entry is queued for review (status `conflicted`), is no longer injected into sessions, and is not deleted. The flag reason is written to the server log (`[entries/flag]`), not stored on the entry. The MCP process needs `KNOWLEDGE_ADMIN_TOKEN` in its environment for this.
+Each injected entry starts with a short id, for example `(id 1a2b3c4d)`. When an entry is wrong or outdated, the agent can call the `knowledge_flag` MCP tool with that id. The entry is queued for review (status `conflicted`), is no longer injected into sessions, and is not deleted. The flag reason is written to the server log (`[entries/flag]`), not stored on the entry. Flagging needs no admin token. When `KNOWLEDGE_ADMIN_TOKEN` is set, the MCP proxy sends it on its calls, as it does for every read.
 
 `knowledge-server status` shows the server's health (`ok`, `degraded` or `down`, with reasons) when the server answers, and, per source, the episodes captured in the last 7 days next to the activations received. It warns when a source is captured but nothing was injected.
 

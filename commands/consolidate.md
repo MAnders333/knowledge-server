@@ -4,7 +4,7 @@ description: Run knowledge consolidation — process recent sessions (OpenCode, 
 
 Run a knowledge consolidation cycle by calling the local knowledge server.
 
-The admin token is printed to the server console at startup only when the server runs in a terminal. Under a service manager or redirected output it is not printed; set `KNOWLEDGE_ADMIN_TOKEN` in `.env` to use a stable token.
+The admin token is printed to the server console at startup only when the server runs in a terminal. Under a service manager or redirected output it is not printed; set `KNOWLEDGE_ADMIN_TOKEN` in `.env` to use a stable token. Only this admin call needs the token; flagging an entry never does (use `knowledge_flag`).
 
 ```bash
 curl -s -X POST -H "Authorization: Bearer $KNOWLEDGE_ADMIN_TOKEN" \
