@@ -52,7 +52,7 @@ export function summarizeCoverage(
 		.filter((r) => r.captured > 0 && r.injected === 0)
 		.map(
 			(r) =>
-				`${r.source}: ${r.captured} episodes captured in the last 7 days but nothing injected. Check that the client calls /activate with its client tag.`,
+				`${r.source}: ${r.captured} episodes captured in the last 7 days but no activation injected any entries (each returned nothing or missed the client deadline). Check that the client calls /activate with its client tag, and that the server answers within the client's deadline.`,
 		);
 	return { rows, warnings };
 }
