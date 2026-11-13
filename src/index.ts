@@ -281,13 +281,6 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	const { serverStateDb } = registry;
 	// Data directory: lockfiles and the daemon status file live here, shared with the daemon and CLI.
 	const dataDir = resolveDataDir();
-	// Housekeeping before anything else writes heavily: reclaim state.db free pages
-	// when the file is large and mostly empty. Skipped if another process is busy with it.
-	if (serverStateDb instanceof ServerStateDB) {
-		serverStateDb.compactIfNeeded({
-			lockPath: stateMaintenanceLockPath(dataDir),
-		});
-	}
 	const activation = new ActivationEngine(
 		db,
 		registry.readStores(),
@@ -460,6 +453,19 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		daemonChild?.kill();
 		removeOwnPidFile(config.pidPath);
 	};
+	// Housekeeping: reclaim state.db free pages when the file is large and mostly
+	// empty. It is scheduled after the port is bound, so a large VACUUM never delays
+	// the listen. The VACUUM itself is synchronous and pauses request handling while
+	// it runs. compactIfNeeded takes its own maintenance lock and skips when another
+	// process is busy with the file.
+	if (serverStateDb instanceof ServerStateDB) {
+		const stateDb = serverStateDb;
+		setTimeout(() => {
+			stateDb.compactIfNeeded({
+				lockPath: stateMaintenanceLockPath(dataDir),
+			});
+		}, 0);
+	}
 
 	logger.raw(`\n✓ HTTP API listening on http://${host}:${port}`);
 	logger.raw("  GET  /activate?q=...                  — Activate knowledge");

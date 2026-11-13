@@ -529,17 +529,19 @@ export class ServerStateDB implements IServerStateDB {
 	}
 
 	/**
-	 * Storage housekeeping for state.db, run once at server startup.
+	 * Storage housekeeping for state.db, run once per server start after the port is
+	 * bound (see index.ts), so it never delays the listen.
 	 *
 	 * Consolidated episodes are deleted from pending_episodes, and SQLite never
 	 * returns those pages to the OS, so a long-lived file can be mostly free space.
 	 * When the file is at least `minBytes` and more than `minFreeRatio` of its pages
 	 * are free, this switches the file to incremental auto_vacuum (a one-time full
-	 * VACUUM is needed for that) and reclaims the free pages.
+	 * VACUUM is needed for that) and reclaims the free pages. The VACUUM is
+	 * synchronous: it pauses other work in this process while it runs.
 	 *
 	 * Skipped when another process holds `lockPath` (another server, the daemon's
 	 * maintenance or a second CLI), and when SQLite reports the file busy: the
-	 * housekeeping is best effort and never blocks startup.
+	 * housekeeping is best effort and never fails the server.
 	 */
 	compactIfNeeded(options: {
 		lockPath: string;
