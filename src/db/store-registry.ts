@@ -7,7 +7,7 @@ import {
 	resolveSqlitePath,
 } from "../config-file.js";
 import type { KnowledgeServerConfig, StoreConfig } from "../config-file.js";
-import { parseIntEnv } from "../config.js";
+import { config as appConfig } from "../config.js";
 import { DomainRouter } from "../consolidation/domain-router.js";
 import { logger } from "../logger.js";
 import type { IKnowledgeStore, IServerStateDB } from "./interface.js";
@@ -170,7 +170,7 @@ export class StoreRegistry {
 		let serverStateDb: IServerStateDB;
 		try {
 			if (config.stateDb.kind === "postgres") {
-				const uri = process.env.STATE_DB_URI ?? config.stateDb.uri;
+				const uri = config.stateDb.uri;
 				if (!uri) {
 					throw new Error(
 						'config.jsonc "stateDb" has kind "postgres" but no "uri" and STATE_DB_URI env var is not set',
@@ -268,7 +268,7 @@ export class StoreRegistry {
 async function tryInitStore(
 	storeConfig: StoreConfig,
 ): Promise<{ id: string; db: IKnowledgeStore | null; error?: string }> {
-	const timeoutMs = parseIntEnv(process.env.STORE_INIT_TIMEOUT_MS, 10_000, 1);
+	const timeoutMs = appConfig.storeInitTimeoutMs;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		const db = await Promise.race([

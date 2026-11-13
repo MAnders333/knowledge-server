@@ -12,12 +12,16 @@ import { type AddressInfo, type Socket, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ActivationEngine, StoreBreaker } from "../src/activation/activate";
+import { config } from "../src/config";
 import { DEFAULT_CONFIG } from "../src/config-file";
 import type { IKnowledgeStore } from "../src/db/interface";
 import { KnowledgeDB } from "../src/db/sqlite/index";
 import { StoreRegistry } from "../src/db/store-registry";
 import * as loggerModule from "../src/logger";
 import { fakeEmbedding, makeEntry } from "./fixtures";
+
+// The store init timeout is read once, from the parsed config.
+const mutableConfig = config as unknown as { storeInitTimeoutMs: number };
 
 describe("StoreRegistry", () => {
 	let tempDir: string;
@@ -161,16 +165,10 @@ describe("StoreRegistry", () => {
 		});
 	}
 
-	function restoreTimeoutEnv(previous: string | undefined): void {
-		// "" reads as absent to parseIntEnv (NaN -> default), so this restores
-		// the unset state without the delete operator.
-		process.env.STORE_INIT_TIMEOUT_MS = previous ?? "";
-	}
-
 	it("bounds an accepting-but-silent store, excludes it, and warns immediately", async () => {
 		const { server, port, sockets } = await startStallServer();
-		const previousTimeout = process.env.STORE_INIT_TIMEOUT_MS;
-		process.env.STORE_INIT_TIMEOUT_MS = "500";
+		const previousTimeout = mutableConfig.storeInitTimeoutMs;
+		mutableConfig.storeInitTimeoutMs = 500;
 		const warnSpy = spyOn(loggerModule.logger, "warn");
 		const configPath = join(tempDir, "config.jsonc");
 		writeFileSync(
@@ -210,7 +208,7 @@ describe("StoreRegistry", () => {
 			}
 		} finally {
 			warnSpy.mockRestore();
-			restoreTimeoutEnv(previousTimeout);
+			mutableConfig.storeInitTimeoutMs = previousTimeout;
 			for (const socket of sockets) socket.destroy();
 			server.close();
 		}
@@ -218,8 +216,8 @@ describe("StoreRegistry", () => {
 
 	it("hard-fails promptly when the only writable store hangs, instead of blocking forever", async () => {
 		const { server, port, sockets } = await startStallServer();
-		const previousTimeout = process.env.STORE_INIT_TIMEOUT_MS;
-		process.env.STORE_INIT_TIMEOUT_MS = "500";
+		const previousTimeout = mutableConfig.storeInitTimeoutMs;
+		mutableConfig.storeInitTimeoutMs = 500;
 		const configPath = join(tempDir, "config.jsonc");
 		writeFileSync(
 			configPath,
@@ -243,7 +241,7 @@ describe("StoreRegistry", () => {
 			);
 			expect(Date.now() - started).toBeLessThan(4_000);
 		} finally {
-			restoreTimeoutEnv(previousTimeout);
+			mutableConfig.storeInitTimeoutMs = previousTimeout;
 			for (const socket of sockets) socket.destroy();
 			server.close();
 		}
