@@ -23,6 +23,17 @@ curl -fsSL https://github.com/MAnders333/knowledge-server/releases/latest/downlo
 
 The installer is attached to the latest release, so it always matches that release's binaries and checksums.
 
+To check the installer before running it, download it with its checksum manifest from the same release and verify both (Linux x64; on macOS arm64 use `SHA256SUMS-darwin-arm64` and `shasum -a 256 --check --ignore-missing`):
+
+```bash
+release=https://github.com/MAnders333/knowledge-server/releases/latest/download
+curl -fsSLO "$release/install.sh" -fsSLO "$release/SHA256SUMS-linux-x64"
+sha256sum --check --ignore-missing SHA256SUMS-linux-x64
+bash install.sh
+```
+
+Or verify the installer's GitHub attestation: `gh attestation verify install.sh --repo MAnders333/knowledge-server --signer-workflow MAnders333/knowledge-server/.github/workflows/release-please.yml`.
+
 **After running:**
 
 1. Edit `~/.config/knowledge-server/.env` — set your LLM API key (e.g. `ANTHROPIC_API_KEY=sk-ant-...`)

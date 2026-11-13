@@ -18,7 +18,7 @@
 # mismatch, or a missing sha256sum/shasum aborts before anything is installed.
 # Set KNOWLEDGE_REQUIRE_ATTESTATION=1 (or true, yes, on) to also require a GitHub
 # artifact attestation (needs the gh CLI). 0, false, no, off or unset skip it; any
-# other value aborts. See the README "Verifying releases" section.
+# other value aborts. See "Verifying a release" under "Security" in the README.
 #
 # The whole script lives in main(), called on the last line. A truncated
 # download therefore fails to parse and executes nothing.

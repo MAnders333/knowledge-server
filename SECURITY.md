@@ -16,4 +16,4 @@ The maintainer replies in the advisory thread. A fix is published as a new relea
 
 ## Verifying releases
 
-Release binaries, `SHA256SUMS` and `install.sh` carry GitHub artifact attestations. See the "Verifying releases" section of the README.
+Release binaries, `SHA256SUMS` and `install.sh` carry GitHub artifact attestations. See "Verifying a release" under "Security" in the README.
