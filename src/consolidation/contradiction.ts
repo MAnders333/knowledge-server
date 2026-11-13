@@ -159,7 +159,7 @@ export class ContradictionScanner {
 			for (const result of results) {
 				if (!validCandidateIds.has(result.candidateId)) {
 					logger.warn(
-						`[contradiction] ${logPrefix}LLM returned candidateId "${result.candidateId}" not in candidate list — skipping`,
+						`[contradiction] ${logPrefix}LLM returned a candidateId that is not in the candidate list — skipping`,
 					);
 					continue;
 				}

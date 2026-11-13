@@ -47,9 +47,10 @@ export function parseItems<S extends z.ZodTypeAny>(
 			out.push(result.data);
 			return;
 		}
-		// Log paths and messages only, never the values (they are model output).
+		// Log paths and issue codes only. Zod messages can echo the received value
+		// (an enum mismatch quotes it), and that value is model output.
 		const reason = result.error.issues
-			.map((issue) => `${issue.path.join(".") || "(item)"}: ${issue.message}`)
+			.map((issue) => `${issue.path.join(".") || "(item)"}: ${issue.code}`)
 			.join("; ");
 		logger.warn(`[llm] ${label}: dropped item ${i + 1} (${reason})`);
 	});
