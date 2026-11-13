@@ -30,6 +30,9 @@ const PLUGIN_FILES = [
 ];
 const BINARIES = ["knowledge-server-linux-x64", "knowledge-daemon-linux-x64"];
 
+/** A full installer run takes seconds on a loaded machine; bun's 5 s default is too tight. */
+const INSTALL_TIMEOUT_MS = 60_000;
+
 const CURL_SHIM = `#!/bin/sh
 out=""; url=""
 while [ $# -gt 0 ]; do
@@ -111,7 +114,7 @@ function writeFullManifest(): void {
 	);
 }
 
-function runInstaller(args: string[]) {
+function runInstaller(args: string[], extraEnv: Record<string, string> = {}) {
 	const env: Record<string, string> = {
 		PATH: `${shims}:${process.env.PATH ?? ""}`,
 		HOME: home,
@@ -120,6 +123,7 @@ function runInstaller(args: string[]) {
 		OPENCODE_PLUGIN_DIR: join(home, "opencode", "plugins"),
 		OPENCODE_COMMAND_DIR: join(home, "opencode", "command"),
 		FIXTURE_DIR: fixtures,
+		...extraEnv,
 	};
 	const proc = Bun.spawnSync(["bash", INSTALLER, ...args], {
 		env,
@@ -133,31 +137,83 @@ function runInstaller(args: string[]) {
 }
 
 describe("install.sh --version", () => {
-	it("installs a release whose manifest covers binaries and plugin files", () => {
+	it(
+		"installs a release whose manifest covers binaries and plugin files",
+		() => {
+			writeFullManifest();
+			const result = runInstaller(["--version", VERSION]);
+			expect(result.output).toContain("verified knowledge-server-linux-x64");
+			expect(result.exitCode).toBe(0);
+			expect(readFileSync(join(installDir, "version"), "utf8").trim()).toBe(
+				VERSION,
+			);
+			expect(existsSync(join(installDir, "libexec", "knowledge-server"))).toBe(
+				true,
+			);
+		},
+		INSTALL_TIMEOUT_MS,
+	);
+
+	it(
+		"refuses a release whose manifest predates plugin checksums, with a clear message",
+		() => {
+			writeBinaryOnlyManifest();
+			const result = runInstaller(["--version", "v3.10.3"]);
+			expect(result.exitCode).toBe(1);
+			expect(result.output).toContain("predates checksummed plugin files");
+			expect(result.output).toContain("knowledge.ts");
+			expect(result.output).toContain("use a newer release");
+			// Nothing was installed.
+			expect(existsSync(join(installDir, "libexec", "knowledge-server"))).toBe(
+				false,
+			);
+			expect(existsSync(join(installDir, "version"))).toBe(false);
+		},
+		INSTALL_TIMEOUT_MS,
+	);
+});
+
+describe("install.sh KNOWLEDGE_REQUIRE_ATTESTATION", () => {
+	beforeEach(() => {
+		// A gh that verifies nothing: any attestation check fails.
+		writeFileSync(join(shims, "gh"), "#!/bin/sh\nexit 1\n");
+		chmodSync(join(shims, "gh"), 0o755);
 		writeFullManifest();
-		const result = runInstaller(["--version", VERSION]);
-		expect(result.output).toContain("verified knowledge-server-linux-x64");
-		expect(result.exitCode).toBe(0);
-		expect(readFileSync(join(installDir, "version"), "utf8").trim()).toBe(
-			VERSION,
-		);
-		expect(existsSync(join(installDir, "libexec", "knowledge-server"))).toBe(
-			true,
-		);
 	});
 
-	it("refuses a release whose manifest predates plugin checksums, with a clear message", () => {
-		writeBinaryOnlyManifest();
-		const result = runInstaller(["--version", "v3.10.3"]);
+	it.each(["1", "true", "YES", "on"])(
+		"requires attestation for %s",
+		(value) => {
+			const result = runInstaller(["--version", VERSION], {
+				KNOWLEDGE_REQUIRE_ATTESTATION: value,
+			});
+			expect(result.output).toContain("Verifying attestations");
+			expect(result.output).toContain("attestation verification failed");
+			expect(result.exitCode).toBe(1);
+			expect(existsSync(join(installDir, "version"))).toBe(false);
+		},
+		INSTALL_TIMEOUT_MS,
+	);
+
+	it.each(["0", "false", "No", "off", ""])(
+		"skips attestation for %s",
+		(value) => {
+			const result = runInstaller(["--version", VERSION], {
+				KNOWLEDGE_REQUIRE_ATTESTATION: value,
+			});
+			expect(result.output).not.toContain("Verifying attestations");
+			expect(result.exitCode).toBe(0);
+		},
+		INSTALL_TIMEOUT_MS,
+	);
+
+	it("aborts before any download on an unrecognised value", () => {
+		const result = runInstaller(["--version", VERSION], {
+			KNOWLEDGE_REQUIRE_ATTESTATION: "maybe",
+		});
 		expect(result.exitCode).toBe(1);
-		expect(result.output).toContain("predates checksummed plugin files");
-		expect(result.output).toContain("knowledge.ts");
-		expect(result.output).toContain("use a newer release");
-		// Nothing was installed.
-		expect(existsSync(join(installDir, "libexec", "knowledge-server"))).toBe(
-			false,
-		);
-		expect(existsSync(join(installDir, "version"))).toBe(false);
+		expect(result.output).toContain("not recognised");
+		expect(result.output).not.toContain("Downloading checksums");
 	});
 });
 
