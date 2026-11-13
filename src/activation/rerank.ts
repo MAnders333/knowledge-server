@@ -356,14 +356,18 @@ export class LocalReranker implements RerankScorer {
 		}
 
 		const deadline = performance.now() + this.timeoutMs;
+		// Set by the timeout timer itself. setTimeout and performance.now() use
+		// different clock granularity, so the timer can fire a millisecond before
+		// `performance.now() >= deadline` holds; the flag is the authoritative signal.
+		const state = { expired: false };
 		const work = this.runQueued(() =>
-			this.scorePairs(query, documents, deadline),
+			this.scorePairs(query, documents, deadline, state),
 		);
 		const { promise: expired, reject } = Promise.withResolvers<never>();
-		const timer = setTimeout(
-			() => reject(new Error(`rerank timeout after ${this.timeoutMs}ms`)),
-			this.timeoutMs,
-		);
+		const timer = setTimeout(() => {
+			state.expired = true;
+			reject(new Error(`rerank timeout after ${this.timeoutMs}ms`));
+		}, this.timeoutMs);
 		try {
 			return await Promise.race([work, expired]);
 		} finally {
@@ -392,9 +396,10 @@ export class LocalReranker implements RerankScorer {
 		query: string,
 		documents: string[],
 		deadline: number,
+		state: { expired: boolean },
 	): Promise<number[]> {
 		// Turn check: a call that waited past its deadline must not occupy the session.
-		if (performance.now() >= deadline) {
+		if (state.expired || performance.now() >= deadline) {
 			throw new Error(`rerank timeout after ${this.timeoutMs}ms`);
 		}
 		const { tokenizer, session } = await this.load();
@@ -404,7 +409,7 @@ export class LocalReranker implements RerankScorer {
 
 		const scores: number[] = [];
 		for (const document of documents) {
-			if (performance.now() >= deadline) {
+			if (state.expired || performance.now() >= deadline) {
 				throw new Error(`rerank timeout after ${this.timeoutMs}ms`);
 			}
 			const features = tokenizer.batchFromIds(
