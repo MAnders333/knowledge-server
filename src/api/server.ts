@@ -502,13 +502,18 @@ export function createApp(
 	/**
 	 * Per-session dedupe key, scoped to the client. Undefined when the client sent
 	 * no session id: such requests are not deduplicated (see session-dedupe.ts).
+	 * Ids longer than 256 characters are replaced by their SHA-256 hex digest.
 	 */
 	function sessionDedupeKey(
 		client: string,
 		sessionId: string | null | undefined,
 	): string | undefined {
 		const id = sessionId?.trim();
-		return id ? `${client}\u0000${id}` : undefined;
+		if (!id) return undefined;
+		// Long ids are hashed so a client-chosen id cannot make the key arbitrarily large.
+		const key =
+			id.length <= 256 ? id : createHash("sha256").update(id).digest("hex");
+		return `${client}\u0000${key}`;
 	}
 
 	// -- Activation --

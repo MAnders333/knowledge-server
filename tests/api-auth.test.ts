@@ -192,6 +192,27 @@ describe("admin token gate", () => {
 			}
 		});
 	});
+
+	describe("session key", () => {
+		it("bounds the dedupe key for very long session ids and keeps ids apart", async () => {
+			build(false);
+			const activate = spyOn(activation, "activate");
+			const long = "s".repeat(100_000);
+			const sessionKey = async (sessionId: string) => {
+				activate.mockClear();
+				await call("/activate?q=churn", {
+					headers: { "x-knowledge-session": sessionId },
+				});
+				return activate.mock.calls[0][1]?.session;
+			};
+
+			const first = await sessionKey(long);
+			expect(first).toBeDefined();
+			expect(first?.length).toBeLessThan(200);
+			expect(await sessionKey(long)).toBe(first);
+			expect(await sessionKey(`${long}x`)).not.toBe(first);
+		});
+	});
 });
 
 describe("AuthFailureThrottle", () => {
