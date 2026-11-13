@@ -78,6 +78,17 @@ function serverBaseUrl(): string {
 }
 
 /**
+ * Headers for read calls. A stable KNOWLEDGE_ADMIN_TOKEN makes the server require it
+ * on every route except /health, so it is sent when set and never otherwise. Flagging
+ * is read-level too and sends the same header.
+ */
+export function readCallHeaders(
+	adminToken: string | null,
+): Record<string, string> {
+	return adminToken ? { Authorization: `Bearer ${adminToken}` } : {};
+}
+
+/**
  * Check whether the knowledge HTTP server is reachable.
  * Returns true if it responds to GET /status within the given timeout.
  */
@@ -87,6 +98,7 @@ async function isServerReachable(
 ): Promise<boolean> {
 	try {
 		const res = await fetch(`${baseUrl}/status`, {
+			headers: readCallHeaders(config.adminToken),
 			signal: AbortSignal.timeout(timeoutMs),
 		});
 		return res.ok;
@@ -200,7 +212,10 @@ export async function main() {
 					url.searchParams.set("threshold", String(threshold));
 
 				const response = await fetch(url, {
-					headers: { "x-knowledge-client": "mcp" },
+					headers: {
+						"x-knowledge-client": "mcp",
+						...readCallHeaders(config.adminToken),
+					},
 					signal: AbortSignal.timeout(15_000),
 				});
 
@@ -265,27 +280,16 @@ export async function main() {
 
 	server.tool(
 		"knowledge_flag",
-		"Report a recalled knowledge entry that is wrong, outdated or irrelevant, using the id shown in its injected line. The entry is queued for review and is no longer injected into sessions; nothing is deleted. Requires KNOWLEDGE_ADMIN_TOKEN in this process's environment.",
+		"Report a recalled knowledge entry that is wrong, outdated or irrelevant, using the id shown in its injected line. The entry is queued for review and is no longer injected into sessions; nothing is deleted.",
 		flagInputSchema,
 		async ({ id, reason }) => {
-			if (!config.adminToken) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: "knowledge_flag needs KNOWLEDGE_ADMIN_TOKEN set in the environment of the knowledge MCP process (the same stable token the server runs with). Nothing was flagged.",
-						},
-					],
-					isError: true,
-				};
-			}
 			try {
 				const response = await fetch(
 					`${baseUrl}/entries/${encodeURIComponent(id)}/flag`,
 					{
 						method: "POST",
 						headers: {
-							Authorization: `Bearer ${config.adminToken}`,
+							...readCallHeaders(config.adminToken),
 							"Content-Type": "application/json",
 						},
 						body: JSON.stringify({ reason }),
