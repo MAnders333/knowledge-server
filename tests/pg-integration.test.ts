@@ -1629,6 +1629,74 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		const hits = await pg.findSimilarEntries(NEW, 5, 0.5);
 		expect(hits.map((h) => h.entry.id)).toEqual(["revive-me"]);
 	});
+
+	it("re-embedding keeps updated_at of archived entries", async () => {
+		const pg = db as PostgresKnowledgeDB;
+		const OLD = unitVec(4, 0);
+		const NEW = unitVec(4, 1);
+		const ARCHIVED_AT = 1_000;
+		await pg.setEmbeddingMetadata("old-model", OLD.length);
+		await pg.insertEntry(
+			makeEntry("archived-old", {
+				status: "archived",
+				updatedAt: ARCHIVED_AT,
+				embedding: OLD,
+			}),
+		);
+
+		const savedModel = config.embedding.model;
+		config.embedding.model = "new-model";
+		try {
+			const activation = new ActivationEngine(pg);
+			spyOn(activation.embeddings, "embedBatch").mockImplementation(
+				async (texts: string[]) => texts.map(() => NEW),
+			);
+			expect(await activation.checkAndReEmbed()).toBe(true);
+		} finally {
+			config.embedding.model = savedModel;
+		}
+
+		const entry = await pg.getEntryWithEmbedding("archived-old");
+		expect(entry?.embedding).toEqual(NEW);
+		expect(entry?.updatedAt).toBe(ARCHIVED_AT);
+		const [row] = await truncSql`
+			SELECT embedding_vec IS NOT NULL AS has_vec FROM knowledge_entry
+			WHERE id = 'archived-old'
+		`;
+		expect(row.has_vec).toBe(true);
+	});
+
+	it("setEmbedding writes the vector to both columns and keeps updated_at", async () => {
+		const pg = db as PostgresKnowledgeDB;
+		const NEW = unitVec(4, 1);
+		await pg.setEmbeddingMetadata("m", 4);
+		await pg.insertEntry(
+			makeEntry("embed-me", { updatedAt: 1_000, embedding: unitVec(4, 0) }),
+		);
+
+		await pg.setEmbedding("embed-me", NEW);
+
+		const entry = await pg.getEntryWithEmbedding("embed-me");
+		expect(entry?.embedding).toEqual(NEW);
+		expect(entry?.updatedAt).toBe(1_000);
+		const hits = await pg.findSimilarEntries(NEW, 5, 0.5);
+		expect(hits.map((h) => h.entry.id)).toEqual(["embed-me"]);
+	});
+
+	it("findIdsByPrefix returns matching ids of any status and matches nothing for wildcards", async () => {
+		const pg = db as PostgresKnowledgeDB;
+		const A1 = "ab12cd34-0000-4000-8000-000000000001";
+		const A2 = "ab12cd34-0000-4000-8000-000000000002";
+		await pg.insertEntry(makeEntry(A1, { status: "archived" }));
+		await pg.insertEntry(makeEntry(A2));
+		await pg.insertEntry(makeEntry("ffff0000-0000-4000-8000-000000000003"));
+
+		expect(await pg.findIdsByPrefix("ab12cd34", 2)).toEqual([A1, A2]);
+		expect(await pg.findIdsByPrefix("ab12cd34", 1)).toEqual([A1]);
+		expect(await pg.findIdsByPrefix("ab%", 5)).toEqual([]);
+		expect(await pg.findIdsByPrefix("ab_", 5)).toEqual([]);
+		expect(await pg.findIdsByPrefix("AB12", 5)).toEqual([]);
+	});
 });
 
 // ── Migrations v16/v17: pgvector setup from a v15 store ──────────────────────

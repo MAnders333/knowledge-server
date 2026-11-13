@@ -16,6 +16,7 @@ import type {
 } from "../../types.js";
 import { ensurePrivateFile } from "../../utils.js";
 import {
+	ID_PREFIX_PATTERN,
 	type IKnowledgeStore,
 	LAST_ACCESS_TOUCH_INTERVAL_MS,
 } from "../interface.js";
@@ -258,6 +259,12 @@ export class KnowledgeDB implements IKnowledgeStore {
 	async getEntry(id: string): Promise<KnowledgeEntry | null> {
 		const row = this.db
 			.prepare(`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE id = ?`)
+	async setEmbedding(id: string, embedding: number[]): Promise<void> {
+		this.db
+			.prepare("UPDATE knowledge_entry SET embedding = ? WHERE id = ?")
+			.run(new Uint8Array(new Float32Array(embedding).buffer), id);
+	}
+
 			.get(id) as RawEntryRow | null;
 
 		return row ? this.rowToEntry(row) : null;
@@ -266,6 +273,25 @@ export class KnowledgeDB implements IKnowledgeStore {
 	async getEntryWithEmbedding(id: string): Promise<KnowledgeEntry | null> {
 		const row = this.db
 			.prepare(
+	/**
+	 * Ids of entries (any status) whose id starts with `prefix`, ascending, at most
+	 * `limit`. See IKnowledgeStore.findIdsByPrefix.
+	 */
+	async findIdsByPrefix(prefix: string, limit: number): Promise<string[]> {
+		if (!ID_PREFIX_PATTERN.test(prefix)) return [];
+		// The binary-order range [prefix, next) holds exactly the ids that start with
+		// prefix, so this is a primary-key range scan with no LIKE involved.
+		const upper =
+			prefix.slice(0, -1) +
+			String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);
+		const rows = this.db
+			.prepare(
+				"SELECT id FROM knowledge_entry WHERE id >= ? AND id < ? ORDER BY id LIMIT ?",
+			)
+			.all(prefix, upper, limit) as Array<{ id: string }>;
+		return rows.map((r) => r.id);
+	}
+
 				`SELECT ${ENTRY_COLUMNS}, embedding FROM knowledge_entry WHERE id = ?`,
 			)
 			.get(id) as RawEntryRow | null;

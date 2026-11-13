@@ -9,6 +9,7 @@ import type {
 	KnowledgeStatus,
 } from "../../types.js";
 import {
+	ID_PREFIX_PATTERN,
 	type IKnowledgeStore,
 	LAST_ACCESS_TOUCH_INTERVAL_MS,
 } from "../interface.js";
@@ -799,6 +800,26 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		);
 	}
 
+	async setEmbedding(id: string, embedding: number[]): Promise<void> {
+		const embeddingBuf = floatsToBuffer(embedding);
+		// Same column pair as updateEntry, without touching updated_at.
+		if (this.vecColumnDims !== null) {
+			await this.sql.unsafe(
+				"UPDATE knowledge_entry SET embedding = $1, embedding_vec = $2::vector WHERE id = $3",
+				[
+					embeddingBuf,
+					this.vecLiteralFor(embedding),
+					id,
+				] as postgres.ParameterOrJSON<never>[],
+			);
+		} else {
+			await this.sql.unsafe(
+				"UPDATE knowledge_entry SET embedding = $1 WHERE id = $2",
+				[embeddingBuf, id] as postgres.ParameterOrJSON<never>[],
+			);
+		}
+	}
+
 	async getEntry(id: string): Promise<KnowledgeEntry | null> {
 		const rows = await this.sql.unsafe(
 			`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE id = $1`,
@@ -806,6 +827,20 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		);
 		if (rows.length === 0) return null;
 		return this.rowToEntry(rows[0] as unknown as RawEntryRow);
+	}
+
+	/**
+	 * Ids of entries (any status) whose id starts with `prefix`, ascending, at most
+	 * `limit`. See IKnowledgeStore.findIdsByPrefix.
+	 */
+	async findIdsByPrefix(prefix: string, limit: number): Promise<string[]> {
+		if (!ID_PREFIX_PATTERN.test(prefix)) return [];
+		// The pattern admits no LIKE wildcard, so the prefix matches literally.
+		const rows = await this.sql.unsafe(
+			"SELECT id FROM knowledge_entry WHERE id LIKE $1 ORDER BY id LIMIT $2",
+			[`${prefix}%`, limit] as postgres.ParameterOrJSON<never>[],
+		);
+		return (rows as unknown as Array<{ id: string }>).map((r) => r.id);
 	}
 
 	async getEntryWithEmbedding(id: string): Promise<KnowledgeEntry | null> {

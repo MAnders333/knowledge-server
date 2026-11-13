@@ -1379,7 +1379,7 @@ export class ActivationEngine {
 			}
 
 			for (let i = 0; i < batch.length; i++) {
-				await db.updateEntry(batch[i].id, { embedding: vectors[i] });
+				await db.setEmbedding(batch[i].id, vectors[i]);
 			}
 
 			processed += batch.length;

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { KnowledgeDB } from "../src/db/sqlite/index";
 import { CREATE_TABLES } from "../src/db/sqlite/schema";
 import { ServerStateDB } from "../src/db/state/index";
+import { makeEntry as entryFixture } from "./fixtures";
 
 describe("KnowledgeDB", () => {
 	let db: KnowledgeDB;
@@ -887,5 +888,57 @@ describe("KnowledgeDB — cluster CRUD", () => {
 		await db.reinitialize();
 
 		expect(await db.getClustersWithMembers()).toHaveLength(0);
+	});
+});
+
+describe("KnowledgeDB — id prefix lookup and embedding-only writes", () => {
+	let db: KnowledgeDB;
+	let tempDir: string;
+
+	beforeEach(() => {
+		tempDir = mkdtempSync(join(tmpdir(), "knowledge-prefix-test-"));
+		db = new KnowledgeDB(join(tempDir, "test.db"));
+	});
+
+	afterEach(async () => {
+		await db.close();
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	const A1 = "ab12cd34-0000-4000-8000-000000000001";
+	const A2 = "ab12cd34-0000-4000-8000-000000000002";
+	const B1 = "ffff0000-0000-4000-8000-000000000003";
+
+	it("findIdsByPrefix returns ids of any status that start with the prefix, up to the limit", async () => {
+		await db.insertEntry(entryFixture({ id: A1, status: "archived" }));
+		await db.insertEntry(entryFixture({ id: A2 }));
+		await db.insertEntry(entryFixture({ id: B1 }));
+
+		expect(await db.findIdsByPrefix("ab12cd34", 2)).toEqual([A1, A2]);
+		expect(await db.findIdsByPrefix("ab12cd34", 1)).toEqual([A1]);
+		expect(await db.findIdsByPrefix("ffff", 2)).toEqual([B1]);
+		expect(await db.findIdsByPrefix("ab12cd35", 2)).toEqual([]);
+	});
+
+	it("findIdsByPrefix matches nothing for wildcards, upper case, or an empty prefix", async () => {
+		await db.insertEntry(entryFixture({ id: A1 }));
+		for (const prefix of ["", "ab%", "ab_", "AB12"]) {
+			expect(await db.findIdsByPrefix(prefix, 5)).toEqual([]);
+		}
+	});
+
+	it("setEmbedding replaces the vector and leaves updated_at alone", async () => {
+		await db.insertEntry(
+			entryFixture({
+				id: A1,
+				status: "archived",
+				updatedAt: 1_000,
+				embedding: [1, 0],
+			}),
+		);
+		await db.setEmbedding(A1, [0, 1]);
+		const entry = await db.getEntryWithEmbedding(A1);
+		expect(entry?.embedding).toEqual([0, 1]);
+		expect(entry?.updatedAt).toBe(1_000);
 	});
 });

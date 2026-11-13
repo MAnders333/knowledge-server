@@ -157,6 +157,12 @@ export interface IServerStateDB {
 export const LAST_ACCESS_TOUCH_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 /**
+ * Shape of an id prefix accepted by findIdsByPrefix: lower-case hex, with the
+ * dashes of a UUID. Nothing else reaches a query, so no LIKE wildcard can.
+ */
+export const ID_PREFIX_PATTERN = /^[0-9a-f-]+$/;
+
+/**
  * Knowledge store interface — the extracted knowledge graph.
  *
  * Implemented by SQLiteKnowledgeStore and PostgresKnowledgeStore.
@@ -183,7 +189,8 @@ export interface IKnowledgeStore {
 	/**
 	 * Low-level field update for non-semantic fields: status, strength, confidence,
 	 * isSynthesized — and `embedding` **only when supplying a freshly computed
-	 * vector for the current content/topics** (e.g. in ensureEmbeddings / checkAndReEmbed).
+	 * vector for the current content/topics** (e.g. in ensureEmbeddings). A model-change
+	 * re-embed uses setEmbedding, which leaves updated_at alone.
 	 *
 	 * **Never call this with `content` or `topics` changes.**
 	 * Use `KnowledgeService.updateEntry` instead — it automatically re-embeds when
@@ -191,8 +198,23 @@ export interface IKnowledgeStore {
 	 */
 	updateEntry(id: string, updates: Partial<KnowledgeEntry>): Promise<void>;
 
+	/**
+	 * Replace only the stored vector of an entry. Unlike updateEntry, this does not
+	 * touch updated_at: a re-embed rewrites the vector, not the content. Decay reads
+	 * updated_at to tombstone archived entries, so a model change must not restart
+	 * that clock.
+	 */
+	setEmbedding(id: string, embedding: number[]): Promise<void>;
+
 	/** Plain entry without its vector; use getEntryWithEmbedding when the vector is needed. */
 	getEntry(id: string): Promise<KnowledgeEntry | null>;
+
+	/**
+	 * Ids of entries (any status) whose id starts with `prefix`, ascending, at most
+	 * `limit`. Resolves the short ids shown in injected lines without loading whole
+	 * entries. `prefix` must match ID_PREFIX_PATTERN; any other input matches nothing.
+	 */
+	findIdsByPrefix(prefix: string, limit: number): Promise<string[]>;
 
 	/** Entry including its stored vector, or `embedding` undefined when none is stored. */
 	getEntryWithEmbedding(id: string): Promise<KnowledgeEntry | null>;
