@@ -23,9 +23,12 @@ interface Seen {
 let server: Server<undefined>;
 let seen: Seen[];
 let home: string;
+/** When set, the stub answers /health with 404, as a server that predates it does. */
+let legacyServer = false;
 
 beforeEach(() => {
 	seen = [];
+	legacyServer = false;
 	home = mkdtempSync(join(tmpdir(), "ks-mcp-home-"));
 	server = Bun.serve({
 		hostname: "127.0.0.1",
@@ -37,6 +40,9 @@ beforeEach(() => {
 				path: pathname,
 				authorization: req.headers.get("authorization"),
 			});
+			if (pathname === "/health" && !legacyServer) {
+				return Response.json({ status: "ok" });
+			}
 			if (pathname === "/status") {
 				return Response.json({ knowledge: { active: 0 } });
 			}
@@ -112,7 +118,7 @@ describe("MCP proxy admin token", () => {
 
 		expect(seen.map((r) => r.path)).toEqual(
 			expect.arrayContaining([
-				"/status",
+				"/health",
 				"/activate",
 				`/entries/${ENTRY_ID}/flag`,
 			]),
@@ -155,4 +161,37 @@ describe("MCP proxy server host", () => {
 		expect(proc.exitCode).toBe(1);
 		expect(proc.stderr.toString()).toContain("is not loopback");
 	});
+});
+
+describe("MCP proxy reachability probe", () => {
+	it("probes /health and not /status when the server has /health", async () => {
+		const client = await connect({});
+		try {
+			await client.callTool({
+				name: "activate",
+				arguments: { cues: "churn analysis" },
+			});
+		} finally {
+			await client.close();
+		}
+		expect(seen.map((r) => r.path)).toEqual(["/health", "/activate"]);
+	}, 20_000);
+
+	it("falls back to /status when /health answers 404, as on a server that predates it", async () => {
+		legacyServer = true;
+		const client = await connect({});
+		try {
+			await client.callTool({
+				name: "activate",
+				arguments: { cues: "churn analysis" },
+			});
+		} finally {
+			await client.close();
+		}
+		expect(seen.map((r) => r.path)).toEqual([
+			"/health",
+			"/status",
+			"/activate",
+		]);
+	}, 20_000);
 });

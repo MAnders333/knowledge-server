@@ -87,16 +87,27 @@ function readCallHeaders(adminToken: string | null): Record<string, string> {
 }
 
 /**
- * Check whether the knowledge HTTP server is reachable.
- * Returns true if it responds to GET /status within the given timeout.
+ * Check whether the knowledge HTTP server is reachable within the given timeout.
+ * GET /health answers any server that has it, whatever its health. A server that
+ * predates /health answers 404 there, so the probe falls back to GET /status.
  */
 async function isServerReachable(
 	baseUrl: string,
 	timeoutMs = 2000,
 ): Promise<boolean> {
+	const headers = readCallHeaders(config.adminToken);
+	try {
+		const health = await fetch(`${baseUrl}/health`, {
+			headers,
+			signal: AbortSignal.timeout(timeoutMs),
+		});
+		if (health.status !== 404) return true;
+	} catch {
+		return false;
+	}
 	try {
 		const res = await fetch(`${baseUrl}/status`, {
-			headers: readCallHeaders(config.adminToken),
+			headers,
 			signal: AbortSignal.timeout(timeoutMs),
 		});
 		return res.ok;
