@@ -1,5 +1,25 @@
 import { describe, expect, it } from "bun:test";
-import { affectedBy, inRange } from "../scripts/check-bun-advisories";
+import {
+	affectedBy,
+	checkPinnedBun,
+	inRange,
+} from "../scripts/check-bun-advisories";
+
+/** A fetch that answers every call with the same response (or throws the error). */
+function fetchReturning(outcome: Response | Error): typeof fetch {
+	return (async () => {
+		if (outcome instanceof Error) throw outcome;
+		return outcome;
+	}) as typeof fetch;
+}
+
+/** The API's advisory list for the range "< 1.4.4". */
+const ADVISORY_BODY = JSON.stringify([
+	{
+		ghsa_id: "GHSA-test-0000-0000",
+		vulnerabilities: [{ vulnerable_version_range: "< 1.4.4" }],
+	},
+]);
 
 describe("Bun advisory range check", () => {
 	it("evaluates bounded and open ranges", () => {
@@ -35,5 +55,48 @@ describe("Bun advisory range check", () => {
 
 	it("pins a version that parses", () => {
 		expect(() => inRange("1.4.4", "< 2.0.0")).not.toThrow();
+	});
+});
+
+describe("checkPinnedBun", () => {
+	it("fails (affected) when the API lists an advisory that covers the pin", async () => {
+		const result = await checkPinnedBun(
+			"1.3.9",
+			fetchReturning(new Response(ADVISORY_BODY, { status: 200 })),
+		);
+		expect(result.status).toBe("affected");
+	});
+
+	it("passes when the API lists no advisory covering the pin", async () => {
+		const result = await checkPinnedBun(
+			"1.4.4",
+			fetchReturning(new Response(ADVISORY_BODY, { status: 200 })),
+		);
+		expect(result.status).toBe("ok");
+	});
+
+	it.each([
+		["a 5xx", new Response("", { status: 503 })],
+		["a 429", new Response("", { status: 429 })],
+		[
+			"an exhausted rate limit (403)",
+			new Response("", {
+				status: 403,
+				headers: { "x-ratelimit-remaining": "0" },
+			}),
+		],
+		["a network error", new TypeError("fetch failed")],
+	])("treats %s as unavailable, not as a verdict", async (_label, outcome) => {
+		const result = await checkPinnedBun("1.4.4", fetchReturning(outcome));
+		expect(result.status).toBe("unavailable");
+	});
+
+	it("still rejects a non-transient API error such as a 404", async () => {
+		await expect(
+			checkPinnedBun(
+				"1.4.4",
+				fetchReturning(new Response("", { status: 404 })),
+			),
+		).rejects.toThrow("advisory API answered 404");
 	});
 });

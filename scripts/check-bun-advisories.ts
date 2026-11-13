@@ -3,6 +3,9 @@
  * security advisory of oven-sh/bun. Compiled release binaries embed the Bun
  * runtime, so a vulnerable pin ships the vulnerability to every user.
  *
+ * A GitHub API outage, rate limit or network error only prints a warning: it says
+ * nothing about the pin, and must not fail CI or block a release.
+ *
  * Usage: bun scripts/check-bun-advisories.ts   (GH_TOKEN optional, raises rate limits)
  */
 import { readFileSync } from "node:fs";
@@ -72,7 +75,28 @@ export function affectedBy(
 	);
 }
 
-async function fetchAdvisories(): Promise<Advisory[]> {
+/** A GitHub API failure that says nothing about the pinned Bun: 5xx, rate limit or network error. */
+export class AdvisoryApiUnavailable extends Error {}
+
+export type AdvisoryCheck =
+	| { status: "ok" }
+	| { status: "affected"; hits: Advisory[] }
+	| { status: "unavailable"; reason: string };
+
+/** 5xx, 429, and the 403 GitHub sends when the rate limit is exhausted. */
+function isTransient(res: Response): boolean {
+	if (res.status >= 500 || res.status === 429) return true;
+	return (
+		res.status === 403 &&
+		(res.headers.get("x-ratelimit-remaining") === "0" ||
+			res.headers.has("retry-after"))
+	);
+}
+
+/** Pages through the published oven-sh/bun advisories. Transient failures throw AdvisoryApiUnavailable. */
+export async function fetchAdvisories(
+	fetchImpl: typeof fetch = fetch,
+): Promise<Advisory[]> {
 	const headers: Record<string, string> = {
 		accept: "application/vnd.github+json",
 		"user-agent": "knowledge-server-bun-advisory-check",
@@ -81,11 +105,22 @@ async function fetchAdvisories(): Promise<Advisory[]> {
 		headers.authorization = `Bearer ${process.env.GH_TOKEN}`;
 	const all: Advisory[] = [];
 	for (let page = 1; page <= 10; page++) {
-		const res = await fetch(
-			`https://api.github.com/repos/oven-sh/bun/security-advisories?per_page=100&page=${page}`,
-			{ headers, signal: AbortSignal.timeout(20_000) },
-		);
-		if (!res.ok) throw new Error(`advisory API answered ${res.status}`);
+		let res: Response;
+		try {
+			res = await fetchImpl(
+				`https://api.github.com/repos/oven-sh/bun/security-advisories?per_page=100&page=${page}`,
+				{ headers, signal: AbortSignal.timeout(20_000) },
+			);
+		} catch (err) {
+			throw new AdvisoryApiUnavailable(
+				`request failed: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+		if (!res.ok) {
+			if (isTransient(res))
+				throw new AdvisoryApiUnavailable(`advisory API answered ${res.status}`);
+			throw new Error(`advisory API answered ${res.status}`);
+		}
 		const batch = (await res.json()) as Advisory[];
 		all.push(...batch);
 		if (batch.length < 100) break;
@@ -93,14 +128,31 @@ async function fetchAdvisories(): Promise<Advisory[]> {
 	return all;
 }
 
+/** Checks a version against the published advisories. An unavailable API is not a verdict. */
+export async function checkPinnedBun(
+	version: string,
+	fetchImpl: typeof fetch = fetch,
+): Promise<AdvisoryCheck> {
+	let advisories: Advisory[];
+	try {
+		advisories = await fetchAdvisories(fetchImpl);
+	} catch (err) {
+		if (err instanceof AdvisoryApiUnavailable)
+			return { status: "unavailable", reason: err.message };
+		throw err;
+	}
+	const hits = affectedBy(version, advisories);
+	return hits.length > 0 ? { status: "affected", hits } : { status: "ok" };
+}
+
 if (import.meta.main) {
 	const version = readFileSync(
 		new URL("../.bun-version", import.meta.url),
 		"utf8",
 	).trim();
-	const hits = affectedBy(version, await fetchAdvisories());
-	if (hits.length > 0) {
-		for (const a of hits) {
+	const result = await checkPinnedBun(version);
+	if (result.status === "affected") {
+		for (const a of result.hits) {
 			console.error(
 				`Bun ${version} is affected by ${a.ghsa_id}${a.cve_id ? ` (${a.cve_id})` : ""} [${a.severity ?? "unknown"}]: ${a.summary ?? ""}`,
 			);
@@ -110,7 +162,14 @@ if (import.meta.main) {
 		);
 		process.exit(1);
 	}
-	console.log(
-		`Bun ${version}: no published oven-sh/bun advisory affects this version.`,
-	);
+	if (result.status === "unavailable") {
+		// A GitHub outage or rate limit must not fail CI or block the release gate.
+		console.warn(
+			`::warning::Could not check Bun ${version} against published advisories (${result.reason}). Re-run the check later.`,
+		);
+	} else {
+		console.log(
+			`Bun ${version}: no published oven-sh/bun advisory affects this version.`,
+		);
+	}
 }
