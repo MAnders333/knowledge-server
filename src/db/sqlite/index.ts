@@ -55,8 +55,11 @@ function qualifiedEntryColumns(alias: string): string {
  */
 export class KnowledgeDB implements IKnowledgeStore {
 	private db: Database;
-	/** Cross-process consolidation lock held for one store write (see tryAcquireConsolidationLock). */
-	private consolidationLock: LockHandle | null = null;
+	/**
+	 * The consolidation lock this store object holds (see tryAcquireConsolidationLock).
+	 * `file` is the lockfile, or null for an in-memory database, which has none.
+	 */
+	private consolidationLock: { file: LockHandle | null } | null = null;
 	/** Absolute path to the SQLite file — exposed for migration tooling. */
 	readonly dbPath: string;
 	/** Store ID — set by StoreRegistry; defaults to "sqlite" in standalone/test use. */
@@ -256,23 +259,20 @@ export class KnowledgeDB implements IKnowledgeStore {
 			.run(...values);
 	}
 
-	async getEntry(id: string): Promise<KnowledgeEntry | null> {
-		const row = this.db
-			.prepare(`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE id = ?`)
 	async setEmbedding(id: string, embedding: number[]): Promise<void> {
 		this.db
 			.prepare("UPDATE knowledge_entry SET embedding = ? WHERE id = ?")
 			.run(new Uint8Array(new Float32Array(embedding).buffer), id);
 	}
 
+	async getEntry(id: string): Promise<KnowledgeEntry | null> {
+		const row = this.db
+			.prepare(`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE id = ?`)
 			.get(id) as RawEntryRow | null;
 
 		return row ? this.rowToEntry(row) : null;
 	}
 
-	async getEntryWithEmbedding(id: string): Promise<KnowledgeEntry | null> {
-		const row = this.db
-			.prepare(
 	/**
 	 * Ids of entries (any status) whose id starts with `prefix`, ascending, at most
 	 * `limit`. See IKnowledgeStore.findIdsByPrefix.
@@ -292,6 +292,9 @@ export class KnowledgeDB implements IKnowledgeStore {
 		return rows.map((r) => r.id);
 	}
 
+	async getEntryWithEmbedding(id: string): Promise<KnowledgeEntry | null> {
+		const row = this.db
+			.prepare(
 				`SELECT ${ENTRY_COLUMNS}, embedding FROM knowledge_entry WHERE id = ?`,
 			)
 			.get(id) as RawEntryRow | null;
@@ -1349,17 +1352,29 @@ export class KnowledgeDB implements IKnowledgeStore {
 	// same file is refused for the duration of this store's write.
 
 	async tryAcquireConsolidationLock(): Promise<boolean> {
+		// A second acquire on the same store object is a missing release upstream.
+		// Throw, as the Postgres store does, so it is not mistaken for contention.
+		if (this.consolidationLock !== null) {
+			throw new Error(
+				"[db] tryAcquireConsolidationLock called while lock already held. " +
+					"Check for a missing releaseConsolidationLock() call.",
+			);
+		}
 		// In-memory databases are private to this process: nothing to lock across.
-		if (this.dbPath === "" || this.dbPath === ":memory:") return true;
-		if (this.consolidationLock !== null) return false;
-		this.consolidationLock = tryAcquireProcessLock(
+		if (this.dbPath === "" || this.dbPath === ":memory:") {
+			this.consolidationLock = { file: null };
+			return true;
+		}
+		const file = tryAcquireProcessLock(
 			sqliteConsolidationLockPath(this.dbPath),
 		);
-		return this.consolidationLock !== null;
+		if (file === null) return false;
+		this.consolidationLock = { file };
+		return true;
 	}
 
 	async releaseConsolidationLock(): Promise<void> {
-		this.consolidationLock?.release();
+		this.consolidationLock?.file?.release();
 		this.consolidationLock = null;
 	}
 
