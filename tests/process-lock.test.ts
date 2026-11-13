@@ -211,24 +211,25 @@ describe("tryAcquireProcessLock", () => {
 		expect(existsSync(lockPath)).toBe(false);
 	});
 
-	it("does not report the lock lost while its lockfile is unreadable for a moment", async () => {
+	it("does not report the lock lost while its lockfile is unreadable for a moment", () => {
 		let lostCalls = 0;
 		const handle = tryAcquireProcessLock(lockPath, {
-			heartbeatMs: 20,
+			// The test steps the heartbeat itself, so the timer never fires here.
+			heartbeatMs: 60_000,
 			onLost: () => {
 				lostCalls++;
 			},
 		});
-		expect(handle).not.toBeNull();
+		if (handle === null) throw new Error("lock not acquired");
 		const ours = readLockRecord(lockPath);
 		// A torn write, as another process's record can look while it is being written.
 		writeFileSync(lockPath, '{"pid": ');
-		// Real timer on purpose: the heartbeat is a setInterval. Several beats run here.
-		await Bun.sleep(100);
-		expect(handle?.lost).toBe(false);
+		expect(handle.beat()).toBe("skipped");
+		expect(handle.lost).toBe(false);
 		expect(lostCalls).toBe(0);
 		writeFileSync(lockPath, JSON.stringify(ours));
-		handle?.release();
+		expect(handle.beat()).toBe("renewed");
+		handle.release();
 		expect(existsSync(lockPath)).toBe(false);
 	});
 
@@ -298,40 +299,51 @@ describe("tryAcquireProcessLock", () => {
 		handle?.release();
 	});
 
-	it("keeps the heartbeat fresh while held", async () => {
-		// Real timer on purpose: the heartbeat is a setInterval, so only the platform
-		// clock exercises it. The interval is 20 ms, so the wait stays short.
-		const handle = tryAcquireProcessLock(lockPath, {
-			heartbeatMs: 20,
-		});
-		expect(handle).not.toBeNull();
-		const before = readLockRecord(lockPath)?.heartbeatAt ?? 0;
-		await Bun.sleep(80);
-		const after = readLockRecord(lockPath)?.heartbeatAt ?? 0;
-		expect(after).toBeGreaterThan(before);
-		handle?.release();
+	it("renews the heartbeat when it is stepped", () => {
+		const handle = tryAcquireProcessLock(lockPath, { heartbeatMs: 60_000 });
+		if (handle === null) throw new Error("lock not acquired");
+		const ours = readLockRecord(lockPath);
+		if (!ours) throw new Error("no lock record");
+		writeFileSync(lockPath, JSON.stringify({ ...ours, heartbeatAt: 0 }));
+		expect(handle.beat()).toBe("renewed");
+		expect(readLockRecord(lockPath)?.heartbeatAt).toBeGreaterThan(0);
+		handle.release();
 	});
 
-	it("reports the lock as lost, once, when another process replaces the lockfile", async () => {
+	it("runs the heartbeat on its timer while held", async () => {
+		// The one test of the production interval itself, so it waits on the platform
+		// clock. The wait is bounded: it fails if no heartbeat fires within about 2 s.
+		const handle = tryAcquireProcessLock(lockPath, { heartbeatMs: 20 });
+		if (handle === null) throw new Error("lock not acquired");
+		const ours = readLockRecord(lockPath);
+		if (!ours) throw new Error("no lock record");
+		writeFileSync(lockPath, JSON.stringify({ ...ours, heartbeatAt: 0 }));
+		for (let i = 0; i < 100 && !readLockRecord(lockPath)?.heartbeatAt; i++) {
+			await Bun.sleep(20);
+		}
+		expect(readLockRecord(lockPath)?.heartbeatAt).toBeGreaterThan(0);
+		handle.release();
+	});
+
+	it("reports the lock as lost, once, when another process replaces the lockfile", () => {
 		let lostCalls = 0;
 		const handle = tryAcquireProcessLock(lockPath, {
-			heartbeatMs: 20,
+			heartbeatMs: 60_000,
 			onLost: () => {
 				lostCalls++;
 			},
 		});
-		expect(handle).not.toBeNull();
+		if (handle === null) throw new Error("lock not acquired");
 		writeFileSync(
 			lockPath,
 			JSON.stringify({ pid: 1, acquiredAt: 0, heartbeatAt: Date.now() }),
 		);
-		// Real timer on purpose: the heartbeat is a setInterval that only the platform
-		// clock fires. The interval is 20 ms, so the poll below ends quickly.
-		for (let i = 0; i < 100 && !handle?.lost; i++) await Bun.sleep(20);
-		expect(handle?.lost).toBe(true);
+		expect(handle.beat()).toBe("lost");
+		expect(handle.lost).toBe(true);
+		expect(handle.beat()).toBe("lost");
 		expect(lostCalls).toBe(1);
 		// The lost holder never writes the lockfile back, and releasing leaves it alone.
-		handle?.release();
+		handle.release();
 		expect(readLockRecord(lockPath)?.pid).toBe(1);
 	});
 });
