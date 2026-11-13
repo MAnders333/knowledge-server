@@ -1,5 +1,6 @@
+import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, mkdtempSync, readdirSync } from "node:fs";
-import { tmpdir, userInfo } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 /**
@@ -55,8 +56,37 @@ const SERVER_RUNTIME_NAME =
  * test runs override). `KS_REAL_HOME_GUARD_ROOT` points the guard at another
  * directory; only the guard's own tests use it, to prove the guard fires.
  */
-export const REAL_HOME =
-	process.env.KS_REAL_HOME_GUARD_ROOT || userInfo().homedir;
+export const REAL_HOME = process.env.KS_REAL_HOME_GUARD_ROOT || passwdHome();
+
+/**
+ * The account's home from the passwd entry. os.homedir() and os.userInfo() read HOME
+ * when the process starts, so an isolated run (HOME set in the shell) would make the
+ * guard watch the temp home instead of the real one. `~name` in sh resolves through
+ * the passwd database and ignores HOME. A failure is an error, not a silent fallback.
+ */
+function passwdHome(): string {
+	const result = spawnSync("/bin/sh", ["-c", 'eval "printf %s ~$(id -un)"'], {
+		encoding: "utf8",
+	});
+	const home = result.stdout.trim();
+	if (result.status !== 0 || !home.startsWith("/")) {
+		throw new Error("real-home guard: could not resolve the account home");
+	}
+	return home;
+}
+
+/**
+ * The real model cache, where the default data directory keeps downloaded models.
+ * Resolved here, when this module loads, which is before the preload moves HOME, so
+ * the real-model tests can still find a model that was fetched earlier.
+ */
+export const REAL_MODELS_DIR = join(
+	REAL_HOME,
+	".local",
+	"share",
+	"knowledge-server",
+	"models",
+);
 
 /**
  * Points HOME and the config and state variables at a fresh temp home, for the

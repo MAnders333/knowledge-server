@@ -261,10 +261,12 @@ function formatActivatedKnowledgeFallback(entries: ActivateEntry[]): string {
 /**
  * Activation queries for one prompt, bounded so the GET /activate URL stays far
  * below Bun's 16 KiB request-line limit: over it the server answers 431 and the
- * plugin drops the prompt. Mirrors boundCues in src/api/input-limits.ts: at most
- * MAX_CUES cues, the first ones plus the holistic prompt last. Limits apply to
- * characters and to encoded length, the size the URL carries (a CJK character
- * encodes to 9 characters).
+ * plugin drops the prompt. The per-cue caps follow the idea of boundCues in
+ * src/api/input-limits.ts, with smaller sizes. The count cap is the plugin's own:
+ * at most MAX_CUES cues, the first ones plus the holistic prompt last. The server's
+ * normalizeCues (src/activation/activate.ts) keeps the head and tail of its list
+ * instead. Limits apply to characters and to encoded length, the size the URL
+ * carries (a CJK character encodes to 9 characters).
  */
 const PROMPT_MAX_CHARS = 4000;
 const SEGMENT_MAX_CHARS = 500;

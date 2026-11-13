@@ -56,6 +56,12 @@ export interface LockHandle {
 	readonly path: string;
 	/** True once another process has replaced or removed the lockfile. */
 	readonly lost: boolean;
+	/**
+	 * Run one heartbeat now. The timer calls it every heartbeatMs; tests call it to step
+	 * the holder without waiting. "renewed": the record was refreshed. "skipped": a torn
+	 * read, or the handle was released. "lost": another process took the lockfile.
+	 */
+	beat(): "renewed" | "skipped" | "lost";
 	/** Remove the lockfile if this process still owns it. Idempotent. */
 	release(): void;
 }
@@ -179,14 +185,16 @@ function makeHandle(
 ): LockHandle {
 	let released = false;
 	let lost = false;
-	const timer = setInterval(() => {
+	const beat = (): "renewed" | "skipped" | "lost" => {
+		if (lost) return "lost";
+		if (released) return "skipped";
 		const state = readLockState(path);
 		// A torn read (another process is writing its record) is not a loss.
-		if (state.kind === "unreadable") return;
+		if (state.kind === "unreadable") return "skipped";
 		if (state.kind === "record" && state.record.pid === process.pid) {
 			record.heartbeatAt = Date.now();
 			writeRecord(path, record);
-			return;
+			return "renewed";
 		}
 		// Removed, or replaced by another process's record. Never write it back: the
 		// lock now belongs to someone else, and this holder must stop.
@@ -197,13 +205,16 @@ function makeHandle(
 			`[lock] ${path} was taken over by another process; this process no longer holds the lock.`,
 		);
 		options.onLost?.();
-	}, options.heartbeatMs);
+		return "lost";
+	};
+	const timer = setInterval(beat, options.heartbeatMs);
 	timer.unref?.();
 	return {
 		path,
 		get lost() {
 			return lost;
 		},
+		beat,
 		release() {
 			if (released) return;
 			released = true;
