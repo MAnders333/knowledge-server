@@ -183,9 +183,9 @@ export class KnowledgeDB implements IKnowledgeStore {
 			.prepare(
 				`INSERT INTO knowledge_entry 
          (id, type, content, topics, confidence, source, status, strength,
-          created_at, updated_at, last_accessed_at, access_count, observation_count,
-          superseded_by, derived_from, is_synthesized, embedding)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          created_at, updated_at, last_accessed_at, access_count, injection_count,
+          observation_count, superseded_by, derived_from, is_synthesized, embedding)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			)
 			.run(
 				entry.id,
@@ -200,6 +200,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 				entry.updatedAt,
 				entry.lastAccessedAt,
 				entry.accessCount,
+				entry.injectionCount ?? 0,
 				entry.observationCount,
 				entry.supersededBy,
 				JSON.stringify(entry.derivedFrom),

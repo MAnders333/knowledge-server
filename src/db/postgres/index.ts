@@ -678,11 +678,12 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			await this.sql.unsafe(
 				`INSERT INTO knowledge_entry
 				(id, type, content, topics, confidence, source, status, strength,
-				 created_at, updated_at, last_accessed_at, access_count, observation_count,
-				 superseded_by, derived_from, is_synthesized, embedding, embedding_vec)
+				 created_at, updated_at, last_accessed_at, access_count, injection_count,
+				 observation_count, superseded_by, derived_from, is_synthesized, embedding,
+				 embedding_vec)
 				VALUES (
-					$1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-					$14, $15::jsonb, $16, $17, $18::vector
+					$1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+					$15, $16::jsonb, $17, $18, $19::vector
 				)`,
 				[
 					entry.id,
@@ -697,6 +698,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 					entry.updatedAt,
 					entry.lastAccessedAt,
 					entry.accessCount,
+					entry.injectionCount ?? 0,
 					entry.observationCount,
 					entry.supersededBy,
 					this.sql.json(entry.derivedFrom),
@@ -709,11 +711,11 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			await this.sql.unsafe(
 				`INSERT INTO knowledge_entry
 				(id, type, content, topics, confidence, source, status, strength,
-				 created_at, updated_at, last_accessed_at, access_count, observation_count,
-				 superseded_by, derived_from, is_synthesized, embedding)
+				 created_at, updated_at, last_accessed_at, access_count, injection_count,
+				 observation_count, superseded_by, derived_from, is_synthesized, embedding)
 				VALUES (
-					$1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-					$14, $15::jsonb, $16, $17
+					$1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+					$15, $16::jsonb, $17, $18
 				)`,
 				[
 					entry.id,
@@ -728,6 +730,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 					entry.updatedAt,
 					entry.lastAccessedAt,
 					entry.accessCount,
+					entry.injectionCount ?? 0,
 					entry.observationCount,
 					entry.supersededBy,
 					this.sql.json(entry.derivedFrom),
