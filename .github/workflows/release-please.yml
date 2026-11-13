@@ -47,15 +47,16 @@ jobs:
             echo "::notice::main is at $current, not the validated $VALIDATED_SHA; skipping this release run."
             echo "current=false" >> "$GITHUB_OUTPUT"
           fi
-      # release-please-config.json sets "draft": true, so this creates a draft
-      # release (with its tag, via force-tag-creation). Nothing is installable
-      # until the publish job below promotes it.
+      # release-please reads release-please-config.json (draft: true, so this creates
+      # a draft release with its tag, via force-tag-creation) and
+      # .release-please-manifest.json. Do not pass release-type here: with that input
+      # the action ignores the config file. Nothing is installable until the publish
+      # job below promotes the draft.
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         if: ${{ steps.head.outputs.current == 'true' }}
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          release-type: node
 
   build-binaries:
     name: Build binaries (${{ matrix.suffix }})
@@ -98,8 +99,8 @@ jobs:
 
       - name: Build binaries
         run: |
-          bun build --compile --minify --no-compile-autoload-dotenv --no-compile-autoload-bunfig src/index.ts --outfile dist/knowledge-server-${{ matrix.suffix }}
-          bun build --compile --minify --no-compile-autoload-dotenv --no-compile-autoload-bunfig src/daemon/index.ts --outfile dist/knowledge-daemon-${{ matrix.suffix }}
+          bun run compile src/index.ts --outfile dist/knowledge-server-${{ matrix.suffix }}
+          bun run compile src/daemon/index.ts --outfile dist/knowledge-daemon-${{ matrix.suffix }}
 
       - name: Re-sign macOS binaries (ad-hoc)
         if: ${{ matrix.suffix == 'darwin-arm64' }}
@@ -136,7 +137,8 @@ jobs:
       - name: Generate SHA256SUMS
         # One manifest per platform. It covers the binaries and every
         # platform-independent file that install.sh, update and setup-tool
-        # download, so none of them can be fetched unverified.
+        # download (install.sh included, so a downloaded copy can be checked
+        # against the same manifest), so none of them can be fetched unverified.
         run: |
           cd dist
           files=(
@@ -147,6 +149,7 @@ jobs:
             omp-knowledge.ts
             consolidate.md
             knowledge-review.md
+            install.sh
           )
           if command -v sha256sum &>/dev/null; then
             sha256sum "${files[@]}" > SHA256SUMS-${{ matrix.suffix }}
@@ -191,6 +194,9 @@ jobs:
   publish:
     # Runs only when every build leg succeeded. Until this job promotes the
     # draft, /releases/latest (used by install.sh and update) does not see it.
+    # If a build leg fails, re-run only the failed jobs. A full re-run does not
+    # recover the draft: release-please has already tagged the release, so the
+    # release-please job reports no new release and this job is skipped.
     name: Publish release
     needs: [release-please, build-binaries]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}

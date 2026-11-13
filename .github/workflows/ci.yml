@@ -67,9 +67,8 @@ jobs:
         if: ${{ github.event_name == 'pull_request' }}
         env:
           # Binary size budgets (bytes) for linux-x64 built with the Bun version in .bun-version and the
-          # same flags as below. Measured 2026-11-12 with
-          #   bunx bun@1.4.4 build --compile --minify --no-compile-autoload-dotenv \
-          #     --no-compile-autoload-bunfig --target=bun-linux-x64 <entry> --outfile <out>
+          # same compile flags as the `compile` script in package.json. Measured 2026-11-12 with
+          #   bun run compile --target=bun-linux-x64 <entry> --outfile <out>   (bun 1.4.4)
           # server 123754672 bytes, daemon 109287600 bytes. Budget = measured + 10%.
           # To re-baseline: re-measure with that command, set each budget to the new
           # size * 1.1 and update the numbers in this comment. Raise a budget only
@@ -77,8 +76,8 @@ jobs:
           SERVER_SIZE_BUDGET: 136130139
           DAEMON_SIZE_BUDGET: 120216360
         run: |
-          bun build --compile --minify --no-compile-autoload-dotenv --no-compile-autoload-bunfig src/index.ts --outfile dist/knowledge-server-linux-x64
-          bun build --compile --minify --no-compile-autoload-dotenv --no-compile-autoload-bunfig src/daemon/index.ts --outfile dist/knowledge-daemon-linux-x64
+          bun run compile src/index.ts --outfile dist/knowledge-server-linux-x64
+          bun run compile src/daemon/index.ts --outfile dist/knowledge-daemon-linux-x64
           ./dist/knowledge-server-linux-x64 --help > /dev/null
           ./dist/knowledge-daemon-linux-x64 --version > /dev/null
 
