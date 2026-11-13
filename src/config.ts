@@ -34,22 +34,19 @@ class EnvReader {
 		if (!this.issues.includes(message)) this.issues.push(message);
 	}
 
-	/** Integer in [min, max]. Non-numeric input is an issue. */
+	/** Integer ≥ min. Non-numeric or smaller input is an issue. */
 	int(
 		name: string,
 		fallback: number,
 		min: number,
-		options: { max?: number; hint?: string } = {},
+		options: { hint?: string } = {},
 	): number {
 		const raw = this.raw(name);
 		if (raw === undefined) return fallback;
-		const max = options.max ?? Number.POSITIVE_INFINITY;
 		const value = Number.parseInt(raw, 10);
-		if (Number.isNaN(value) || value < min || value > max) {
-			const range =
-				max === Number.POSITIVE_INFINITY ? `≥ ${min}` : `from ${min} to ${max}`;
+		if (Number.isNaN(value) || value < min) {
 			this.issue(
-				`${name} must be an integer ${range} (got "${raw}").${options.hint ? ` ${options.hint}` : ""}`,
+				`${name} must be an integer ≥ ${min} (got "${raw}").${options.hint ? ` ${options.hint}` : ""}`,
 			);
 			return fallback;
 		}
