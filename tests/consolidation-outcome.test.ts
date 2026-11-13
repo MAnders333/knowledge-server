@@ -914,3 +914,29 @@ describe("episodes blocked after extraction", () => {
 		expect(waiting[0].failedAttempts ?? 0).toBe(0);
 	});
 });
+
+describe("secrets are scrubbed before extraction", () => {
+	it("the extraction prompt carries no credential from the episode text or its metadata", async () => {
+		const token = ["ghp_", "e".repeat(36)].join("");
+		await state.insertPendingEpisode(
+			pendingRow({
+				id: "scrub-1",
+				sessionId: "session-scrub",
+				sessionTitle: `Debug ${token}`,
+				projectName: `proj ${token}`,
+				content: `User: deploy with ${token} please.`,
+			}),
+		);
+		const extract = spyOn(
+			ConsolidationLLM.prototype,
+			"extractKnowledge",
+		).mockResolvedValue([entry("Deploys use a vault key.")]);
+
+		await engine.consolidate();
+
+		expect(extract).toHaveBeenCalledTimes(1);
+		const prompt = String(extract.mock.calls[0]?.[0]);
+		expect(prompt).not.toContain(token);
+		expect(prompt).toContain("[REDACTED:github_token]");
+	});
+});

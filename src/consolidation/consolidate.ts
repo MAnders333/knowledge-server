@@ -597,6 +597,24 @@ export class ConsolidationEngine {
 		let totalConflictsResolved = 0;
 		const sourceTouchedStores = new Set<IKnowledgeStore>();
 
+		const outcome: EpisodeOutcome = { completed: [], failed: [] };
+
+		// Secrets are scrubbed before an episode can reach an extraction prompt,
+		// whatever the reader staged. An episode that cannot be scrubbed fails closed:
+		// it is not sent to the LLM, and it counts as an attempt.
+		const scrubbed: Episode[] = [];
+		for (const episode of episodes) {
+			try {
+				scrubbed.push(this.scrubEpisode(episode));
+			} catch (err) {
+				attempted.add(episodeKeyId(episode));
+				outcome.failed.push({
+					episode,
+					error: `redaction failed; episode not sent to the LLM: ${err instanceof Error ? err.message : String(err)}`,
+				});
+			}
+		}
+
 		const chunkSize = config.consolidation.chunkSize;
 
 		// Group episodes by domain when domain routing is configured so all
@@ -605,9 +623,9 @@ export class ConsolidationEngine {
 		// as the domain hint for all entries — likely misrouting entries from the
 		// other directories. When no domain router is configured, episodes are
 		// processed in their original order (single-store mode).
-		const episodeGroups: (typeof episodes)[] = this.domainRouter
-			? groupByDomain(episodes, this.domainRouter)
-			: [episodes];
+		const episodeGroups: (typeof scrubbed)[] = this.domainRouter
+			? groupByDomain(scrubbed, this.domainRouter)
+			: [scrubbed];
 
 		// Flatten groups into a single ordered sequence of chunks, preserving
 		// within-group ordering while ensuring cross-domain episodes don't mix.
@@ -618,7 +636,6 @@ export class ConsolidationEngine {
 			}
 		}
 
-		const outcome: EpisodeOutcome = { completed: [], failed: [] };
 		const completedSessionIds = new Set<string>();
 
 		for (let ci = 0; ci < chunks.length; ci++) {
@@ -711,7 +728,7 @@ export class ConsolidationEngine {
 	}
 
 	/**
-	 * Scrub secrets from LLM-produced entry text before it is embedded or stored.
+	 * Scrub secrets from text before it is stored or sent to an LLM.
 	 * Counts accumulate in `_runRedactions` and are logged once per run.
 	 */
 	private redactRunText(text: string): string {
@@ -720,6 +737,17 @@ export class ConsolidationEngine {
 			this._runRedactions[kind] = (this._runRedactions[kind] ?? 0) + n;
 		}
 		return result.text;
+	}
+
+	/** Scrub every free-text field of an episode. Throws when a field cannot be scrubbed. */
+	private scrubEpisode(episode: Episode): Episode {
+		return {
+			...episode,
+			content: this.redactRunText(episode.content),
+			sessionTitle: this.redactRunText(episode.sessionTitle),
+			projectName: this.redactRunText(episode.projectName),
+			directory: this.redactRunText(episode.directory),
+		};
 	}
 
 	/**
