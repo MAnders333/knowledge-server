@@ -128,7 +128,7 @@ export async function runReinitialize(args: string[]): Promise<void> {
 	// command's deletes are not coordinated — running both at once can corrupt
 	// in-flight consolidation state or leave knowledge entries in a mixed state.
 	// Run unconditionally so even the default cursor-reset is guarded.
-	const located = locatePidFile(config.pidPath, null);
+	const located = locatePidFile(config.pidPath, config.legacyPidPath);
 	if (located !== null) {
 		const refusal = serverRefusal(readFileSync(located, "utf8"));
 		if (refusal) {

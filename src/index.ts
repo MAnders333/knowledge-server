@@ -114,12 +114,12 @@ async function main() {
 
 	// `knowledge-server stop`
 	if (subcommand === "stop") {
-		process.exit(await runStop(config.pidPath, null));
+		process.exit(await runStop(config.pidPath, config.legacyPidPath));
 	}
 
 	// `knowledge-server status`
 	if (subcommand === "status") {
-		await runStatus(config.pidPath, null);
+		await runStatus(config.pidPath, config.legacyPidPath);
 		process.exit(0);
 	}
 
@@ -362,7 +362,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	// PID still runs knowledge-server; a PID that is dead, reused by another program,
 	// or unreadable is stale and replaced. The actual write happens after serve()
 	// succeeds so the file only exists when a port is truly bound.
-	const located = locatePidFile(config.pidPath, null);
+	const located = locatePidFile(config.pidPath, config.legacyPidPath);
 	if (located !== null) {
 		const state = classifyPidFile(
 			readFileSync(located, "utf8"),
