@@ -167,7 +167,7 @@ function defineMergeTargetDeletedSuite(
 					return realMerge(id, updates, embedding);
 				},
 			);
-			const log = spyOn(logger, "log");
+			const log = spyOn(logger, "debug");
 
 			const activation = new ActivationEngine(store);
 			spyOn(activation.embeddings, "embed").mockResolvedValue(VEC);
