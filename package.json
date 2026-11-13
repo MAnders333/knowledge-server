@@ -14,8 +14,8 @@
 		"build:server": "bun build --compile --minify --no-compile-autoload-dotenv --no-compile-autoload-bunfig src/index.ts --outfile dist/knowledge-server",
 		"build:daemon": "bun build --compile --minify --no-compile-autoload-dotenv --no-compile-autoload-bunfig src/daemon/index.ts --outfile dist/knowledge-daemon",
 		"setup": "bash scripts/setup.sh",
-		"lint": "bunx biome check src/ tests/ plugin/ bench/",
-		"format": "bunx biome format --write src/ tests/ plugin/ bench/"
+		"lint": "bunx biome check src/ tests/ plugin/ bench/ scripts/",
+		"format": "bunx biome format --write src/ tests/ plugin/ bench/ scripts/"
 	},
 	"dependencies": {
 		"@ai-sdk/anthropic": "^3.0.0",
