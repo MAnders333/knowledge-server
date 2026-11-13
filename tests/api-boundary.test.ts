@@ -347,7 +347,10 @@ describe("HTTP API boundary", () => {
 
 	describe("KNOWLEDGE_ALLOWED_HOSTS entries", () => {
 		it("accepts a configured extra host and refuses lookalikes", async () => {
-			buildApp({ extraAllowedHosts: ["knowledge.example.com"] });
+			buildApp({
+				extraAllowedHosts: ["knowledge.example.com"],
+				adminTokenIsStable: false,
+			});
 			const ok = await fetch(`${base}/status`, {
 				headers: { Host: "knowledge.example.com" },
 			});
@@ -557,7 +560,11 @@ describe("HTTP API boundary", () => {
 				join(tempDir, "readonly-opencode.db"),
 			);
 			await roDb.insertEntry(entryFixture("ro-1", "read-only entry"));
-			buildApp({ readDbs: [db, roDb], writableDbs: [db] });
+			buildApp({
+				readDbs: [db, roDb],
+				writableDbs: [db],
+				adminTokenIsStable: false,
+			});
 		});
 
 		it("PATCH and DELETE refuse entries that live only in a read-only store", async () => {

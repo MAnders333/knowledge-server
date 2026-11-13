@@ -483,26 +483,20 @@ describe("HTTP API", () => {
 		});
 	}
 
-	function postFlag(path: string, body: unknown, authorized = true) {
+	/** Flagging is read-level: it sends no admin token. */
+	function postFlag(path: string, body: unknown) {
 		return request(path, {
 			method: "POST",
-			headers: {
-				...(authorized ? { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` } : {}),
-				"Content-Type": "application/json",
-			},
+			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(body),
 		});
 	}
 
-	it("POST /entries/:id/flag should return 401 without token", async () => {
+	it("POST /entries/:id/flag works without an admin token", async () => {
 		const id = "c0ffee00-0000-4000-8000-000000000001";
 		await insertForFlag(id, "active");
-		const res = await postFlag(
-			`/entries/${id}/flag`,
-			{ reason: "wrong" },
-			false,
-		);
-		expect(res.status).toBe(401);
+		const res = await postFlag(`/entries/${id}/flag`, { reason: "wrong" });
+		expect(res.status).toBe(200);
 	});
 
 	it("flags an active entry by its short id: status becomes conflicted and the row is kept", async () => {
