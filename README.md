@@ -260,7 +260,7 @@ Configuration is split across two files:
 
 **`~/.config/knowledge-server/config.jsonc`** — store topology (which databases to use and where). Created automatically on first run (default: local SQLite). Edit this for Postgres or multi-store setups.
 
-**Invalid values fail at startup.** The server refuses to start when a value is not a number, is outside its range, or is not a recognised flag spelling; the message names the variable. An empty value means the default. The daemon logs these as warnings and keeps running; the MCP proxy does not check them. Flags take `true`/`false`, `on`/`off`, `yes`/`no` or `1`/`0` (case-insensitive): `ACTIVATION_PRECISION_GATE`, `ACTIVATION_STRENGTH_DAMPENING`, `CONTRADICTION_CONFLICTS_ONLY`, `RERANK_ENABLED` and the `*_ENABLED` source switches.
+**Invalid values fail at startup.** The server refuses to start when a value is not a number, is outside its range, or is not a recognised flag spelling; the message names the variable. An empty value means the default. The daemon logs these as warnings and keeps running; the MCP proxy does not check them. Flags take `true`/`false`, `on`/`off`, `yes`/`no` or `1`/`0` (case-insensitive): `ACTIVATION_PRECISION_GATE`, `ACTIVATION_STRENGTH_DAMPENING`, `CONTRADICTION_CONFLICTS_ONLY`, `RERANK_ENABLED`, the `*_ENABLED` source switches, `DAEMON_AUTO_SPAWN` and `REDACT_SECRETS`.
 
 ### Editor validation (`$schema`)
 
@@ -435,7 +435,7 @@ EMBEDDING_MODEL=nomic-embed-text
 |---|---|---|---|---|
 | HTTP port | `port` | `KNOWLEDGE_PORT` | `3179` | |
 | Bind address | `host` | `KNOWLEDGE_HOST` | `127.0.0.1` | Loopback only |
-| Daemon auto-spawn | `daemonAutoSpawn` | `DAEMON_AUTO_SPAWN=false` | `true` | Set false to manage daemon yourself |
+| Daemon auto-spawn | `daemonAutoSpawn` | `DAEMON_AUTO_SPAWN=false` | `true` | Set `false` (or `0`, `no`, `off`) to manage the daemon yourself |
 
 Credentials and paths stay in `.env`:
 
@@ -444,7 +444,7 @@ Credentials and paths stay in `.env`:
 | `KNOWLEDGE_ADMIN_TOKEN` | *(random per process)* | Fixed admin token for scripted use (≥16 chars; the template placeholder `your-stable-token-here` is rejected). When set, every route except `/health` requires it as a Bearer token |
 | `KNOWLEDGE_ALLOWED_HOSTS` | *(empty)* | Extra `Host` names the API accepts, comma-separated (`name` or `name:port`). `localhost`, `127.0.0.1`, `[::1]` and the bind host are always accepted. Needed when a reverse proxy forwards a different hostname. |
 | `POSTGRES_POOL_MAX` | `10` | Connections per Postgres pool: each Postgres knowledge store and the state DB |
-| `REDACT_SECRETS` | `true` | Scrub credentials (private keys, cloud/SaaS/LLM API tokens, JWTs, `Authorization` headers, `*_SECRET`/`*_TOKEN`/`*_PASSWORD`/`*_API_KEY` values, URL passwords, long keyed secrets) from transcript text before it is staged, sent to an LLM or embedding API, or stored. Set `false` to disable. Counts are logged per run; values are never logged. |
+| `REDACT_SECRETS` | `true` | Scrub credentials (private keys, cloud/SaaS/LLM API tokens, JWTs, `Authorization` headers, `*_SECRET`/`*_TOKEN`/`*_PASSWORD`/`*_API_KEY` values, URL passwords, long keyed secrets) from transcript text before it is staged, sent to an LLM or embedding API, or stored. Set `false` (or `0`, `no`, `off`) to disable. Counts are logged per run; values are never logged. |
 | `KNOWLEDGE_LOG_PATH` | `server.log` in the data directory: the directory of `stateDb.path` (default `~/.local/share/knowledge-server`) | Log file. Set to `""` to disable. When stdout or stderr already points at this file (the launchd plist does this), each line is written once. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. `info` logs lengths, ids, counts and similarity scores; entry and episode text is logged only at `debug`. `warn` suppresses info lines. |
 | `LOG_MAX_BYTES` | `20971520` (20 MB) | Size at which the active log rotates. Rotation keeps `server.log.1` to `server.log.3` and drops the oldest, so the files total about four times this value. `0` disables rotation. Rotated copies can hold text written by earlier versions, including an old admin token; delete them once you no longer need them. |

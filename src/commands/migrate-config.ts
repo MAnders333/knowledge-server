@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { defaultConfigPath, defaultSqlitePath } from "../config-file.js";
+import { parseFlag } from "../env-flag.js";
 
 /**
  * `knowledge-server migrate-config`
@@ -25,11 +26,10 @@ export function runMigrateConfig(): void {
 		? Number.parseInt(process.env.KNOWLEDGE_PORT, 10)
 		: null;
 	const host = process.env.KNOWLEDGE_HOST?.trim() || null;
-	// Capture DAEMON_AUTO_SPAWN when explicitly set to any value — both true and false
+	// Capture DAEMON_AUTO_SPAWN when explicitly set to a known spelling, true or false,
 	// should be migrated so the env var can be removed after migration.
-	const daemonAutoSpawnRaw = process.env.DAEMON_AUTO_SPAWN;
 	const daemonAutoSpawnExplicit =
-		daemonAutoSpawnRaw !== undefined ? daemonAutoSpawnRaw !== "false" : null;
+		parseFlag(process.env.DAEMON_AUTO_SPAWN) ?? null;
 
 	let storeBlock: string;
 	let envVarsToRemove: string[];

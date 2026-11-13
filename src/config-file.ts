@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
+import { FLAG_SPELLINGS, parseFlag } from "./env-flag.js";
 import { homeDir } from "./home.js";
 
 /**
@@ -311,9 +312,7 @@ function validateConfigFile(
 		throw new Error(`config.jsonc "stores" must contain at least one store`);
 	}
 
-	const stores: StoreConfig[] = obj.stores.map((s, i) =>
-		validateStore(s, i, configPath),
-	);
+	const stores: StoreConfig[] = obj.stores.map((s, i) => validateStore(s, i));
 
 	// Duplicate store IDs would silently clobber each other in StoreRegistry's Map.
 	const ids = stores.map((s) => s.id);
@@ -445,8 +444,14 @@ function validateConfigFile(
 		}
 		daemonAutoSpawn = obj.daemonAutoSpawn as boolean;
 	}
-	if (process.env.DAEMON_AUTO_SPAWN !== undefined) {
-		daemonAutoSpawn = process.env.DAEMON_AUTO_SPAWN !== "false";
+	const envAutoSpawn = parseFlag(process.env.DAEMON_AUTO_SPAWN);
+	if (envAutoSpawn === null) {
+		throw new Error(
+			`DAEMON_AUTO_SPAWN must be one of ${FLAG_SPELLINGS} (got "${process.env.DAEMON_AUTO_SPAWN}").`,
+		);
+	}
+	if (envAutoSpawn !== undefined) {
+		daemonAutoSpawn = envAutoSpawn;
 	}
 
 	// stateDb — optional, defaults to local SQLite. STATE_DB_URI env var forces Postgres.
@@ -581,11 +586,7 @@ function validateProject(
 	};
 }
 
-function validateStore(
-	raw: unknown,
-	index: number,
-	configPath: string,
-): StoreConfig {
+function validateStore(raw: unknown, index: number): StoreConfig {
 	const loc = `config.jsonc stores[${index}]`;
 
 	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
@@ -736,5 +737,6 @@ export const DEFAULT_CONFIG: KnowledgeServerConfig = {
 	userId: resolveUserId(),
 	port: parsePortEnvVar(process.env.KNOWLEDGE_PORT, 3179),
 	host: process.env.KNOWLEDGE_HOST?.trim() || "127.0.0.1",
-	daemonAutoSpawn: process.env.DAEMON_AUTO_SPAWN !== "false",
+	// An unknown spelling is reported by config.ts (validateConfig); the default applies here.
+	daemonAutoSpawn: parseFlag(process.env.DAEMON_AUTO_SPAWN) ?? true,
 };
