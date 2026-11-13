@@ -16,8 +16,9 @@
 # Verification: every downloaded file (binaries, plugin, slash commands) must
 # match its entry in the release's SHA256SUMS-<platform>. A missing entry, a
 # mismatch, or a missing sha256sum/shasum aborts before anything is installed.
-# Set KNOWLEDGE_REQUIRE_ATTESTATION=1 to also require a GitHub artifact
-# attestation (needs the gh CLI). See the README "Verifying releases" section.
+# Set KNOWLEDGE_REQUIRE_ATTESTATION=1 (or true, yes, on) to also require a GitHub
+# artifact attestation (needs the gh CLI). 0, false, no, off or unset skip it; any
+# other value aborts. See "Verifying a release" under "Security" in the README.
 #
 # The whole script lives in main(), called on the last line. A truncated
 # download therefore fails to parse and executes nothing.
@@ -87,11 +88,22 @@ verify_asset() {
   echo "  ✓ verified $name"
 }
 
+# Whether KNOWLEDGE_REQUIRE_ATTESTATION asks for an attestation check. Spellings
+# are case-insensitive: 1/true/yes/on require it; 0/false/no/off, or an unset or
+# empty value, do not. Any other value aborts, so a typo never silently skips it.
+attestation_required() {
+  local value
+  value="$(printf '%s' "${KNOWLEDGE_REQUIRE_ATTESTATION:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$value" in
+    1 | true | yes | on) return 0 ;;
+    "" | 0 | false | no | off) return 1 ;;
+    *) die "KNOWLEDGE_REQUIRE_ATTESTATION='${KNOWLEDGE_REQUIRE_ATTESTATION}' is not recognised. Use 1, true, yes or on to require attestation, or 0, false, no or off to skip it." ;;
+  esac
+}
+
 # Require a GitHub artifact attestation for a staged file. Only used when
-# KNOWLEDGE_REQUIRE_ATTESTATION=1.
+# attestation is required (see attestation_required).
 verify_attestation() {
-  command -v gh > /dev/null 2>&1 \
-    || die "KNOWLEDGE_REQUIRE_ATTESTATION=1 but the gh CLI is not installed (https://cli.github.com)."
   gh attestation verify "$1" --repo "$REPO" --signer-workflow "$REPO/.github/workflows/release-please.yml" > /dev/null \
     || die "attestation verification failed for $(basename "$1")."
   echo "  ✓ attestation $(basename "$1")"
@@ -187,6 +199,15 @@ main() {
     die "no sha256sum or shasum found — cannot verify downloads. Install coreutils (or perl's shasum) and re-run."
   fi
 
+  # Read KNOWLEDGE_REQUIRE_ATTESTATION before any download, so a bad value or a
+  # missing gh CLI fails here rather than after the binaries are fetched.
+  local require_attestation=false
+  if attestation_required; then
+    require_attestation=true
+    command -v gh > /dev/null 2>&1 \
+      || die "KNOWLEDGE_REQUIRE_ATTESTATION is set but the gh CLI is not installed (https://cli.github.com)."
+  fi
+
   # ── Resolve version ─────────────────────────────────────────────────────────
   if [ -z "$VERSION" ]; then
     echo "Fetching latest release..."
@@ -258,11 +279,11 @@ main() {
   for asset in "$server_asset" "$daemon_asset" "${plugin_assets[@]}"; do
     verify_asset "$STAGE_DIR/$asset" "$asset"
   done
-  # The manifest itself is trusted through the release origin, unless
-  # KNOWLEDGE_REQUIRE_ATTESTATION=1 (then it is attested too).
+  # The manifest itself is trusted through the release origin, unless attestation
+  # is required (KNOWLEDGE_REQUIRE_ATTESTATION), then it is attested too.
 
-  if [[ "${KNOWLEDGE_REQUIRE_ATTESTATION:-}" == "1" ]]; then
-    echo "Verifying attestations (KNOWLEDGE_REQUIRE_ATTESTATION=1)..."
+  if [[ "$require_attestation" == true ]]; then
+    echo "Verifying attestations (KNOWLEDGE_REQUIRE_ATTESTATION is set)..."
     verify_attestation "$STAGE_DIR/$server_asset"
     verify_attestation "$STAGE_DIR/$daemon_asset"
     verify_attestation "$STAGE_DIR/SHA256SUMS"
@@ -510,7 +531,11 @@ WRAPPER
   step=$((step + 1))
 
   echo "  $step. Verify it's running:"
-  echo "     curl http://127.0.0.1:3179/status"
+  if [ -n "${KNOWLEDGE_ADMIN_TOKEN:-}" ]; then
+    echo "     curl -H \"Authorization: Bearer \$KNOWLEDGE_ADMIN_TOKEN\" http://127.0.0.1:3179/status"
+  else
+    echo "     curl http://127.0.0.1:3179/status"
+  fi
   echo ""
   echo "The OpenCode plugin is already active — no restart needed."
   echo "The MCP 'activate' tool is available in any session once you add the config block above."

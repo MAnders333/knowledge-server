@@ -59,9 +59,11 @@ describe("KnowledgeDB.tryAcquireConsolidationLock (SQLite lockfile)", () => {
 		expect(existsSync(lockFile)).toBe(false);
 	});
 
-	it("refuses a second acquire while this store holds the lock", async () => {
+	it("throws on a second acquire while this store holds the lock", async () => {
 		expect(await db.tryAcquireConsolidationLock()).toBe(true);
-		expect(await db.tryAcquireConsolidationLock()).toBe(false);
+		await expect(db.tryAcquireConsolidationLock()).rejects.toThrow(
+			"already held",
+		);
 		await db.releaseConsolidationLock();
 		expect(await db.tryAcquireConsolidationLock()).toBe(true);
 		await db.releaseConsolidationLock();
@@ -82,7 +84,9 @@ describe("KnowledgeDB.tryAcquireConsolidationLock (SQLite lockfile)", () => {
 		const memory = new KnowledgeDB(":memory:");
 		try {
 			expect(await memory.tryAcquireConsolidationLock()).toBe(true);
-			expect(await memory.tryAcquireConsolidationLock()).toBe(true);
+			await expect(memory.tryAcquireConsolidationLock()).rejects.toThrow(
+				"already held",
+			);
 			await memory.releaseConsolidationLock();
 		} finally {
 			await memory.close();

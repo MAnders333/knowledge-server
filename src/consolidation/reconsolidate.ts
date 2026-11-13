@@ -5,13 +5,13 @@ import {
 	formatEmbeddingText,
 } from "../activation/embeddings.js";
 import { config } from "../config.js";
-import { approxTokens } from "../daemon/readers/shared.js";
 import type { IKnowledgeStore } from "../db/index.js";
+import { computeStrength } from "../domain/strength.js";
+import { approxTokens } from "../domain/tokens.js";
 import { logger } from "../logger.js";
 import { redactSecrets } from "../redact.js";
 import { clampKnowledgeType } from "../types.js";
 import type { KnowledgeEntry } from "../types.js";
-import { computeStrength } from "./decay.js";
 import type { ConsolidationLLM, ExtractedKnowledge } from "./llm.js";
 
 /**
@@ -252,14 +252,14 @@ export class Reconsolidator {
 				insertDb,
 			);
 			await callbacks.onInsert(inserted);
-			logger.log(
+			logger.debug(
 				`[${logPrefix}] Insert (novel, sim=${nearestSimilarity.toFixed(3)}): ${JSON.stringify(entry.content)}`,
 			);
 			return;
 		}
 
 		// Above threshold → ask LLM for a focused merge decision
-		logger.log(
+		logger.debug(
 			`[${logPrefix}] Reconsolidation candidate (sim=${nearestSimilarity.toFixed(3)}): ${JSON.stringify(entry.content)} vs ${JSON.stringify(nearestEntry.content)}`,
 		);
 
@@ -291,7 +291,7 @@ export class Reconsolidator {
 				// event; it's confirmation that the knowledge is still true.
 				// existingDb — nearestEntry lives in whichever store entriesMap was loaded from.
 				await existingDb.reinforceObservation(nearestEntry.id);
-				logger.log(
+				logger.debug(
 					`[${logPrefix}] Keep existing (reinforced): ${JSON.stringify(nearestEntry.content)}`,
 				);
 				await callbacks.onKeep();
@@ -337,13 +337,13 @@ export class Reconsolidator {
 						sessionTimestamp,
 						insertDb,
 					);
-					logger.log(
+					logger.debug(
 						`[${logPrefix}] Insert (merge target deleted): ${JSON.stringify(entry.content)}`,
 					);
 					await callbacks.onInsert(inserted);
 					break;
 				}
-				logger.log(
+				logger.debug(
 					`[${logPrefix}] ${decision.action === "update" ? "Updated" : "Replaced"}: ${JSON.stringify(nearestEntry.content)} → ${JSON.stringify(decision.content)}`,
 				);
 				await callbacks.onUpdate(nearestEntry.id, mergeUpdates, freshEmbedding);
@@ -358,7 +358,7 @@ export class Reconsolidator {
 					sessionTimestamp,
 					insertDb,
 				);
-				logger.log(
+				logger.debug(
 					`[${logPrefix}] Insert (distinct despite similarity): ${JSON.stringify(entry.content)}`,
 				);
 				await callbacks.onInsert(inserted);
@@ -640,7 +640,7 @@ export class Reconsolidator {
 			// the cluster will not be retried even if all results fail here.
 			let clusterReconsolidated = 0;
 			for (const result of results) {
-				logger.log(
+				logger.debug(
 					`[synthesis] Synthesized ${result.type}: ${JSON.stringify(result.content)}`,
 				);
 
@@ -793,10 +793,9 @@ export class Reconsolidator {
 		// log a warning so the operator can investigate, since an entry stamped at
 		// 1970-01-01 will appear 55+ years old and likely archive on the first decay pass.
 		if (sessionTimestamp === 0) {
-			// JSON.stringify escapes control characters and ANSI codes so LLM-sourced
-			// content cannot inject structured tokens into the log stream.
+			// Entry text is left out of this warning: it is LLM-sourced and logged at debug only.
 			logger.warn(
-				`[consolidation] sessionTimestamp = 0 (epoch) — likely a corrupt or uninitialised session record. Entry will be stamped at 1970-01-01 and may archive immediately. Entry: ${JSON.stringify(entry.content)}`,
+				"[consolidation] sessionTimestamp = 0 (epoch) — likely a corrupt or uninitialised session record. Entry will be stamped at 1970-01-01 and may archive immediately.",
 			);
 		}
 		const entryTime =

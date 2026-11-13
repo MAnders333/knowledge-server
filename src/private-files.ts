@@ -2,17 +2,17 @@ import { chmodSync, lstatSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
 	DEFAULT_CONFIG,
-	DEFAULT_CONFIG_PATH,
 	type KnowledgeServerConfig,
+	defaultConfigPath,
 	loadConfigFile,
 	resolveSqlitePath,
 } from "./config-file.js";
 import { config } from "./config.js";
-import { DEFAULT_DAEMON_DB_PATH } from "./db/daemon/index.js";
-import { DEFAULT_SERVER_STATE_PATH } from "./db/state/index.js";
+import { defaultDaemonDbPath } from "./db/daemon/index.js";
+import { defaultStateDbPath } from "./db/state/index.js";
 import { logger } from "./logger.js";
 
-export interface PrivatePathTargets {
+interface PrivatePathTargets {
 	/** Files that hold secrets, logs or state: owner-only (0600). */
 	files: string[];
 	/** Directories we own: owner-only (0700). */
@@ -27,7 +27,7 @@ const SQLITE_SIDECARS = ["", "-wal", "-shm", "-journal"];
  * Missing paths are harmless; a config that fails to load falls back to defaults.
  */
 export function ownedPrivatePaths(
-	configPath = DEFAULT_CONFIG_PATH,
+	configPath = defaultConfigPath(),
 ): PrivatePathTargets {
 	let file: KnowledgeServerConfig = DEFAULT_CONFIG;
 	try {
@@ -41,14 +41,14 @@ export function ownedPrivatePaths(
 			.filter((s) => s.kind === "sqlite")
 			.map((s) => resolveSqlitePath(s)),
 		...(file.stateDb.kind === "sqlite"
-			? [file.stateDb.path ?? DEFAULT_SERVER_STATE_PATH]
+			? [file.stateDb.path ?? defaultStateDbPath()]
 			: []),
-		DEFAULT_DAEMON_DB_PATH,
+		defaultDaemonDbPath(),
 	];
 
 	const configDir = dirname(configPath);
 	// Legacy .env location (pre-config-dir installs) lives in the data dir.
-	const dataDir = dirname(DEFAULT_SERVER_STATE_PATH);
+	const dataDir = dirname(defaultStateDbPath());
 	const envFiles = [
 		join(configDir, ".env"),
 		join(dataDir, ".env"),
@@ -58,6 +58,7 @@ export function ownedPrivatePaths(
 	];
 
 	const files = [
+		configPath,
 		config.logPath,
 		config.pidPath,
 		join(dataDir, "daemon.log"),

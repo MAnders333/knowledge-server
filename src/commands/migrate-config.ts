@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { DEFAULT_CONFIG_PATH, DEFAULT_SQLITE_PATH } from "../config-file.js";
+import { defaultConfigPath, defaultSqlitePath } from "../config-file.js";
+import { parseFlag } from "../env-flag.js";
 
 /**
  * `knowledge-server migrate-config`
@@ -12,24 +13,23 @@ import { DEFAULT_CONFIG_PATH, DEFAULT_SQLITE_PATH } from "../config-file.js";
  * Safe to run multiple times — exits early if config.jsonc already exists.
  */
 export function runMigrateConfig(): void {
-	if (existsSync(DEFAULT_CONFIG_PATH)) {
-		console.log(`Config file already exists at ${DEFAULT_CONFIG_PATH}`);
+	if (existsSync(defaultConfigPath())) {
+		console.log(`Config file already exists at ${defaultConfigPath()}`);
 		console.log("Remove it first if you want to regenerate it.");
 		process.exit(0);
 	}
 
 	const pgUri = process.env.POSTGRES_CONNECTION_URI;
-	const sqlitePath = process.env.KNOWLEDGE_DB_PATH ?? DEFAULT_SQLITE_PATH;
+	const sqlitePath = process.env.KNOWLEDGE_DB_PATH ?? defaultSqlitePath();
 	const userId = process.env.KNOWLEDGE_USER_ID?.trim();
 	const port = process.env.KNOWLEDGE_PORT
 		? Number.parseInt(process.env.KNOWLEDGE_PORT, 10)
 		: null;
 	const host = process.env.KNOWLEDGE_HOST?.trim() || null;
-	// Capture DAEMON_AUTO_SPAWN when explicitly set to any value — both true and false
+	// Capture DAEMON_AUTO_SPAWN when explicitly set to a known spelling, true or false,
 	// should be migrated so the env var can be removed after migration.
-	const daemonAutoSpawnRaw = process.env.DAEMON_AUTO_SPAWN;
 	const daemonAutoSpawnExplicit =
-		daemonAutoSpawnRaw !== undefined ? daemonAutoSpawnRaw !== "false" : null;
+		parseFlag(process.env.DAEMON_AUTO_SPAWN) ?? null;
 
 	let storeBlock: string;
 	let envVarsToRemove: string[];
@@ -54,7 +54,7 @@ export function runMigrateConfig(): void {
       "writable": true
     }`;
 		envVarsToRemove =
-			sqlitePath !== DEFAULT_SQLITE_PATH ? ["KNOWLEDGE_DB_PATH"] : [];
+			sqlitePath !== defaultSqlitePath() ? ["KNOWLEDGE_DB_PATH"] : [];
 	}
 
 	// userId block — written only when KNOWLEDGE_USER_ID is set, so the generated
@@ -140,11 +140,19 @@ ${daemonBlock}
 }
 `;
 
-	// Ensure directory exists
-	mkdirSync(dirname(DEFAULT_CONFIG_PATH), { recursive: true });
-	writeFileSync(DEFAULT_CONFIG_PATH, content, "utf8");
+	// The config holds store credentials, so its directory and the file are owner-only.
+	// writeFileSync applies its mode only when it creates the file, so chmod covers a
+	// file that already exists.
+	const configDir = dirname(defaultConfigPath());
+	mkdirSync(configDir, { recursive: true, mode: 0o700 });
+	chmodSync(configDir, 0o700);
+	writeFileSync(defaultConfigPath(), content, {
+		encoding: "utf8",
+		mode: 0o600,
+	});
+	chmodSync(defaultConfigPath(), 0o600);
 
-	console.log(`✓ Written to ${DEFAULT_CONFIG_PATH}`);
+	console.log(`✓ Written to ${defaultConfigPath()}`);
 	console.log("");
 
 	if (pgUri) {

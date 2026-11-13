@@ -10,6 +10,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
+	chmodSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
@@ -17,15 +18,18 @@ import {
 	readFileSync,
 	readlinkSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	setupClaudeCode,
 	setupCodex,
 	setupCursor,
 	setupOhMyPi,
 	stripJsoncComments,
+	writeOpenCodeMcpEntry,
 } from "../src/commands/setup-tool";
 import {
 	type SetupIsolation,
@@ -388,16 +392,25 @@ describe("setupCodex UserPromptSubmit hook", () => {
 				h.command?.includes("/hooks/claude-code/user-prompt?client=codex"),
 			);
 
-	it("writes a command hook that posts to the endpoint with a 5 s timeout and never fails the prompt", () => {
+	/** The script inside `/bin/sh -c '…'`, with the outer quoting undone. */
+	const innerScript = (command: string): string => {
+		const prefix = "/bin/sh -c '";
+		expect(command.startsWith(prefix)).toBe(true);
+		expect(command.endsWith("'")).toBe(true);
+		return command.slice(prefix.length, -1).replace(/'\\''/g, "'");
+	};
+
+	it("writes a command hook that runs under /bin/sh with a 5 s timeout and never fails the prompt", () => {
 		setupCodex();
 		const handlers = knowledgeHandlers();
 		expect(handlers).toHaveLength(1);
 		expect(handlers[0].type).toBe("command");
 		expect(handlers[0].timeout).toBe(5);
-		expect(handlers[0].command).toContain(
-			"curl -s --noproxy '*' --fail --max-time 4 --data-binary @-",
+		const script = innerScript(handlers[0].command ?? "");
+		expect(script).toContain(
+			"curl -s --noproxy '*' --fail --max-time 4 ${KNOWLEDGE_ADMIN_TOKEN:+-H @/dev/fd/3} --data-binary @-",
 		);
-		expect(handlers[0].command?.endsWith("|| true")).toBe(true);
+		expect(script.split("\n")[0].endsWith("|| true")).toBe(true);
 	});
 
 	it("is idempotent: a second run leaves hooks.json byte-identical", () => {
@@ -467,6 +480,221 @@ describe("setupCodex UserPromptSubmit hook", () => {
 		setupCodex();
 		expect(readFileSync(HOOKS_PATH(), "utf8")).toBe("{ broken");
 	});
+
+	// Codex starts the hook with the user's shell. Every shell installed here runs the
+	// same hook command against the stub server.
+	const SHELLS = ["sh", "bash", "zsh", "fish"].filter(
+		(name) => Bun.which(name) !== null,
+	);
+	for (const shell of SHELLS) {
+		it(`sends the admin bearer only when set, with ${shell} as the outer shell`, async () => {
+			const token = "stable-admin-token-0123456789";
+			setupCodex();
+			const command = knowledgeHandlers()[0]?.command ?? "";
+			const received: Array<string | null> = [];
+			const server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				fetch(req) {
+					received.push(req.headers.get("authorization"));
+					return Response.json({});
+				},
+			});
+			// A curl shim records the arguments it starts with, then runs the real curl.
+			const shimDir = mkdtempSync(join(tmpdir(), "setup-codex-curl-"));
+			const argvLog = join(shimDir, "argv.txt");
+			const realCurl = Bun.which("curl") ?? "/usr/bin/curl";
+			writeFileSync(
+				join(shimDir, "curl"),
+				`#!/bin/sh\nprintf '%s\\n' "$@" > "${argvLog}"\nexec "${realCurl}" "$@"\n`,
+			);
+			chmodSync(join(shimDir, "curl"), 0o755);
+			try {
+				// Only the origin changes: the command runs as written.
+				const local = command.replace(
+					/http:\/\/[^\s']+/,
+					`http://127.0.0.1:${server.port}/hooks/claude-code/user-prompt?client=codex`,
+				);
+				const shellPath = Bun.which(shell) ?? shell;
+				const run = async (env: Record<string, string>): Promise<string[]> => {
+					const proc = Bun.spawn([shellPath, "-c", local], {
+						env: {
+							PATH: `${shimDir}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+							HOME: shimDir,
+							...env,
+						},
+						stdin: Buffer.from('{"prompt":"hello"}'),
+						stdout: "pipe",
+						stderr: "pipe",
+					});
+					await proc.exited;
+					return readFileSync(argvLog, "utf8").split("\n");
+				};
+				const argvUnset = await run({});
+				const argvSet = await run({ KNOWLEDGE_ADMIN_TOKEN: token });
+
+				expect(argvUnset).not.toContain("-H");
+				expect(argvSet).toContain("-H");
+				expect(argvSet.join("\n")).not.toContain(token);
+			} finally {
+				server.stop(true);
+				rmSync(shimDir, { recursive: true, force: true });
+			}
+			expect(received).toEqual([null, `Bearer ${token}`]);
+		});
+	}
+
+	it("replaces the one-line hook an earlier release wrote, and a re-run is byte-identical", () => {
+		writeFileSync(
+			HOOKS_PATH(),
+			JSON.stringify({
+				hooks: {
+					UserPromptSubmit: [
+						{
+							hooks: [
+								{
+									type: "command",
+									command:
+										"curl -s --noproxy '*' --fail --max-time 4 ${KNOWLEDGE_ADMIN_TOKEN:+-H @/dev/fd/3} --data-binary @- 'http://127.0.0.1:3179/hooks/claude-code/user-prompt?client=codex' || true",
+									timeout: 5,
+								},
+							],
+						},
+					],
+				},
+			}),
+		);
+		setupCodex();
+		const handlers = knowledgeHandlers();
+		expect(handlers).toHaveLength(1);
+		expect(handlers[0].command?.startsWith("/bin/sh -c '")).toBe(true);
+		const first = readFileSync(HOOKS_PATH(), "utf8");
+		setupCodex();
+		expect(readFileSync(HOOKS_PATH(), "utf8")).toBe(first);
+	});
+});
+
+// ── setupClaudeCode UserPromptSubmit hook ────────────────────────────────────
+
+describe("setupClaudeCode UserPromptSubmit hook", () => {
+	const settingsPath = () => join(isolation.home, ".claude", "settings.json");
+	const readHandlers = (): Array<Record<string, unknown>> => {
+		const settings = JSON.parse(readFileSync(settingsPath(), "utf8")) as {
+			hooks: {
+				UserPromptSubmit: Array<{ hooks?: Array<Record<string, unknown>> }>;
+			};
+		};
+		return settings.hooks.UserPromptSubmit.flatMap(
+			(group) => group.hooks ?? [],
+		);
+	};
+	const knowledgeHandlers = () =>
+		readHandlers().filter((h) =>
+			String(h.url).includes("/hooks/claude-code/user-prompt"),
+		);
+
+	it("writes the hook with the admin bearer and allows that variable to be expanded", () => {
+		setupClaudeCode();
+		expect(knowledgeHandlers()).toEqual([
+			{
+				type: "http",
+				url: expect.stringContaining("/hooks/claude-code/user-prompt"),
+				timeout: 5,
+				headers: { Authorization: "Bearer $KNOWLEDGE_ADMIN_TOKEN" },
+				allowedEnvVars: ["KNOWLEDGE_ADMIN_TOKEN"],
+			},
+		]);
+	});
+
+	it("upgrades a hook written before the token header, and a re-run is byte-identical", () => {
+		setupClaudeCode();
+		const url = knowledgeHandlers()[0].url;
+		writeFileSync(
+			settingsPath(),
+			JSON.stringify({
+				hooks: {
+					UserPromptSubmit: [{ hooks: [{ type: "http", url, timeout: 5 }] }],
+				},
+			}),
+		);
+
+		setupClaudeCode();
+		expect(knowledgeHandlers()).toHaveLength(1);
+		expect(knowledgeHandlers()[0].headers).toEqual({
+			Authorization: "Bearer $KNOWLEDGE_ADMIN_TOKEN",
+		});
+
+		const first = readFileSync(settingsPath(), "utf8");
+		setupClaudeCode();
+		expect(readFileSync(settingsPath(), "utf8")).toBe(first);
+	});
+
+	it("keeps the user's own hooks", () => {
+		mkdirSync(join(isolation.home, ".claude"), { recursive: true });
+		writeFileSync(
+			settingsPath(),
+			JSON.stringify({
+				hooks: {
+					UserPromptSubmit: [
+						{ hooks: [{ type: "command", command: "user-hook.sh" }] },
+					],
+				},
+			}),
+		);
+		setupClaudeCode();
+		expect(readHandlers().map((h) => h.command)).toContain("user-hook.sh");
+		expect(knowledgeHandlers()).toHaveLength(1);
+	});
+});
+
+// ── Config file modes ────────────────────────────────────────────────────────
+
+describe("setup keeps config file modes", () => {
+	const modeOf = (path: string) => statSync(path).mode & 0o777;
+
+	it("creates new Codex config and hooks files 0600", () => {
+		setupCodex();
+		expect(modeOf(join(isolation.home, ".codex", "config.toml"))).toBe(0o600);
+		expect(modeOf(join(isolation.home, ".codex", "hooks.json"))).toBe(0o600);
+	});
+
+	it("keeps the mode of an existing Codex config.toml", () => {
+		mkdirSync(join(isolation.home, ".codex"), { recursive: true });
+		const configPath = join(isolation.home, ".codex", "config.toml");
+		writeFileSync(configPath, '[model]\nname = "o4-mini"\n');
+		chmodSync(configPath, 0o640);
+		setupCodex();
+		expect(modeOf(configPath)).toBe(0o640);
+	});
+
+	it("keeps the mode of an existing Cursor mcp.json", () => {
+		mkdirSync(join(isolation.home, ".cursor"), { recursive: true });
+		const mcpPath = join(isolation.home, ".cursor", "mcp.json");
+		writeFileSync(mcpPath, JSON.stringify({ mcpServers: {} }));
+		chmodSync(mcpPath, 0o640);
+		setupCursor();
+		expect(modeOf(mcpPath)).toBe(0o640);
+	});
+
+	it("keeps the mode of an existing opencode.jsonc", () => {
+		const dir = join(isolation.home, ".config", "opencode");
+		mkdirSync(dir, { recursive: true });
+		const configPath = join(dir, "opencode.jsonc");
+		writeFileSync(configPath, "{}");
+		chmodSync(configPath, 0o640);
+		writeOpenCodeMcpEntry(dir);
+		expect(modeOf(configPath)).toBe(0o640);
+	});
+
+	it("creates a new Claude settings.json 0600 and keeps an existing mode", () => {
+		const settingsPath = join(isolation.home, ".claude", "settings.json");
+		setupClaudeCode();
+		expect(modeOf(settingsPath)).toBe(0o600);
+
+		chmodSync(settingsPath, 0o640);
+		setupClaudeCode();
+		expect(modeOf(settingsPath)).toBe(0o640);
+	});
 });
 
 // ── setupOhMyPi ──────────────────────────────────────────────────────────────
@@ -507,5 +735,213 @@ describe("setupOhMyPi", () => {
 		mkdirSync(join(ompRoot, "agent"), { recursive: true });
 		setupOhMyPi(ompRoot);
 		expect(existsSync(join(ompRoot, "agent", "settings.json"))).toBe(false);
+	});
+});
+
+// ── MCP entries for a source install ─────────────────────────────────────────
+
+describe("source-install MCP entries load .env", () => {
+	const cursorPath = () => join(isolation.home, ".cursor", "mcp.json");
+	const cursorEnv = () =>
+		(
+			JSON.parse(readFileSync(cursorPath(), "utf8")) as {
+				mcpServers: { knowledge: { env: Record<string, string> } };
+			}
+		).mcpServers.knowledge.env;
+
+	it("sets KNOWLEDGE_LOAD_ENV in the Cursor entry", () => {
+		setupCursor();
+		expect(cursorEnv()).toMatchObject({
+			KNOWLEDGE_HOST: expect.any(String),
+			KNOWLEDGE_PORT: expect.any(String),
+			KNOWLEDGE_LOAD_ENV: "1",
+		});
+	});
+
+	it("sets KNOWLEDGE_LOAD_ENV in the Codex config.toml entry", () => {
+		setupCodex();
+		expect(
+			readFileSync(join(isolation.home, ".codex", "config.toml"), "utf8"),
+		).toMatch(/env = \{ .*KNOWLEDGE_LOAD_ENV = "1" \}/);
+	});
+
+	it("sets KNOWLEDGE_LOAD_ENV in the opencode.jsonc entry", () => {
+		const dir = join(isolation.home, ".config", "opencode");
+		mkdirSync(dir, { recursive: true });
+		writeOpenCodeMcpEntry(dir);
+		const parsed = JSON.parse(
+			readFileSync(join(dir, "opencode.jsonc"), "utf8"),
+		) as { mcp: { knowledge: { environment: Record<string, string> } } };
+		expect(parsed.mcp.knowledge.environment).toMatchObject({
+			KNOWLEDGE_LOAD_ENV: "1",
+		});
+	});
+
+	it("upgrades a Cursor entry written before the variable existed", () => {
+		setupCursor();
+		const written = JSON.parse(readFileSync(cursorPath(), "utf8")) as {
+			mcpServers: { knowledge: { env: Record<string, string | undefined> } };
+		};
+		// An entry from before the variable: undefined is dropped by JSON.stringify.
+		written.mcpServers.knowledge.env.KNOWLEDGE_LOAD_ENV = undefined;
+		writeFileSync(cursorPath(), JSON.stringify(written));
+
+		setupCursor();
+		expect(cursorEnv().KNOWLEDGE_LOAD_ENV).toBe("1");
+	});
+});
+
+// ── MCP entries keep what the user set ───────────────────────────────────────
+
+describe("setup merges MCP entries instead of replacing them", () => {
+	const STALE_COMMAND = ["/old/bun", "run", "/old/src/index.ts", "mcp"];
+	const openCodeDir = () => join(isolation.home, ".config", "opencode");
+	const openCodePath = () => join(openCodeDir(), "opencode.jsonc");
+	const cursorDir = () => join(isolation.home, ".cursor");
+	const cursorPath = () => join(cursorDir(), "mcp.json");
+	type Knowledge = Record<string, unknown>;
+	type Environment = Record<string, string>;
+
+	/** The entry setup writes into an empty config: the baseline for user edits. */
+	const freshOpenCode = (): Knowledge => {
+		writeOpenCodeMcpEntry(openCodeDir());
+		return (
+			JSON.parse(readFileSync(openCodePath(), "utf8")) as {
+				mcp: { knowledge: Knowledge };
+			}
+		).mcp.knowledge;
+	};
+	const seedOpenCode = (knowledge: Knowledge, mode?: number) => {
+		mkdirSync(openCodeDir(), { recursive: true });
+		writeFileSync(
+			openCodePath(),
+			JSON.stringify({ mcp: { knowledge } }, null, 2),
+		);
+		if (mode !== undefined) chmodSync(openCodePath(), mode);
+	};
+	const readOpenCode = (): Knowledge =>
+		(
+			JSON.parse(readFileSync(openCodePath(), "utf8")) as {
+				mcp: { knowledge: Knowledge };
+			}
+		).mcp.knowledge;
+
+	const freshCursor = (): Knowledge => {
+		setupCursor();
+		return (
+			JSON.parse(readFileSync(cursorPath(), "utf8")) as {
+				mcpServers: { knowledge: Knowledge };
+			}
+		).mcpServers.knowledge;
+	};
+	const seedCursor = (knowledge: Knowledge, mode?: number) => {
+		mkdirSync(cursorDir(), { recursive: true });
+		writeFileSync(
+			cursorPath(),
+			JSON.stringify({ mcpServers: { knowledge } }, null, 2),
+		);
+		if (mode !== undefined) chmodSync(cursorPath(), mode);
+	};
+	const readCursor = (): Knowledge =>
+		(
+			JSON.parse(readFileSync(cursorPath(), "utf8")) as {
+				mcpServers: { knowledge: Knowledge };
+			}
+		).mcpServers.knowledge;
+
+	it("keeps enabled: false when the command is refreshed (OpenCode)", () => {
+		const fresh = freshOpenCode();
+		seedOpenCode({ ...fresh, command: STALE_COMMAND, enabled: false });
+		writeOpenCodeMcpEntry(openCodeDir());
+		expect(readOpenCode()).toMatchObject({
+			enabled: false,
+			command: fresh.command,
+		});
+	});
+
+	it("keeps environment variables the user added (OpenCode)", () => {
+		const fresh = freshOpenCode();
+		const env = fresh.environment as Environment;
+		seedOpenCode({ ...fresh, environment: { ...env, MY_SETTING: "kept" } });
+		writeOpenCodeMcpEntry(openCodeDir());
+		expect(readOpenCode().environment).toEqual({ ...env, MY_SETTING: "kept" });
+	});
+
+	it("replaces a stale command and a stale KNOWLEDGE_* value (OpenCode)", () => {
+		const fresh = freshOpenCode();
+		const env = fresh.environment as Environment;
+		seedOpenCode({
+			...fresh,
+			command: STALE_COMMAND,
+			environment: { ...env, KNOWLEDGE_PORT: "1111" },
+		});
+		writeOpenCodeMcpEntry(openCodeDir());
+		expect(readOpenCode()).toMatchObject({
+			command: fresh.command,
+			environment: env,
+		});
+	});
+
+	it("a second run leaves opencode.jsonc byte-identical", () => {
+		seedOpenCode({ ...freshOpenCode(), command: STALE_COMMAND });
+		writeOpenCodeMcpEntry(openCodeDir());
+		const first = readFileSync(openCodePath(), "utf8");
+		writeOpenCodeMcpEntry(openCodeDir());
+		expect(readFileSync(openCodePath(), "utf8")).toBe(first);
+	});
+
+	it("keeps the mode of opencode.jsonc when it changes", () => {
+		seedOpenCode({ ...freshOpenCode(), command: STALE_COMMAND }, 0o640);
+		writeOpenCodeMcpEntry(openCodeDir());
+		expect(statSync(openCodePath()).mode & 0o777).toBe(0o640);
+	});
+
+	it("keeps a disabled flag the user set (Cursor)", () => {
+		const fresh = freshCursor();
+		seedCursor({ ...fresh, command: STALE_COMMAND, disabled: true });
+		setupCursor();
+		expect(readCursor()).toMatchObject({
+			disabled: true,
+			command: fresh.command,
+		});
+	});
+
+	it("keeps environment variables the user added (Cursor)", () => {
+		const fresh = freshCursor();
+		const env = fresh.env as Environment;
+		seedCursor({ ...fresh, env: { ...env, MY_SETTING: "kept" } });
+		setupCursor();
+		expect(readCursor().env).toEqual({ ...env, MY_SETTING: "kept" });
+	});
+
+	it("replaces a stale command and a stale KNOWLEDGE_* value (Cursor)", () => {
+		const fresh = freshCursor();
+		const env = fresh.env as Environment;
+		seedCursor({
+			...fresh,
+			command: STALE_COMMAND[0],
+			args: STALE_COMMAND.slice(1),
+			env: { ...env, KNOWLEDGE_PORT: "1111" },
+		});
+		setupCursor();
+		expect(readCursor()).toMatchObject({
+			command: fresh.command,
+			args: fresh.args,
+			env,
+		});
+	});
+
+	it("a second run leaves mcp.json byte-identical (Cursor)", () => {
+		seedCursor({ ...freshCursor(), command: STALE_COMMAND[0] });
+		setupCursor();
+		const first = readFileSync(cursorPath(), "utf8");
+		setupCursor();
+		expect(readFileSync(cursorPath(), "utf8")).toBe(first);
+	});
+
+	it("keeps the mode of mcp.json when it changes (Cursor)", () => {
+		seedCursor({ ...freshCursor(), command: STALE_COMMAND[0] }, 0o640);
+		setupCursor();
+		expect(statSync(cursorPath()).mode & 0o777).toBe(0o640);
 	});
 });

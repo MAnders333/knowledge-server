@@ -35,7 +35,7 @@
 import "../env.js";
 import pkg from "../../package.json" with { type: "json" };
 import { resolveDataDir } from "../config-file.js";
-import { config } from "../config.js";
+import { config, configEnvIssues } from "../config.js";
 import { DaemonDB } from "../db/daemon/index.js";
 import { createServerStateDB } from "../db/state/factory.js";
 import { logger, parseLogLevel } from "../logger.js";
@@ -83,14 +83,12 @@ const intervalArg = args.find((a) => a.startsWith("--interval="));
 const parsedInterval = intervalArg
 	? Number.parseInt(intervalArg.split("=")[1], 10)
 	: Number.NaN;
-const envInterval = process.env.DAEMON_UPLOAD_INTERVAL_SECONDS
-	? Number.parseInt(process.env.DAEMON_UPLOAD_INTERVAL_SECONDS, 10)
-	: Number.NaN;
+// DAEMON_UPLOAD_INTERVAL_SECONDS is parsed once, in config.
 const intervalMs =
 	!Number.isNaN(parsedInterval) && parsedInterval > 0
 		? parsedInterval * 1000
-		: !Number.isNaN(envInterval) && envInterval > 0
-			? envInterval * 1000
+		: config.daemon.uploadIntervalSeconds !== null
+			? config.daemon.uploadIntervalSeconds * 1000
 			: 30 * 60 * 1000; // default: 30 minutes — gives sessions time to reach a natural pause
 
 const onceFlag = args.includes("--once");
@@ -107,15 +105,28 @@ logger.init(
 	parseLogLevel(process.env.LOG_LEVEL),
 	config.logMaxBytes,
 );
+// The daemon does not run validateConfig() (it needs no LLM credentials), so it
+// reports the invalid environment values it parsed itself.
+for (const issue of configEnvIssues()) logger.warn(`[config] ${issue}`);
 
 // Single instance per data directory. Taken before any DB connection. A polling
 // daemon that finds another one running idles and takes over when it exits; it
 // does not exit, so launchd/systemd do not restart it in a loop. A one-shot run
 // (--once, cron/on-demand) has nothing to wait for and exits instead.
 const daemonLockFile = daemonLockPath(dataDir);
+// A daemon that finds its lock taken over stops at once: another daemon now owns
+// the data directory. launchd/systemd restart this process, and the restart waits.
+const onDaemonLockLost = () => {
+	logger.error(
+		"[daemon] daemon.lock was taken over by another process. Exiting so only one daemon writes.",
+	);
+	process.exit(1);
+};
 let daemonLock: LockHandle;
 if (onceFlag) {
-	const lock = tryAcquireProcessLock(daemonLockFile);
+	const lock = tryAcquireProcessLock(daemonLockFile, {
+		onLost: onDaemonLockLost,
+	});
 	if (!lock) {
 		const holder = lockHolder(daemonLockFile);
 		const who = holder && holder.pid > 0 ? ` (PID ${holder.pid})` : "";
@@ -133,6 +144,7 @@ if (onceFlag) {
 				`[daemon] Another knowledge-daemon${who} already runs for ${dataDir}. Waiting to take over; retrying every ${DAEMON_LOCK_RETRY_MS / 1000} s.`,
 			);
 		},
+		onLost: onDaemonLockLost,
 	});
 	daemonLock = lock;
 	if (waited) logger.log("[daemon] Took over the daemon lock; starting.");
@@ -180,6 +192,9 @@ const uploader = new EpisodeUploader(readers, serverStateDb, daemonDb, userId, {
 	initialLookbackDays: parseInitialLookbackDays(
 		process.env.INITIAL_LOOKBACK_DAYS,
 	),
+	// Only the daemon honours reinitialize's full re-ingest request. Other uploaders
+	// (process-inbox) must not clear it, or the daemon would skip its history.
+	fullBackfillRequests: true,
 });
 
 const closeResources = async () => {

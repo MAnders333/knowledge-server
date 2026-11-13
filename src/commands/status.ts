@@ -1,11 +1,17 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import pkg from "../../package.json" with { type: "json" };
 import { resolveServerAddress } from "../config-file.js";
 import { StoreRegistry } from "../db/store-registry.js";
-import { errCode } from "../utils.js";
+import {
+	type ProcessTable,
+	classifyPidFile,
+	isServerCommand,
+	locatePidFile,
+	systemProcessTable,
+} from "../process-identity.js";
 
 /** Window for the per-source capture vs injection check. */
-export const COVERAGE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const COVERAGE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
  * Capture source (reader `source`) -> activation client tag, where they differ.
@@ -19,7 +25,7 @@ const CLIENT_TO_SOURCE = Object.fromEntries(
 	Object.entries(SOURCE_TO_CLIENT).map(([source, client]) => [client, source]),
 );
 
-export interface CoverageRow {
+interface CoverageRow {
 	source: string;
 	captured: number;
 	injected: number;
@@ -52,26 +58,31 @@ export function summarizeCoverage(
 		.filter((r) => r.captured > 0 && r.injected === 0)
 		.map(
 			(r) =>
-				`${r.source}: ${r.captured} episodes captured in the last 7 days but nothing injected. Check that the client calls /activate with its client tag.`,
+				`${r.source}: ${r.captured} episodes captured in the last 7 days but no activation injected any entries (each returned nothing or missed the client deadline). Check that the client calls /activate with its client tag, and that the server answers within the client's deadline.`,
 		);
 	return { rows, warnings };
 }
 
-export interface ServerHealth {
+interface ServerHealth {
 	health: string;
 	reasons: string[];
 }
 
 /**
- * Health verdict from a running server's GET /status. Null when the server does
- * not answer or the reply has no health field (for example an older server).
+ * Health verdict from a running server's GET /status. Null when the server does not
+ * answer or the reply has no health field (for example an older server). With a stable
+ * admin token the server may require it on /status (KNOWLEDGE_PROTECT_READS), so it is
+ * sent when given.
  */
 export async function fetchServerHealth(
 	baseUrl: string,
 	timeoutMs = 2000,
+	adminToken: string | null = null,
 ): Promise<ServerHealth | null> {
 	try {
 		const res = await fetch(`${baseUrl}/status`, {
+			headers:
+				adminToken === null ? {} : { Authorization: `Bearer ${adminToken}` },
 			signal: AbortSignal.timeout(timeoutMs),
 		});
 		if (!res.ok) return null;
@@ -87,39 +98,51 @@ export async function fetchServerHealth(
 }
 
 /**
+ * The server line of `status`, from the contents of the PID file. A PID counts as
+ * running only when it still runs knowledge-server (see `classifyPidFile`).
+ */
+export function serverStateLine(
+	raw: string,
+	table: ProcessTable = systemProcessTable,
+): string {
+	const state = classifyPidFile(raw, table, isServerCommand);
+	switch (state.kind) {
+		case "invalid":
+			return "unknown (malformed PID file)";
+		case "running":
+			return `running (PID ${state.pid})`;
+		case "unverified":
+			return `unknown (PID ${state.pid} is alive; its command line is unreadable)`;
+		case "stale":
+			return state.reason === "dead"
+				? "stopped (stale PID file)"
+				: `stopped (stale PID file; PID ${state.pid} belongs to another program)`;
+	}
+}
+
+/**
  * `knowledge-server status`
  *
  * Prints a human-readable summary of the knowledge store and whether the
  * HTTP server is currently running (detected via PID file).
  */
-export async function runStatus(pidPath: string): Promise<void> {
+export async function runStatus(
+	pidPath: string,
+	legacyPidPath: string | null = null,
+	adminToken: string | null = null,
+): Promise<void> {
 	// Server running state — detected via PID file.
-	let serverLine: string;
-	if (!pidPath || !existsSync(pidPath)) {
-		serverLine = "stopped";
-	} else {
-		const raw = readFileSync(pidPath, "utf8").trim();
-		const pid = Number.parseInt(raw, 10);
-		if (Number.isNaN(pid)) {
-			serverLine = "unknown (malformed PID file)";
-		} else {
-			const isAlive = (() => {
-				try {
-					process.kill(pid, 0);
-					return true;
-				} catch (e) {
-					return errCode(e) === "EPERM";
-				}
-			})();
-			serverLine = isAlive
-				? `running (PID ${pid})`
-				: "stopped (stale PID file)";
-		}
-	}
+	const located = locatePidFile(pidPath, legacyPidPath);
+	const serverLine =
+		located === null
+			? "stopped"
+			: serverStateLine(readFileSync(located, "utf8"));
 
 	const address = resolveServerAddress();
 	const serverHealth = await fetchServerHealth(
 		`http://${address.host}:${address.port}`,
+		2000,
+		adminToken,
 	);
 	const healthLine = serverHealth
 		? serverHealth.reasons.length > 0

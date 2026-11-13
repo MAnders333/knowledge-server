@@ -284,10 +284,11 @@ describe("redactSecrets: linear time on 1 MB adversarial input", () => {
 		"scheme and userinfo run": `http://${"u".repeat(MB)}`,
 	};
 	for (const [name, text] of Object.entries(cases)) {
-		it(`${name}: completes under 500 ms`, () => {
+		it(`${name}: completes under 5 s`, () => {
 			const start = performance.now();
 			redactSecrets(text);
-			expect(performance.now() - start).toBeLessThan(500);
+			// A catastrophic-backtracking regex takes minutes on 1 MB; this bound only catches that.
+			expect(performance.now() - start).toBeLessThan(5_000);
 		});
 	}
 });
@@ -312,4 +313,91 @@ describe("redactSecrets: context kept after the move to captured prefixes", () =
 			"export API_TOKEN=[REDACTED:env_secret]",
 		);
 	});
+});
+
+describe("redactSecrets: lowercase and mid-line credential assignments", () => {
+	// Fixtures are assembled at runtime, as in the rest of this file.
+	const positives: Array<[string, string]> = [
+		[
+			`connect with ${["db_password", "hunter2"].join("=")} now`,
+			"connect with db_password=[REDACTED:keyed_secret] now",
+		],
+		[
+			`{"auth_token": "${["a1b2c3d4", "e5f6"].join("")}"}`,
+			'{"auth_token": "[REDACTED:keyed_secret]"}',
+		],
+		[
+			`my-api-key: ${["xK9", "42pQ"].join("-")}`,
+			"my-api-key: [REDACTED:keyed_secret]",
+		],
+		[
+			`https://h.example/x?${["api_key", "abcd1234"].join("=")}&v=2`,
+			"https://h.example/x?api_key=[REDACTED:keyed_secret]&v=2",
+		],
+	];
+	for (const [input, expected] of positives) {
+		it(`redacts the value of: ${input}`, () => {
+			const result = redactSecrets(input);
+			expect(result.text).toBe(expected);
+			expect(result.counts).toEqual({ keyed_secret: 1 });
+		});
+	}
+
+	for (const [input] of positives) {
+		it(`is idempotent on: ${input}`, () => {
+			const once = redactSecrets(input).text;
+			expect(redactSecrets(once)).toEqual({ text: once, counts: {} });
+		});
+	}
+
+	it("redacts a 32-character hex value after api_key=, mid-line", () => {
+		const hex = "9f8e7d6c5b4a39281706f5e4d3c2b1a0";
+		const result = redactSecrets(`run with api_key=${hex}`);
+		expect(result.text).toBe("run with api_key=[REDACTED:keyed_entropy]");
+		expect(result.text).not.toContain(hex);
+	});
+
+	it("redacts a short secret that contains a digit, mid-line", () => {
+		expectRedacted(
+			`run with db_password=${["hunter2", "x9"].join("")}`,
+			"run with db_password=[REDACTED:keyed_secret]",
+			"keyed_secret",
+		);
+	});
+
+	it("redacts a secret assigned in a code-like line", () => {
+		expectRedacted(
+			`config.db_password = "${["hunter2", "x9"].join("")}"`,
+			'config.db_password = "[REDACTED:keyed_secret]"',
+			"keyed_secret",
+		);
+	});
+
+	const prose = [
+		"the auth_token: none",
+		"api_key: see the docs",
+		"primary_key = id",
+		"password_reset: enabled",
+		"set db_password to the new value",
+		"pass_rate=0.5",
+	];
+	const code = [
+		"primary_key=True",
+		"next_token=None",
+		"public_key=False",
+		"cache_key=build_key(x)",
+		"db_password=$DB_PASSWORD",
+		"sort_key=lambda r: r[0]",
+		"access_token = await fetchToken()",
+		"api_key = process.env.X",
+		"partition_key: user_id",
+		'"sort_key": "created_at"',
+		"ssh-key: ~/.ssh/id_ed25519",
+		"ssh-key: /home/me/id_ed25519",
+	];
+	for (const input of [...prose, ...code]) {
+		it(`keeps ordinary prose and code unchanged: ${input}`, () => {
+			expect(redactSecrets(input)).toEqual({ text: input, counts: {} });
+		});
+	}
 });

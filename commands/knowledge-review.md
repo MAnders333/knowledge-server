@@ -4,26 +4,26 @@ description: Review and resolve knowledge entries needing attention — conflict
 
 Review the knowledge graph and resolve entries that need human attention.
 
-## Step 1 — Fetch review data
+## Step 1 — Load the admin token and fetch review data
+
+Load the token before any call. Take it from the environment, else from `.env`. It stays in a shell variable and is never printed. Every call sends it in a header read from stdin (`-H @-`), so it stays out of the process arguments. With the random per-start token an empty bearer counts as no token, so the header is harmless when the variable is unset:
 
 ```bash
-curl -s http://127.0.0.1:3179/review | python3 -m json.tool
-```
-
-Also load the admin token into a shell variable — this keeps it out of shell history while
-allowing the curl commands below to reference it:
-
-```bash
-# Load token from .env (preferred — token never appears in history)
-TOKEN="$(grep '^KNOWLEDGE_ADMIN_TOKEN=' ~/.config/knowledge-server/.env 2>/dev/null | cut -d= -f2-)"
+TOKEN="${KNOWLEDGE_ADMIN_TOKEN:-}"
+# Not in the environment: read it from .env (the grep output goes only into TOKEN)
+if [ -z "$TOKEN" ]; then
+  TOKEN="$(grep '^KNOWLEDGE_ADMIN_TOKEN=' ~/.config/knowledge-server/.env 2>/dev/null | cut -d= -f2-)"
+fi
 # Legacy location fallback for older installs
 if [ -z "$TOKEN" ]; then
   TOKEN="$(grep '^KNOWLEDGE_ADMIN_TOKEN=' ~/.local/share/knowledge-server/.env 2>/dev/null | cut -d= -f2-)"
 fi
-# If not set in .env, the token was printed at server startup only when it ran in a terminal; otherwise set KNOWLEDGE_ADMIN_TOKEN in .env and reload:
-# TOKEN="paste-token-here"
-echo "Token loaded: ${#TOKEN} chars"
+curl -s -H @- http://127.0.0.1:3179/review <<EOF | python3 -m json.tool
+Authorization: Bearer $TOKEN
+EOF
 ```
+
+If the shell was reset, run the load block again before the calls below. Flagging an entry (the `knowledge_flag` MCP tool) is read-level and needs no admin token; the MCP process needs `KNOWLEDGE_ADMIN_TOKEN` set only when the server runs with `KNOWLEDGE_PROTECT_READS=true`. Only the resolve, PATCH and DELETE calls below change the knowledge base.
 
 ## Step 2 — Work through each section
 
@@ -45,26 +45,30 @@ To resolve, call the appropriate endpoint using `$TOKEN`. For the entry whose ID
 
 ```bash
 # Keep the entry at :id, supersede its counterpart
-curl -s -X POST -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
+curl -s -X POST -H @- -H "Content-Type: application/json" \
   -d '{"resolution":"supersede_other"}' \
-  http://127.0.0.1:3179/entries/:id/resolve
+  http://127.0.0.1:3179/entries/:id/resolve <<EOF
+Authorization: Bearer $TOKEN
+EOF
 
 # Supersede the entry at :id, keep its counterpart
-curl -s -X POST -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
+curl -s -X POST -H @- -H "Content-Type: application/json" \
   -d '{"resolution":"supersede_this"}' \
-  http://127.0.0.1:3179/entries/:id/resolve
+  http://127.0.0.1:3179/entries/:id/resolve <<EOF
+Authorization: Bearer $TOKEN
+EOF
 
 # Merge — provide the merged content
-curl -s -X POST -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
+curl -s -X POST -H @- -H "Content-Type: application/json" \
   -d '{"resolution":"merge","mergedContent":"<merged text>"}' \
-  http://127.0.0.1:3179/entries/:id/resolve
+  http://127.0.0.1:3179/entries/:id/resolve <<EOF
+Authorization: Bearer $TOKEN
+EOF
 
 # Hard-delete the entry at :id (use for noise/junk)
-curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
-  http://127.0.0.1:3179/entries/:id
+curl -s -X DELETE -H @- http://127.0.0.1:3179/entries/:id <<EOF
+Authorization: Bearer $TOKEN
+EOF
 ```
 
 ### Stale entries
@@ -76,16 +80,18 @@ Entries with low strength haven't been accessed recently. For each:
 
 To archive (soft removal):
 ```bash
-curl -s -X PATCH -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
+curl -s -X PATCH -H @- -H "Content-Type: application/json" \
   -d '{"status":"archived"}' \
-  http://127.0.0.1:3179/entries/:id
+  http://127.0.0.1:3179/entries/:id <<EOF
+Authorization: Bearer $TOKEN
+EOF
 ```
 
 To delete:
 ```bash
-curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
-  http://127.0.0.1:3179/entries/:id
+curl -s -X DELETE -H @- http://127.0.0.1:3179/entries/:id <<EOF
+Authorization: Bearer $TOKEN
+EOF
 ```
 
 ### Team-relevant entries
@@ -97,10 +103,11 @@ High-confidence entries scoped to `team`. These may be worth copying into shared
 
 If the content needs correction, use PATCH (content/topic edits automatically re-compute the embedding):
 ```bash
-curl -s -X PATCH -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
+curl -s -X PATCH -H @- -H "Content-Type: application/json" \
   -d '{"content":"corrected content here"}' \
-  http://127.0.0.1:3179/entries/:id
+  http://127.0.0.1:3179/entries/:id <<EOF
+Authorization: Bearer $TOKEN
+EOF
 ```
 
 ## Step 3 — Confirm and summarise

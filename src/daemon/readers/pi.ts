@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "../../config.js";
-import { stripInjectedKnowledge } from "../../consolidation/untrusted.js";
+import { stripInjectedKnowledge } from "../../domain/untrusted.js";
 import type {
 	Episode,
 	EpisodeMessage,

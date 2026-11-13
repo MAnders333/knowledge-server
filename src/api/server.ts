@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { Hono } from "hono";
@@ -11,6 +11,7 @@ import { splitIntoCues } from "../activation/activate.js";
 import {
 	CLIENT_HEADER,
 	type ClientTag,
+	activationBudgetMs,
 	parseClientTag,
 } from "../activation/client.js";
 import {
@@ -23,6 +24,7 @@ import { REVIEW_STALE_STRENGTH_THRESHOLD, config } from "../config.js";
 import type { ConsolidationEngine } from "../consolidation/consolidate.js";
 import { type DaemonStatus, readDaemonStatus } from "../daemon/status.js";
 import type { IKnowledgeStore } from "../db/index.js";
+import type { IServerStateDB } from "../db/interface.js";
 import { componentHealth, evaluateHealth } from "../health.js";
 import { logger } from "../logger.js";
 import { activateInputSchema } from "../mcp/index.js";
@@ -36,6 +38,7 @@ import type {
 	KnowledgeStatus,
 } from "../types.js";
 import { withTimeout } from "../utils.js";
+import { AuthFailureThrottle } from "./auth-throttle.js";
 import { buildHostAllowlist } from "./host-allowlist.js";
 import { MAX_BODY_BYTES, boundCues, capText } from "./input-limits.js";
 
@@ -65,32 +68,42 @@ function readDaemonView(dataDir: string): {
 }
 
 /**
+ * The socket address of the request, as set by the server's fetch wrapper, or
+ * "unknown". Forwarding headers are ignored because clients control them. Behind a
+ * reverse proxy every request shares the proxy's address, so the throttle is shared.
+ */
+function clientAddressOf(c: Context): string {
+	const env: { remoteAddress?: string } | undefined = c.env;
+	return env?.remoteAddress ?? "unknown";
+}
+
+/**
  * HTTP API for the knowledge server.
  *
  * Endpoints:
+ * - GET  /health                            -- Liveness probe, no store access (always open)
  * - GET  /activate?q=...                   -- Activate knowledge entries by query (used by plugin)
- * - POST /consolidate                       -- Run consolidation cycle          [requires admin token]
- * - POST /reinitialize                      -- Wipe knowledge DB and reset cursor [requires admin token]
+ * - POST /consolidate                       -- Run consolidation cycle          [admin token]
+ * - POST /reinitialize                      -- Wipe knowledge DB and reset cursor [admin token]
  * - GET  /review                            -- List entries needing attention
- * - GET  /status                            -- Server health and stats
+ * - GET  /status                            -- Server health and stats (config block: admin)
  * - GET  /entries                           -- List all entries (with filters)
  * - GET  /entries/:id                       -- Get a specific entry
- * - PATCH /entries/:id                      -- Update fields on an entry       [requires admin token]
- * - POST /entries/:id/resolve               -- Resolve a conflicted entry pair [requires admin token]
- * - DELETE /entries/:id                     -- Hard-delete an entry            [requires admin token]
- * - POST /hooks/claude-code/user-prompt     -- Claude Code UserPromptSubmit hook (unauthenticated)
- * - ALL  /mcp                               -- MCP streamable-http endpoint (auth optional, see below)
+ * - PATCH /entries/:id                      -- Update fields on an entry       [admin token]
+ * - POST /entries/:id/flag                  -- Queue an entry for review       [read auth]
+ * - POST /entries/:id/resolve               -- Resolve a conflicted entry pair [admin token]
+ * - DELETE /entries/:id                     -- Hard-delete an entry            [admin token]
+ * - POST /hooks/claude-code/user-prompt     -- Claude Code UserPromptSubmit hook
+ * - ALL  /mcp                               -- MCP streamable-http endpoint
  *
- * Admin token:
- * A random token is generated at startup and printed to the console once.
- * Pass it as `Authorization: Bearer <token>` on protected endpoints.
- * This guards against CSRF and other local-process abuse of destructive operations.
- *
- * /mcp auth:
- * When KNOWLEDGE_ADMIN_TOKEN is set, the /mcp endpoint requires the same Bearer
- * token. When unset (random token per process), /mcp is unauthenticated — suitable
- * for local use where the server is only accessible on 127.0.0.1. For hosted/shared
- * deployments, always set KNOWLEDGE_ADMIN_TOKEN so remote MCP clients must authenticate.
+ * Auth:
+ * - Random token (default, per process): printed to the console once, and only when
+ *   stdout is a terminal. Mutation routes require `Authorization: Bearer <token>`.
+ *   Reads stay open to loopback clients that pass the Host and Origin checks.
+ * - Stable token (KNOWLEDGE_ADMIN_TOKEN): mutation routes and /mcp require the Bearer
+ *   token. With KNOWLEDGE_PROTECT_READS, every route except /health requires it. Failed
+ *   attempts are throttled per client address (429, Retry-After). The throttle only
+ *   bounds noise; the token's entropy is what protects it.
  */
 /**
  * The request's JSON body when it is an object. Null for malformed JSON and for
@@ -112,45 +125,69 @@ async function readJsonObject(
 	return body as Record<string, unknown>;
 }
 
-export function createApp(
-	db: IKnowledgeStore,
-	serverStateDb: import("../db/interface.js").IServerStateDB,
-	activation: ActivationEngine,
-	consolidation: ConsolidationEngine,
-	adminToken: string,
-	/** Whether adminToken was explicitly configured (vs randomly generated for local use). */
-	adminTokenIsStable = false,
-	/** Store IDs that failed to connect at startup and are currently unavailable. */
-	unavailableStoreIds: ReadonlySet<string> = new Set(),
+/** Options for createApp. Only the first five fields are required; the rest default as documented. */
+export interface CreateAppOptions {
+	/** Primary writable store. Default for `readDbs` and `writableDbs`; the store /entries reads from. */
+	db: IKnowledgeStore;
+	serverStateDb: IServerStateDB;
+	activation: ActivationEngine;
+	consolidation: ConsolidationEngine;
+	adminToken: string;
+	/** Whether adminToken was explicitly configured (vs randomly generated for local use). Default false. */
+	adminTokenIsStable?: boolean;
+	/** Store IDs that failed to connect at startup and are currently unavailable. Default: none. */
+	unavailableStoreIds?: ReadonlySet<string>;
 	/**
 	 * All stores to fan out read operations across (/entries, /review, /status).
-	 * Defaults to [db] for backwards compatibility (single-store mode).
-	 * In multi-store setups, pass registry.readStores() so entries in secondary
-	 * stores are visible via the API.
+	 * Default [db] (single-store mode). In multi-store setups, pass
+	 * registry.readStores() so entries in secondary stores are visible via the API.
 	 */
-	readDbs: IKnowledgeStore[] = [db],
+	readDbs?: IKnowledgeStore[];
 	/**
-	 * All writable stores for /reinitialize fan-out.
-	 * Defaults to [db]. Pass registry.writableStores() in multi-store setups
-	 * so all domain stores are wiped atomically on reinitialize.
+	 * All writable stores for /reinitialize fan-out. Default [db]. Pass
+	 * registry.writableStores() in multi-store setups so all domain stores are wiped
+	 * atomically on reinitialize.
 	 */
-	writableDbs: IKnowledgeStore[] = [db],
-	/** Port the server is bound to; reported by the admin /status. */
-	serverPort: number = DEFAULT_CONFIG.port,
+	writableDbs?: IKnowledgeStore[];
+	/** Port the server is bound to; reported by the admin /status. Default DEFAULT_CONFIG.port. */
+	serverPort?: number;
 	/**
 	 * Content-free activation telemetry sink. The caller owns its lifecycle
-	 * (start/stop). Defaults to a recorder on serverStateDb with no timers.
+	 * (start/stop). Default: a recorder on serverStateDb with no timers.
 	 */
-	activationEvents: ActivationEventRecorder = new ActivationEventRecorder(
+	activationEvents?: ActivationEventRecorder;
+	/** Address the server is bound to; always accepted in the Host allow-list. Default "127.0.0.1". */
+	bindHost?: string;
+	/** Extra Host values (KNOWLEDGE_ALLOWED_HOSTS), each `name` or `name:port`. Default none. */
+	extraAllowedHosts?: readonly string[];
+	/** Where the daemon's lockfile and status file live; enables the daemon checks in /status. Default none. */
+	runtime?: StatusRuntime;
+	/**
+	 * Protect reads too: with a stable admin token, every route except /health needs it.
+	 * Default false: only the admin routes need it, and reads stay open under the
+	 * Host/Origin checks. Ignored without a stable token.
+	 */
+	readsProtected?: boolean;
+}
+
+export function createApp(options: CreateAppOptions): Hono {
+	const {
+		db,
 		serverStateDb,
-	),
-	/** Address the server is bound to; always accepted in the Host allow-list. */
-	bindHost = "127.0.0.1",
-	/** Extra Host values (KNOWLEDGE_ALLOWED_HOSTS), each `name` or `name:port`. */
-	extraAllowedHosts: readonly string[] = [],
-	/** Where the daemon's lockfile and status file live; enables the daemon checks in /status. */
-	runtime: StatusRuntime = {},
-): Hono {
+		activation,
+		consolidation,
+		adminToken,
+		adminTokenIsStable = false,
+		unavailableStoreIds = new Set(),
+		readDbs = [db],
+		writableDbs = [db],
+		serverPort = DEFAULT_CONFIG.port,
+		activationEvents = new ActivationEventRecorder(serverStateDb),
+		bindHost = "127.0.0.1",
+		extraAllowedHosts = [],
+		runtime = {},
+		readsProtected = false,
+	} = options;
 	const app = new Hono();
 	const allowlist = buildHostAllowlist(bindHost, extraAllowedHosts);
 
@@ -181,6 +218,65 @@ export function createApp(
 		await next();
 	});
 
+	// -- Admin token --
+
+	// The Bearer token the request presents, or null when there is none. The scheme is
+	// case-insensitive. An empty or whitespace-only bearer is no token at all.
+	function presentedToken(c: Context): string | null {
+		const parts = (c.req.header("Authorization") ?? "").trim().split(/\s+/);
+		if (parts.length !== 2 || parts[0].toLowerCase() !== "bearer") return null;
+		return parts[1];
+	}
+
+	// Compare SHA-256 digests, not the raw strings: both digests are 32 bytes, so the
+	// comparison does not reveal the length of the token that was sent.
+	const expectedTokenDigest = createHash("sha256").update(adminToken).digest();
+
+	function requireAdminToken(c: Context): boolean {
+		const token = presentedToken(c);
+		if (token === null) return false;
+		const provided = createHash("sha256").update(token).digest();
+		return timingSafeEqual(provided, expectedTokenDigest);
+	}
+
+	// Stable admin token. With readsProtected, every route except /health needs its Bearer
+	// token, reads included. Otherwise /mcp and the admin routes need it, and reads stay
+	// open under the Host/Origin checks. A correct token always passes. Only failed
+	// attempts are counted, and a client over its limit gets 429 until its window ends.
+	const adminRoutes = [
+		{ method: "POST", path: /^\/(consolidate|reinitialize)$/ },
+		{ method: "PATCH", path: /^\/entries\/[^/]+$/ },
+		{ method: "DELETE", path: /^\/entries\/[^/]+$/ },
+		{ method: "POST", path: /^\/entries\/[^/]+\/resolve$/ },
+	];
+	const authFailures = new AuthFailureThrottle();
+	if (adminTokenIsStable) {
+		app.use("*", async (c, next) => {
+			const path = c.req.path;
+			const needsToken = readsProtected
+				? path !== "/health"
+				: path === "/mcp" ||
+					adminRoutes.some(
+						(r) => r.method === c.req.method && r.path.test(path),
+					);
+			if (!needsToken || requireAdminToken(c)) return next();
+			const client = clientAddressOf(c);
+			const blockedMs = authFailures.blockedForMs(client);
+			if (blockedMs > 0) {
+				c.header("Retry-After", String(Math.ceil(blockedMs / 1000)));
+				return c.json(
+					{ error: "Too many failed authentication attempts" },
+					429,
+				);
+			}
+			authFailures.recordFailure(client);
+			return c.json({ error: "Unauthorized" }, 401);
+		});
+	}
+
+	// Liveness probe that touches no store. Open even with a stable admin token.
+	app.get("/health", (c) => c.json({ status: "ok" }));
+
 	// Body cap for JSON routes. Oversized bodies are rejected before parsing.
 	const jsonBodyLimit = bodyLimit({
 		maxSize: MAX_BODY_BYTES,
@@ -204,8 +300,8 @@ export function createApp(
 	// refuses to reuse a stateless transport, and a shared server would let
 	// JSON-RPC ids from concurrent clients collide.
 	//
-	// For hosted deployments: set KNOWLEDGE_ADMIN_TOKEN and point MCP clients at
-	// https://your-server.com/mcp with `Authorization: Bearer <token>`.
+	// With a stable admin token (KNOWLEDGE_ADMIN_TOKEN) clients send
+	// `Authorization: Bearer <token>`, as for every other route except /health.
 	// For local use: no token required (server binds to 127.0.0.1 only).
 	const createMcpServer = (): McpServer => {
 		const mcpServer = new McpServer({
@@ -287,14 +383,11 @@ export function createApp(
 		return mcpServer;
 	};
 
-	// Auth: required only when a stable admin token is configured (hosted mode).
-	// In local mode (random per-process token) /mcp is open; the server already
-	// binds to loopback and the Host/Origin checks above apply.
+	// Auth: with a stable admin token, the gate near the top requires its Bearer token on
+	// /mcp in both read modes. In random-token mode /mcp is open; the server binds to
+	// loopback and the Host/Origin checks above apply.
 	const mcpHostHeaders = allowlist.sdkHostHeaders(serverPort);
 	app.all("/mcp", jsonBodyLimit, async (c) => {
-		if (adminTokenIsStable && !requireAdminToken(c)) {
-			return c.json({ error: "Unauthorized" }, 401);
-		}
 		const transport = new WebStandardStreamableHTTPServerTransport({
 			sessionIdGenerator: undefined, // stateless
 			enableDnsRebindingProtection: true,
@@ -308,20 +401,6 @@ export function createApp(
 			void mcpServer.close();
 		});
 	});
-
-	// -- Auth helper --
-
-	// Pre-encode the expected token once so timingSafeEqual can compare buffers.
-	// "Bearer " + 48-char hex = a public constant length, so the early length
-	// check leaks nothing meaningful while keeping the comparison simple.
-	const expectedToken = Buffer.from(`Bearer ${adminToken}`);
-
-	function requireAdminToken(c: Context): boolean {
-		const auth = c.req.header("Authorization") ?? "";
-		const provided = Buffer.from(auth);
-		if (provided.length !== expectedToken.length) return false;
-		return timingSafeEqual(provided, expectedToken);
-	}
 
 	/**
 	 * Find an entry for a mutating admin route. Only writable stores are searched.
@@ -356,33 +435,35 @@ export function createApp(
 			return findWritableEntry(ref);
 		}
 		const needle = ref.toLowerCase();
-		const matches: Array<{ entry: KnowledgeEntry; store: IKnowledgeStore }> =
-			[];
+		// Only matching ids are read, at most two per store: enough to tell one from many.
+		const matches: Array<{ id: string; store: IKnowledgeStore }> = [];
 		for (const store of readDbs) {
-			for (const entry of await store.getEntries({})) {
-				if (entry.id.toLowerCase().startsWith(needle)) {
-					matches.push({ entry, store });
-				}
+			for (const id of await store.findIdsByPrefix(needle, 2)) {
+				matches.push({ id, store });
 			}
 		}
 		if (matches.length === 0) return null;
 		if (matches.length > 1) return "ambiguous";
 		const [only] = matches;
-		return writableDbs.includes(only.store) ? only : "read-only";
+		const entry = await only.store.getEntry(only.id);
+		if (!entry) return null;
+		return writableDbs.includes(only.store)
+			? { entry, store: only.store }
+			: "read-only";
 	}
 
 	// -- Helpers --
 
 	/**
-	 * Log one activation to the server log. Content-light by default:
+	 * Log one activation to the server log. Ids and scores only at info level:
 	 *
 	 *   [activation/opencode] chars=129 → 3 entries
 	 *   [activation/opencode]   0.72 fact  <id>
 	 *
-	 * At LOG_LEVEL=debug the query and entry text are added:
+	 * Query and entry text are logged only at debug level, on separate lines:
 	 *
-	 *   [activation/opencode] q="<full query>" → 3 entries
-	 *   [activation/opencode]   0.72 fact  <id>  "full entry content"
+	 *   [activation/opencode] q="<full query>"
+	 *   [activation/opencode]     content "<entry content>"
 	 *
 	 * caller is the client tag (opencode, pi, claude-code, mcp, unknown, …).
 	 * Measurement lives in activation_event (see recordActivationEvent).
@@ -394,19 +475,21 @@ export function createApp(
 	): void {
 		const prefix = `[activation/${caller}]`;
 		const debug = logger.isEnabled("debug");
-		const head = debug ? `q=${JSON.stringify(query)}` : `chars=${query.length}`;
-		if (entries.length === 0) {
-			logger.log(`${prefix} ${head} → 0 entries`);
-			return;
-		}
-		logger.log(
-			`${prefix} ${head} → ${entries.length} entr${entries.length === 1 ? "y" : "ies"}`,
-		);
+		const count =
+			entries.length === 0
+				? "0 entries"
+				: `${entries.length} entr${entries.length === 1 ? "y" : "ies"}`;
+		logger.log(`${prefix} chars=${query.length} → ${count}`);
+		if (debug) logger.debug(`${prefix} q=${JSON.stringify(query)}`);
 		for (const r of entries) {
-			const content = debug ? `  ${JSON.stringify(r.entry.content)}` : "";
 			logger.log(
-				`${prefix}   ${r.rawSimilarity.toFixed(3)} ${r.entry.type.padEnd(10)} ${r.entry.id}${content}`,
+				`${prefix}   ${r.rawSimilarity.toFixed(3)} ${r.entry.type.padEnd(10)} ${r.entry.id}`,
 			);
+			if (debug) {
+				logger.debug(
+					`${prefix}     content ${JSON.stringify(r.entry.content)}`,
+				);
+			}
 		}
 	}
 
@@ -467,13 +550,18 @@ export function createApp(
 	/**
 	 * Per-session dedupe key, scoped to the client. Undefined when the client sent
 	 * no session id: such requests are not deduplicated (see session-dedupe.ts).
+	 * Ids longer than 256 characters are replaced by their SHA-256 hex digest.
 	 */
 	function sessionDedupeKey(
 		client: string,
 		sessionId: string | null | undefined,
 	): string | undefined {
 		const id = sessionId?.trim();
-		return id ? `${client}\u0000${id}` : undefined;
+		if (!id) return undefined;
+		// Long ids are hashed so a client-chosen id cannot make the key arbitrarily large.
+		const key =
+			id.length <= 256 ? id : createHash("sha256").update(id).digest("hex");
+		return `${client}\u0000${key}`;
 	}
 
 	// -- Activation --
@@ -481,6 +569,7 @@ export function createApp(
 	// Access records are written for every returned entry, including for
 	// unauthenticated callers. Gating that is deliberately out of scope here.
 	app.get("/activate", async (c) => {
+		const started = performance.now();
 		// Accept one or more `q` params (repeated: ?q=seg1&q=seg2&q=full).
 		// Single ?q=... still works — queries() returns a one-element array.
 		const rawQueries = c.req.queries("q");
@@ -514,10 +603,15 @@ export function createApp(
 		const sessionId = c.req.header("x-knowledge-session");
 		const prompt = queries[queries.length - 1] ?? "";
 		try {
-			const started = performance.now();
 			const result = await activation.activate(
 				queries.length === 1 ? queries[0] : queries,
-				{ limit, threshold, session: sessionDedupeKey(client, sessionId) },
+				{
+					limit,
+					threshold,
+					session: sessionDedupeKey(client, sessionId),
+					requestStartedAt: started,
+					budgetMs: activationBudgetMs(client),
+				},
 			);
 			const latencyMs = Math.round(performance.now() - started);
 			logActivation(client, queries.join(" | "), result.entries);
@@ -733,11 +827,11 @@ export function createApp(
 			},
 		});
 
-		// Config block (model names, port) is gated behind the admin token.
-		// Unauthenticated callers (e.g. healthcheck scripts) still get version +
-		// knowledge stats and health, but don't learn which models / endpoint are in use.
-		// Intentional: non-blocking — unauthenticated callers still receive a 200
-		// with partial data; the config block is simply omitted.
+		// Config block (model names, port) and diagnostics are admin-only. In random-token
+		// mode, unauthenticated callers still get version, stats and health, and the blocks
+		// are omitted. With KNOWLEDGE_PROTECT_READS and a stable token, the gate near the
+		// top has already required the token, so every caller here is admin; otherwise the
+		// check below decides.
 		const isAdmin = requireAdminToken(c);
 
 		// Use primary store's embedding metadata (model is shared across all stores).
@@ -954,11 +1048,9 @@ export function createApp(
 	// POST /entries/:id/flag — an agent reports an entry as wrong, outdated or irrelevant.
 	// The entry is queued for review by moving it to status 'conflicted' (it stays in
 	// the store and in /review). Only active entries can be flagged. :id is the full
-	// entry id or the short id shown in injected lines.
+	// entry id or the short id shown in injected lines. Flagging is reversible, so it
+	// takes read-level auth and needs no admin token of its own.
 	app.post("/entries/:id/flag", jsonBodyLimit, async (c) => {
-		if (!requireAdminToken(c)) {
-			return c.json({ error: "Unauthorized" }, 401);
-		}
 		const located = await findEntryByRef(c.req.param("id"));
 		if (located === "read-only") {
 			return c.json({ error: "Entry is in a read-only store" }, 403);
@@ -996,7 +1088,9 @@ export function createApp(
 			logger.error("[entries/flag] Failed to flag entry:", e);
 			return c.json({ error: "Failed to flag entry" }, 500);
 		}
-		logger.log(`[entries/flag] ${entry.id.slice(0, 8)} reason=${body.reason}`);
+		logger.log(
+			`[entries/flag] ${entry.id.slice(0, 8)} reason length ${body.reason.length}`,
+		);
 		return c.json({ ok: true, id: entry.id, status: "conflicted" });
 	});
 
@@ -1171,10 +1265,10 @@ export function createApp(
 	// to the model. Activates relevant knowledge and returns it as additionalContext
 	// so Claude Code injects it into the conversation automatically.
 	//
-	// This endpoint is intentionally unauthenticated (same as GET /activate) because:
-	// - The server binds to 127.0.0.1 only — loopback is the security boundary
-	// - Claude Code hooks run as the local user, not a remote caller
-	// - Adding auth would require storing a token in ~/.claude/settings.json in plaintext
+	// In random-token mode this endpoint is unauthenticated, like GET /activate: the
+	// server binds to 127.0.0.1 only, and loopback is the security boundary. With a
+	// stable admin token the gate near the top requires Bearer auth, and clients
+	// send the token from KNOWLEDGE_ADMIN_TOKEN.
 	//
 	// On any error (bad body, activation failure, etc.) we return {} so Claude Code
 	// continues normally without the context — hook errors are always non-blocking.
@@ -1190,6 +1284,7 @@ export function createApp(
 		"/hooks/claude-code/user-prompt",
 		bodyLimit({ maxSize: MAX_BODY_BYTES, onError: (c) => c.json({}) }),
 		async (c) => {
+			const started = performance.now();
 			let prompt: string;
 			let sessionIdBody: unknown;
 			try {
@@ -1207,7 +1302,6 @@ export function createApp(
 				// Split prompt into per-line cues + full prompt holistic cue,
 				// matching the same multi-cue strategy used by the OpenCode plugin.
 				const cues = boundCues(splitIntoCues(capText(prompt)));
-				const started = performance.now();
 				const client = parseClientTag(
 					c.req.query("client") ?? c.req.header(CLIENT_HEADER) ?? "claude-code",
 				);
@@ -1216,6 +1310,8 @@ export function createApp(
 				const result = await activation.activate(cues, {
 					limit: 8,
 					session: sessionDedupeKey(client, sessionId),
+					requestStartedAt: started,
+					budgetMs: activationBudgetMs(client),
 				});
 				const latencyMs = Math.round(performance.now() - started);
 				logActivation(client, prompt, result.entries);

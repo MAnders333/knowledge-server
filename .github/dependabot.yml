@@ -4,6 +4,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Wait before proposing a new release, so a compromised or yanked version
+    # has time to be noticed before it reaches a PR.
+    cooldown:
+      default-days: 7
     groups:
       actions:
         patterns: ["*"]
@@ -12,6 +16,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     groups:
       npm:
         patterns: ["*"]

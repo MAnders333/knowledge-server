@@ -23,6 +23,17 @@ curl -fsSL https://github.com/MAnders333/knowledge-server/releases/latest/downlo
 
 The installer is attached to the latest release, so it always matches that release's binaries and checksums.
 
+To check the installer before running it, download it with its checksum manifest from the same release and verify both (Linux x64; on macOS arm64 use `SHA256SUMS-darwin-arm64` and `shasum -a 256 --check --ignore-missing`):
+
+```bash
+release=https://github.com/MAnders333/knowledge-server/releases/latest/download
+curl -fsSLO "$release/install.sh" -fsSLO "$release/SHA256SUMS-linux-x64"
+sha256sum --check --ignore-missing SHA256SUMS-linux-x64
+bash install.sh
+```
+
+Or verify the installer's GitHub attestation: `gh attestation verify install.sh --repo MAnders333/knowledge-server --signer-workflow MAnders333/knowledge-server/.github/workflows/release-please.yml`.
+
 **After running:**
 
 1. Edit `~/.config/knowledge-server/.env` — set your LLM API key (e.g. `ANTHROPIC_API_KEY=sk-ant-...`)
@@ -51,9 +62,16 @@ Every downloaded file is checked against the release's `SHA256SUMS` before anyth
 
 Releases published before plugin and command files were checksummed (their `SHA256SUMS` has no `knowledge.ts` entry) cannot be installed with `update --version` or `install.sh --version`; both stop with a message. To roll back an update, use the `*.prev` binaries it kept.
 
+### Upgrade notes
+
+- **Upgrade the server and the daemon together.** The state DB schema is now v6, and older builds refuse a v6 state DB. Upgrade the server and the daemon on every machine, and every machine that shares a Postgres state DB, at the same time. Rolling back with the `*.prev` binaries works only until a v6 state DB is written; after that, roll forward.
+- **Stricter settings.** A value that used to be clamped or ignored now stops startup and names the variable, for example `LOG_MAX_BYTES=-1`, `LLM_MAX_RETRIES=-1`, `LLM_TIMEOUT_*_MS=0`, `RERANK_TIMEOUT_MS=50`, `POSTGRES_POOL_MAX=0` or `DAEMON_UPLOAD_INTERVAL_SECONDS=0`. Empty values count as unset. `ACTIVATION_PRECISION_GATE`, `ACTIVATION_STRENGTH_DAMPENING` and `CONTRADICTION_CONFLICTS_ONLY` accept true/false, on/off, yes/no or 1/0; any other spelling stops startup. Before this change, any value other than `off` enabled the precision gate.
+- **Codex hooks need trust again.** After `knowledge-server setup-tool codex` is re-run, open Codex, run `/hooks` and trust the knowledge-server hook again.
+- **`/mcp` and read protection.** `/mcp` requires the stable `KNOWLEDGE_ADMIN_TOKEN` whenever one is set, as on earlier releases. Other reads (`/activate`, `/entries`, `/status`, the hooks) are open to local clients unless you set `KNOWLEDGE_PROTECT_READS=true`, which requires the token on every route except `/health`. With it set, plugins, hooks and any other client need the token in their own environment, not only in `.env`.
+
 ### From source
 
-**Prerequisites:** [Bun](https://bun.sh) ≥ 1.2
+**Prerequisites:** [Bun](https://bun.sh) 1.4.4, the version in `.bun-version` that the release binaries are built with. Other Bun versions are not tested.
 
 ```bash
 git clone https://github.com/MAnders333/knowledge-server
@@ -178,9 +196,9 @@ Cursor and VSCode are capture-only in practice. Cursor's session-start hook is n
 
 Codex: after `setup-tool codex`, open Codex, run `/hooks`, and trust the knowledge-server hook. Codex does not run a new or changed hook until it is trusted, so trust it again after a port change. Codex limits each hook's output to about 2,500 tokens and saves the rest to a file. The injected block is capped at 6,000 characters, which is usually under that limit.
 
-Each injected entry starts with a short id, for example `(id 1a2b3c4d)`. When an entry is wrong or outdated, the agent can call the `knowledge_flag` MCP tool with that id. The entry is queued for review (status `conflicted`), is no longer injected into sessions, and is not deleted. The flag reason is written to the server log (`[entries/flag]`), not stored on the entry. The MCP process needs `KNOWLEDGE_ADMIN_TOKEN` in its environment for this.
+Each injected entry starts with a short id, for example `(id 1a2b3c4d)`. When an entry is wrong or outdated, the agent can call the `knowledge_flag` MCP tool with that id. The entry is queued for review (status `conflicted`), is no longer injected into sessions, and is not deleted. The flag reason is neither stored on the entry nor written to the log (only its length is). Flagging is read-level: it needs no admin token of its own in any mode, so the MCP process never needs `KNOWLEDGE_ADMIN_TOKEN` for it. With `KNOWLEDGE_PROTECT_READS` it takes the same Bearer token as every other read.
 
-`knowledge-server status` shows the server's health (`ok`, `degraded` or `down`, with reasons) when the server answers, and, per source, the episodes captured in the last 7 days next to the activations received. It warns when a source is captured but nothing was injected.
+`knowledge-server status` shows the server's health (`ok`, `degraded` or `down`, with reasons) when the server answers, and, per source, the episodes captured in the last 7 days next to the activations that injected entries. It warns when a source is captured but nothing was injected.
 
 ## Components
 
@@ -203,8 +221,11 @@ The main HTTP server. Drains `pending_episodes` via the consolidation engine, ex
 
 Hono-based HTTP server. Binds to `127.0.0.1:3179` by default.
 
+The Auth column: `—` is open under the Host and Origin checks, unless `KNOWLEDGE_PROTECT_READS=true` with a stable `KNOWLEDGE_ADMIN_TOKEN` is set, which then requires the Bearer token on every route except `/health`. `stable token` (`/mcp`) needs it whenever a stable `KNOWLEDGE_ADMIN_TOKEN` is set, with or without `KNOWLEDGE_PROTECT_READS`. `admin` needs the admin token in every mode (the random per-start token, or the stable one). `read` is read-level: open like `—`, and with `KNOWLEDGE_PROTECT_READS` it takes the same Bearer token. `/health` is always open. Plugins and the Claude Code and Codex hooks read the token only from their own process environment, so with `KNOWLEDGE_PROTECT_READS` it must be exported there, not only written to `.env`.
+
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
+| `/health` | GET | — | Liveness probe with no store access. Always open, even with a stable `KNOWLEDGE_ADMIN_TOKEN` |
 | `/activate?q=...` | GET | — | Activate knowledge entries by query. Optional `client` query param or `x-knowledge-client` header (`opencode`, `claude-code`, `pi`, `omp`, `codex`, `mcp`, `cli`); missing or unknown values are recorded as `unknown`. |
 | `/consolidate` | POST | admin | Run a consolidation batch |
 | `/reinitialize?confirm=yes` | POST | admin | Wipe all entries and reset consolidation state |
@@ -216,8 +237,8 @@ Hono-based HTTP server. Binds to `127.0.0.1:3179` by default.
 | `/entries/:id` | DELETE | admin | Hard-delete an entry |
 | `/review` | GET | — | Surface conflicted, stale, and team-relevant entries |
 | `/hooks/claude-code/user-prompt` | POST | — | `UserPromptSubmit` hook endpoint for Claude Code; Codex CLI uses it too, with `?client=codex` |
-| `/entries/:id/flag` | POST | admin | Queue an active entry for review (status `conflicted`); accepts the short id shown in injected lines |
-| `/mcp` | ALL | — / admin | MCP streamable-http endpoint |
+| `/entries/:id/flag` | POST | read | Queue an active entry for review (status `conflicted`); accepts the short id shown in injected lines. Reversible, so it needs no admin token of its own |
+| `/mcp` | ALL | stable token | MCP streamable-http endpoint |
 
 ### MCP server
 
@@ -227,14 +248,14 @@ Two connection modes:
 
 **stdio** — `knowledge-server mcp` starts a lightweight stdio proxy. Registered automatically by `setup-tool`. Only `KNOWLEDGE_HOST`/`KNOWLEDGE_PORT` needed; no LLM credentials required.
 
-**streamable-http** — `ALL /mcp` on the main HTTP server. MCP clients connect directly at `http://127.0.0.1:3179/mcp`. When `KNOWLEDGE_ADMIN_TOKEN` is set, requires `Authorization: Bearer <token>` — suitable for hosted setups.
+**streamable-http** — `ALL /mcp` on the main HTTP server. MCP clients connect directly at `http://127.0.0.1:3179/mcp`. Whenever a stable `KNOWLEDGE_ADMIN_TOKEN` is set, `/mcp` requires `Authorization: Bearer <token>`, with or without `KNOWLEDGE_PROTECT_READS`. The stdio proxy loads `.env` itself and sends the token on its calls; a client that connects directly needs the token in its own environment.
 
 ### Consolidation engine (`src/consolidation/`)
 
 - `readers/pending.ts` — drains `pending_episodes` uploaded by the daemon
 - `consolidate.ts` — full cycle: read → extract → reconsolidate → contradiction scan → embed → synthesis → delete processed rows. Decay runs on its own timer (`DECAY_INTERVAL_MS`).
 - `llm.ts` — four LLM calls: `extractKnowledge` (extraction model), `decideMerge` (merge model), `detectAndResolveContradiction` (contradiction model), `synthesizePrinciple` (synthesis model, fires rarely on ripe clusters)
-- `decay.ts` — forgetting curve with type-specific half-lives
+- `src/domain/strength.ts` — forgetting curve with type-specific half-lives
 
 ## Configuration
 
@@ -247,6 +268,8 @@ Configuration is split across two files:
 **Proxy and CA variables are read from `.env`.** `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` (and their lowercase forms), `NODE_EXTRA_CA_CERTS`, `CURL_CA_BUNDLE` and `SSL_CERT_FILE` are loaded from this file, so a machine behind a corporate proxy or CA keeps them across binary upgrades.
 
 **`~/.config/knowledge-server/config.jsonc`** — store topology (which databases to use and where). Created automatically on first run (default: local SQLite). Edit this for Postgres or multi-store setups.
+
+**Invalid values fail at startup.** The server refuses to start when a value is not a number, is outside its range, or is not a recognised flag spelling; the message names the variable. An empty value means the default. The daemon logs these as warnings and keeps running; the MCP proxy does not check them. Flags take `true`/`false`, `on`/`off`, `yes`/`no` or `1`/`0` (case-insensitive): `ACTIVATION_PRECISION_GATE`, `ACTIVATION_STRENGTH_DAMPENING`, `CONTRADICTION_CONFLICTS_ONLY`, `RERANK_ENABLED`, the `*_ENABLED` source switches, `DAEMON_AUTO_SPAWN` and `REDACT_SECRETS`.
 
 ### Editor validation (`$schema`)
 
@@ -403,7 +426,7 @@ Provider-specific credentials take precedence over the unified endpoint.
 | `EMBEDDING_MODEL` | `text-embedding-3-large` | Embedding model. **Changing this re-embeds all entries on next startup.** |
 | `EMBEDDING_DIMENSIONS` | *(model default)* | Truncated output dimensions (only valid for `text-embedding-3-*`) |
 | `EMBEDDING_BASE_URL` | *(see below)* | Dedicated embedding endpoint. Priority: `EMBEDDING_BASE_URL` → `OPENAI_BASE_URL` → `LLM_BASE_ENDPOINT/openai/v1` |
-| `EMBEDDING_API_KEY` | *(see below)* | Key for a dedicated `EMBEDDING_BASE_URL`. `LLM_API_KEY` is used there only when that URL shares `LLM_BASE_ENDPOINT`'s origin. Otherwise falls back to `OPENAI_API_KEY`, then `LLM_API_KEY`. |
+| `EMBEDDING_API_KEY` | *(see below)* | Key for a dedicated `EMBEDDING_BASE_URL`. `LLM_API_KEY` is used there only when that URL shares `LLM_BASE_ENDPOINT`'s origin. Otherwise no key is sent. |
 | `EMBEDDING_TIMEOUT_MS` | `20000` | Per-request embedding timeout in ms. Background re-embed and backfill use at least `60000` |
 | `EMBEDDING_MAX_RETRIES` | `2` | Retries per 100-text chunk on transient errors (timeouts, network errors, HTTP 408/429/5xx, truncated or malformed responses) during background re-embed and backfill. Interactive activation does not retry |
 
@@ -421,18 +444,22 @@ EMBEDDING_MODEL=nomic-embed-text
 |---|---|---|---|---|
 | HTTP port | `port` | `KNOWLEDGE_PORT` | `3179` | |
 | Bind address | `host` | `KNOWLEDGE_HOST` | `127.0.0.1` | Loopback only |
-| Daemon auto-spawn | `daemonAutoSpawn` | `DAEMON_AUTO_SPAWN=false` | `true` | Set false to manage daemon yourself |
+| Daemon auto-spawn | `daemonAutoSpawn` | `DAEMON_AUTO_SPAWN=false` | `true` | Set `false` (or `0`, `no`, `off`) to manage the daemon yourself |
 
 Credentials and paths stay in `.env`:
 
 | Variable | Default | Description |
 |---|---|---|
-| `KNOWLEDGE_ADMIN_TOKEN` | *(random per process)* | Fixed admin token for scripted use (≥16 chars; the template placeholder `your-stable-token-here` is rejected) |
+| `KNOWLEDGE_ADMIN_TOKEN` | *(random per process)* | Stable admin token, for service or scripted use (`openssl rand -hex 24`). At least 16 characters: startup refuses a shorter value, and so does the template placeholder `your-stable-token-here`. Under 32 characters, or with fewer than 12 distinct characters, logs a warning; the value is never printed. It guards every mutation route and `/mcp` |
+| `KNOWLEDGE_PROTECT_READS` | `false` | With a stable `KNOWLEDGE_ADMIN_TOKEN`, require the Bearer token on every route except `/health`, reads included. Needs the stable token (startup error otherwise). Plugins and the Claude Code and Codex hooks read the token only from their own process environment, so export it there too; a token only in `.env` does not reach them |
 | `KNOWLEDGE_ALLOWED_HOSTS` | *(empty)* | Extra `Host` names the API accepts, comma-separated (`name` or `name:port`). `localhost`, `127.0.0.1`, `[::1]` and the bind host are always accepted. Needed when a reverse proxy forwards a different hostname. |
-| `REDACT_SECRETS` | `true` | Scrub credentials (private keys, cloud/SaaS/LLM API tokens, JWTs, `Authorization` headers, `*_SECRET`/`*_TOKEN`/`*_PASSWORD`/`*_API_KEY` values, URL passwords, long keyed secrets) from transcript text before it is staged, sent to an LLM or embedding API, or stored. Set `false` to disable. Counts are logged per run; values are never logged. |
-| `KNOWLEDGE_LOG_PATH` | `~/.local/share/knowledge-server/server.log` | Log file. Set to `""` to disable. When stdout or stderr already points at this file (the launchd plist does this), each line is written once. |
-| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. `info` logs lengths, ids and similarity scores; consolidation and contradiction decisions at `info` include entry text. `warn` suppresses those lines. |
+| `POSTGRES_POOL_MAX` | `10` | Connections per Postgres pool: each Postgres knowledge store and the state DB |
+| `REDACT_SECRETS` | `true` | Scrub credentials (private keys, cloud/SaaS/LLM API tokens, JWTs, `Authorization` headers, `*_SECRET`/`*_TOKEN`/`*_PASSWORD`/`*_API_KEY` values, URL passwords, long keyed secrets) from transcript text before it is staged, sent to an LLM or embedding API, or stored. Set `false` (or `0`, `no`, `off`) to disable. Counts are logged per run; values are never logged. |
+| `KNOWLEDGE_LOG_PATH` | `server.log` in the data directory: the directory of `stateDb.path` (default `~/.local/share/knowledge-server`) | Log file. Set to `""` to disable. When stdout or stderr already points at this file (the launchd plist does this), each line is written once. |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. `info` logs lengths, ids, counts and similarity scores; entry and episode text is logged only at `debug`. `warn` suppresses info lines. |
 | `LOG_MAX_BYTES` | `20971520` (20 MB) | Size at which the active log rotates. Rotation keeps `server.log.1` to `server.log.3` and drops the oldest, so the files total about four times this value. `0` disables rotation. Rotated copies can hold text written by earlier versions, including an old admin token; delete them once you no longer need them. |
+
+**Upgrading with a custom `stateDb.path`.** The PID file and server log now sit in the directory of `stateDb.path`, not in `~/.local/share/knowledge-server`. `knowledge-server stop` and `status` find a PID file left in the old location, so stop a server that was started before the upgrade with `knowledge-server stop`.
 
 ### Session sources
 
@@ -441,21 +468,21 @@ All sources are auto-detected. Override paths or disable sources via environment
 | Variable | Default | Description |
 |---|---|---|
 | `OPENCODE_DB_PATH` | `~/.local/share/opencode/opencode.db` | OpenCode SQLite DB |
-| `OPENCODE_ENABLED` | `true` | Set to `false` to disable |
+| `OPENCODE_ENABLED` | `true` | Set to `false` (or `0`, `no`, `off`) to disable |
 | `CLAUDE_DB_PATH` | `~/.claude` | Claude Code JSONL root dir |
-| `CLAUDE_ENABLED` | `true` | Set to `false` to disable |
+| `CLAUDE_ENABLED` | `true` | Set to `false` (or `0`, `no`, `off`) to disable |
 | `CODEX_SESSIONS_DIR` | *(auto-detected)* | Codex CLI sessions root |
-| `CODEX_ENABLED` | `true` | Set to `false` to disable |
+| `CODEX_ENABLED` | `true` | Set to `false` (or `0`, `no`, `off`) to disable |
 | `CURSOR_DB_PATH` | *(auto-detected)* | Cursor `state.vscdb` path |
-| `CURSOR_ENABLED` | `true` | Set to `false` to disable |
+| `CURSOR_ENABLED` | `true` | Set to `false` (or `0`, `no`, `off`) to disable |
 | `VSCODE_DATA_DIR` | *(auto-detected)* | VSCode data directory |
-| `VSCODE_ENABLED` | `true` | Set to `false` to disable |
+| `VSCODE_ENABLED` | `true` | Set to `false` (or `0`, `no`, `off`) to disable |
 | `LOCAL_FILES_DIR` | `~/knowledge` | Markdown files to ingest |
-| `LOCAL_FILES_ENABLED` | `true` | Set to `false` to disable |
+| `LOCAL_FILES_ENABLED` | `true` | Set to `false` (or `0`, `no`, `off`) to disable |
 | `PI_SESSIONS_ROOT` | `~/.pi` | pi sessions root (scans `<root>/*/sessions`) |
-| `PI_ENABLED` | `true` | Set to `false` to disable |
+| `PI_ENABLED` | `true` | Set to `false` (or `0`, `no`, `off`) to disable |
 | `OMP_SESSIONS_ROOT` | `~/.omp` | oh-my-pi sessions root (scans shared + profile layers) |
-| `OMP_ENABLED` | `true` | Set to `false` to disable |
+| `OMP_ENABLED` | `true` | Set to `false` (or `0`, `no`, `off`) to disable |
 
 #### Daemon upload behaviour
 
@@ -496,10 +523,10 @@ All sources are auto-detected. Override paths or disable sources via environment
 |---|---|---|
 | `ACTIVATION_MAX_RESULTS` | `10` | Max entries returned per activation |
 | `ACTIVATION_SIMILARITY_THRESHOLD` | `0.42` | Minimum cosine similarity to activate |
-| `ACTIVATION_PRECISION_GATE` | `on` | `off` disables the floors and the token budget below (dedupe is separate). The render cap still applies, so the block never exceeds the formatter's 6,000-character limit |
+| `ACTIVATION_PRECISION_GATE` | `on` | `off`, `false`, `0` or `no` disables the floors and the token budget below (dedupe is separate). The render cap still applies, so the block never exceeds the formatter's 6,000-character limit |
 | `RERANK_FLOOR` | unset | Absolute rerank-score floor for the configured scorer. Unset: relative rule only; no absolute floor is enabled by default. The benchmark's suggested value for `jev-1.14.0` is `0.2`, with a precision trade-off (see the note under Reranking). Applies to the top entry too |
 | `RERANK_REL_FRAC` | `0.35` | With rerank, a candidate must reach this fraction of the best rerank score (floor = max of this and `RERANK_FLOOR`) |
-| `ACTIVATION_DENSE_MARGIN` | `0` | Used when rerank did not run (disabled, failed, or timed out): raw cosine must clear the similarity threshold by this margin. At `0` the dense fallback adds no filtering beyond the threshold |
+| `ACTIVATION_DENSE_MARGIN` | `0` | Used when rerank did not run (disabled, failed, skipped, or out of time): raw cosine must clear the similarity threshold by this margin. Above `0`, relation-expanded support sources are gated too, at 0.9× their parent's score. At `0` without rerank the dense fallback adds no filtering beyond the threshold, and sources are not gated |
 | `ACTIVATION_TOKEN_BUDGET` | `1500` | Estimated tokens (chars / 4) for the injected entries. The top entry is always kept. Values above `1500` are clamped to it: the formatter caps the block at 6,000 characters, so an entry counted here is always an entry rendered |
 | `ACTIVATION_SESSION_TTL_MS` | `1800000` | Per-session dedupe: an entry injected in a session with a client session id is suppressed for this long after its injection. `0` disables it. Without a session id there is no dedupe |
 | `ACTIVATION_STRENGTH_DAMPENING` | `false` | Rank-time freshness dampening: `rerank × (0.5 + 0.5·strength)` instead of `rerank × strength` |
@@ -515,7 +542,7 @@ Dense retrieval overfetches `RERANK_CANDIDATES` entries and a second stage re-sc
 - `local` (default): an in-process cross-encoder. It runs offline after a one-time model download (~23MB). The default model is pinned to a Hugging Face revision and checksum. Nothing leaves the machine.
 - `remote` (opt-in): one call per activation to a decision model through the System One API (`POST` to `RERANK_REMOTE_URL`). Each candidate gets one Noul question ("is this document relevant to the query?", hev/reranker's `generic-1` wording, Apache-2.0), and the scores are the model's probabilities in [0, 1]. A response with a missing, non-noul, or out-of-range answer fails open to dense ordering. It needs no local model memory and does not block the event loop. After 3 consecutive failures remote reranking pauses for 60 s, and dense ordering is used meanwhile. The default model is the versioned `jev-1.14.0`: aliases such as `jev-latest` move, and a changed model changes the scores.
 
-> **Privacy: `RERANK_PROVIDER=remote` sends content off this machine.** On every activation the remote provider sends (1) the query tail, the last `RERANK_MAX_QUERY_TOKENS` tokens of the prompt, and (2) the text of each candidate entry, its first `RERANK_MAX_DOC_TOKENS` tokens with its type and topics. Only the candidates dense retrieval returned for that prompt are sent, never the whole store. The endpoint forwards the request to the hosting provider of the model, so the retention and processing terms are those of that host, which this project does not control. Keep the default `local` provider unless you accept that.
+> **Privacy: `RERANK_PROVIDER=remote` sends content off this machine.** On every activation the remote provider sends (1) the query tail, the last `RERANK_MAX_QUERY_TOKENS` tokens of the prompt, and (2) the text of each candidate entry, its first `RERANK_MAX_DOC_TOKENS` tokens with its type and topics. Only the candidates dense retrieval returned for that prompt are sent, never the whole store. Both are first scrubbed with the `REDACT_SECRETS` rules (keys, tokens, URL passwords), unless `REDACT_SECRETS=false`; that catches known credential shapes, not arbitrary sensitive text. The endpoint forwards the request to the hosting provider of the model, so the retention and processing terms are those of that host, which this project does not control. Keep the default `local` provider unless you accept that.
 
 Hosts of the models seen on the maintainer's gateway. Check the routing of your own gateway, since the gateway decides where a model runs:
 
@@ -530,18 +557,18 @@ The default name `jev-1.14.0` exists on the maintainer's gateway and on TypeSafe
 
 | Variable | Default | Description |
 |---|---|---|
-| `RERANK_ENABLED` | `true` | `false` restores dense-only ordering |
+| `RERANK_ENABLED` | `true` | `false` (or `0`, `no`, `off`) restores dense-only ordering |
 | `RERANK_PROVIDER` | `local` | `local` or `remote`. Any other value fails validation. `remote` sends content off this machine (see the privacy note) |
 | `RERANK_MODEL` | `Xenova/ms-marco-MiniLM-L-6-v2` | Local Hugging Face ONNX cross-encoder. **The default is English-only.** For other languages use a multilingual ONNX export with a WordPiece `tokenizer.json`. Other models are fetched from `main` without a checksum |
-| `RERANK_MODELS_DIR` | `~/.local/share/knowledge-server/models` | Local model cache |
-| `RERANK_CANDIDATES` | `16` (local); `30` with `RERANK_PROVIDER=remote` | Dense candidates scored per activation. Remote scores at most 40 in one call. 30 was the benchmark's choice: 16 to 40 gave +0.030 nDCG on NFCorpus (CI +0.014 to +0.047) and +0.011 on SciFact (not significant) |
+| `RERANK_MODELS_DIR` | `models` in the data directory (see `KNOWLEDGE_LOG_PATH`) | Local model cache |
+| `RERANK_CANDIDATES` | `30` when the remote reranker is usable (`RERANK_PROVIDER=remote` with an endpoint and key); otherwise `16` | Dense candidates scored per activation. Remote scores at most 40 in one call. 30 was the benchmark's choice: 16 to 40 gave +0.030 nDCG on NFCorpus (CI +0.014 to +0.047) and +0.011 on SciFact (not significant) |
 | `RERANK_TIMEOUT_MS` | `3000` | Budget for one local rerank call. On expiry the whole batch falls back to dense ordering (no partial scores) |
 | `RERANK_MAX_QUERY_TOKENS` | `128` | Last N tokens of the prompt used as the rerank query (remote: N × 4 characters) |
 | `RERANK_MAX_DOC_TOKENS` | `256` | First N tokens of each candidate that is scored (remote: N × 4 characters). Shorter caps lowered quality on long documents |
-| `RERANK_REMOTE_URL` | `${LLM_BASE_ENDPOINT}/decisions/v1/systemone` | Full System One URL. Direct TypeSafe: `https://api.typesafe.ai/v1/systemone`. A URL on another origin than `LLM_BASE_ENDPOINT` needs `RERANK_REMOTE_API_KEY`; without it remote reranking stays off and the local reranker runs. Plain http to a non-loopback host logs a warning |
+| `RERANK_REMOTE_URL` | `${LLM_BASE_ENDPOINT}/decisions/v1/systemone` | Full System One URL. Direct TypeSafe: `https://api.typesafe.ai/v1/systemone`. A URL on another origin than `LLM_BASE_ENDPOINT` needs `RERANK_REMOTE_API_KEY`; without it remote reranking stays off and the local reranker runs. Plain http to a non-loopback host logs a startup warning, since the key is then sent unencrypted; requests are not refused |
 | `RERANK_REMOTE_API_KEY` | `LLM_API_KEY`, only on the `LLM_BASE_ENDPOINT` origin | Key for `RERANK_REMOTE_URL`. The gateway key is never sent to another origin |
 | `RERANK_REMOTE_MODEL` | `jev-1.14.0` | Decision model for `RERANK_PROVIDER=remote`, named as your endpoint names it. Use a versioned name. The gateway does not resolve an alias to a version (`jev-latest` comes back as `typesafe/jev-latest`), and calibrated floors are keyed by the configured name. `activation_event.rerank_model` stores `remote/<configured model>`, the floor key; the name the endpoint reports resolving to is logged as `resolved_model` |
-| `RERANK_REMOTE_TIMEOUT_MS` | `4000` | Budget for one call, including one retry after a 429 whose `Retry-After` fits in what is left. It sits inside the 5 s plugin budget; on expiry dense ordering is used |
+| `RERANK_REMOTE_TIMEOUT_MS` | `2500` | Budget for one call, including one retry after a 429 whose `Retry-After` fits in what is left. The call gets no more than the request's remaining budget less 500 ms reserved for later work (the request budget is 4.5 s per activation, 3.5 s for the Codex hook). Rerank is skipped when under 300 ms is left, and dense ordering is used. The request clock starts at request entry, so the query embedding and store reads count against it. On expiry dense ordering is used |
 
 Remote mode needs an endpoint (`RERANK_REMOTE_URL`, or `LLM_BASE_ENDPOINT`) and a key (`RERANK_REMOTE_API_KEY`, or `LLM_API_KEY` for the gateway's own origin). If either is missing (or still a template placeholder), the server logs a warning at startup and uses the local reranker. When remote reranking is active, startup also rejects `RERANK_CANDIDATES` above 40, and any configuration whose request could exceed about 100,000 characters: `RERANK_CANDIDATES × (RERANK_MAX_DOC_TOKENS × 4 + 512) + RERANK_MAX_QUERY_TOKENS × 4`. The defaults give about 25,000.
 
@@ -657,7 +684,7 @@ knowledge-server reinitialize --reset-store --store=personal --confirm
 knowledge-server reinitialize --reset-store --dry-run
 ```
 
-**Note:** Stop both the server and the daemon before running any reinitialize variant. The command exits with an error if either is live. The server is checked by its PID file: run `knowledge-server stop`. The daemon is checked by its lock file (`daemon.lock` in the data directory): an upload cycle that is in flight writes a fresh `daemon_cursor` after the reset, which defeats the full re-ingest. Stop the daemon with its service command when it is registered as one: `launchctl bootout gui/$(id -u)/com.knowledge-server.daemon` on macOS, or `systemctl --user stop knowledge-daemon` on Linux. Otherwise run `kill <pid>`, using the `pid` field of `daemon.lock`.
+**Note:** Stop both the server and the daemon before running any reinitialize variant. The command exits with an error if either is live. The server is checked by its PID file: run `knowledge-server stop`. The daemon is checked by its lock file (`daemon.lock` in the data directory): an upload cycle that is in flight writes a fresh `daemon_cursor` after the reset, which defeats the full re-ingest. Stop the daemon with its service command when it is registered as one: `launchctl bootout gui/$(id -u)/com.knowledge-server.daemon` on macOS, or `systemctl --user stop knowledge-daemon` on Linux. Otherwise, check the PID first: `ps -p <pid> -o command=` must show `knowledge-daemon`, because a lock left by a crashed daemon can name a PID that another process now uses. Then run `kill <pid>`, using the `pid` field of `daemon.lock`.
 
 `--dry-run` and `--confirm` are mutually exclusive — `--dry-run` previews the action without requiring `--confirm`.
 
@@ -708,9 +735,9 @@ You work across multiple machines and want a single knowledge base that spans al
 
 **Host and Origin checks** — Every route, including `/mcp`, rejects a `Host` header that does not name `localhost`, `127.0.0.1`, `[::1]`, the bind host, or an entry in `KNOWLEDGE_ALLOWED_HOSTS` (403). A request carrying an `Origin` header must also name an allowed host over `http` or `https`, so cross-origin browser pages are refused. Clients that send no `Origin` (curl, the hook, MCP stdio proxy) are unaffected.
 
-**Admin token** — Mutation endpoints require an admin token. A random token is generated at startup. It is printed only when the server's stdout is a terminal; under launchd, systemd or redirected output it is not printed and never written to `server.log`. For service or scripted use, set `KNOWLEDGE_ADMIN_TOKEN` in `.env` (≥16 chars) for a stable token across restarts. `PATCH`, `resolve` and `DELETE` act only on writable stores; an entry that lives only in a read-only store returns 403.
+**Admin token** — Mutation endpoints (`/consolidate`, `/reinitialize`, and `PATCH`, `resolve` and `DELETE` on entries) always require an admin token. A random token is generated at startup. It is printed only when the server's stdout is a terminal; under launchd, systemd or redirected output it is never printed and never written to `server.log`. For service or scripted use, set `KNOWLEDGE_ADMIN_TOKEN` (`openssl rand -hex 24`) for a stable token across restarts. A stable token also guards `/mcp`. Other reads (`/activate`, `/entries`, `/status` and the hooks) stay open to loopback clients that pass the Host and Origin checks, unless `KNOWLEDGE_PROTECT_READS=true`, which requires the stable token on every route except `/health`. Failed attempts against a stable token are throttled per client address (10 a minute, then 429 with `Retry-After`). The throttle only bounds noise and CPU; it does not make guessing hard. The protection is the token's entropy. A token shorter than 16 characters is refused at startup; one under 32 characters, or with fewer than 12 distinct characters, logs a warning without printing the value. A correct token is never refused. `PATCH`, `resolve` and `DELETE` act only on writable stores; an entry that lives only in a read-only store returns 403.
 
-**Input limits** — Request bodies are capped at 1 MB. `/activate` and the MCP `activate` tool keep at most 16 cues, truncate each query to head and tail (20k characters for the full query, 2k per segment), and clamp `limit` to 1–50. The Claude Code hook applies the same caps to the prompt. Read endpoints still record access counts for returned entries; gating that is tracked separately.
+**Input limits** — Request bodies are capped at 1 MB. `/activate`, the MCP `activate` tool and the Claude Code hook keep at most 12 cues: duplicates are removed first, then the first 6 and the last 6 are kept, and the last is the full message. Each query is truncated to head and tail (20k characters for the full query, 2k per segment), and `limit` is clamped to 1–50. Read endpoints still count each returned entry as an injection (`injection_count`); gating that is tracked separately.
 
 **Postgres TLS** — `sslmode=require` encrypts the connection but does not verify the server certificate. For remote databases use `sslmode=verify-full` (system CAs), or `sslmode=verify-ca&sslrootcert=/path/to/ca.pem`. A non-local Postgres host connected without `sslmode` logs a one-time warning. Existing URIs without `sslmode` keep their behaviour.
 

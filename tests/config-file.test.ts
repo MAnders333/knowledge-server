@@ -1,16 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	DEFAULT_CONFIG,
-	DEFAULT_SQLITE_PATH,
+	defaultSqlitePath,
 	loadConfigFile,
 	resolveLegacyKnowledgeDbPath,
 	resolvePostgresUri,
 	resolveServerAddress,
 	resolveSqlitePath,
 } from "../src/config-file";
+import { homeDir } from "../src/home";
 
 describe("loadConfigFile", () => {
 	let tempDir: string;
@@ -260,13 +261,13 @@ describe("resolveSqlitePath", () => {
 		expect(result).toBe("/custom/path.db");
 	});
 
-	it("falls back to DEFAULT_SQLITE_PATH if path is omitted", () => {
+	it("falls back to defaultSqlitePath() if path is omitted", () => {
 		const result = resolveSqlitePath({
 			id: "main",
 			kind: "sqlite",
 			writable: true,
 		});
-		expect(result).toBe(DEFAULT_SQLITE_PATH);
+		expect(result).toBe(defaultSqlitePath());
 	});
 });
 
@@ -375,7 +376,7 @@ describe("loadConfigFile — domain and project validation", () => {
 		);
 		const config = loadConfigFile(configPath);
 		expect(config.projects[0].path).not.toContain("~");
-		expect(config.projects[0].path).toContain(homedir());
+		expect(config.projects[0].path).toContain(homeDir());
 	});
 
 	it("throws when domain references a read-only store", () => {
@@ -587,8 +588,8 @@ describe("config path and server address resolution", () => {
 			}),
 		);
 		const cfg = loadConfigFile(configPath);
-		expect(cfg?.stores[0].path).toBe(join(homedir(), "kb", "work.db"));
-		expect(cfg?.stateDb.path).toBe(join(homedir(), "kb", "state.db"));
+		expect(cfg?.stores[0].path).toBe(join(homeDir(), "kb", "work.db"));
+		expect(cfg?.stateDb.path).toBe(join(homeDir(), "kb", "state.db"));
 	});
 
 	it("resolveServerAddress returns the port and host from config.jsonc", () => {

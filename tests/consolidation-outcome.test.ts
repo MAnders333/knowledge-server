@@ -7,6 +7,7 @@
  * attempt, and are dead-lettered after PENDING_EPISODE_MAX_ATTEMPTS. The drain
  * loops stop when a batch settles nothing.
  */
+import { Database } from "bun:sqlite";
 import {
 	afterEach,
 	beforeEach,
@@ -19,12 +20,12 @@ import {
 import { mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import * as aiModule from "ai";
 import { ActivationEngine } from "../src/activation/activate";
 import { drainConsolidation } from "../src/commands/consolidation-drain";
 import { config } from "../src/config";
 import type { KnowledgeServerConfig } from "../src/config-file";
 import { ConsolidationEngine } from "../src/consolidation/consolidate";
-import { DomainRouter } from "../src/consolidation/domain-router";
 import { ConsolidationLLM } from "../src/consolidation/llm";
 import type { ExtractedKnowledge } from "../src/consolidation/llm";
 import { MalformedLlmOutputError } from "../src/consolidation/llm-output";
@@ -33,6 +34,7 @@ import { PENDING_EPISODE_MAX_ATTEMPTS } from "../src/db/interface";
 import type { IKnowledgeStore } from "../src/db/interface";
 import { KnowledgeDB } from "../src/db/sqlite/index";
 import { ServerStateDB } from "../src/db/state/index";
+import { DomainRouter } from "../src/domain/domain-router";
 import { LLM_DEGRADED_FAILING_RUNS, componentHealth } from "../src/health";
 import { logger } from "../src/logger";
 import type { PendingEpisode as PendingRow } from "../src/types";
@@ -773,5 +775,251 @@ describe("unavailable store and the batch window", () => {
 			config.consolidation.maxSessionsPerRun = savedMax;
 			await workDb.close();
 		}
+	});
+});
+
+describe("episodes blocked after extraction", () => {
+	/** Routing config: "work" is a configured domain whose store is unavailable. */
+	function workUnavailableRouter(workDb: KnowledgeDB): DomainRouter {
+		const homeDir = homedir();
+		const routedConfig = {
+			userId: "alice",
+			stores: [
+				{ id: "personal", kind: "sqlite", writable: true },
+				{ id: "work", kind: "sqlite", writable: true },
+			],
+			domains: [
+				{ id: "personal", description: "Personal", store: "personal" },
+				{ id: "work", description: "Work", store: "work" },
+			],
+			projects: [
+				{ path: `${homeDir}/work`, default_domain: "work" },
+				{ path: `${homeDir}/personal`, default_domain: "personal" },
+			],
+		} as unknown as KnowledgeServerConfig;
+		const stores = new Map<string, IKnowledgeStore>([
+			["personal", db],
+			["work", workDb],
+		]);
+		return new DomainRouter(routedConfig, stores, db, new Set(["work"]));
+	}
+
+	function routedEngine(router: DomainRouter): ConsolidationEngine {
+		const activation = new ActivationEngine(db);
+		spyOn(activation.embeddings, "embed").mockImplementation(async (text) =>
+			uniqueEmbedding(seenEmbeddings, text),
+		);
+		return new ConsolidationEngine(
+			db,
+			state,
+			activation,
+			[new PendingEpisodesReader(state)],
+			router,
+		);
+	}
+
+	it("an entry routed to the unavailable store is not extracted again in later batches of the drain", async () => {
+		const workDb = new KnowledgeDB(join(tempDir, "work-blocked.db"));
+		try {
+			const routed = routedEngine(workUnavailableRouter(workDb));
+			const home = homedir();
+			const now = Date.now();
+			// The blocked episode is the oldest, so it is settled first in the drain.
+			await state.insertPendingEpisode(
+				pendingRow({
+					id: "blocked",
+					sessionId: "session-blocked",
+					directory: `${home}/personal/notes`,
+					content: "ROUTE-TO-WORK the release notes.",
+					maxMessageTime: now - 5000,
+				}),
+			);
+			await state.insertPendingEpisode(
+				pendingRow({
+					id: "healthy",
+					sessionId: "session-healthy",
+					directory: `${home}/personal/notes`,
+					content: "Healthy session content.",
+					maxMessageTime: now - 1000,
+				}),
+			);
+			const extract = spyOn(
+				ConsolidationLLM.prototype,
+				"extractKnowledge",
+			).mockImplementation(async (summary: string) =>
+				summary.includes("ROUTE-TO-WORK")
+					? [entry("Ship the release on Fridays.", "work")]
+					: [entry("Use tabs for indentation.")],
+			);
+
+			// The drain loop: batches share one `attempted` set until a batch settles nothing.
+			const attempted = new Set<string>();
+			for (let batch = 0; batch < 5; batch++) {
+				const result = await routed.consolidate({ attempted });
+				if (result.sessionsProcessed === 0) break;
+			}
+
+			// One extraction for each episode. The blocked one is not paid for again.
+			expect(extract).toHaveBeenCalledTimes(2);
+			const waiting = await state.getPendingEpisodes(0);
+			expect(waiting.map((r) => r.id)).toEqual(["blocked"]);
+			expect(waiting[0].failedAttempts ?? 0).toBe(0);
+
+			// A later drain (a new `attempted` set) tries it again: it was deferred, not failed.
+			await routed.consolidate();
+			expect(extract).toHaveBeenCalledTimes(3);
+		} finally {
+			await workDb.close();
+		}
+	});
+
+	it("a store lock taken between the check and the write blocks the episode for the rest of the drain", async () => {
+		const now = Date.now();
+		await state.insertPendingEpisode(
+			pendingRow({
+				id: "locked-late",
+				sessionId: "session-locked-late",
+				content: "Late lock content.",
+				maxMessageTime: now - 5000,
+			}),
+		);
+		await state.insertPendingEpisode(
+			pendingRow({
+				id: "healthy",
+				sessionId: "session-healthy",
+				content: "Healthy session content.",
+				maxMessageTime: now - 1000,
+			}),
+		);
+		// Per chunk: one check before extraction (free, then released), one lock
+		// attempt at write time. The write attempt of the first chunk finds it held.
+		spyOn(db, "tryAcquireConsolidationLock")
+			.mockResolvedValueOnce(true)
+			.mockResolvedValueOnce(false)
+			.mockResolvedValueOnce(true)
+			.mockResolvedValueOnce(true)
+			.mockResolvedValue(true);
+		const extract = spyOn(
+			ConsolidationLLM.prototype,
+			"extractKnowledge",
+		).mockResolvedValue([entry("Use tabs for indentation.")]);
+
+		const attempted = new Set<string>();
+		for (let batch = 0; batch < 5; batch++) {
+			const result = await engine.consolidate({ attempted });
+			if (result.sessionsProcessed === 0) break;
+		}
+
+		expect(extract).toHaveBeenCalledTimes(2);
+		const waiting = await state.getPendingEpisodes(0);
+		expect(waiting.map((r) => r.id)).toEqual(["locked-late"]);
+		expect(waiting[0].failedAttempts ?? 0).toBe(0);
+	});
+});
+
+describe("secrets are scrubbed before extraction", () => {
+	it("the extraction prompt carries no credential from the episode text or its metadata", async () => {
+		const token = ["ghp_", "e".repeat(36)].join("");
+		await state.insertPendingEpisode(
+			pendingRow({
+				id: "scrub-1",
+				sessionId: "session-scrub",
+				sessionTitle: `Debug ${token}`,
+				projectName: `proj ${token}`,
+				content: `User: deploy with ${token} please.`,
+			}),
+		);
+		const extract = spyOn(
+			ConsolidationLLM.prototype,
+			"extractKnowledge",
+		).mockResolvedValue([entry("Deploys use a vault key.")]);
+
+		await engine.consolidate();
+
+		expect(extract).toHaveBeenCalledTimes(1);
+		const prompt = String(extract.mock.calls[0]?.[0]);
+		expect(prompt).not.toContain(token);
+		expect(prompt).toContain("[REDACTED:github_token]");
+	});
+});
+
+describe("provider failures from a real model call", () => {
+	// Provider text is assembled as data, the way a gateway returns it.
+	const ECHO = "EPISODE-TEXT-THAT-MUST-NOT-LEAK";
+	let savedRetries: number;
+
+	beforeEach(() => {
+		savedRetries = config.llm.maxRetries;
+		config.llm.maxRetries = 0;
+	});
+	afterEach(() => {
+		config.llm.maxRetries = savedRetries;
+	});
+
+	function providerError(message: string, statusCode: number, body: unknown) {
+		return Object.assign(new Error(message), {
+			name: "AI_APICallError",
+			statusCode,
+			responseBody: JSON.stringify(body),
+		});
+	}
+
+	/** The last_error recorded for a pending row, read from the state DB file. */
+	function storedLastError(id: string): string | null {
+		const reader = new Database(join(tempDir, "state.db"), { readonly: true });
+		try {
+			const row = reader
+				.query<{ last_error: string | null }, [string]>(
+					"SELECT last_error FROM pending_episode_attempts WHERE id = ?",
+				)
+				.get(id);
+			return row?.last_error ?? null;
+		} finally {
+			reader.close();
+		}
+	}
+
+	it("stores the status and error code of a rejected request, not the provider's text", async () => {
+		await state.insertPendingEpisode(
+			pendingRow({
+				id: "row-422",
+				sessionId: "session-422",
+				maxMessageTime: Date.now() - 1000,
+			}),
+		);
+		spyOn(aiModule, "generateText").mockRejectedValue(
+			providerError(`Invalid input: ${ECHO}`, 422, {
+				detail: [{ loc: ["body", "input"], msg: ECHO, type: "string_type" }],
+			}),
+		);
+
+		await engine.consolidate();
+
+		const stored = storedLastError("row-422");
+		expect(stored).toContain("AI_APICallError HTTP 422 (error: string_type)");
+		expect(stored).not.toContain(ECHO);
+	});
+
+	it("a billing rejection stays pending and is never dead-lettered", async () => {
+		await state.insertPendingEpisode(
+			pendingRow({
+				id: "row-billing",
+				sessionId: "session-billing",
+				maxMessageTime: Date.now() - 1000,
+			}),
+		);
+		spyOn(aiModule, "generateText").mockRejectedValue(
+			providerError("Your credit balance is too low", 400, {
+				error: { message: "Your credit balance is too low" },
+			}),
+		);
+
+		for (let i = 0; i <= PENDING_EPISODE_MAX_ATTEMPTS; i++) {
+			await engine.consolidate();
+		}
+
+		const rows = await state.getPendingEpisodes(0);
+		expect(rows.map((r) => r.id)).toContain("row-billing");
+		expect(storedLastError("row-billing")).toBeNull();
 	});
 });

@@ -50,7 +50,6 @@ export async function runReview(args: string[]): Promise<void> {
 	}
 
 	const registry = await StoreRegistry.create();
-	const db = registry.writableStore();
 	const readDbs = registry.readStores();
 	// Share one EmbeddingClient instance for the lifetime of the command so
 	// re-embeds on edit reuse the same config/connection as the rest of the run.

@@ -23,6 +23,8 @@ import type { Plugin } from "@opencode-ai/plugin";
  * Configuration:
  *   Set KNOWLEDGE_SERVER_URL, or KNOWLEDGE_PORT / "port" in
  *   ~/.config/knowledge-server/config.jsonc (default: 3179)
+ *   KNOWLEDGE_ADMIN_TOKEN is sent as a Bearer on read calls, only when it is set
+ *   (with KNOWLEDGE_PROTECT_READS=true the server requires it on every route except /health)
  *
  * Design principle: NEVER throw. All errors are caught and silently swallowed.
  * A broken knowledge plugin must never affect OpenCode's core functionality.
@@ -82,6 +84,14 @@ const KNOWLEDGE_SERVER_URL_SAFE =
 	(_parsedUrl.hostname === "127.0.0.1" ||
 		_parsedUrl.hostname === "localhost" ||
 		_parsedUrl.hostname === "[::1]");
+
+/**
+ * Headers for read calls. The server needs the token on reads only with
+ * KNOWLEDGE_PROTECT_READS=true, so it is sent when set and never otherwise.
+ */
+const AUTH_HEADERS: Record<string, string> = process.env.KNOWLEDGE_ADMIN_TOKEN
+	? { Authorization: `Bearer ${process.env.KNOWLEDGE_ADMIN_TOKEN}` }
+	: {};
 
 const safeLog = async (
 	client: Parameters<Plugin>[0]["client"],
@@ -143,7 +153,7 @@ const ACTIVATED_KNOWLEDGE_NOTICE =
 const MAX_ENTRY_CHARS = 1000;
 const MAX_CONTEXT_CHARS = 6000;
 
-/** Wrapper tag names guarded in untrusted text. MUST match UNTRUSTED_TAGS in src/consolidation/untrusted.ts. */
+/** Wrapper tag names guarded in untrusted text. MUST match UNTRUSTED_TAGS in src/domain/untrusted.ts. */
 const UNTRUSTED_TAGS = [
 	"episode-content",
 	"episode-title",
@@ -168,7 +178,7 @@ const UNTRUSTED_TAGS = [
 
 // One character class with a star, not a whitespace star, optional slash and another
 // whitespace star: adjacent runs split a whitespace run in O(n²) ways when the name fails.
-// Mirrors src/consolidation/untrusted.ts.
+// Mirrors src/domain/untrusted.ts.
 const GUARDED_TAG_START = new RegExp(
 	`<(?=[\\s/]*(?:${UNTRUSTED_TAGS.join("|")})(?![\\w-]))`,
 	"gi",
@@ -177,7 +187,7 @@ const GUARDED_TAG_START = new RegExp(
 /** Control and format code points kept on purpose: TAB, LF, CR, and ZWNJ/ZWJ (see dropJoinersNextToAscii). */
 const KEPT_CONTROL_CODE_POINTS = new Set([0x09, 0x0a, 0x0d, 0x200c, 0x200d]);
 
-/** Drops each ZWNJ/ZWJ run that has an ASCII neighbour. Mirrors src/consolidation/untrusted.ts. */
+/** Drops each ZWNJ/ZWJ run that has an ASCII neighbour. Mirrors src/domain/untrusted.ts. */
 const JOINER_RUN = /[\u200C\u200D]+/g;
 
 function dropJoinersNextToAscii(text: string): string {
@@ -248,6 +258,95 @@ function formatActivatedKnowledgeFallback(entries: ActivateEntry[]): string {
 	].join("\n");
 }
 
+/**
+ * Activation queries for one prompt, bounded so the GET /activate URL stays far
+ * below Bun's 16 KiB request-line limit: over it the server answers 431 and the
+ * plugin drops the prompt. The per-cue caps follow the idea of boundCues in
+ * src/api/input-limits.ts, with smaller sizes. The count cap is the plugin's own:
+ * at most MAX_CUES cues, the first ones plus the holistic prompt last. The server's
+ * normalizeCues (src/activation/activate.ts) keeps the head and tail of its list
+ * instead. Limits apply to characters and to encoded length, the size the URL
+ * carries (a CJK character encodes to 9 characters).
+ */
+const PROMPT_MAX_CHARS = 4000;
+const SEGMENT_MAX_CHARS = 500;
+const PROMPT_MAX_ENCODED = 5000;
+const SEGMENT_MAX_ENCODED = 500;
+const SEGMENT_MIN_ENCODED = SEGMENT_MAX_ENCODED / 2;
+const QUERIES_MAX_ENCODED = 10000;
+const MAX_CUES = 12;
+const QUERY_TRUNCATION_MARKER = "\n…\n";
+
+/** Length of `value` as it appears in a query string, without the `q=` prefix. */
+function encodedLength(value: string): number {
+	return new URLSearchParams({ q: value }).toString().length - 2;
+}
+
+/** Keeps the head and tail of `text` around a marker, so its weight is at most `max`. */
+function keepHeadAndTail(
+	text: string,
+	max: number,
+	weight: (ch: string) => number,
+): string {
+	const chars = [...text];
+	if (chars.reduce((sum, ch) => sum + weight(ch), 0) <= max) return text;
+	const markerWeight = [...QUERY_TRUNCATION_MARKER].reduce(
+		(sum, ch) => sum + weight(ch),
+		0,
+	);
+	const room = max - markerWeight;
+	let head = 0;
+	let headWeight = 0;
+	while (head < chars.length && headWeight + weight(chars[head]) <= room / 2) {
+		headWeight += weight(chars[head]);
+		head++;
+	}
+	let tail = chars.length;
+	let tailWeight = 0;
+	while (
+		tail > head &&
+		tailWeight + weight(chars[tail - 1]) <= room - headWeight
+	) {
+		tailWeight += weight(chars[tail - 1]);
+		tail--;
+	}
+	return `${chars.slice(0, head).join("")}${QUERY_TRUNCATION_MARKER}${chars.slice(tail).join("")}`;
+}
+
+/** Activation queries for one prompt: its unique segments, then the whole prompt last. */
+function activationQueries(prompt: string): string[] {
+	// Dedupe the uncut segments against the whole prompt first, so a single long line
+	// is one cue. The character and encoded caps apply afterwards.
+	const segments = prompt
+		.split("\n")
+		.map((s) => s.trim())
+		.filter((s) => s.length >= 15);
+	const unique = [...new Set([...segments, prompt.trim()])];
+	const bounded =
+		unique.length <= MAX_CUES
+			? unique
+			: [...unique.slice(0, MAX_CUES - 1), unique[unique.length - 1]];
+
+	const holistic = keepHeadAndTail(
+		keepHeadAndTail(bounded[bounded.length - 1], PROMPT_MAX_CHARS, () => 1),
+		PROMPT_MAX_ENCODED,
+		encodedLength,
+	);
+	let budget = QUERIES_MAX_ENCODED - encodedLength(holistic);
+	const queries: string[] = [];
+	for (const raw of bounded.slice(0, -1)) {
+		const segment = keepHeadAndTail(raw, SEGMENT_MAX_CHARS, () => 1);
+		const capped = keepHeadAndTail(segment, SEGMENT_MAX_ENCODED, encodedLength);
+		// A segment cut to the remaining budget must keep at least half the encoded
+		// cap; a shorter fragment says little, so the list stops instead.
+		if (encodedLength(capped) > budget && budget < SEGMENT_MIN_ENCODED) break;
+		const fitted = keepHeadAndTail(capped, budget, encodedLength);
+		queries.push(fitted);
+		budget -= encodedLength(fitted);
+	}
+	return [...queries, holistic];
+}
+
 export const KnowledgePlugin: Plugin = async (ctx) => {
 	// Refuse to operate if KNOWLEDGE_SERVER_URL points to a non-loopback host.
 	// The plugin sends user message content to this URL — external hosts are not allowed.
@@ -263,6 +362,7 @@ export const KnowledgePlugin: Plugin = async (ctx) => {
 	// Verify server is reachable on plugin load — but never throw
 	try {
 		const health = await fetch(`${KNOWLEDGE_SERVER_URL}/status`, {
+			headers: AUTH_HEADERS,
 			signal: AbortSignal.timeout(2000),
 		});
 		if (health.ok) {
@@ -324,32 +424,17 @@ export const KnowledgePlugin: Plugin = async (ctx) => {
 					return;
 				}
 
-				// Build a set of activation queries:
-				//   1. Per-line segments — each newline (shift+enter) is a topic boundary.
-				//      Short segments (< 15 chars) are skipped — they're usually connective
-				//      phrases, not substantive cues.
-				//   2. The full message as a holistic cue — captures overall intent that
-				//      no individual segment may express on its own.
-				// All queries are embedded in a single batched API call server-side.
-				// No truncation — let the embedding model handle long inputs natively.
-				const segments = queryText
-					.split("\n")
-					.map((s) => s.trim())
-					.filter((s) => s.length >= 15);
-
-				// Union: unique segments + full message (deduplicated if message == single segment).
-				// Trim queryText before dedup so a single-line message with leading/trailing
-				// whitespace doesn't appear twice (once trimmed as a segment, once raw).
-				const allQueries = [...new Set([...segments, queryText.trim()])];
-
+				// Activation queries: each line is a topic boundary (shift+enter) and the
+				// whole message is a holistic cue. activationQueries keeps the URL under
+				// the server's request-line limit.
 				const params = new URLSearchParams();
-				for (const q of allQueries) params.append("q", q);
+				for (const q of activationQueries(queryText)) params.append("q", q);
 				params.set("limit", "8"); // passive injection: up from 5 to reduce silent misses
 
 				const response = await fetch(
 					`${KNOWLEDGE_SERVER_URL}/activate?${params.toString()}`,
 					{
-						headers: { "x-knowledge-client": "opencode" },
+						headers: { "x-knowledge-client": "opencode", ...AUTH_HEADERS },
 						signal: AbortSignal.timeout(5000),
 					},
 				);
@@ -412,6 +497,7 @@ export const KnowledgePlugin: Plugin = async (ctx) => {
 		"experimental.session.compacting": async (_input, output) => {
 			try {
 				const response = await fetch(`${KNOWLEDGE_SERVER_URL}/status`, {
+					headers: AUTH_HEADERS,
 					signal: AbortSignal.timeout(2000),
 				});
 				if (!response.ok) return;

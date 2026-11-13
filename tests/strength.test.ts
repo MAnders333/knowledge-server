@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { computeStrength } from "../src/consolidation/decay";
+import { computeStrength } from "../src/domain/strength";
 import { makeEntry } from "./fixtures";
 
 const ONE_DAY = 24 * 60 * 60 * 1000;
@@ -142,5 +142,21 @@ describe("computeStrength", () => {
 		const strength = computeStrength(entry);
 		expect(strength).toBeLessThanOrEqual(1.0);
 		expect(strength).toBeGreaterThanOrEqual(0.0);
+	});
+});
+
+describe("computeStrength half-life argument", () => {
+	it("uses the half-lives it is given instead of the built-in table", () => {
+		const entry = {
+			...makeEntry({ type: "fact" }),
+			confidence: 1,
+			observationCount: 1,
+			accessCount: 0,
+			lastAccessedAt: 0,
+		};
+		const oneDayLater = 24 * 60 * 60 * 1000;
+		const shortLived = computeStrength(entry, oneDayLater, { fact: 1 });
+		const longLived = computeStrength(entry, oneDayLater, { fact: 1000 });
+		expect(shortLived).toBeLessThan(longLived);
 	});
 });

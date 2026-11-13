@@ -680,10 +680,17 @@ describe("validateConfig: remote reranker", () => {
 describe("default candidate pool", () => {
 	/** Candidate count read in a child process, so the config singleton loads fresh. */
 	function candidatesWith(env: Record<string, string>): number {
+		const reranking: Record<string, true> = {
+			RERANK_CANDIDATES: true,
+			RERANK_PROVIDER: true,
+			RERANK_ENABLED: true,
+			RERANK_REMOTE_URL: true,
+			RERANK_REMOTE_API_KEY: true,
+			LLM_BASE_ENDPOINT: true,
+			LLM_API_KEY: true,
+		};
 		const childEnv = Object.fromEntries(
-			Object.entries(process.env).filter(
-				([name]) => name !== "RERANK_CANDIDATES" && name !== "RERANK_PROVIDER",
-			),
+			Object.entries(process.env).filter(([name]) => !reranking[name]),
 		);
 		const configPath = new URL("../src/config.ts", import.meta.url).pathname;
 		const child = Bun.spawnSync({
@@ -700,17 +707,84 @@ describe("default candidate pool", () => {
 		return Number(child.stdout.toString().trim().split("\n").pop());
 	}
 
-	it("is 30 for the remote reranker when RERANK_CANDIDATES is unset", () => {
-		expect(candidatesWith({ RERANK_PROVIDER: "remote" })).toBe(30);
+	const gateway = {
+		LLM_BASE_ENDPOINT: "https://gateway.example.org",
+		LLM_API_KEY: API_KEY,
+	};
+
+	it("is 30 for a usable remote reranker when RERANK_CANDIDATES is unset", () => {
+		expect(candidatesWith({ RERANK_PROVIDER: "remote", ...gateway })).toBe(30);
+	});
+
+	it("is 16 when the remote reranker cannot run, so the local fallback keeps its pool", () => {
+		expect(candidatesWith({ RERANK_PROVIDER: "remote" })).toBe(16);
 	});
 
 	it("keeps an explicit RERANK_CANDIDATES for the remote reranker", () => {
 		expect(
-			candidatesWith({ RERANK_PROVIDER: "remote", RERANK_CANDIDATES: "16" }),
+			candidatesWith({
+				RERANK_PROVIDER: "remote",
+				RERANK_CANDIDATES: "16",
+				...gateway,
+			}),
 		).toBe(16);
 	});
 
 	it("stays 16 for the local reranker", () => {
 		expect(candidatesWith({})).toBe(16);
+	});
+});
+
+describe("RemoteReranker transport and privacy", () => {
+	it("clamps the call to the budget the caller passes", async () => {
+		// Real clock on purpose: the abort comes from AbortSignal.timeout, which fake
+		// timers cannot drive. The stub answers after the budget has run out.
+		respond = async () => {
+			await Bun.sleep(500);
+			return systemOne({ D00: 0.5 });
+		};
+		await expect(
+			makeReranker({ timeoutMs: 2_000 }).scoreBatch("q", ["a"], {
+				budgetMs: 100,
+			}),
+		).rejects.toThrow("request budget");
+	});
+
+	it("a call the request budget cut short is skipped, and the breaker does not count it", async () => {
+		respond = async () => {
+			await Bun.sleep(500);
+			return systemOne({ D00: 0.5 });
+		};
+		const reranker = makeReranker({ timeoutMs: 2_000 });
+		for (let i = 0; i < 3; i++) {
+			await expect(
+				reranker.scoreBatch("q", ["a"], { budgetMs: 100 }),
+			).rejects.toBeInstanceOf(RerankSkippedError);
+		}
+		respond = () => systemOne({ D00: 0.5 });
+		// The breaker is still closed: a call with no budget reaches the endpoint.
+		expect(await reranker.scoreBatch("q", ["a"])).toEqual([0.5]);
+	});
+
+	it("scrubs secrets from the query and the documents before the call", async () => {
+		const secret = "a".repeat(40);
+		respond = () => systemOne({ D00: 0.5 });
+		await makeReranker().scoreBatch(`check api_key = ${secret} please`, [
+			`doc with api_key=${secret}`,
+		]);
+		const sent = JSON.stringify(requests[0].body);
+		expect(sent).not.toContain(secret);
+		expect(sent).toContain("[REDACTED:keyed_entropy]");
+	});
+
+	it("does not follow a redirect, so the key is not sent to the redirect target", async () => {
+		respond = () =>
+			new Response(null, {
+				status: 307,
+				headers: { Location: `http://127.0.0.1:${server.port}/elsewhere` },
+			});
+		await expect(makeReranker().scoreBatch("q", ["a"])).rejects.toThrow();
+		expect(requests).toHaveLength(1);
+		expect(requests[0].path).toBe(ROUTE);
 	});
 });

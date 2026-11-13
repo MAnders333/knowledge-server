@@ -14,7 +14,7 @@ import type { ActivationEventRow } from "../types.js";
  */
 
 /** How long activation_event rows are kept. */
-export const ACTIVATION_EVENT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+const ACTIVATION_EVENT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 
 /** Hash a session id so rows can be grouped without storing the id. */
 export function hashSessionId(
@@ -30,7 +30,7 @@ interface EventStore {
 	pruneActivationEvents(cutoffMs: number): Promise<number>;
 }
 
-export interface ActivationEventRecorderOptions {
+interface ActivationEventRecorderOptions {
 	batchSize?: number;
 	flushDelayMs?: number;
 	maxQueued?: number;
@@ -40,7 +40,7 @@ export interface ActivationEventRecorderOptions {
 
 export class ActivationEventRecorder {
 	private queue: ActivationEventRow[] = [];
-	private flushTimer: ReturnType<typeof setTimeout> | null = null;
+	private flushTimer: ReturnType<typeof setTimeout> | undefined;
 	private pruneTimer: ReturnType<typeof setInterval> | null = null;
 	private inFlight: Promise<void> = Promise.resolve();
 	private failing = false;
@@ -69,14 +69,12 @@ export class ActivationEventRecorder {
 			this.droppedRows++;
 		}
 		this.queue.push(row);
-		if (this.queue.length >= this.batchSize) {
+		// While the store is failing, rows wait for the timer instead: a flush per record
+		// would retry a dead store on every activation.
+		if (this.queue.length >= this.batchSize && !this.failing) {
 			void this.flush();
-		} else if (!this.flushTimer) {
-			this.flushTimer = setTimeout(() => {
-				this.flushTimer = null;
-				void this.flush();
-			}, this.flushDelayMs);
-			this.flushTimer.unref?.();
+		} else {
+			this.scheduleFlush();
 		}
 	}
 
@@ -103,9 +101,33 @@ export class ActivationEventRecorder {
 						`[activation-events] Could not write activation_event rows; metrics are incomplete until this clears. Reason: ${reason}`,
 					);
 				}
+				// Keep the failed batch at the front for a retry. Overflow past maxQueued
+				// drops the oldest rows and counts them, as record() does.
+				this.queue.unshift(...batch);
+				const overflow = this.queue.length - this.maxQueued;
+				if (overflow > 0) {
+					this.queue.splice(0, overflow);
+					this.droppedRows += overflow;
+				}
+				this.scheduleFlush();
 				return;
 			}
 		}
+	}
+
+	/** Schedule one flush after flushDelayMs unless one is already scheduled. */
+	private scheduleFlush(): void {
+		if (this.flushTimer) return;
+		this.flushTimer = setTimeout(() => {
+			this.flushTimer = undefined;
+			void this.flush();
+		}, this.flushDelayMs);
+		this.flushTimer.unref?.();
+	}
+
+	private clearFlushTimer(): void {
+		clearTimeout(this.flushTimer);
+		this.flushTimer = undefined;
 	}
 
 	/** Delete rows older than the retention window. Errors are logged, not thrown. */
@@ -140,11 +162,11 @@ export class ActivationEventRecorder {
 
 	/** Stop timers and write what is queued. */
 	async stop(): Promise<void> {
-		if (this.flushTimer) clearTimeout(this.flushTimer);
 		if (this.pruneTimer) clearInterval(this.pruneTimer);
-		this.flushTimer = null;
 		this.pruneTimer = null;
+		this.clearFlushTimer();
 		await this.flush();
+		this.clearFlushTimer();
 		if (this.droppedRows > 0) {
 			logger.warn(
 				`[activation-events] Dropped ${this.droppedRows} rows while the queue was full.`,

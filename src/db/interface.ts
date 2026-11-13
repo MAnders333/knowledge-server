@@ -157,6 +157,12 @@ export interface IServerStateDB {
 export const LAST_ACCESS_TOUCH_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 /**
+ * Shape of an id prefix accepted by findIdsByPrefix: lower-case hex, with the
+ * dashes of a UUID. Nothing else reaches a query, so no LIKE wildcard can.
+ */
+export const ID_PREFIX_PATTERN = /^[0-9a-f-]+$/;
+
+/**
  * Knowledge store interface — the extracted knowledge graph.
  *
  * Implemented by SQLiteKnowledgeStore and PostgresKnowledgeStore.
@@ -183,7 +189,8 @@ export interface IKnowledgeStore {
 	/**
 	 * Low-level field update for non-semantic fields: status, strength, confidence,
 	 * isSynthesized — and `embedding` **only when supplying a freshly computed
-	 * vector for the current content/topics** (e.g. in ensureEmbeddings / checkAndReEmbed).
+	 * vector for the current content/topics** (e.g. in ensureEmbeddings). A model-change
+	 * re-embed uses setEmbedding, which leaves updated_at alone.
 	 *
 	 * **Never call this with `content` or `topics` changes.**
 	 * Use `KnowledgeService.updateEntry` instead — it automatically re-embeds when
@@ -191,8 +198,23 @@ export interface IKnowledgeStore {
 	 */
 	updateEntry(id: string, updates: Partial<KnowledgeEntry>): Promise<void>;
 
+	/**
+	 * Replace only the stored vector of an entry. Unlike updateEntry, this does not
+	 * touch updated_at: a re-embed rewrites the vector, not the content. Decay reads
+	 * updated_at to tombstone archived entries, so a model change must not restart
+	 * that clock.
+	 */
+	setEmbedding(id: string, embedding: number[]): Promise<void>;
+
 	/** Plain entry without its vector; use getEntryWithEmbedding when the vector is needed. */
 	getEntry(id: string): Promise<KnowledgeEntry | null>;
+
+	/**
+	 * Ids of entries (any status) whose id starts with `prefix`, ascending, at most
+	 * `limit`. Resolves the short ids shown in injected lines without loading whole
+	 * entries. `prefix` must match ID_PREFIX_PATTERN; any other input matches nothing.
+	 */
+	findIdsByPrefix(prefix: string, limit: number): Promise<string[]>;
 
 	/** Entry including its stored vector, or `embedding` undefined when none is stored. */
 	getEntryWithEmbedding(id: string): Promise<KnowledgeEntry | null>;
@@ -452,20 +474,25 @@ export interface IKnowledgeStore {
 	// different processes targeting the same physical database.
 	//
 	// The lock key is derived from the database's own OID (Postgres) or is a
-	// no-op (SQLite — single-process by design). This makes the lock config-
-	// name independent: two users who assign different local names to the same
-	// Postgres database will still share the same lock automatically.
+	// lockfile beside the database file (SQLite). Either way it belongs to the
+	// physical database, not to the config name: two users who assign different
+	// local names to the same Postgres database still share the same lock.
 	//
 	// Owned by consolidateExtractedToStore() in the ConsolidationEngine. Each
 	// store acquires its own lock independently, allowing stores backed by
 	// different physical databases to consolidate in parallel.
 
 	/**
-	 * Try to acquire an exclusive per-database consolidation lock.
-	 * Returns true if acquired, false if another process holds it.
+	 * Try to acquire the exclusive consolidation lock on this store's database.
+	 * Resolves true when acquired. Resolves false when another holder has it: another
+	 * process, or another store object on the same database. The caller skips the
+	 * store and retries later. Throws when this same store object already holds the
+	 * lock, since that means a missing releaseConsolidationLock() upstream, and a false
+	 * would be mistaken for contention. Every backend behaves this way.
 	 *
-	 * Postgres: uses pg_try_advisory_lock(db_oid) on a reserved connection.
-	 * SQLite: always returns true (single-process, no cross-process risk).
+	 * Postgres: pg_try_advisory_lock(db_oid) on a reserved connection.
+	 * SQLite: lockfile beside the database file. An in-memory database is private to
+	 * this process, so its lock is bookkeeping only.
 	 */
 	tryAcquireConsolidationLock(): Promise<boolean>;
 

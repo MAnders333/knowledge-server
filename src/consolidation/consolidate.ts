@@ -2,8 +2,13 @@ import type { ActivationEngine } from "../activation/activate.js";
 import { formatEmbeddingText } from "../activation/embeddings.js";
 import { cosineSimilarity } from "../activation/embeddings.js";
 import { config } from "../config.js";
-import { approxTokens } from "../daemon/readers/shared.js";
 import type { IKnowledgeStore, IServerStateDB } from "../db/index.js";
+import type {
+	DomainResolution,
+	DomainRouter,
+} from "../domain/domain-router.js";
+import { computeStrength } from "../domain/strength.js";
+import { approxTokens } from "../domain/tokens.js";
 import { componentHealth } from "../health.js";
 import { logger } from "../logger.js";
 import {
@@ -27,8 +32,6 @@ import type {
 } from "../types.js";
 import { clampKnowledgeType, episodeKeyId } from "../types.js";
 import { ContradictionScanner } from "./contradiction.js";
-import { computeStrength } from "./decay.js";
-import type { DomainResolution, DomainRouter } from "./domain-router.js";
 import { isDeterministicFailure, providerFailureClass } from "./errors.js";
 import { ConsolidationLLM, formatEpisodes } from "./llm.js";
 import type { ExtractedKnowledge } from "./llm.js";
@@ -50,12 +53,23 @@ const MAX_CHUNK_TOKENS = 150_000;
 /**
  * How a chunk ended in processChunk():
  * - completed: every store that received entries succeeded; episodes are recorded.
- * - deferred:  nothing was written because a store was unavailable or its lock
- *              was held by another process. Not counted as an attempt.
+ * - deferred:  stopped before extraction because a store was unavailable or its
+ *              lock was held by another process. No LLM call was made; the episodes
+ *              stay eligible for the next batch of the drain.
+ * - blocked:   extraction ran, but a store was unavailable or its lock was held.
+ *              Nothing was written. The episodes stay out of the rest of this drain,
+ *              so the same extraction is not paid again. Not an attempt.
+ * - transient: extraction or a store write failed for a retryable reason. The
+ *              episodes stay out of the rest of this drain. Not an attempt.
  * - failed:    extraction or a store write threw. The episodes stay pending and
  *              their failed-attempt count is incremented.
  */
-type ChunkOutcome = "completed" | "deferred" | "transient" | "failed";
+type ChunkOutcome =
+	| "completed"
+	| "deferred"
+	| "blocked"
+	| "transient"
+	| "failed";
 
 interface ChunkResult {
 	outcome: ChunkOutcome;
@@ -69,11 +83,11 @@ interface ChunkResult {
 	touchedStores: Set<IKnowledgeStore>;
 }
 
-/** Thrown when another process holds a store's consolidation lock. The chunk is deferred, not failed. */
+/** Thrown when another process holds a store's consolidation lock. The chunk is blocked, not failed. */
 class StoreLockHeldError extends Error {}
 
 /** Consolidation health as seen by this process (exposed through /status). */
-export interface ConsolidationOutcome {
+interface ConsolidationOutcome {
 	consecutiveFailures: number;
 	lastError: string | null;
 	lastErrorAt: number | null;
@@ -280,6 +294,8 @@ export class ConsolidationEngine {
 
 	/**
 	 * Public entry point. Delegates to _consolidate().
+	 * `attempted` is the drain's set of episode keys to skip in later batches: the
+	 * caller passes the same set to every batch (see consolidateSource).
 	 *
 	 * **Two-layer locking contract:**
 	 *
@@ -418,7 +434,8 @@ export class ConsolidationEngine {
 		// store — to cover stores that may have received writes in prior runs but
 		// never had metadata recorded.
 		// Only seeds when metadata is absent — the model-change path is handled
-		// exclusively by checkAndReEmbed() at startup.
+		// by checkAndReEmbed(), which runs before consolidation starts (server
+		// startup, the drain loops and the CLI).
 		for (const store of this.knowledgeStores()) {
 			if (!(await store.getEmbeddingMetadata())) {
 				const sample = await store.getOneEntryWithEmbedding();
@@ -584,6 +601,24 @@ export class ConsolidationEngine {
 		let totalConflictsResolved = 0;
 		const sourceTouchedStores = new Set<IKnowledgeStore>();
 
+		const outcome: EpisodeOutcome = { completed: [], failed: [] };
+
+		// Secrets are scrubbed before an episode can reach an extraction prompt,
+		// whatever the reader staged. An episode that cannot be scrubbed fails closed:
+		// it is not sent to the LLM, and it counts as an attempt.
+		const scrubbed: Episode[] = [];
+		for (const episode of episodes) {
+			try {
+				scrubbed.push(this.scrubEpisode(episode));
+			} catch (err) {
+				attempted.add(episodeKeyId(episode));
+				outcome.failed.push({
+					episode,
+					error: `redaction failed; episode not sent to the LLM: ${err instanceof Error ? err.message : String(err)}`,
+				});
+			}
+		}
+
 		const chunkSize = config.consolidation.chunkSize;
 
 		// Group episodes by domain when domain routing is configured so all
@@ -592,9 +627,9 @@ export class ConsolidationEngine {
 		// as the domain hint for all entries — likely misrouting entries from the
 		// other directories. When no domain router is configured, episodes are
 		// processed in their original order (single-store mode).
-		const episodeGroups: (typeof episodes)[] = this.domainRouter
-			? groupByDomain(episodes, this.domainRouter)
-			: [episodes];
+		const episodeGroups: (typeof scrubbed)[] = this.domainRouter
+			? groupByDomain(scrubbed, this.domainRouter)
+			: [scrubbed];
 
 		// Flatten groups into a single ordered sequence of chunks, preserving
 		// within-group ordering while ensuring cross-domain episodes don't mix.
@@ -605,10 +640,15 @@ export class ConsolidationEngine {
 			}
 		}
 
-		const outcome: EpisodeOutcome = { completed: [], failed: [] };
 		const completedSessionIds = new Set<string>();
 
 		for (let ci = 0; ci < chunks.length; ci++) {
+			// Another process took over consolidate.lock: stop before writing anything more.
+			if (this.processLock?.lost) {
+				throw new Error(
+					"consolidate.lock was taken over by another process; this run stopped",
+				);
+			}
 			const chunk = chunks[ci];
 			const chunkLabel = `${ci + 1}/${chunks.length}`;
 			const episodeTitles = [...new Set(chunk.map((ep) => ep.sessionTitle))]
@@ -616,7 +656,10 @@ export class ConsolidationEngine {
 				.join(", ");
 
 			logger.log(
-				`[consolidation/${reader.source}] Chunk ${chunkLabel} (${chunk.length} episodes): ${episodeTitles}`,
+				`[consolidation/${reader.source}] Chunk ${chunkLabel} (${chunk.length} episodes)`,
+			);
+			logger.debug(
+				`[consolidation/${reader.source}] Chunk ${chunkLabel} session titles: ${episodeTitles}`,
 			);
 
 			// Use the first episode's source as the log label — all episodes in a
@@ -639,10 +682,11 @@ export class ConsolidationEngine {
 					startMessageId: ep.startMessageId,
 					endMessageId: ep.endMessageId,
 				}));
-				// Only episodes that failed or hit a transient error are kept out of later
-				// batches of this drain. Deferred episodes (store locked or unavailable)
-				// stay eligible: a contended drain must not leave the backlog for the next
-				// poll tick.
+				// Episodes that failed, hit a transient error, or were blocked after
+				// extraction stay out of later batches of this drain. A blocked chunk (a
+				// store unavailable or locked once extraction had run) would otherwise pay
+				// for the same extraction again. Only "failed" counts as an attempt. A
+				// deferral before extraction (store locked or unavailable) stays eligible.
 				if (result.outcome === "completed") {
 					this._runProgress.completedChunks++;
 					outcome.completed.push(...keys);
@@ -657,6 +701,8 @@ export class ConsolidationEngine {
 						this._runProgress.transientChunks++;
 						this._runProgress.providerFailure = result.providerFailure;
 					}
+				} else if (result.outcome === "blocked") {
+					for (const key of keys) attempted.add(episodeKeyId(key));
 				}
 			}
 		}
@@ -695,7 +741,7 @@ export class ConsolidationEngine {
 	}
 
 	/**
-	 * Scrub secrets from LLM-produced entry text before it is embedded or stored.
+	 * Scrub secrets from text before it is stored or sent to an LLM.
 	 * Counts accumulate in `_runRedactions` and are logged once per run.
 	 */
 	private redactRunText(text: string): string {
@@ -704,6 +750,17 @@ export class ConsolidationEngine {
 			this._runRedactions[kind] = (this._runRedactions[kind] ?? 0) + n;
 		}
 		return result.text;
+	}
+
+	/** Scrub every free-text field of an episode. Throws when a field cannot be scrubbed. */
+	private scrubEpisode(episode: Episode): Episode {
+		return {
+			...episode,
+			content: this.redactRunText(episode.content),
+			sessionTitle: this.redactRunText(episode.sessionTitle),
+			projectName: this.redactRunText(episode.projectName),
+			directory: this.redactRunText(episode.directory),
+		};
 	}
 
 	/**
@@ -762,9 +819,10 @@ export class ConsolidationEngine {
 	 * Outcome (see ChunkOutcome): the chunk is "completed" only when every store
 	 * that received entries succeeded. Only then are its episodes recorded in
 	 * consolidated_episode. A failed store makes the chunk "failed"; a store whose
-	 * lock was held makes it "deferred". Neither records anything, so the pending
-	 * rows stay for the next run. Re-extraction dedups against what was already
-	 * written, because reconsolidate() is idempotent via embedding similarity.
+	 * lock was held, or an unavailable domain store, makes it "blocked". Neither
+	 * records anything, so the pending rows stay for the next run. Re-extraction
+	 * dedups against what was already written, because reconsolidate() is
+	 * idempotent via embedding similarity.
 	 *
 	 * The outcome depends only on the stores the chunk's entries were written to,
 	 * not on each episode's own directory. An episode whose entries all landed in
@@ -846,7 +904,7 @@ export class ConsolidationEngine {
 			logger.warn(
 				`[consolidation/${source}] Deferring chunk — store for domain "${unavailableDomain}" is unavailable; nothing written, episodes kept for retry.`,
 			);
-			return { outcome: "deferred", ...none };
+			return { outcome: "blocked", ...none };
 		}
 
 		// Use the max message time of the chunk as the session timestamp for new entries.
@@ -920,7 +978,7 @@ export class ConsolidationEngine {
 		let outcome: ChunkOutcome = "completed";
 		if (failure !== undefined) outcome = "failed";
 		else if (transientFailure !== undefined) outcome = "transient";
-		else if (deferred) outcome = "deferred";
+		else if (deferred) outcome = "blocked";
 
 		if (outcome === "completed") {
 			// Only reached when every store that received entries succeeded, or when
@@ -1109,7 +1167,7 @@ export class ConsolidationEngine {
 			logger.log(
 				`[consolidation/${source}] Skipping store — consolidation lock held by another process. Episodes will be retried.`,
 			);
-			// Typed so processChunk defers this store (retry later, no attempt
+			// Typed so processChunk blocks this store (retry later, no attempt
 			// counted) instead of treating it as a failed write.
 			throw new StoreLockHeldError(
 				"consolidation lock held by another process",
@@ -1197,7 +1255,7 @@ export class ConsolidationEngine {
 					);
 					created++;
 					contradictionCandidates.add(inserted.id);
-					logger.log(
+					logger.debug(
 						`[consolidation/${source}] + insert [${inserted.type}] ${c.entry.domain ? `domain:${c.entry.domain} ` : ""}${JSON.stringify(inserted.content)}`,
 					);
 					if (inserted.embedding) {
@@ -1208,7 +1266,7 @@ export class ConsolidationEngine {
 					}
 				} catch (err) {
 					logger.error(
-						`[consolidation/${source}] Failed to insert novel entry ${JSON.stringify(c.entry.content ?? "")} — skipping:`,
+						`[consolidation/${source}] Failed to insert novel entry (${c.entry.type}) — skipping:`,
 						err,
 					);
 				}
@@ -1270,13 +1328,13 @@ export class ConsolidationEngine {
 				const decision = mergeDecisions[i];
 				const nearest = c.nearestEntry;
 				try {
-					logger.log(
+					logger.debug(
 						`[consolidation/${source}] Reconsolidation candidate (sim=${c.nearestSimilarity.toFixed(3)}): ${JSON.stringify(c.entry.content)} vs ${JSON.stringify(nearest.content)}`,
 					);
 					switch (decision.action) {
 						case "keep": {
 							await store.reinforceObservation(nearest.id);
-							logger.log(
+							logger.debug(
 								`[consolidation/${source}] Keep existing (reinforced): ${JSON.stringify(nearest.content)}`,
 							);
 							break;
@@ -1307,7 +1365,7 @@ export class ConsolidationEngine {
 								await applyInsert(c);
 								break;
 							}
-							logger.log(
+							logger.debug(
 								`[consolidation/${source}] ${decision.action === "update" ? "Updated" : "Replaced"}: ${JSON.stringify(nearest.content)} → ${JSON.stringify(content)}`,
 							);
 							updated++;
@@ -1339,7 +1397,7 @@ export class ConsolidationEngine {
 					}
 				} catch (err) {
 					logger.error(
-						`[consolidation/${source}] Failed to apply merge decision for ${JSON.stringify(c.entry.content ?? "")} — skipping:`,
+						`[consolidation/${source}] Failed to apply merge decision for an extracted entry (${c.entry.type}) — skipping:`,
 						err,
 					);
 				}
@@ -1421,7 +1479,7 @@ export class ConsolidationEngine {
 					strength: newStrength,
 				});
 				archived++;
-				logger.log(
+				logger.debug(
 					`[decay] Archived: ${JSON.stringify(entry.content)} (strength: ${newStrength.toFixed(3)})`,
 				);
 			}
@@ -1435,7 +1493,7 @@ export class ConsolidationEngine {
 		for (const entry of archivedEntries) {
 			if (entry.updatedAt < tombstoneThreshold) {
 				await db.updateEntry(entry.id, { status: "tombstoned" });
-				logger.log(
+				logger.debug(
 					`[decay] Tombstoned: ${JSON.stringify(entry.content)} (archived for ${config.decay.tombstoneAfterDays}+ days)`,
 				);
 			}

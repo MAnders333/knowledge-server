@@ -23,7 +23,7 @@ import { runStatus } from "./commands/status.js";
 import { runStop } from "./commands/stop.js";
 import { downloadAndInstallDaemon, runUpdate } from "./commands/update.js";
 import { resolveDataDir } from "./config-file.js";
-import { config, validateConfig } from "./config.js";
+import { config, spawnedDaemonIntervalArgs, validateConfig } from "./config.js";
 import { ConsolidationEngine } from "./consolidation/consolidate.js";
 import { runDecayTick, runPollTick } from "./consolidation/poll.js";
 import { PendingEpisodesReader } from "./consolidation/readers/pending.js";
@@ -32,6 +32,12 @@ import { StoreRegistry } from "./db/store-registry.js";
 import { logger, parseLogLevel } from "./logger.js";
 import { main as mcpMain } from "./mcp/index.js";
 import { tightenOwnedPrivatePaths } from "./private-files.js";
+import {
+	locatePidFile,
+	parsePid,
+	startupPidAction,
+	systemProcessTable,
+} from "./process-identity.js";
 import { lockHolder } from "./process-lock.js";
 import {
 	consolidationLockPath,
@@ -108,13 +114,12 @@ async function main() {
 
 	// `knowledge-server stop`
 	if (subcommand === "stop") {
-		await runStop(config.pidPath);
-		process.exit(0);
+		process.exit(await runStop(config.pidPath, config.legacyPidPath));
 	}
 
 	// `knowledge-server status`
 	if (subcommand === "status") {
-		await runStatus(config.pidPath);
+		await runStatus(config.pidPath, config.legacyPidPath, config.adminToken);
 		process.exit(0);
 	}
 
@@ -276,13 +281,6 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	const { serverStateDb } = registry;
 	// Data directory: lockfiles and the daemon status file live here, shared with the daemon and CLI.
 	const dataDir = resolveDataDir();
-	// Housekeeping before anything else writes heavily: reclaim state.db free pages
-	// when the file is large and mostly empty. Skipped if another process is busy with it.
-	if (serverStateDb instanceof ServerStateDB) {
-		serverStateDb.compactIfNeeded({
-			lockPath: stateMaintenanceLockPath(dataDir),
-		});
-	}
 	const activation = new ActivationEngine(
 		db,
 		registry.readStores(),
@@ -353,39 +351,29 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	const adminToken = config.adminToken ?? randomBytes(24).toString("hex");
 
 	// PID file guard — check before serve() so we never bind the port if another
-	// instance is already running. If the file exists but the PID is dead (crash
-	// without cleanup), treat it as stale and continue. The actual write happens
-	// after serve() succeeds so the file only exists when a port is truly bound.
-	if (config.pidPath && existsSync(config.pidPath)) {
-		const stalePid = Number.parseInt(
-			readFileSync(config.pidPath, "utf8").trim(),
-			10,
-		);
-		const isAlive =
-			!Number.isNaN(stalePid) &&
-			(() => {
-				try {
-					process.kill(stalePid, 0);
-					return true;
-				} catch (e) {
-					// EPERM = process exists but we can't signal it (still alive).
-					// ESRCH = no such process (truly dead).
-					return errCode(e) === "EPERM";
-				}
-			})();
-		if (isAlive) {
+	// instance is already running. The file blocks startup only when its PID runs
+	// knowledge-server. A dead, reused or malformed PID is stale and replaced. A PID
+	// that is alive but whose command line cannot be read is kept: the port bind
+	// decides. The actual write happens after serve() succeeds so the file only
+	// exists when a port is truly bound.
+	const located = locatePidFile(config.pidPath, config.legacyPidPath);
+	if (located !== null) {
+		const raw = readFileSync(located, "utf8");
+		const action = startupPidAction(raw, systemProcessTable);
+		if (action === "refuse") {
 			logger.error(
-				`Server already running at PID ${stalePid}. Run \`knowledge-server stop\` first.`,
+				`Server already running at PID ${parsePid(raw)}. Run \`knowledge-server stop\` first.`,
 			);
 			process.exit(1);
 		}
-		// Stale file — remove and continue. Wrapped in try/catch to handle
-		// a TOCTOU race where two concurrent starts both pass the liveness
-		// check and the second unlinkSync hits ENOENT.
-		try {
-			unlinkSync(config.pidPath);
-		} catch (e) {
-			if (errCode(e) !== "ENOENT") throw e;
+		if (action === "remove") {
+			// Wrapped in try/catch to handle a TOCTOU race where two concurrent starts
+			// both see the stale file and the second unlinkSync hits ENOENT.
+			try {
+				unlinkSync(located);
+			} catch (e) {
+				if (errCode(e) !== "ENOENT") throw e;
+			}
 		}
 	}
 
@@ -394,22 +382,23 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	activationEvents.start();
 
 	// Create HTTP app
-	const app = createApp(
+	const app = createApp({
 		db,
 		serverStateDb,
 		activation,
 		consolidation,
 		adminToken,
 		adminTokenIsStable,
-		registry.unavailableStoreIds,
-		registry.readStores(),
-		registry.writableStores(),
-		registry.port,
+		unavailableStoreIds: registry.unavailableStoreIds,
+		readDbs: registry.readStores(),
+		writableDbs: registry.writableStores(),
+		serverPort: registry.port,
 		activationEvents,
-		registry.host,
-		config.allowedHosts,
-		{ dataDir, daemonAutoSpawn: registry.daemonAutoSpawn },
-	);
+		bindHost: registry.host,
+		extraAllowedHosts: config.allowedHosts,
+		runtime: { dataDir, daemonAutoSpawn: registry.daemonAutoSpawn },
+		readsProtected: config.protectReads,
+	});
 
 	// port/host/daemonAutoSpawn come from the registry (config.jsonc with env var override)
 	// rather than config.ts, so they reflect the config file if one exists.
@@ -424,17 +413,18 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	const loopbackHosts = ["127.0.0.1", "::1", "localhost"];
 	if (!loopbackHosts.includes(bindHost)) {
 		logger.error(
-			`"host" is set to "${host}", which exposes the server on non-loopback interfaces with no authentication. Only use 127.0.0.1 unless you have added authentication and understand the security implications.`,
+			`"host" is set to "${host}", which exposes the server on non-loopback interfaces${config.protectReads ? "" : " with no authentication on reads"}. Only use 127.0.0.1 unless you have added authentication and understand the security implications.`,
 		);
 		process.exit(1);
 	}
 
 	// Start server — PID file written after this succeeds so it only exists
 	// when a port is truly bound.
-	let server: ReturnType<typeof serve>;
 	try {
-		server = serve({
-			fetch: app.fetch,
+		serve({
+			// The socket peer, not a forwarded header, keys the failed-auth throttle.
+			fetch: (req, bunServer) =>
+				app.fetch(req, { remoteAddress: bunServer.requestIP(req)?.address }),
 			port,
 			hostname: bindHost,
 			idleTimeout: 255, // max allowed by Bun — consolidation can take a while
@@ -464,7 +454,33 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		daemonChild?.kill();
 		removeOwnPidFile(config.pidPath);
 	};
+	// Housekeeping: reclaim state.db free pages when the file is large and mostly
+	// empty. It is scheduled after the port is bound, so a large VACUUM never delays
+	// the listen. The VACUUM itself is synchronous and pauses request handling while
+	// it runs. compactIfNeeded takes its own maintenance lock and skips when another
+	// process is busy with the file.
+	if (serverStateDb instanceof ServerStateDB) {
+		const stateDb = serverStateDb;
+		setTimeout(() => {
+			try {
+				stateDb.compactIfNeeded({
+					lockPath: stateMaintenanceLockPath(dataDir),
+				});
+			} catch (err) {
+				// The server is already bound: housekeeping must never take it down.
+				logger.warn(
+					`[db] state.db housekeeping failed: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+		}, 0);
+	}
 
+	// Reads are protected only with a stable token and KNOWLEDGE_PROTECT_READS; the
+	// banner says which mode is running.
+	const readAuth =
+		adminTokenIsStable && config.protectReads
+			? "[admin token required]"
+			: "(open — local only)";
 	logger.raw(`\n✓ HTTP API listening on http://${host}:${port}`);
 	logger.raw("  GET  /activate?q=...                  — Activate knowledge");
 	logger.raw(
@@ -474,13 +490,19 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	logger.raw("  GET  /status                           — Health check");
 	logger.raw("  GET  /entries                          — List entries");
 	logger.raw(
-		"  POST /hooks/claude-code/user-prompt    — Claude Code hook (unauthenticated)",
+		`  POST /hooks/claude-code/user-prompt    — Claude Code hook ${readAuth}`,
 	);
 	logger.raw(
-		`  ALL  /mcp                              — MCP streamable-http${adminTokenIsStable ? " [admin token required]" : " (unauthenticated — local only)"}`,
+		`  ALL  /mcp                              — MCP streamable-http ${readAuth}`,
 	);
 	if (process.stdout.isTTY) {
-		logger.rawStdoutOnly(`\n  Admin token (keep this private): ${adminToken}`);
+		// Only a generated token is printed. A stable one is the user's own value, so the
+		// banner names its source and never echoes it.
+		logger.rawStdoutOnly(
+			adminTokenIsStable
+				? "\n  Admin token: from KNOWLEDGE_ADMIN_TOKEN (not printed)."
+				: `\n  Admin token (keep this private): ${adminToken}`,
+		);
 	} else {
 		// Non-terminal stdout is usually a log file (launchd/systemd/nohup redirect),
 		// so the token is never printed there.
@@ -531,11 +553,11 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		//
 		// Compiled install:   process.execPath = .../libexec/knowledge-server
 		//                     basename starts with "knowledge-server"
-		//                     cmd = [".../libexec/knowledge-daemon", "--interval=300"]
+		//                     cmd = [".../libexec/knowledge-daemon", ...interval args]
 		//
 		// Source install:     process.execPath = .../bun (basename starts with "bun")
 		//                     process.argv[1]  = .../repo/src/index.ts
-		//                     cmd = [".../bun", "run", ".../repo/src/daemon/index.ts", "--interval=300"]
+		//                     cmd = [".../bun", "run", ".../repo/src/daemon/index.ts", ...interval args]
 		//
 		// Uses basename(process.execPath).startsWith("bun") — same convention as
 		// resolveEnvFilePath() and setup-tool.ts for source-vs-compiled detection.
@@ -559,17 +581,22 @@ Run \`knowledge-server help-advanced\` for additional commands.
 			}
 		}
 
+		// Interval arguments for the spawned daemon (--interval=300 unless
+		// DAEMON_UPLOAD_INTERVAL_SECONDS is set); see spawnedDaemonIntervalArgs.
+		const spawnedIntervalArgs = spawnedDaemonIntervalArgs(
+			config.daemon.uploadIntervalSeconds,
+		);
 		const daemonCmd: string[] = isSourceRun
 			? process.argv[1]
 				? [
 						process.execPath,
 						"run",
 						join(dirname(process.argv[1]), "daemon", "index.ts"),
-						"--interval=300",
+						...spawnedIntervalArgs,
 					]
 				: [] // argv[1] missing — can't locate daemon entry point
 			: existsSync(daemonBinPath)
-				? [daemonBinPath, "--interval=300"]
+				? [daemonBinPath, ...spawnedIntervalArgs]
 				: [];
 
 		if (daemonCmd.length === 0) {

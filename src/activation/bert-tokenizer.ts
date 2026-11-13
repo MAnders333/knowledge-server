@@ -20,7 +20,7 @@
  * when the model files are not present locally.
  */
 
-export interface BertTokenizerConfig {
+interface BertTokenizerConfig {
 	lowercase: boolean;
 	stripAccents: boolean;
 	cleanText: boolean;
@@ -28,7 +28,7 @@ export interface BertTokenizerConfig {
 	unkToken: string;
 }
 
-export interface BatchEncoding {
+interface BatchEncoding {
 	inputIds: BigInt64Array;
 	attentionMask: BigInt64Array;
 	tokenTypeIds: BigInt64Array;
@@ -260,34 +260,6 @@ export class BertWordPieceTokenizer {
 		maxLength: number = MAX_SEQUENCE_LENGTH,
 	): { ids: number[]; tokenTypeIds: number[] } {
 		return this.joinPair(this.encode(query), this.encode(document), maxLength);
-	}
-
-	/**
-	 * Batch-encode pairs with right padding to the longest sequence.
-	 * Each distinct string is encoded once (a reranker repeats one query).
-	 */
-	batchEncodePairs(
-		queries: string[],
-		documents: string[],
-		maxLength: number = MAX_SEQUENCE_LENGTH,
-	): BatchEncoding {
-		if (queries.length !== documents.length) {
-			throw new Error("queries and documents must have the same length");
-		}
-		const memo = new Map<string, number[]>();
-		const encodeOnce = (text: string): number[] => {
-			let ids = memo.get(text);
-			if (!ids) {
-				ids = this.encode(text);
-				memo.set(text, ids);
-			}
-			return ids;
-		};
-		return this.batchFromIds(
-			queries.map(encodeOnce),
-			documents.map(encodeOnce),
-			maxLength,
-		);
 	}
 
 	/**

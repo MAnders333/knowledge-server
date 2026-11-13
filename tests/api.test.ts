@@ -102,13 +102,13 @@ describe("HTTP API", () => {
 			unlock: () => {},
 			close: () => {},
 		} as unknown as ConsolidationEngine;
-		app = createApp(
+		app = createApp({
 			db,
 			serverStateDb,
 			activation,
 			consolidation,
-			TEST_ADMIN_TOKEN,
-		);
+			adminToken: TEST_ADMIN_TOKEN,
+		});
 	});
 
 	afterEach(async () => {
@@ -316,13 +316,13 @@ describe("HTTP API", () => {
 				unlock: () => {},
 				close: () => {},
 			} as unknown as ConsolidationEngine;
-			const busyApp = createApp(
-				busyDb,
-				busyServerLocalDb,
-				busyActivation,
-				busyConsolidation,
-				TEST_ADMIN_TOKEN,
-			);
+			const busyApp = createApp({
+				db: busyDb,
+				serverStateDb: busyServerLocalDb,
+				activation: busyActivation,
+				consolidation: busyConsolidation,
+				adminToken: TEST_ADMIN_TOKEN,
+			});
 			const res = await withHostHeader(busyApp).request("/consolidate", {
 				method: "POST",
 				headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
@@ -483,26 +483,20 @@ describe("HTTP API", () => {
 		});
 	}
 
-	function postFlag(path: string, body: unknown, authorized = true) {
+	/** Flagging is read-level: it sends no admin token. */
+	function postFlag(path: string, body: unknown) {
 		return request(path, {
 			method: "POST",
-			headers: {
-				...(authorized ? { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` } : {}),
-				"Content-Type": "application/json",
-			},
+			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(body),
 		});
 	}
 
-	it("POST /entries/:id/flag should return 401 without token", async () => {
+	it("POST /entries/:id/flag works without an admin token", async () => {
 		const id = "c0ffee00-0000-4000-8000-000000000001";
 		await insertForFlag(id, "active");
-		const res = await postFlag(
-			`/entries/${id}/flag`,
-			{ reason: "wrong" },
-			false,
-		);
-		expect(res.status).toBe(401);
+		const res = await postFlag(`/entries/${id}/flag`, { reason: "wrong" });
+		expect(res.status).toBe(200);
 	});
 
 	it("flags an active entry by its short id: status becomes conflicted and the row is kept", async () => {
@@ -843,16 +837,14 @@ describe("HTTP API", () => {
 				close: () => {},
 			} as unknown as ConsolidationEngine;
 
-			const crossStoreApp = createApp(
+			const crossStoreApp = createApp({
 				db,
 				serverStateDb,
 				activation,
-				mockConsolidation,
-				TEST_ADMIN_TOKEN,
-				false,
-				new Set(),
-				[db, db2],
-			);
+				consolidation: mockConsolidation,
+				adminToken: TEST_ADMIN_TOKEN,
+				readDbs: [db, db2],
+			});
 
 			// All resolution types should return 422
 			for (const resolution of [

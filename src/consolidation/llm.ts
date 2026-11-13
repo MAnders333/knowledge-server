@@ -5,13 +5,22 @@ import { generateText } from "ai";
 import {
 	ANTHROPIC_BETA_HEADERS,
 	ANTHROPIC_OAUTH_USER_AGENT,
+	assertOAuthBaseUrl,
 	getAccessToken,
 	hasOAuthTokens,
 } from "../auth/claude-oauth.js";
-import { config } from "../config.js";
+import { anthropicRouting, config } from "../config.js";
+import type { DomainContext } from "../domain/domain-router.js";
+import {
+	UNTRUSTED_DATA_RULE,
+	escapeUntrusted,
+	untrustedField,
+	untrustedLine,
+	untrustedList,
+} from "../domain/untrusted.js";
 import { logger } from "../logger.js";
+import { providerErrorSuffix } from "../provider-error.js";
 import type { Episode, KnowledgeType } from "../types.js";
-import type { DomainContext } from "./domain-router.js";
 import {
 	type ContradictionConflict,
 	type ContradictionReplyFormat,
@@ -22,13 +31,6 @@ import {
 	parseItems,
 	synthesisItemSchema,
 } from "./llm-output.js";
-import {
-	UNTRUSTED_DATA_RULE,
-	escapeUntrusted,
-	untrustedField,
-	untrustedLine,
-	untrustedList,
-} from "./untrusted.js";
 
 /**
  * LLM interface for consolidation.
@@ -174,19 +176,14 @@ function createModel(modelString: string) {
 	switch (providerName) {
 		case "anthropic": {
 			// Per-provider credentials take precedence over unified endpoint.
-			// baseURL: per-provider override → unified proxy path → undefined (SDK uses api.anthropic.com)
-			const apiKey = config.llm.anthropic.apiKey || config.llm.apiKey;
-			const baseURL =
-				config.llm.anthropic.baseURL ||
-				(config.llm.baseEndpoint
-					? `${config.llm.baseEndpoint}/anthropic/v1`
-					: undefined);
+			const { apiKey, baseURL } = anthropicRouting();
 
 			// When no API key is configured, fall back to Claude subscription OAuth.
 			// The custom fetch wrapper injects Authorization + beta headers and handles
 			// silent token refresh. The placeholder apiKey is never sent (x-api-key is
 			// deleted by the wrapper before every request).
 			if (!apiKey && hasOAuthTokens()) {
+				assertOAuthBaseUrl(baseURL);
 				const provider = createAnthropic({
 					...(baseURL && { baseURL }),
 					apiKey: "oauth-placeholder",
@@ -250,20 +247,36 @@ function createModel(modelString: string) {
 /** Consolidation call types; each has its own timeout in config.llm.timeoutsMs. */
 type LlmCallType = keyof typeof config.llm.timeoutsMs;
 
+/** The Vercel AI SDK wraps the failed HTTP call: AI_RetryError → lastError. */
+function innerLlmError(err: Error): Error {
+	return "lastError" in err && err.lastError instanceof Error
+		? err.lastError
+		: err;
+}
+
 /**
- * Unwrap the Vercel AI SDK's error chain to surface the actual HTTP status
- * code and response body, which are otherwise buried inside AI_RetryError.
- *
- * Chain: AI_RetryError { lastError: AI_APICallError { statusCode, responseBody } }
+ * A short description of a failed model call for logs and callers: the error class,
+ * the HTTP status and the provider's error code. The message and the provider body
+ * are left out, since they can echo the prompt. See llmErrorDetail for debug logs.
  */
-function formatLlmError(err: unknown): string {
+export function formatLlmError(err: unknown): string {
+	if (!(err instanceof Error)) return "non-Error failure";
+	const inner = innerLlmError(err);
+	const status =
+		"statusCode" in inner && inner.statusCode != null
+			? ` HTTP ${inner.statusCode}`
+			: "";
+	const label =
+		"responseBody" in inner && typeof inner.responseBody === "string"
+			? providerErrorSuffix(inner.responseBody)
+			: "";
+	return `${inner.name}${status}${label}`;
+}
+
+/** The full text of a failed model call. Debug logs only: it can echo the prompt. */
+function llmErrorDetail(err: unknown): string {
 	if (!(err instanceof Error)) return String(err);
-
-	// Unwrap AI_RetryError → lastError
-	const inner =
-		"lastError" in err && err.lastError instanceof Error ? err.lastError : err;
-
-	// Extract HTTP details from AI_APICallError
+	const inner = innerLlmError(err);
 	const status =
 		"statusCode" in inner && inner.statusCode != null
 			? ` HTTP ${inner.statusCode}`
@@ -272,8 +285,20 @@ function formatLlmError(err: unknown): string {
 		"responseBody" in inner && typeof inner.responseBody === "string"
 			? ` — ${inner.responseBody.slice(0, 500)}`
 			: "";
-
 	return `${inner.message}${status}${body}`;
+}
+
+/**
+ * A failed model call, thrown by complete(). Its message is formatLlmError(cause):
+ * the error class, the HTTP status and the provider's error code, which are safe to
+ * store and show. The provider's own error stays on `cause`, where the classifiers
+ * in consolidation/errors.ts read it. It is never printed.
+ */
+export class LlmCallError extends Error {
+	constructor(cause: unknown) {
+		super(formatLlmError(cause), { cause });
+		this.name = "LlmCallError";
+	}
 }
 
 /**
@@ -331,12 +356,15 @@ async function complete(
 				logger.error(
 					`[llm] ${callType} call to ${modelString} exceeded ${budget} timeout (attempt ${attempt}/${maxAttempts}) — not retrying`,
 				);
-				throw err;
+				throw new LlmCallError(err);
 			}
 			if (attempt < maxAttempts) {
 				const delay = Math.min(retryBaseDelayMs * 2 ** (attempt - 1), 60_000);
 				logger.warn(
 					`[llm] ${callType} call to ${modelString} failed on attempt ${attempt}/${maxAttempts} — retrying in ${delay / 1000}s. Error: ${formatLlmError(err)}`,
+				);
+				logger.debug(
+					`[llm] ${callType} call to ${modelString} attempt ${attempt} detail: ${llmErrorDetail(err)}`,
 				);
 				await new Promise((resolve) => setTimeout(resolve, delay));
 			}
@@ -348,7 +376,10 @@ async function complete(
 	logger.error(
 		`[llm] ${callType} call to ${modelString} failed after ${maxAttempts} attempt(s) — giving up. Last error: ${formatLlmError(lastError)}`,
 	);
-	throw lastError;
+	logger.debug(
+		`[llm] ${callType} call to ${modelString} last error detail: ${llmErrorDetail(lastError)}`,
+	);
+	throw new LlmCallError(lastError);
 }
 
 /**
@@ -550,7 +581,10 @@ ${episodeSummaries}
 		const parsed = parseJSON(response, true);
 		if (!Array.isArray(parsed)) {
 			logger.error(
-				"[llm] Failed to parse extraction response:",
+				`[llm] Failed to parse extraction response (${response.length} chars).`,
+			);
+			logger.debug(
+				"[llm] Extraction response preview:",
 				response.slice(0, 500),
 			);
 			throw new MalformedLlmOutputError("extraction");
@@ -571,7 +605,7 @@ ${episodeSummaries}
 					: undefined;
 			if (validDomainIds && item.domain !== undefined && domain === undefined) {
 				logger.warn(
-					`[llm] extractKnowledge: LLM returned unknown domain ${JSON.stringify(item.domain)} — ignoring. Valid: ${[...validDomainIds].join(", ")}`,
+					`[llm] extractKnowledge: LLM returned an unknown domain (${String(item.domain).length} chars) — ignoring. Valid: ${[...validDomainIds].join(", ")}`,
 				);
 			}
 			return {
@@ -682,7 +716,10 @@ Rules for the response array:
 
 		if (!Array.isArray(parsed) || parsed.length !== pairs.length) {
 			logger.warn(
-				`[llm] batchDecideMerge parse failure (got ${Array.isArray(parsed) ? parsed.length : "non-array"}, expected ${pairs.length}) — defaulting all to insert: ${response.slice(0, 200)}`,
+				`[llm] batchDecideMerge parse failure (got ${Array.isArray(parsed) ? parsed.length : "non-array"}, expected ${pairs.length}, ${response.length} chars) — defaulting all to insert.`,
+			);
+			logger.debug(
+				`[llm] batchDecideMerge response preview: ${response.slice(0, 200)}`,
 			);
 			return pairs.map(() => ({ action: "insert" }) as MergeDecision);
 		}
@@ -864,7 +901,10 @@ If no meaningful synthesis is possible, return: []`;
 		if (!Array.isArray(parsed)) {
 			// Synthesis is best-effort per cluster: a non-array response means "no synthesis".
 			logger.warn(
-				`[llm] synthesizePrinciple: response is not a JSON array — no synthesis: ${response.slice(0, 200)}`,
+				`[llm] synthesizePrinciple: response is not a JSON array (${response.length} chars) — no synthesis.`,
+			);
+			logger.debug(
+				`[llm] synthesizePrinciple response preview: ${response.slice(0, 200)}`,
 			);
 			return [];
 		}
@@ -973,7 +1013,10 @@ Return the JSON object. "checked" must be ${candidates.length}.`;
 			);
 		} catch (err) {
 			logger.error(
-				"[llm] Failed to parse contradiction response:",
+				`[llm] Failed to parse contradiction response (${response.length} chars).`,
+			);
+			logger.debug(
+				"[llm] Contradiction response preview:",
 				response.slice(0, 500),
 			);
 			throw err;

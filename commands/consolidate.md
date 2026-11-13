@@ -4,11 +4,12 @@ description: Run knowledge consolidation — process recent sessions (OpenCode, 
 
 Run a knowledge consolidation cycle by calling the local knowledge server.
 
-The admin token is printed to the server console at startup only when the server runs in a terminal. Under a service manager or redirected output it is not printed; set `KNOWLEDGE_ADMIN_TOKEN` in `.env` to use a stable token.
+The admin token is printed to the server console at startup only when the server runs in a terminal. Under a service manager or redirected output it is not printed; set `KNOWLEDGE_ADMIN_TOKEN` in `.env` to use a stable token. This admin call needs the token. Flagging (`knowledge_flag`) is read-level and needs no admin token; the MCP process needs `KNOWLEDGE_ADMIN_TOKEN` set only when the server runs with `KNOWLEDGE_PROTECT_READS=true`.
 
 ```bash
-curl -s -X POST -H "Authorization: Bearer $KNOWLEDGE_ADMIN_TOKEN" \
-  http://127.0.0.1:3179/consolidate | python3 -m json.tool
+curl -s -X POST -H @- http://127.0.0.1:3179/consolidate <<EOF | python3 -m json.tool
+Authorization: Bearer $KNOWLEDGE_ADMIN_TOKEN
+EOF
 ```
 
 This processes recent session logs from all configured sources (OpenCode, Claude Code,

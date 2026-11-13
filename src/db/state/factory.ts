@@ -8,11 +8,12 @@
  */
 import {
 	DEFAULT_CONFIG,
-	DEFAULT_CONFIG_PATH,
+	defaultConfigPath,
 	loadConfigFile,
 	resolveLegacyKnowledgeDbPath,
 } from "../../config-file.js";
 import { logger } from "../../logger.js";
+import { redactUriCredentials } from "../../redact-uri.js";
 import { errCode } from "../../utils.js";
 import type { IServerStateDB } from "../interface.js";
 import { ServerStateDB } from "./index.js";
@@ -23,7 +24,7 @@ import { PostgresServerStateDB } from "./postgres.js";
  * Reads config.jsonc (or uses DEFAULT_CONFIG if absent).
  */
 export async function createServerStateDB(
-	configPath = DEFAULT_CONFIG_PATH,
+	configPath = defaultConfigPath(),
 ): Promise<IServerStateDB> {
 	let config = DEFAULT_CONFIG;
 	try {
@@ -40,16 +41,14 @@ export async function createServerStateDB(
 		// Config file absent — use defaults (local SQLite)
 	}
 
-	const stateDbUri = process.env.STATE_DB_URI ?? config.stateDb?.uri;
-
-	if (config.stateDb?.kind === "postgres" || stateDbUri) {
+	// STATE_DB_URI is already applied to config.stateDb by config-file.ts.
+	if (config.stateDb?.kind === "postgres") {
+		const stateDbUri = config.stateDb.uri;
 		if (!stateDbUri) {
-			throw new Error(
-				'stateDb.kind is "postgres" but no uri configured and STATE_DB_URI env var is not set',
-			);
+			throw new Error('stateDb.kind is "postgres" but no uri configured');
 		}
 		logger.log(
-			`[db] Server state DB: Postgres at ${stateDbUri.replace(/:\/\/[^@]*@/, "://<redacted>@")}`,
+			`[db] Server state DB: Postgres at ${redactUriCredentials(stateDbUri)}`,
 		);
 		const db = new PostgresServerStateDB(stateDbUri);
 		await db.initialize();

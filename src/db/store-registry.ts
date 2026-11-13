@@ -1,15 +1,16 @@
 import {
 	DEFAULT_CONFIG,
-	DEFAULT_CONFIG_PATH,
+	defaultConfigPath,
 	loadConfigFile,
 	resolveLegacyKnowledgeDbPath,
 	resolvePostgresUri,
 	resolveSqlitePath,
 } from "../config-file.js";
 import type { KnowledgeServerConfig, StoreConfig } from "../config-file.js";
-import { parseIntEnv } from "../config.js";
-import { DomainRouter } from "../consolidation/domain-router.js";
+import { config as appConfig } from "../config.js";
+import { DomainRouter } from "../domain/domain-router.js";
 import { logger } from "../logger.js";
+import { redactUriCredentials } from "../redact-uri.js";
 import type { IKnowledgeStore, IServerStateDB } from "./interface.js";
 import { PostgresKnowledgeDB } from "./postgres/index.js";
 import { isNonLocalPostgresUri } from "./postgres/tls.js";
@@ -146,7 +147,7 @@ export class StoreRegistry {
 	 *   single SQLite store at the default paths; tests pass temp paths.
 	 */
 	static async create(
-		configPath = DEFAULT_CONFIG_PATH,
+		configPath = defaultConfigPath(),
 		fallbackConfig: KnowledgeServerConfig = DEFAULT_CONFIG,
 	): Promise<StoreRegistry> {
 		let fileConfig: KnowledgeServerConfig | null;
@@ -165,12 +166,13 @@ export class StoreRegistry {
 		}
 
 		// Create IServerStateDB — backed by local SQLite (default) or remote Postgres.
-		// Must run BEFORE knowledge stores initialize: schema v14 drops staging
-		// tables from Postgres, and the migration must copy them first.
+		// Must run BEFORE knowledge stores initialize. A Postgres state DB in the same
+		// schema must create state_schema_version first: migration v14 then recognises
+		// its staging tables as live and leaves them alone.
 		let serverStateDb: IServerStateDB;
 		try {
 			if (config.stateDb.kind === "postgres") {
-				const uri = process.env.STATE_DB_URI ?? config.stateDb.uri;
+				const uri = config.stateDb.uri;
 				if (!uri) {
 					throw new Error(
 						'config.jsonc "stateDb" has kind "postgres" but no "uri" and STATE_DB_URI env var is not set',
@@ -180,7 +182,7 @@ export class StoreRegistry {
 				await pgStateDb.initialize();
 				serverStateDb = pgStateDb;
 				logger.log(
-					`[db] Server state DB: Postgres at ${uri.replace(/:\/\/[^@]*@/, "://<redacted>@")}`,
+					`[db] Server state DB: Postgres at ${redactUriCredentials(uri)}`,
 				);
 			} else {
 				serverStateDb = new ServerStateDB(
@@ -268,7 +270,7 @@ export class StoreRegistry {
 async function tryInitStore(
 	storeConfig: StoreConfig,
 ): Promise<{ id: string; db: IKnowledgeStore | null; error?: string }> {
-	const timeoutMs = parseIntEnv(process.env.STORE_INIT_TIMEOUT_MS, 10_000, 1);
+	const timeoutMs = appConfig.storeInitTimeoutMs;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		const db = await Promise.race([
@@ -317,7 +319,7 @@ async function initStore(storeConfig: StoreConfig): Promise<IKnowledgeStore> {
 		}
 
 		logger.log(
-			`[db] Store "${storeConfig.id}": PostgreSQL at ${redactUri(uri)}`,
+			`[db] Store "${storeConfig.id}": PostgreSQL at ${redactUriCredentials(uri)}`,
 		);
 		const db = new PostgresKnowledgeDB(uri);
 		db.id = storeConfig.id;
@@ -375,16 +377,5 @@ function warnIfMixedTopology(config: KnowledgeServerConfig): void {
 				"and will fall back to the default store. " +
 				"Consider using Postgres for all writable stores in remote deployments.",
 		);
-	}
-}
-
-/** Redact password from a postgres URI for safe logging. */
-function redactUri(uri: string): string {
-	try {
-		const url = new URL(uri);
-		if (url.password) url.password = "***";
-		return url.toString();
-	} catch {
-		return uri.replace(/(\/\/[^:/@]*):[^@]*@/, "$1:***@");
 	}
 }

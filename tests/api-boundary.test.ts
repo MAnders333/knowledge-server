@@ -123,26 +123,26 @@ describe("HTTP API boundary", () => {
 	function buildApp(
 		options: {
 			adminTokenIsStable?: boolean;
+			readsProtected?: boolean;
 			readDbs?: KnowledgeDB[];
 			writableDbs?: KnowledgeDB[];
 			extraAllowedHosts?: string[];
 		} = {},
 	): void {
-		app = createApp(
+		app = createApp({
 			db,
 			serverStateDb,
 			activation,
-			consolidationStub(),
-			TOKEN,
-			options.adminTokenIsStable ?? true,
-			new Set(),
-			options.readDbs ?? [db],
-			options.writableDbs ?? [db],
-			port,
-			undefined,
-			"127.0.0.1",
-			options.extraAllowedHosts ?? [],
-		);
+			consolidation: consolidationStub(),
+			adminToken: TOKEN,
+			adminTokenIsStable: options.adminTokenIsStable ?? true,
+			readsProtected: options.readsProtected ?? false,
+			readDbs: options.readDbs ?? [db],
+			writableDbs: options.writableDbs ?? [db],
+			serverPort: port,
+			bindHost: "127.0.0.1",
+			extraAllowedHosts: options.extraAllowedHosts ?? [],
+		});
 	}
 
 	beforeAll(() => {
@@ -347,7 +347,10 @@ describe("HTTP API boundary", () => {
 
 	describe("KNOWLEDGE_ALLOWED_HOSTS entries", () => {
 		it("accepts a configured extra host and refuses lookalikes", async () => {
-			buildApp({ extraAllowedHosts: ["knowledge.example.com"] });
+			buildApp({
+				extraAllowedHosts: ["knowledge.example.com"],
+				adminTokenIsStable: false,
+			});
 			const ok = await fetch(`${base}/status`, {
 				headers: { Host: "knowledge.example.com" },
 			});
@@ -431,7 +434,7 @@ describe("HTTP API boundary", () => {
 		});
 
 		it("requires the admin token when one is configured", async () => {
-			buildApp({ adminTokenIsStable: true });
+			buildApp({ adminTokenIsStable: true, readsProtected: true });
 			const none = await post(initialize);
 			expect(none.status).toBe(401);
 
@@ -460,12 +463,12 @@ describe("HTTP API boundary", () => {
 	// ── Input caps and body limits ──────────────────────────────────────────
 
 	describe("input caps", () => {
-		it("/activate: limits the cue count and keeps the full query last", async () => {
+		it("/activate: keeps the full query last in the cues the engine receives", async () => {
 			const qs = Array.from({ length: 40 }, (_, i) => `q=segment-${i}-text`);
 			const res = await fetch(`${base}/activate?${qs.join("&")}&q=FINAL-QUERY`);
 			expect(res.status).toBe(200);
+			// The engine applies the cue cap (MAX_CUES) and the dedupe; see activation-cues.
 			const cues = activateSpy.mock.calls[0][0] as string[];
-			expect(cues.length).toBeLessThanOrEqual(16);
 			expect(cues[cues.length - 1]).toBe("FINAL-QUERY");
 		});
 
@@ -483,10 +486,20 @@ describe("HTTP API boundary", () => {
 
 		it("/activate: clamps limit to 1..50", async () => {
 			await fetch(`${base}/activate?q=hello+there+world&limit=9999`);
-			expect(activateSpy.mock.calls[0][1]).toEqual({
-				limit: 50,
-				threshold: undefined,
-			});
+			expect(activateSpy.mock.calls[0][1]).toEqual(
+				expect.objectContaining({ limit: 50 }),
+			);
+		});
+
+		it("/activate: the client's budget reaches the engine (codex has less)", async () => {
+			await fetch(`${base}/activate?q=hello+there+world&client=codex`);
+			expect(activateSpy.mock.calls[0][1]).toEqual(
+				expect.objectContaining({ budgetMs: 3_500 }),
+			);
+			await fetch(`${base}/activate?q=hello+there+world&client=opencode`);
+			expect(activateSpy.mock.calls[1][1]).toEqual(
+				expect.objectContaining({ budgetMs: 4_500 }),
+			);
 		});
 
 		it("hook: bounds a very long prompt before splitting into cues", async () => {
@@ -557,7 +570,11 @@ describe("HTTP API boundary", () => {
 				join(tempDir, "readonly-opencode.db"),
 			);
 			await roDb.insertEntry(entryFixture("ro-1", "read-only entry"));
-			buildApp({ readDbs: [db, roDb], writableDbs: [db] });
+			buildApp({
+				readDbs: [db, roDb],
+				writableDbs: [db],
+				adminTokenIsStable: false,
+			});
 		});
 
 		it("PATCH and DELETE refuse entries that live only in a read-only store", async () => {

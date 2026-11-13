@@ -161,19 +161,16 @@ describe("abandoned requests are not recorded as injections", () => {
 				return false;
 			},
 		} as unknown as ConsolidationEngine;
-		const app = createApp(
-			{} as IKnowledgeStore,
-			state,
+		const app = createApp({
+			db: {} as IKnowledgeStore,
+			serverStateDb: state,
 			activation,
 			consolidation,
-			"test-token-for-access",
-			false,
-			new Set(),
-			[],
-			[],
-			8080,
-			undefined,
-		);
+			adminToken: "test-token-for-access",
+			readDbs: [],
+			writableDbs: [],
+			serverPort: 8080,
+		});
 		return { app, commitInjections, activate };
 	}
 

@@ -80,3 +80,40 @@ describe("fetchServerHealth", () => {
 		expect(await fetchServerHealth(`http://127.0.0.1:${port}`, 500)).toBeNull();
 	});
 });
+
+describe("fetchServerHealth with a protected /status", () => {
+	const TOKEN = "stable-admin-token-0123456789";
+	/** A server that answers /status only to the admin bearer, as with KNOWLEDGE_PROTECT_READS. */
+	function protectedServer() {
+		return Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: (req) =>
+				req.headers.get("authorization") === `Bearer ${TOKEN}`
+					? Response.json({ status: "ok", health: "ok", reasons: [] })
+					: Response.json({ error: "Unauthorized" }, { status: 401 }),
+		});
+	}
+
+	it("sends the admin token as a bearer and reads the health", async () => {
+		const server = protectedServer();
+		try {
+			expect(
+				await fetchServerHealth(`http://127.0.0.1:${server.port}`, 2000, TOKEN),
+			).toEqual({ health: "ok", reasons: [] });
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	it("without the token, a protected server reads as not answering", async () => {
+		const server = protectedServer();
+		try {
+			expect(
+				await fetchServerHealth(`http://127.0.0.1:${server.port}`),
+			).toBeNull();
+		} finally {
+			server.stop(true);
+		}
+	});
+});

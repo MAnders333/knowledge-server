@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { config } from "../config.js";
+import { DEFAULT_RERANK_MODEL, config } from "../config.js";
 import { logger } from "../logger.js";
 import {
 	BertWordPieceTokenizer,
@@ -76,7 +76,7 @@ import wasmRuntimeBin from "../../node_modules/onnxruntime-web/dist/ort-wasm-sim
  */
 
 /** Where a scorer's numbers come from. Score-dependent settings are keyed by it. */
-export type RerankProvider = "local" | "remote";
+type RerankProvider = "local" | "remote";
 
 export interface RerankIdentity {
 	provider: RerankProvider;
@@ -94,9 +94,14 @@ export interface RerankScorer {
 	readonly identity: RerankIdentity;
 	/**
 	 * Score each document's relevance to the query, in input order, normalized to
-	 * [0, 1].
+	 * [0, 1]. `budgetMs` caps this call; the scorer's own timeout still applies when
+	 * it is shorter.
 	 */
-	scoreBatch(query: string, documents: string[]): Promise<number[]>;
+	scoreBatch(
+		query: string,
+		documents: string[],
+		options?: { budgetMs?: number },
+	): Promise<number[]>;
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: ort session type via dynamic import
@@ -106,9 +111,6 @@ interface LoadedModel {
 	tokenizer: BertWordPieceTokenizer;
 	session: OrtSession;
 }
-
-/** The model the reranker ships with (English-only). */
-const DEFAULT_RERANK_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2";
 
 /**
  * Hugging Face revisions and sha256 checksums for models we pin. Artifacts
@@ -344,7 +346,11 @@ export class LocalReranker implements RerankScorer {
 	 * is refused at once with RerankSkippedError. The timeout covers queue wait
 	 * too, and a queued call whose deadline has passed never starts scoring.
 	 */
-	async scoreBatch(query: string, documents: string[]): Promise<number[]> {
+	async scoreBatch(
+		query: string,
+		documents: string[],
+		options?: { budgetMs?: number },
+	): Promise<number[]> {
 		if (documents.length === 0) return [];
 		// Admission is decided before any await, so refusals follow call order.
 		// `admitted` includes the running call, hence the comparison.
@@ -355,21 +361,33 @@ export class LocalReranker implements RerankScorer {
 			);
 		}
 
-		const deadline = performance.now() + this.timeoutMs;
+		const timeoutMs = Math.min(
+			this.timeoutMs,
+			options?.budgetMs ?? this.timeoutMs,
+		);
+		const budgetCut = timeoutMs < this.timeoutMs;
+		const deadline = performance.now() + timeoutMs;
 		// Set by the timeout timer itself. setTimeout and performance.now() use
 		// different clock granularity, so the timer can fire a millisecond before
 		// `performance.now() >= deadline` holds; the flag is the authoritative signal.
 		const state = { expired: false };
 		const work = this.runQueued(() =>
-			this.scorePairs(query, documents, deadline, state),
+			this.scorePairs(query, documents, deadline, state, timeoutMs),
 		);
 		const { promise: expired, reject } = Promise.withResolvers<never>();
 		const timer = setTimeout(() => {
 			state.expired = true;
-			reject(new Error(`rerank timeout after ${this.timeoutMs}ms`));
-		}, this.timeoutMs);
+			reject(new Error(`rerank timeout after ${timeoutMs}ms`));
+		}, timeoutMs);
 		try {
 			return await Promise.race([work, expired]);
+		} catch (err) {
+			// A call the request budget cut short, and that then ran out, is refused as
+			// skipped: the budget, not the scorer, ended it.
+			if (budgetCut && (state.expired || performance.now() >= deadline)) {
+				throw new RerankSkippedError("request budget");
+			}
+			throw err;
 		} finally {
 			clearTimeout(timer);
 		}
@@ -397,10 +415,11 @@ export class LocalReranker implements RerankScorer {
 		documents: string[],
 		deadline: number,
 		state: { expired: boolean },
+		timeoutMs: number,
 	): Promise<number[]> {
 		// Turn check: a call that waited past its deadline must not occupy the session.
 		if (state.expired || performance.now() >= deadline) {
-			throw new Error(`rerank timeout after ${this.timeoutMs}ms`);
+			throw new Error(`rerank timeout after ${timeoutMs}ms`);
 		}
 		const { tokenizer, session } = await this.load();
 		const ort = await import("onnxruntime-web");
@@ -410,7 +429,7 @@ export class LocalReranker implements RerankScorer {
 		const scores: number[] = [];
 		for (const document of documents) {
 			if (state.expired || performance.now() >= deadline) {
-				throw new Error(`rerank timeout after ${this.timeoutMs}ms`);
+				throw new Error(`rerank timeout after ${timeoutMs}ms`);
 			}
 			const features = tokenizer.batchFromIds(
 				[queryIds],

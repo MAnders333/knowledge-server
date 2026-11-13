@@ -343,6 +343,7 @@ describe("EpisodeUploader — full re-ingest after reinitialize", () => {
 		const reader = fakeReader(new Map());
 		const uploader = new EpisodeUploader([reader], db, daemonDb, "alice", {
 			initialLookbackDays: DEFAULT_INITIAL_LOOKBACK_DAYS,
+			fullBackfillRequests: true,
 		});
 		await uploader.upload();
 
@@ -363,6 +364,7 @@ describe("EpisodeUploader — full re-ingest after reinitialize", () => {
 		const reader = fakeReader(sessions);
 		const uploader = new EpisodeUploader([reader], db, daemonDb, "alice", {
 			initialLookbackDays: DEFAULT_INITIAL_LOOKBACK_DAYS,
+			fullBackfillRequests: true,
 		});
 
 		const first = await uploader.upload();
@@ -390,11 +392,26 @@ describe("EpisodeUploader — full re-ingest after reinitialize", () => {
 		};
 		const uploader = new EpisodeUploader([reader], db, daemonDb, "alice", {
 			initialLookbackDays: DEFAULT_INITIAL_LOOKBACK_DAYS,
+			fullBackfillRequests: true,
 		});
 
 		const result = await uploader.upload();
 
 		expect(result.failedSources).toHaveLength(1);
+		expect(await daemonDb.hasFullBackfillRequest()).toBe(true);
+	});
+
+	it("an uploader that does not own the request (process-inbox) leaves it for the daemon", async () => {
+		await daemonDb.resetDaemonCursors();
+		const reader = fakeReader(new Map());
+		const uploader = new EpisodeUploader([reader], db, daemonDb, "alice", {
+			initialLookbackDays: DEFAULT_INITIAL_LOOKBACK_DAYS,
+		});
+
+		await uploader.upload();
+
+		// Read from the first-run lookback, not from the start of history, and keep the request.
+		expect(reader.sinceArgs[0]).toBeGreaterThan(0);
 		expect(await daemonDb.hasFullBackfillRequest()).toBe(true);
 	});
 });

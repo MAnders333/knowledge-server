@@ -1,5 +1,17 @@
-import { config } from "../config.js";
 import type { KnowledgeEntry } from "../types.js";
+
+/**
+ * Type-specific base half-lives in days (higher = slower decay). config.decay
+ * exposes this same table; the domain owns it so storage does not depend on
+ * configuration to score entries.
+ */
+export const TYPE_HALF_LIFE_DAYS: Record<string, number> = {
+	fact: 30, // facts go stale in ~30 days
+	principle: 180, // principles last ~6 months
+	pattern: 90, // patterns last ~3 months
+	decision: 120, // decisions last ~4 months
+	procedure: 365, // procedures are very stable
+};
 
 /**
  * Compute the current strength of a knowledge entry.
@@ -37,23 +49,23 @@ import type { KnowledgeEntry } from "../types.js";
  *   4 obs + 4 accesses (obs=4, access=4):
  *     both bonuses ≈ 3.32
  *     effectiveHalfLife = 30 × 3.32 × 3.32 ≈ 331 days
- */
-/**
+ *
  * @param nowMs - Current timestamp in milliseconds. Defaults to Date.now().
  *   Pass an explicit value when scoring many entries in a loop so all entries
- *   are measured against the same instant (avoids per-entry clock skew and
- *   makes the function pure/testable).
+ *   are measured against the same instant (avoids per-entry clock skew).
+ * @param halfLives - Base half-life in days per entry type; unknown types use
+ *   the `fact` half-life.
  */
 export function computeStrength(
 	entry: KnowledgeEntry,
 	nowMs = Date.now(),
+	halfLives: Record<string, number> = TYPE_HALF_LIFE_DAYS,
 ): number {
 	const daysSinceAccess =
 		(nowMs - entry.lastAccessedAt) / (1000 * 60 * 60 * 24);
 
 	// Base half-life in days (type-specific)
-	const baseHalfLife =
-		config.decay.typeHalfLife[entry.type] ?? config.decay.typeHalfLife.fact;
+	const baseHalfLife = halfLives[entry.type] ?? halfLives.fact;
 
 	// Observation bonus: more evidence → longer effective half-life
 	// observationCount=1 (new): 1 + log2(2) = 2×

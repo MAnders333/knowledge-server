@@ -337,18 +337,49 @@ export const PG_MIGRATIONS: Array<{
 	{
 		version: 14,
 		label:
-			"drop staging tables from Postgres — they now live in state.db (ServerStateDB)",
+			"retire staging tables from Postgres — they now live in state.db (ServerStateDB)",
 		up: async (sql: TxSql) => {
-			// consolidated_episode, consolidation_state, pending_episodes all moved to
-			// state.db (local SQLite). Drop them from Postgres so the schema is clean.
-			// These tables may not exist on fresh installs — DROP IF EXISTS is safe.
-			//
-			// IMPORTANT: any data in consolidated_episode here should have already been
-			// migrated to state.db by ServerStateDB (runStateMigrations) on startup.
-			// The idempotency history from these rows is preserved in state.db.
-			await sql`DROP TABLE IF EXISTS pending_episodes CASCADE`;
-			await sql`DROP TABLE IF EXISTS consolidated_episode CASCADE`;
-			await sql`DROP TABLE IF EXISTS consolidation_state CASCADE`;
+			// consolidated_episode, consolidation_state and pending_episodes moved to the
+			// server state DB. Three cases decide what happens to them here:
+			//  1. A Postgres state DB (STATE_DB_URI) in this same schema owns the tables.
+			//     Its init creates them before the knowledge stores open, so they are
+			//     live state, not leftovers: leave them alone.
+			//  2. Empty: drop them, as before.
+			//  3. Rows: ServerStateDB cannot read them (it copies only a legacy SQLite
+			//     knowledge.db), and a Postgres migration cannot reach state.db to copy
+			//     them. Dropping would destroy unconsolidated episodes, so the table is
+			//     renamed to legacy_<table> and kept for manual recovery.
+			const stateOwned = await sql`
+				SELECT 1 FROM information_schema.tables
+				WHERE table_schema = current_schema() AND table_name = 'state_schema_version'
+			`;
+			if (stateOwned.length > 0) return;
+
+			for (const table of [
+				"pending_episodes",
+				"consolidated_episode",
+				"consolidation_state",
+			]) {
+				const exists = await sql`
+					SELECT 1 FROM information_schema.tables
+					WHERE table_schema = current_schema() AND table_name = ${table}
+				`;
+				if (exists.length === 0) continue;
+				// The lock is held until this transaction commits, so no row can land
+				// between the count and the drop or rename.
+				await sql.unsafe(`LOCK TABLE ${table} IN ACCESS EXCLUSIVE MODE`);
+				const [{ n }] = await sql.unsafe(
+					`SELECT COUNT(*)::int AS n FROM ${table}`,
+				);
+				if (n === 0) {
+					await sql.unsafe(`DROP TABLE ${table} CASCADE`);
+					continue;
+				}
+				await sql.unsafe(`ALTER TABLE ${table} RENAME TO legacy_${table}`);
+				logger.warn(
+					`[pg-db] Migration v14: ${table} held ${n} row(s). They are not copied to state.db and are no longer read; kept as legacy_${table} for manual recovery.`,
+				);
+			}
 		},
 	},
 	{

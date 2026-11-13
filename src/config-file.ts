@@ -1,6 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
-import { homedir, hostname } from "node:os";
+import { hostname } from "node:os";
 import { dirname, join } from "node:path";
+import { parseFlag } from "./env-flag.js";
+import { defaultDataDir, homeDir } from "./home.js";
 
 /**
  * Store configuration — one entry per knowledge database.
@@ -82,7 +84,7 @@ export interface ProjectConfig {
  * Note: daemon_cursor always stays in daemon.db (local SQLite) regardless of
  * this setting — it is per-machine and never shared.
  */
-export interface StateDbConfig {
+interface StateDbConfig {
 	kind: "sqlite" | "postgres";
 	/** SQLite only: path to state.db. Defaults to ~/.local/share/knowledge-server/state.db */
 	path?: string;
@@ -145,39 +147,34 @@ function parsePortEnvVar(raw: string | undefined, fallback: number): number {
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
 
-export const DEFAULT_CONFIG_PATH = join(
-	homedir(),
-	".config",
-	"knowledge-server",
-	"config.jsonc",
-);
+/** Default config.jsonc location. */
+export function defaultConfigPath(home: string = homeDir()): string {
+	return join(home, ".config", "knowledge-server", "config.jsonc");
+}
 
-export const DEFAULT_SQLITE_PATH = join(
-	homedir(),
-	".local",
-	"share",
-	"knowledge-server",
-	"knowledge.db",
-);
+/** Default knowledge.db: the SQLite store used when none is configured. */
+export function defaultSqlitePath(home: string = homeDir()): string {
+	return join(defaultDataDir(home), "knowledge.db");
+}
 
 /**
  * Directory that holds state.db, the default knowledge.db, the lockfiles
  * (daemon.lock, consolidate.lock), the daemon status file and daemon.log.
  * Follows `stateDb.path` from config.jsonc, else the default location.
  */
-export function resolveDataDir(configPath = DEFAULT_CONFIG_PATH): string {
+export function resolveDataDir(configPath = defaultConfigPath()): string {
 	let stateDbPath: string | undefined;
 	try {
 		stateDbPath = loadConfigFile(configPath)?.stateDb.path;
 	} catch {
 		// A malformed config is reported by the component that needs it.
 	}
-	return dirname(stateDbPath ?? DEFAULT_SQLITE_PATH);
+	return dirname(stateDbPath ?? defaultSqlitePath());
 }
 
 /** Expand a leading `~` (alone or as `~/…`) to the home directory. */
-export function expandHome(p: string): string {
-	return p.replace(/^~(?=$|\/)/, homedir());
+function expandHome(p: string): string {
+	return p.replace(/^~(?=$|\/)/, homeDir());
 }
 
 // ── JSONC strip-comments ──────────────────────────────────────────────────────
@@ -254,7 +251,7 @@ function stripJsoncComments(jsonc: string): string {
  * @param configPath Override path — used in tests and by migrate-config.
  */
 export function loadConfigFile(
-	configPath = DEFAULT_CONFIG_PATH,
+	configPath = defaultConfigPath(),
 ): KnowledgeServerConfig | null {
 	if (!existsSync(configPath)) {
 		return null;
@@ -306,9 +303,7 @@ function validateConfigFile(
 		throw new Error(`config.jsonc "stores" must contain at least one store`);
 	}
 
-	const stores: StoreConfig[] = obj.stores.map((s, i) =>
-		validateStore(s, i, configPath),
-	);
+	const stores: StoreConfig[] = obj.stores.map((s, i) => validateStore(s, i));
 
 	// Duplicate store IDs would silently clobber each other in StoreRegistry's Map.
 	const ids = stores.map((s) => s.id);
@@ -440,10 +435,11 @@ function validateConfigFile(
 		}
 		daemonAutoSpawn = obj.daemonAutoSpawn as boolean;
 	}
-	if (process.env.DAEMON_AUTO_SPAWN !== undefined) {
-		daemonAutoSpawn = process.env.DAEMON_AUTO_SPAWN !== "false";
-	}
-
+	// DAEMON_AUTO_SPAWN overrides config.jsonc. An unknown spelling keeps the
+	// config.jsonc value here, so non-server consumers (daemon, MCP proxy) still
+	// load; config.ts reports the spelling through validateConfig().
+	const envAutoSpawn = parseFlag(process.env.DAEMON_AUTO_SPAWN);
+	if (typeof envAutoSpawn === "boolean") daemonAutoSpawn = envAutoSpawn;
 	// stateDb — optional, defaults to local SQLite. STATE_DB_URI env var forces Postgres.
 	let stateDb: StateDbConfig = { kind: "sqlite" };
 	if (
@@ -576,11 +572,7 @@ function validateProject(
 	};
 }
 
-function validateStore(
-	raw: unknown,
-	index: number,
-	configPath: string,
-): StoreConfig {
+function validateStore(raw: unknown, index: number): StoreConfig {
 	const loc = `config.jsonc stores[${index}]`;
 
 	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
@@ -661,7 +653,7 @@ export function resolvePostgresUri(store: StoreConfig): string {
  * Falls back to the default path if not specified.
  */
 export function resolveSqlitePath(store: StoreConfig): string {
-	return store.path ?? DEFAULT_SQLITE_PATH;
+	return store.path ?? defaultSqlitePath();
 }
 
 /**
@@ -681,7 +673,7 @@ export function resolveLegacyKnowledgeDbPath(
  * Same precedence as loadConfigFile(): KNOWLEDGE_PORT / KNOWLEDGE_HOST env →
  * config.jsonc → defaults (127.0.0.1:3179).
  */
-export function resolveServerAddress(configPath = DEFAULT_CONFIG_PATH): {
+export function resolveServerAddress(configPath = defaultConfigPath()): {
 	host: string;
 	port: number;
 } {
@@ -731,5 +723,6 @@ export const DEFAULT_CONFIG: KnowledgeServerConfig = {
 	userId: resolveUserId(),
 	port: parsePortEnvVar(process.env.KNOWLEDGE_PORT, 3179),
 	host: process.env.KNOWLEDGE_HOST?.trim() || "127.0.0.1",
-	daemonAutoSpawn: process.env.DAEMON_AUTO_SPAWN !== "false",
+	// An unknown spelling is reported by config.ts (validateConfig); the default applies here.
+	daemonAutoSpawn: parseFlag(process.env.DAEMON_AUTO_SPAWN) ?? true,
 };

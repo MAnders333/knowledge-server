@@ -320,6 +320,30 @@ describe("checkAndReEmbed", () => {
 		expect(callArgs.length).toBe(3);
 	});
 
+	it("re-embedding keeps updated_at of archived entries, so their tombstone clock keeps running", async () => {
+		const oldEmb = fakeEmbedding("old");
+		const newEmb = fakeEmbedding("new");
+		const ARCHIVED_AT = 1_000;
+
+		await db.insertEntry(
+			makeEntry({
+				id: "archived-old",
+				status: "archived",
+				updatedAt: ARCHIVED_AT,
+				embedding: oldEmb,
+			}),
+		);
+		await db.setEmbeddingMetadata("old-model", oldEmb.length);
+		config.embedding.model = "new-model";
+		spyOn(activation.embeddings, "embedBatch").mockResolvedValue([newEmb]);
+
+		await activation.checkAndReEmbed();
+
+		const entry = await db.getEntryWithEmbedding("archived-old");
+		expect(entry?.embedding).toEqual(newEmb.map((x) => Math.fround(x)));
+		expect(entry?.updatedAt).toBe(ARCHIVED_AT);
+	});
+
 	it("re-embeds conflicted entries alongside active ones", async () => {
 		const oldEmb = fakeEmbedding("old");
 		const newEmb = fakeEmbedding("new");

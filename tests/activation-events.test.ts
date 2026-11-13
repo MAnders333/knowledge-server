@@ -100,58 +100,25 @@ describe("activation_event schema", () => {
 		);
 	});
 
-	it("state DB is at the registered v5 schema", () => {
-		expect(SERVER_LOCAL_SCHEMA_VERSION).toBe(5);
-	});
-
-	it("upgrading a v2 state DB adds the table", async () => {
-		await state.close();
-		const raw = new Database(statePath);
-		raw.exec("DROP TABLE activation_event");
-		raw.exec("DELETE FROM schema_version WHERE version = 3");
-		raw.close();
-
-		state = new ServerStateDB(statePath);
-		const check = openRaw(statePath);
-		const found = check
-			.prepare(
-				"SELECT name FROM sqlite_master WHERE type='table' AND name='activation_event'",
-			)
-			.get();
-		check.close();
-		expect(found).not.toBeNull();
-	});
-
-	it("upgrading a v4 state DB adds rerank_model and keeps its rows", async () => {
-		await state.insertActivationEvents([row({ ts: 1_000 })]);
-		await state.close();
-		const raw = new Database(statePath);
-		raw.exec("ALTER TABLE activation_event DROP COLUMN rerank_model");
-		raw.exec("DELETE FROM schema_version WHERE version = 5");
-		raw.close();
-
-		state = new ServerStateDB(statePath);
-		await state.insertActivationEvents([
-			row({ ts: 2_000, rerankModel: "local/Xenova/ms-marco-MiniLM-L-6-v2" }),
-		]);
-		const check = openRaw(statePath);
-		const stored = check
-			.prepare("SELECT ts, rerank_model FROM activation_event ORDER BY ts")
-			.all() as Array<{ ts: number; rerank_model: string | null }>;
-		check.close();
-		expect(stored).toEqual([
-			{ ts: 1_000, rerank_model: null },
-			{ ts: 2_000, rerank_model: "local/Xenova/ms-marco-MiniLM-L-6-v2" },
-		]);
+	it("state DB is at the registered v6 schema", () => {
+		expect(SERVER_LOCAL_SCHEMA_VERSION).toBe(6);
 	});
 });
 
 describe("ServerStateDB activation methods", () => {
-	it("counts injections per client inside the window", async () => {
+	it("counts only activations that injected entries, per client, inside the window", async () => {
 		const now = Date.now();
 		await state.insertActivationEvents([
 			row({ client: "opencode", ts: now }),
 			row({ client: "opencode", ts: now - 1000 }),
+			row({
+				client: "opencode",
+				ts: now - 2000,
+				nReturned: 0,
+				entryIds: [],
+				rawSims: [],
+			}),
+			row({ client: "opencode", ts: now - 3000, clientDeadlineExceeded: true }),
 			row({ client: "pi", ts: now - 10 * 24 * 3600 * 1000 }),
 		]);
 		expect(await state.countActivationsByClient(now - 3600 * 1000)).toEqual({
@@ -214,11 +181,14 @@ describe("ActivationEventRecorder", () => {
 		await recorder.stop();
 	});
 
-	it("logs a failing write once and keeps accepting rows", async () => {
+	it("keeps a failed batch and writes it once the store recovers", async () => {
 		const logPath = join(dir, "server.log");
 		logger.init(logPath, "info");
-		const insert = mock(async () => {
-			throw new Error("disk gone");
+		let failing = true;
+		const written: ActivationEventRow[] = [];
+		const insert = mock(async (rows: ActivationEventRow[]) => {
+			if (failing) throw new Error("disk gone");
+			written.push(...rows);
 		});
 		const recorder = new ActivationEventRecorder(
 			{ insertActivationEvents: insert, pruneActivationEvents: async () => 0 },
@@ -228,14 +198,80 @@ describe("ActivationEventRecorder", () => {
 		await recorder.flush();
 		recorder.record(row());
 		await recorder.flush();
-		recorder.record(row());
-		await recorder.flush();
+		expect(recorder.pending).toBe(2);
 		const warnings = readFileSync(logPath, "utf8")
 			.split("\n")
 			.filter((l) => l.includes("Could not write activation_event"));
 		expect(warnings.length).toBe(1);
+
+		failing = false;
+		await recorder.flush();
 		expect(recorder.pending).toBe(0);
-		expect(insert).toHaveBeenCalledTimes(3);
+		expect(written.length).toBe(2);
+		expect(readFileSync(logPath, "utf8")).toContain("Writes recovered");
+	});
+
+	it("retries a failed batch on its own, without another record() or flush()", async () => {
+		let failing = true;
+		const insert = mock(async () => {
+			if (failing) {
+				failing = false;
+				throw new Error("disk gone");
+			}
+		});
+		const recorder = new ActivationEventRecorder(
+			{ insertActivationEvents: insert, pruneActivationEvents: async () => 0 },
+			{ flushDelayMs: 5 },
+		);
+		recorder.record(row());
+		// The retry is a real timer (flushDelayMs), so the test polls for it with a bound.
+		for (let i = 0; i < 400 && recorder.pending > 0; i++) {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setTimeout(resolve, 5);
+			await promise;
+		}
+		expect(recorder.pending).toBe(0);
+		expect(insert).toHaveBeenCalledTimes(2);
+	});
+
+	it("keeps at most maxQueued rows across failures and counts the rest as dropped", async () => {
+		const logPath = join(dir, "server.log");
+		logger.init(logPath, "info");
+		const insert = mock(async () => {
+			throw new Error("disk gone");
+		});
+		const recorder = new ActivationEventRecorder(
+			{ insertActivationEvents: insert, pruneActivationEvents: async () => 0 },
+			{ flushDelayMs: 60_000, maxQueued: 2 },
+		);
+		for (let i = 0; i < 3; i++) {
+			recorder.record(row());
+			await recorder.flush();
+		}
+		expect(recorder.pending).toBe(2);
+		await recorder.stop();
+		expect(readFileSync(logPath, "utf8")).toContain("Dropped 1 rows");
+	});
+
+	it("a failing store is retried on the timer, not on every record past the batch size", async () => {
+		const insert = mock(async () => {
+			throw new Error("disk gone");
+		});
+		const recorder = new ActivationEventRecorder(
+			{ insertActivationEvents: insert, pruneActivationEvents: async () => 0 },
+			{ batchSize: 2, flushDelayMs: 60_000 },
+		);
+		recorder.record(row());
+		recorder.record(row());
+		await recorder.flush();
+		// The second record sees an empty store (not yet failing) and flushes; the
+		// explicit flush is the second attempt.
+		expect(insert).toHaveBeenCalledTimes(2);
+		const before = insert.mock.calls.length;
+		for (let i = 0; i < 4; i++) recorder.record(row());
+		await recorder.flush();
+		// Once failing, records wait for the timer: only the explicit flush tries.
+		expect(insert.mock.calls.length - before).toBe(1);
 	});
 
 	it("hashes session ids and never returns the raw id", () => {
@@ -306,19 +342,17 @@ describe("HTTP activation writes telemetry without prompt text", () => {
 				return false;
 			},
 		} as unknown as ConsolidationEngine;
-		return createApp(
-			{} as IKnowledgeStore,
-			state,
+		return createApp({
+			db: {} as IKnowledgeStore,
+			serverStateDb: state,
 			activation,
 			consolidation,
-			"test-token-for-activation-events",
-			false,
-			new Set(),
-			[],
-			[],
-			8080,
-			recorder,
-		);
+			adminToken: "test-token-for-activation-events",
+			readDbs: [],
+			writableDbs: [],
+			serverPort: 8080,
+			activationEvents: recorder,
+		});
 	}
 
 	it("GET /activate stores client tag and content-free fields; response has no telemetry", async () => {

@@ -17,6 +17,9 @@ import { ensurePrivateFile } from "./utils.js";
  * Design decisions:
  * - One file descriptor, opened once and reused for every line (no open/close per
  *   line). Writes are synchronous so ordering is exact.
+ *   Other processes may append to the same file (the server, `consolidate`,
+ *   `process-inbox`). Each write checks that the path still names the open file
+ *   and reopens it after another process rotated or removed it.
  * - Never double-write: launchd points stdout and stderr at the same server.log.
  *   When a stream is already the log file (same device + inode), lines are written
  *   through the logger's own descriptor and skipped on that stream. The file gets
@@ -42,7 +45,7 @@ import { ensurePrivateFile } from "./utils.js";
  *   logger.error("[llm] Parse failure:", err);
  */
 
-export type LogLevelName = "debug" | "info" | "warn" | "error";
+type LogLevelName = "debug" | "info" | "warn" | "error";
 type LineLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
 
 /** Rotated copies kept beside the active log: `<log>.1` … `<log>.3`. */
@@ -99,7 +102,7 @@ function isSameFile(fd: number, path: string): boolean {
 	}
 }
 
-export interface LoggerOptions {
+interface LoggerOptions {
 	/** Mirror to stdout/stderr. Tests turn this off to keep output quiet. */
 	mirror?: boolean;
 	/** Rotate the active file before it would exceed this size. 0 disables rotation. */
@@ -114,9 +117,11 @@ export class Logger {
 	private fd: number | null = null;
 	/** Bytes in the active file as far as this process knows (set on open, grown per write). */
 	private bytes = 0;
+	/** Device and inode of the open file, to detect rotation by another process. */
+	private fileId: { dev: number; ino: number } | null = null;
 	private readonly stdoutIsLog: boolean;
 	private readonly stderrIsLog: boolean;
-	/** Number of times the log file was opened. Grows by one per rotation. */
+	/** Number of times the log file was opened. Grows by one per rotation or reopen. */
 	fileOpens = 0;
 
 	constructor(
@@ -154,10 +159,33 @@ export class Logger {
 	/** Open the active file through the reused descriptor (append, owner-only). */
 	private openFile(): number {
 		const fd = openSync(this.logPath, "a", 0o600);
+		const st = fstatSync(fd);
 		this.fd = fd;
 		this.fileOpens++;
-		this.bytes = fstatSync(fd).size;
+		this.bytes = st.size;
+		this.fileId = { dev: st.dev, ino: st.ino };
 		return fd;
+	}
+
+	/**
+	 * Descriptor of the active file. When another process has rotated or removed
+	 * `logPath`, this descriptor still points at the old copy, so it is reopened.
+	 */
+	private activeFd(): number {
+		if (this.fd !== null && this.pathIsOpenFile()) return this.fd;
+		this.close();
+		return this.openFile();
+	}
+
+	/** True while `logPath` still names the file this descriptor was opened on. */
+	private pathIsOpenFile(): boolean {
+		if (this.fileId === null) return false;
+		try {
+			const st = statSync(this.logPath);
+			return st.dev === this.fileId.dev && st.ino === this.fileId.ino;
+		} catch {
+			return false; // Removed: reopening recreates it.
+		}
 	}
 
 	/**
@@ -177,7 +205,7 @@ export class Logger {
 		try {
 			const data = `${line}\n`;
 			const len = Buffer.byteLength(data);
-			let fd = this.fd ?? this.openFile();
+			let fd = this.activeFd();
 			if (
 				this.maxBytes > 0 &&
 				this.bytes > 0 &&

@@ -58,4 +58,58 @@ describe("real home guard", () => {
 			rmSync(home, { recursive: true, force: true });
 		}
 	});
+
+	it("runs with HOME in a temp sandbox, not the real home", () => {
+		expect(process.env.HOME).not.toBe(REAL_HOME);
+		expect(process.env.HOME?.startsWith(tmpdir())).toBe(true);
+	});
+
+	it("reports changes under the knowledge data and config directories", () => {
+		const home = mkdtempSync(join(tmpdir(), "home-guard-"));
+		try {
+			const dataDir = join(home, ".local", "share", "knowledge-server");
+			const configDir = join(home, ".config", "knowledge-server");
+			mkdirSync(dataDir, { recursive: true });
+			mkdirSync(configDir, { recursive: true });
+			writeFileSync(join(configDir, "config.jsonc"), "{}");
+			const before = snapshotHome(home);
+
+			writeFileSync(join(dataDir, "knowledge.db"), "");
+			writeFileSync(join(configDir, "config.jsonc"), '{ "port": 4321 }');
+
+			expect(diffSnapshots(before, snapshotHome(home))).toEqual([
+				".config/knowledge-server/config.jsonc",
+				".local/share/knowledge-server",
+			]);
+		} finally {
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	it("ignores runtime files a running server writes in its data directory", () => {
+		const home = mkdtempSync(join(tmpdir(), "home-guard-"));
+		try {
+			const dataDir = join(home, ".local", "share", "knowledge-server");
+			mkdirSync(dataDir, { recursive: true });
+			const before = snapshotHome(home);
+
+			for (const name of [
+				"consolidate.lock",
+				"server.log.1",
+				"server.pid",
+				"knowledge.db-wal",
+				"knowledge.db-shm",
+				"state.db-journal",
+				"daemon.status",
+				"scratch.tmp",
+			]) {
+				writeFileSync(join(dataDir, name), "");
+			}
+			mkdirSync(join(dataDir, "models"));
+
+			expect(diffSnapshots(before, snapshotHome(home))).toEqual([]);
+		} finally {
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
 });

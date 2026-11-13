@@ -26,3 +26,19 @@ export function parseClientTag(raw: string | null | undefined): ClientTag {
 		? (v as ClientTag)
 		: "unknown";
 }
+
+/** Time budget of one activation request, from request entry (see activate.ts). */
+export const DEFAULT_ACTIVATION_BUDGET_MS = 4_500;
+
+/**
+ * Budgets that differ from the default, by client. Codex's hook curl gives up at 4 s,
+ * so codex is answered within 3.5 s. The plugins abort at 5 s and keep the default.
+ */
+const ACTIVATION_BUDGET_MS_BY_CLIENT: Partial<Record<ClientTag, number>> = {
+	codex: 3_500,
+};
+
+/** The request budget, in ms, for a client's /activate or hook call. */
+export function activationBudgetMs(client: ClientTag): number {
+	return ACTIVATION_BUDGET_MS_BY_CLIENT[client] ?? DEFAULT_ACTIVATION_BUDGET_MS;
+}

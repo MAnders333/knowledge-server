@@ -1,4 +1,5 @@
 import postgres from "postgres";
+import { config } from "../../config.js";
 import { logger } from "../../logger.js";
 import type {
 	ActivationEventRow,
@@ -14,85 +15,16 @@ import {
 	pendingMigrations,
 } from "../migration-registry.js";
 import { resolvePostgresTls, warnNoTlsOnce } from "../postgres/tls.js";
+import {
+	ACTIVATION_EVENT_COLUMNS,
+	type ActivationEventValue,
+	activationEventColumnDefs,
+} from "./activation-columns.js";
 
 // biome-ignore lint: TS limitation with Omit stripping call signatures
 type TxSql = any;
 
-/**
- * Versioned migrations for the Postgres state DB. Version 1 is the baseline
- * created by PG_CREATE_STATE_TABLES; each later entry runs once, in order.
- */
-const PG_STATE_MIGRATIONS: Array<{
-	version: number;
-	label: string;
-	up?: (tx: TxSql) => Promise<void>;
-}> = [
-	{ version: 1, label: "baseline state schema" },
-	{
-		version: 2,
-		label:
-			"pending_episode_attempts table (attempt counts kept out of pending_episodes)",
-		up: async (tx: TxSql) => {
-			await tx.unsafe(PG_ATTEMPTS_TABLE);
-		},
-	},
-	{
-		version: 3,
-		label: "activation_event table (content-free measurement)",
-		up: async (tx: TxSql) => {
-			await tx.unsafe(PG_ACTIVATION_EVENT_TABLE);
-		},
-	},
-	{
-		version: 4,
-		label: "activation_event gate and budget counts (precision gate)",
-		up: async (tx: TxSql) => {
-			// Only add what is missing: a non-owner role cannot ALTER a table another
-			// role created, and fresh installs already have the columns (v3 DDL).
-			// pg_attribute, not information_schema: the latter hides columns from roles
-			// without privileges on the table, which would look like "missing".
-			const present = new Set(
-				(
-					await tx`SELECT a.attname FROM pg_attribute a
-					         WHERE a.attrelid = to_regclass('activation_event')
-					           AND a.attnum > 0 AND NOT a.attisdropped`
-				).map((r: { attname: string }) => r.attname),
-			);
-			for (const column of [
-				"gate_dropped",
-				"budget_dropped",
-				"deduped",
-				"injected_tokens",
-			]) {
-				if (!present.has(column)) {
-					await tx.unsafe(
-						`ALTER TABLE activation_event ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`,
-					);
-				}
-			}
-		},
-	},
-	{
-		version: 5,
-		label: "activation_event rerank model (scorer of rerank_scores)",
-		up: async (tx: TxSql) => {
-			// Same guard as v4: add the column only when missing. pg_attribute, so a
-			// non-owner role sees columns another role created.
-			const [row] = await tx`SELECT EXISTS (
-				SELECT 1 FROM pg_attribute a
-				WHERE a.attrelid = to_regclass('activation_event')
-				  AND a.attname = 'rerank_model' AND a.attnum > 0 AND NOT a.attisdropped
-			) AS present`;
-			if (!row.present) {
-				await tx.unsafe(
-					"ALTER TABLE activation_event ADD COLUMN rerank_model TEXT",
-				);
-			}
-		},
-	},
-];
-const STATE_SCHEMA_VERSION = latestVersion(PG_STATE_MIGRATIONS);
-
+/** Attempt counts for pending episodes (v2). Kept out of pending_episodes. */
 const PG_ATTEMPTS_TABLE = `
   CREATE TABLE IF NOT EXISTS pending_episode_attempts (
     id              TEXT    PRIMARY KEY,
@@ -103,44 +35,79 @@ const PG_ATTEMPTS_TABLE = `
 
 // Content-free measurement rows: ids, counts, scores, latency, and a session
 // hash. Never prompt text. entry_ids / raw_sims / rerank_scores are JSON text.
-const PG_ACTIVATION_EVENT_TABLE = `
+// Columns come from ACTIVATION_EVENT_COLUMNS. A version limits them to the ones
+// that version introduces, so the v3 table is created without the later columns.
+function pgActivationEventTable(version?: number): string {
+	return `
   CREATE TABLE IF NOT EXISTS activation_event (
-    id                       BIGSERIAL PRIMARY KEY,
-    ts                       BIGINT    NOT NULL,
-    client                   TEXT      NOT NULL,
-    session_hash             TEXT,
-    prompt_chars             INTEGER   NOT NULL,
-    cue_count                INTEGER   NOT NULL,
-    n_candidates             INTEGER   NOT NULL,
-    n_returned               INTEGER   NOT NULL,
-    entry_ids                TEXT      NOT NULL,
-    raw_sims                 TEXT      NOT NULL,
-    rerank_scores            TEXT,
-    rerank_model             TEXT,
-    gate_mode                TEXT      NOT NULL CHECK (gate_mode IN ('rerank', 'dense', 'off')),
-    latency_ms               INTEGER   NOT NULL,
-    client_deadline_exceeded BOOLEAN   NOT NULL DEFAULT FALSE,
-    gate_dropped             INTEGER   NOT NULL DEFAULT 0,
-    budget_dropped           INTEGER   NOT NULL DEFAULT 0,
-    deduped                  INTEGER   NOT NULL DEFAULT 0,
-    injected_tokens          INTEGER   NOT NULL DEFAULT 0
+    id BIGSERIAL PRIMARY KEY,
+    ${activationEventColumnDefs("pg", version)}
   );
+`;
+}
 
-  -- CREATE INDEX checks table ownership before IF NOT EXISTS skips, so an
-  -- upgrade run by a role that does not own the table would fail. Create the
-  -- indexes only when missing.
+/**
+ * CREATE INDEX checks table ownership before IF NOT EXISTS skips, so an index is
+ * created only when it is missing from the table's own schema. The table is found
+ * through pg_class, not assumed to live in current_schema().
+ */
+function createIndexIfMissing(
+	table: string,
+	index: string,
+	columns: string,
+): string {
+	return `
   DO $$
+  DECLARE table_schema name;
   BEGIN
+    SELECT n.nspname INTO table_schema
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.oid = to_regclass('${table}');
     IF NOT EXISTS (SELECT 1 FROM pg_indexes
-                   WHERE schemaname = current_schema() AND indexname = 'idx_activation_event_ts') THEN
-      CREATE INDEX idx_activation_event_ts ON activation_event(ts);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes
-                   WHERE schemaname = current_schema() AND indexname = 'idx_activation_event_client_ts') THEN
-      CREATE INDEX idx_activation_event_client_ts ON activation_event(client, ts);
+                   WHERE schemaname = table_schema AND indexname = '${index}') THEN
+      CREATE INDEX ${index} ON ${table}(${columns});
     END IF;
   END $$;
 `;
+}
+
+const PG_ACTIVATION_EVENT_INDEXES =
+	createIndexIfMissing("activation_event", "idx_activation_event_ts", "ts") +
+	createIndexIfMissing(
+		"activation_event",
+		"idx_activation_event_client_ts",
+		"client, ts",
+	);
+
+// Serves the duplicate check on staged episodes and queryRanges (both filter by session_id).
+const PG_PENDING_SESSION_INDEX = createIndexIfMissing(
+	"pending_episodes",
+	"idx_pending_session",
+	"session_id",
+);
+
+/**
+ * Run an index step under its own SAVEPOINT. A role that does not own the table
+ * gets 42501 (insufficient_privilege) from CREATE INDEX, and without a savepoint
+ * that error aborts the whole upgrade transaction. An index is only a performance
+ * aid, so the error is logged and the step skipped; the version is still stamped.
+ * Any other error stays fatal.
+ */
+async function skipWithoutOwnership(
+	tx: TxSql,
+	version: number,
+	statement: string,
+	step: (sql: TxSql) => Promise<unknown>,
+): Promise<void> {
+	try {
+		await tx.savepoint(step);
+	} catch (err) {
+		if ((err as { code?: string }).code !== "42501") throw err;
+		logger.warn(
+			`[pg-state-db] Migration v${version}: skipped \`${statement}\` — the connecting role does not own the table. Lookups stay unindexed until the owner creates the index. Error: ${err instanceof Error ? err.message : String(err)}`,
+		);
+	}
+}
 
 const PG_CREATE_STATE_TABLES = `
   CREATE TABLE IF NOT EXISTS state_schema_version (
@@ -170,6 +137,8 @@ const PG_CREATE_STATE_TABLES = `
 
   CREATE INDEX IF NOT EXISTS idx_pending_source_time
     ON pending_episodes(source, max_message_time);
+
+  ${PG_PENDING_SESSION_INDEX}
 
   CREATE TABLE IF NOT EXISTS consolidated_episode (
     source            TEXT    NOT NULL,
@@ -201,32 +170,93 @@ const PG_CREATE_STATE_TABLES = `
   VALUES (1, 0, 0, 0, 0)
   ON CONFLICT (id) DO NOTHING;
 
-  ${PG_ACTIVATION_EVENT_TABLE}
+  ${pgActivationEventTable()}
+  ${PG_ACTIVATION_EVENT_INDEXES}
 `;
 
-/** Column values for one activation_event row. Arrays are stored as JSON text. */
-function activationEventColumns(r: ActivationEventRow) {
-	return {
-		ts: r.ts,
-		client: r.client,
-		session_hash: r.sessionHash,
-		prompt_chars: r.promptChars,
-		cue_count: r.cueCount,
-		n_candidates: r.nCandidates,
-		n_returned: r.nReturned,
-		entry_ids: JSON.stringify(r.entryIds),
-		raw_sims: JSON.stringify(r.rawSims),
-		rerank_scores:
-			r.rerankScores === null ? null : JSON.stringify(r.rerankScores),
-		rerank_model: r.rerankModel,
-		gate_mode: r.gateMode,
-		latency_ms: r.latencyMs,
-		client_deadline_exceeded: r.clientDeadlineExceeded,
-		gate_dropped: r.gateDropped,
-		budget_dropped: r.budgetDropped,
-		deduped: r.deduped,
-		injected_tokens: r.injectedTokens,
-	};
+/**
+ * Versioned migrations for the Postgres state DB. Version 1 is the baseline
+ * created by PG_CREATE_STATE_TABLES; each later entry runs once, in order.
+ */
+const PG_STATE_MIGRATIONS: Array<{
+	version: number;
+	label: string;
+	up?: (tx: TxSql) => Promise<void>;
+}> = [
+	{ version: 1, label: "baseline state schema" },
+	{
+		version: 2,
+		label:
+			"pending_episode_attempts table (attempt counts kept out of pending_episodes)",
+		up: async (tx: TxSql) => {
+			await tx.unsafe(PG_ATTEMPTS_TABLE);
+		},
+	},
+	{
+		version: 3,
+		label: "activation_event table (content-free measurement)",
+		up: async (tx: TxSql) => {
+			await tx.unsafe(pgActivationEventTable(3));
+			await skipWithoutOwnership(
+				tx,
+				3,
+				"CREATE INDEX idx_activation_event_ts, idx_activation_event_client_ts",
+				(sql) => sql.unsafe(PG_ACTIVATION_EVENT_INDEXES),
+			);
+		},
+	},
+	{
+		version: 4,
+		label: "activation_event gate and budget counts (precision gate)",
+		up: (tx: TxSql) => addActivationEventColumns(tx, 4),
+	},
+	{
+		version: 5,
+		label: "activation_event rerank model (scorer of rerank_scores)",
+		up: (tx: TxSql) => addActivationEventColumns(tx, 5),
+	},
+	{
+		version: 6,
+		label: "pending_episodes session_id index (duplicate check, queryRanges)",
+		up: (tx: TxSql) =>
+			skipWithoutOwnership(tx, 6, "CREATE INDEX idx_pending_session", (sql) =>
+				sql.unsafe(PG_PENDING_SESSION_INDEX),
+			),
+	},
+];
+const STATE_SCHEMA_VERSION = latestVersion(PG_STATE_MIGRATIONS);
+
+/** Add the activation_event columns introduced in `version` that the table lacks. */
+async function addActivationEventColumns(
+	tx: TxSql,
+	version: number,
+): Promise<void> {
+	// Only add what is missing: a non-owner role cannot ALTER a table another role
+	// created. pg_attribute, not information_schema: the latter hides columns from
+	// roles without privileges on the table, which would look like "missing".
+	const present = new Set(
+		(
+			await tx`SELECT a.attname FROM pg_attribute a
+			         WHERE a.attrelid = to_regclass('activation_event')
+			           AND a.attnum > 0 AND NOT a.attisdropped`
+		).map((r: { attname: string }) => r.attname),
+	);
+	for (const column of ACTIVATION_EVENT_COLUMNS) {
+		if (column.since === version && !present.has(column.name)) {
+			await tx.unsafe(
+				`ALTER TABLE activation_event ADD COLUMN ${column.name} ${column.pg}`,
+			);
+		}
+	}
+}
+
+/** One activation_event row keyed by column name, for the multi-row Postgres insert. */
+function activationEventRecord(
+	r: ActivationEventRow,
+): Record<string, ActivationEventValue> {
+	return Object.fromEntries(
+		ACTIVATION_EVENT_COLUMNS.map((c) => [c.name, c.value(r)]),
+	);
 }
 
 /**
@@ -242,12 +272,12 @@ export class PostgresServerStateDB implements IServerStateDB {
 	private readonly sql: postgres.Sql;
 	private initPromise: Promise<void> | null = null;
 
-	constructor(uri: string) {
+	constructor(uri: string, poolMax = config.postgres.poolMax) {
 		const tls = resolvePostgresTls(uri);
 		warnNoTlsOnce(tls.warnNoTls);
 		this.sql = postgres(tls.uri, {
 			...(tls.ssl ? { ssl: tls.ssl } : {}),
-			max: 10,
+			max: poolMax,
 			idle_timeout: 30,
 			connect_timeout: 10,
 		});
@@ -317,8 +347,9 @@ export class PostgresServerStateDB implements IServerStateDB {
 	 * Upgrade an existing state DB to STATE_SCHEMA_VERSION. Runs in one transaction
 	 * under a transaction-scoped advisory lock, and re-reads the version under the
 	 * lock, so concurrent server/daemon starts do not both run the ALTER.
-	 * v2: pending_episodes gains failed_attempts / last_error (dead-lettering).
-	 * v3: activation_event table (content-free measurement).
+	 * v2: pending_episode_attempts table (dead-lettering attempt counts).
+	 * v3: activation_event table (content-free measurement); v4-v5: its later columns.
+	 * v6: pending_episodes session_id index.
 	 */
 	private async upgradeSchema(): Promise<void> {
 		await this.sql.begin(async (tx: TxSql) => {
@@ -609,7 +640,7 @@ export class PostgresServerStateDB implements IServerStateDB {
 		// One multi-row INSERT is a single atomic statement. Arrays are stored as
 		// JSON text, the same encoding the SQLite backend uses.
 		await this.sql`
-			INSERT INTO activation_event ${this.sql(rows.map(activationEventColumns))}
+			INSERT INTO activation_event ${this.sql(rows.map(activationEventRecord))}
 		`;
 	}
 
@@ -621,13 +652,14 @@ export class PostgresServerStateDB implements IServerStateDB {
 		return result.count;
 	}
 
+	/** Injected activations per client since sinceMs: only those that returned entries and were not cut off by the client deadline. */
 	async countActivationsByClient(
 		sinceMs: number,
 	): Promise<Record<string, number>> {
 		await this.initialize();
 		const rows = await this.sql`
 			SELECT client, COUNT(*) AS n FROM activation_event
-			WHERE ts >= ${sinceMs}
+			WHERE ts >= ${sinceMs} AND n_returned > 0 AND client_deadline_exceeded = FALSE
 			GROUP BY client
 		`;
 		return Object.fromEntries(

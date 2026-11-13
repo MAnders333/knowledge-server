@@ -89,7 +89,7 @@ const LEGACY_COPY_LOCATIONS: ReadonlyArray<{
 	},
 ];
 
-export interface LegacyCopy {
+interface LegacyCopy {
 	target: ExtensionTarget;
 	/** True when the bytes match a known release, so update may take it over. */
 	adoptable: boolean;
@@ -185,7 +185,7 @@ export function recordExtensionTarget(
 	}
 }
 
-export interface RefreshOutcome {
+interface RefreshOutcome {
 	target: ExtensionTarget;
 	status: "refreshed" | "skipped";
 	reason?: string;

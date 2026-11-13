@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import {
+	chmodSync,
 	copyFileSync,
 	existsSync,
 	lstatSync,
@@ -7,16 +8,19 @@ import {
 	readFileSync,
 	readdirSync,
 	renameSync,
+	rmSync,
+	statSync,
 	symlinkSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 // @ts-ignore — Bun supports JSON imports natively
 import pkg from "../../package.json" with { type: "json" };
 import {
 	DEFAULT_CONFIG,
-	DEFAULT_CONFIG_PATH,
+	defaultConfigPath,
 	loadConfigFile,
 } from "../config-file.js";
 import { config } from "../config.js";
@@ -37,7 +41,7 @@ import {
 // Evaluated once at module load — setup-tool is a CLI command, not a long-running server.
 const fileConfig = (() => {
 	try {
-		return loadConfigFile(DEFAULT_CONFIG_PATH) ?? DEFAULT_CONFIG;
+		return loadConfigFile(defaultConfigPath()) ?? DEFAULT_CONFIG;
 	} catch (err) {
 		// Malformed config.jsonc — warn so user knows why defaults are used.
 		console.warn(
@@ -94,6 +98,94 @@ function getProjectDir(): string {
 	return resolve(dirname(mainFile), "..");
 }
 
+/**
+ * Replaces a config file atomically (temp file + rename), so a crash never leaves a
+ * truncated file. The replacement keeps the mode of the file it replaces. A new file
+ * is 0600, because these configs can hold credentials. The mode is set explicitly,
+ * so the umask cannot widen it.
+ */
+function replaceConfigFile(path: string, content: string): void {
+	const mode = existsSync(path) ? statSync(path).mode & 0o777 : 0o600;
+	const tmpPath = `${path}.tmp`;
+	try {
+		rmSync(tmpPath, { force: true });
+		writeFileSync(tmpPath, content, { encoding: "utf8", mode });
+		chmodSync(tmpPath, mode);
+		renameSync(tmpPath, path);
+	} catch (e) {
+		try {
+			unlinkSync(tmpPath);
+		} catch {
+			// Ignore — tmp file may not have been created yet.
+		}
+		throw e;
+	}
+}
+
+/**
+ * Environment for an MCP entry. A source install runs `bun run src/index.ts`, which
+ * does not load .env by itself (compiled binaries do), so the flag is set only for
+ * source installs. Without it the proxy would miss a stable KNOWLEDGE_ADMIN_TOKEN
+ * kept in .env.
+ */
+function mcpEnvironment(): Record<string, string> {
+	return {
+		// Thin HTTP proxy — only needs to locate the knowledge HTTP server.
+		KNOWLEDGE_HOST: resolvedHost,
+		KNOWLEDGE_PORT: String(resolvedPort),
+		...(isSourceInstall() ? { KNOWLEDGE_LOAD_ENV: "1" } : {}),
+	};
+}
+
+/** The environment variables setup writes into an MCP entry. Any other variable is the user's. */
+const OWNED_MCP_ENV = [
+	"KNOWLEDGE_HOST",
+	"KNOWLEDGE_PORT",
+	"KNOWLEDGE_LOAD_ENV",
+] as const;
+
+/**
+ * Merge setup's MCP entry into the one already in a config file. Setup owns the
+ * entry's `command`, `args`, `type` and the variables in OWNED_MCP_ENV. Everything
+ * else the user set is kept: `enabled: false`, `disabled`, and their own environment
+ * variables. `enabled` is filled in only when the entry has none. `changed` is false
+ * when nothing setup owns differs, so the caller can skip the write.
+ */
+function mergeMcpEntry(
+	existing: Record<string, unknown>,
+	entry: Record<string, unknown>,
+	envField: "environment" | "env",
+): { merged: Record<string, unknown>; changed: boolean } {
+	const merged: Record<string, unknown> = { ...existing };
+	let changed = false;
+	for (const [key, value] of Object.entries(entry)) {
+		if (key === envField) continue;
+		if (key === "enabled" && key in existing) continue;
+		if (!isDeepStrictEqual(existing[key], value)) {
+			merged[key] = value;
+			changed = true;
+		}
+	}
+	const ours = entry[envField] as Record<string, string>;
+	const env: Record<string, unknown> = {
+		...((existing[envField] as Record<string, unknown> | undefined) ?? {}),
+	};
+	for (const key of OWNED_MCP_ENV) {
+		const want = ours[key];
+		if (want === undefined) {
+			if (key in env) {
+				Reflect.deleteProperty(env, key);
+				changed = true;
+			}
+		} else if (env[key] !== want) {
+			env[key] = want;
+			changed = true;
+		}
+	}
+	merged[envField] = env;
+	return { merged, changed };
+}
+
 // ── OpenCode MCP config ────────────────────────────────────────────────────────
 
 /**
@@ -114,11 +206,7 @@ function makeOpenCodeMcpEntry(): { command: string[] } & Record<
 	string,
 	unknown
 > {
-	const env = {
-		// Thin HTTP proxy — only needs to locate the knowledge HTTP server.
-		KNOWLEDGE_HOST: resolvedHost,
-		KNOWLEDGE_PORT: String(resolvedPort),
-	};
+	const env = mcpEnvironment();
 
 	if (isSourceInstall()) {
 		const projectDir = getProjectDir();
@@ -216,14 +304,14 @@ export function stripJsoncComments(jsonc: string): string {
 /**
  * Merge `mcp.knowledge` into `~/.config/opencode/opencode.jsonc`.
  *
- * Idempotent: if the key already exists with the same command, prints "no
- * change". If it exists with a different command (e.g. stale path after a
- * reinstall), replaces it and logs the update.
+ * Idempotent: when setup's fields already match, the file is not written. Otherwise
+ * setup updates only what it owns (see mergeMcpEntry), so a user's `enabled: false`
+ * and their own environment variables survive a re-run.
  *
  * Creates a minimal opencode.jsonc with only the mcp.knowledge block if the
  * file does not yet exist.
  */
-function writeOpenCodeMcpEntry(opencodeConfigDir: string): void {
+export function writeOpenCodeMcpEntry(opencodeConfigDir: string): void {
 	const configPath = join(opencodeConfigDir, "opencode.jsonc");
 	const entry = makeOpenCodeMcpEntry();
 
@@ -246,44 +334,28 @@ function writeOpenCodeMcpEntry(opencodeConfigDir: string): void {
 	}
 
 	const mcp = (parsed.mcp ?? {}) as Record<string, unknown>;
-	const existing = mcp.knowledge as
-		| ({ command: string[] } & Record<string, unknown>)
-		| undefined;
+	const existing = mcp.knowledge as Record<string, unknown> | undefined;
+	const { merged, changed } = existing
+		? mergeMcpEntry(existing, entry, "environment")
+		: { merged: entry, changed: true };
 
-	if (existing) {
-		const existingCmd = JSON.stringify(existing.command);
-		const newCmd = JSON.stringify(entry.command);
-		if (existingCmd === newCmd) {
-			console.log(
-				"  ✓ MCP server 'knowledge' already in opencode.jsonc (no change)",
-			);
-			return;
-		}
-		// Command changed (e.g. project moved or reinstalled) — update in place.
+	if (existing && !changed) {
 		console.log(
-			"  ✓ MCP server 'knowledge' updated in opencode.jsonc (command changed)",
+			"  ✓ MCP server 'knowledge' already in opencode.jsonc (no change)",
 		);
-	} else {
-		console.log("  ✓ MCP server 'knowledge' added to opencode.jsonc");
+		return;
 	}
+	console.log(
+		existing
+			? "  ✓ MCP server 'knowledge' updated in opencode.jsonc (entry changed)"
+			: "  ✓ MCP server 'knowledge' added to opencode.jsonc",
+	);
 
-	mcp.knowledge = entry;
+	mcp.knowledge = merged;
 	parsed.mcp = mcp;
 
 	mkdirSync(opencodeConfigDir, { recursive: true });
-	const tmpPath = `${configPath}.tmp`;
-	try {
-		writeFileSync(tmpPath, `${JSON.stringify(parsed, null, 2)}\n`, "utf8");
-		renameSync(tmpPath, configPath);
-	} catch (e) {
-		// Clean up the temp file so it doesn't litter the config directory.
-		try {
-			unlinkSync(tmpPath);
-		} catch {
-			// Ignore — tmp file may not have been created yet.
-		}
-		throw e;
-	}
+	replaceConfigFile(configPath, `${JSON.stringify(parsed, null, 2)}\n`);
 }
 
 // ── OpenCode setup ─────────────────────────────────────────────────────────────
@@ -473,12 +545,7 @@ Setup complete!`);
  *   - The `mcp` subcommand is built into the main binary.
  */
 function makeClaudeMcpEntry() {
-	const env = {
-		// The MCP subcommand is a thin HTTP proxy — it only needs to locate the
-		// knowledge HTTP server. No LLM credentials required here.
-		KNOWLEDGE_HOST: resolvedHost,
-		KNOWLEDGE_PORT: String(resolvedPort),
-	};
+	const env = mcpEnvironment();
 	if (isSourceInstall()) {
 		const projectDir = getProjectDir();
 		// In source mode, process.execPath is the bun binary itself.
@@ -522,6 +589,21 @@ function claudeHookUrl(): string {
 	return `http://${resolvedHost}:${resolvedPort}/hooks/claude-code/user-prompt`;
 }
 
+/** True when a settings handler points at this knowledge server's Claude hook URL. */
+function isOurClaudeHandler(handler: unknown): boolean {
+	return (
+		typeof handler === "object" &&
+		handler !== null &&
+		(handler as Record<string, unknown>).url === claudeHookUrl()
+	);
+}
+
+/**
+ * The header carries the admin bearer. Claude Code expands `$KNOWLEDGE_ADMIN_TOKEN`
+ * only when the variable is listed in allowedEnvVars, and an unset variable expands
+ * to an empty string. So the token is sent when Claude Code has it set, and an empty
+ * bearer otherwise, which is not a token.
+ */
 function makeClaudeHookEntry() {
 	return {
 		hooks: [
@@ -529,12 +611,14 @@ function makeClaudeHookEntry() {
 				type: "http",
 				url: claudeHookUrl(),
 				timeout: 5,
+				headers: { Authorization: "Bearer $KNOWLEDGE_ADMIN_TOKEN" },
+				allowedEnvVars: ["KNOWLEDGE_ADMIN_TOKEN"],
 			},
 		],
 	};
 }
 
-function setupClaudeCode(): void {
+export function setupClaudeCode(): void {
 	const claudeDir =
 		process.env.CLAUDE_DB_PATH ??
 		process.env.CLAUDE_CONFIG_DIR ??
@@ -598,45 +682,46 @@ function setupClaudeCode(): void {
 
 	const hooks = (settings.hooks ?? {}) as Record<string, unknown>;
 	const existingHooks = (hooks.UserPromptSubmit ?? []) as unknown[];
+	const desired = makeClaudeHookEntry();
 
-	const alreadyHasHook = existingHooks.some((h) => {
-		if (typeof h !== "object" || h === null) return false;
-		const entry = h as Record<string, unknown>;
-		const innerHooks = entry.hooks;
-		if (Array.isArray(innerHooks)) {
-			return innerHooks.some(
-				(ih) =>
-					typeof ih === "object" &&
-					ih !== null &&
-					(ih as Record<string, unknown>).url === claudeHookUrl(),
-			);
+	// Drop every handler for this URL, in any shape, and append the current one. A
+	// re-run therefore upgrades a handler written before the token header existed.
+	let ours = 0;
+	let upToDate = false;
+	const kept: unknown[] = [];
+	for (const entry of existingHooks) {
+		if (typeof entry !== "object" || entry === null) {
+			kept.push(entry);
+			continue;
 		}
-		// Old format (pre-matcher): { type, url, ... }
-		return entry.url === claudeHookUrl();
-	});
+		const group = entry as Record<string, unknown>;
+		if (!Array.isArray(group.hooks)) {
+			// Old format (pre-matcher): the handler sits at the top level.
+			if (isOurClaudeHandler(group)) ours += 1;
+			else kept.push(entry);
+			continue;
+		}
+		const rest = group.hooks.filter((handler) => {
+			if (!isOurClaudeHandler(handler)) return true;
+			ours += 1;
+			if (isDeepStrictEqual(handler, desired.hooks[0])) upToDate = true;
+			return false;
+		});
+		if (rest.length === group.hooks.length) kept.push(entry);
+		else if (rest.length > 0) kept.push({ ...group, hooks: rest });
+	}
 
-	if (alreadyHasHook) {
+	if (ours === 1 && upToDate) {
 		console.log("  ✓ UserPromptSubmit hook already configured (no change)");
 	} else {
-		hooks.UserPromptSubmit = [...existingHooks, makeClaudeHookEntry()];
-		console.log(`  ✓ UserPromptSubmit hook added (${claudeHookUrl()})`);
+		hooks.UserPromptSubmit = [...kept, desired];
+		console.log(
+			`  ✓ UserPromptSubmit hook ${ours > 0 ? "updated" : "added"} (${claudeHookUrl()})`,
+		);
 	}
 	settings.hooks = hooks;
 
-	// Write atomically via a temp file + rename so a crash mid-write never
-	// leaves settings.json in a truncated/unparseable state.
-	const tmpPath = `${settingsPath}.tmp`;
-	try {
-		writeFileSync(tmpPath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
-		renameSync(tmpPath, settingsPath);
-	} catch (e) {
-		try {
-			unlinkSync(tmpPath);
-		} catch {
-			// Ignore — tmp file may not have been created yet.
-		}
-		throw e;
-	}
+	replaceConfigFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
 	console.log(`  ✓ Wrote ${settingsPath}`);
 
 	// ── Slash command symlinks — ~/.claude/commands/*.md ──
@@ -692,10 +777,7 @@ Setup complete!`);
  * Each entry: { command, args?, env? }
  */
 function makeCursorMcpEntry() {
-	const env = {
-		KNOWLEDGE_HOST: resolvedHost,
-		KNOWLEDGE_PORT: String(resolvedPort),
-	};
+	const env = mcpEnvironment();
 
 	if (isSourceInstall()) {
 		const projectDir = getProjectDir();
@@ -743,48 +825,27 @@ export function setupCursor(): void {
 
 	const entry = makeCursorMcpEntry();
 	const existing = mcpConfig.mcpServers.knowledge as
-		| { command: string; args?: string[] }
+		| Record<string, unknown>
 		| undefined;
+	const { merged, changed } = existing
+		? mergeMcpEntry(existing, entry, "env")
+		: { merged: entry, changed: true };
 
-	let needsWrite = true;
-	if (existing) {
-		const existingCmd = JSON.stringify([
-			existing.command,
-			...(existing.args ?? []),
-		]);
-		const newCmd = JSON.stringify([entry.command, ...(entry.args ?? [])]);
-		if (existingCmd === newCmd) {
-			console.log(
-				"  ✓ MCP server 'knowledge' already in ~/.cursor/mcp.json (no change)",
-			);
-			console.log(
-				"    To update: remove the 'knowledge' entry from ~/.cursor/mcp.json and re-run this command.",
-			);
-			needsWrite = false;
-		} else {
-			mcpConfig.mcpServers.knowledge = entry;
-			console.log(
-				"  ✓ MCP server 'knowledge' updated in ~/.cursor/mcp.json (command changed)",
-			);
-		}
+	if (existing && !changed) {
+		console.log(
+			"  ✓ MCP server 'knowledge' already in ~/.cursor/mcp.json (no change)",
+		);
 	} else {
-		mcpConfig.mcpServers.knowledge = entry;
-		console.log("  ✓ MCP server 'knowledge' added to ~/.cursor/mcp.json");
+		mcpConfig.mcpServers.knowledge = merged;
+		console.log(
+			existing
+				? "  ✓ MCP server 'knowledge' updated in ~/.cursor/mcp.json (entry changed)"
+				: "  ✓ MCP server 'knowledge' added to ~/.cursor/mcp.json",
+		);
 	}
 
-	if (needsWrite) {
-		const tmpPath = `${mcpPath}.tmp`;
-		try {
-			writeFileSync(tmpPath, `${JSON.stringify(mcpConfig, null, 2)}\n`, "utf8");
-			renameSync(tmpPath, mcpPath);
-		} catch (e) {
-			try {
-				unlinkSync(tmpPath);
-			} catch {
-				/* ignore */
-			}
-			throw e;
-		}
+	if (!existing || changed) {
+		replaceConfigFile(mcpPath, `${JSON.stringify(mcpConfig, null, 2)}\n`);
 		console.log(`  ✓ Wrote ${mcpPath}`);
 	}
 
@@ -812,11 +873,24 @@ const CODEX_HOOK_PATH_MARKER = "/hooks/claude-code/user-prompt?client=codex";
  * ({prompt, session_id, cwd}) to stdin and reads hookSpecificOutput from stdout,
  * which is the same JSON the Claude Code endpoint returns.
  *
- * Budgets: the hook's own `timeout` in hooks.json is 5 s. curl gives up
- * after 4 s, which leaves Codex time to start the process. The server's local
- * rerank budget is 3 s (RERANK_TIMEOUT_MS) and falls back to unreranked results
- * on expiry; embedding (EMBEDDING_TIMEOUT_MS, 20 s default) can still exceed the
- * 4 s curl limit, in which case the prompt goes through without injected context.
+ * Budgets: the hook's own `timeout` in hooks.json is 5 s, and curl gives up after
+ * 4 s, which leaves Codex time to start the process. Local rerank has a 3 s budget
+ * (RERANK_TIMEOUT_MS) and falls back to unreranked results on expiry. Remote rerank
+ * has a 2.5 s budget (RERANK_REMOTE_TIMEOUT_MS), but that budget starts after the
+ * query embedding and store reads, so the reply takes the embedding time plus up to
+ * 2.5 s. The 4 s limit leaves about 1.5 s for the embedding and the reads. A slower
+ * embedding (EMBEDDING_TIMEOUT_MS, 20 s default) goes past the limit, and the prompt
+ * then goes through without injected context. A longer limit needs a longer
+ * hooks.json timeout to match.
+ *
+ * Auth: the admin bearer is sent only when KNOWLEDGE_ADMIN_TOKEN is set in the hook's
+ * environment. The header is a here-document on fd 3, which the shell expands into a
+ * pipe; curl reads it with `-H @/dev/fd/3`. The token is therefore never in curl's
+ * argv, where other local users can read it with `ps`.
+ *
+ * Codex starts the command with the user's shell (`$SHELL -lc`), and zsh and fish do
+ * not split or parse it the same way. The script therefore runs under /bin/sh -c, and
+ * the outer quoting is the POSIX `'\''` form, which zsh and fish read the same way.
  *
  * `--noproxy '*'`: loopback must never go through an HTTP proxy from the
  * environment (the prompt would leave the machine). `--fail`: an error body is
@@ -827,7 +901,16 @@ function codexHookCommand(): string {
 	const url = `http://${resolvedHost}:${resolvedPort}${CODEX_HOOK_PATH_MARKER}`;
 	// POSIX single-quoting: host and port come from config, so the URL is always quoted.
 	const quoted = `'${url.replace(/'/g, "'\\''")}'`;
-	return `curl -s --noproxy '*' --fail --max-time 4 --data-binary @- ${quoted} || true`;
+	// `${…:+…}` adds the header option only when the token is set. The here-document
+	// is unused otherwise.
+	const auth = "${KNOWLEDGE_ADMIN_TOKEN:+-H @/dev/fd/3}";
+	const script = [
+		`curl -s --noproxy '*' --fail --max-time 4 ${auth} --data-binary @- ${quoted} 3<<KS_AUTH || true`,
+		"Authorization: Bearer $KNOWLEDGE_ADMIN_TOKEN",
+		"KS_AUTH",
+		"",
+	].join("\n");
+	return `/bin/sh -c '${script.replace(/'/g, "'\\''")}'`;
 }
 
 /**
@@ -890,18 +973,7 @@ function setupCodexHook(codexHome: string): void {
 	hooks.UserPromptSubmit = kept;
 	file.hooks = hooks;
 
-	const tmpPath = `${hooksPath}.tmp`;
-	try {
-		writeFileSync(tmpPath, `${JSON.stringify(file, null, 2)}\n`, "utf8");
-		renameSync(tmpPath, hooksPath);
-	} catch (e) {
-		try {
-			unlinkSync(tmpPath);
-		} catch {
-			/* ignore */
-		}
-		throw e;
-	}
+	replaceConfigFile(hooksPath, `${JSON.stringify(file, null, 2)}\n`);
 	console.log(`  ✓ UserPromptSubmit hook written to ${hooksPath}`);
 	console.log(
 		"  ⚠ Codex does not run a new or changed hook until you trust it:",
@@ -957,10 +1029,13 @@ export function setupCodex(): void {
 		commandToml = `command = "${mainBin.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"\nargs = ["mcp"]`;
 	}
 
+	const tomlEnv = Object.entries(mcpEnvironment())
+		.map(([key, value]) => `${key} = "${value}"`)
+		.join(", ");
 	const block = `
 [mcp_servers.knowledge]
 ${commandToml}
-env = { KNOWLEDGE_HOST = "${resolvedHost}", KNOWLEDGE_PORT = "${resolvedPort}" }
+env = { ${tomlEnv} }
 `;
 
 	// Check if the section already exists (simple string match on the header).
@@ -983,18 +1058,7 @@ env = { KNOWLEDGE_HOST = "${resolvedHost}", KNOWLEDGE_PORT = "${resolvedPort}" }
 		);
 	} else {
 		const updated = `${existing.trimEnd()}\n${block}`;
-		const tmpPath = `${configPath}.tmp`;
-		try {
-			writeFileSync(tmpPath, updated, "utf8");
-			renameSync(tmpPath, configPath);
-		} catch (e) {
-			try {
-				unlinkSync(tmpPath);
-			} catch {
-				/* ignore */
-			}
-			throw e;
-		}
+		replaceConfigFile(configPath, updated);
 		console.log("  ✓ MCP server 'knowledge' added to ~/.codex/config.toml");
 		console.log(`  ✓ Wrote ${configPath}`);
 	}
@@ -1026,10 +1090,7 @@ Setup complete!`);
  * profile's mcp.json. This avoids hardcoding profile-specific paths.
  */
 function makeVSCodeMcpEntry() {
-	const env = {
-		KNOWLEDGE_HOST: resolvedHost,
-		KNOWLEDGE_PORT: String(resolvedPort),
-	};
+	const env = mcpEnvironment();
 
 	if (isSourceInstall()) {
 		const projectDir = getProjectDir();
@@ -1051,7 +1112,7 @@ function makeVSCodeMcpEntry() {
 	return { name: "knowledge", command: mainBin, args: ["mcp"], env };
 }
 
-export function setupVSCode(): void {
+function setupVSCode(): void {
 	console.log("Setting up VSCode integration...\n");
 
 	const entry = makeVSCodeMcpEntry();

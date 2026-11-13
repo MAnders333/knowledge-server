@@ -1,6 +1,6 @@
 import {
 	DEFAULT_CONFIG,
-	DEFAULT_CONFIG_PATH,
+	defaultConfigPath,
 	loadConfigFile,
 } from "./config-file.js";
 
@@ -10,6 +10,6 @@ import {
  * StoreRegistry applies to config.userId: KNOWLEDGE_USER_ID → config.jsonc
  * userId → hostname → "default".
  */
-export function currentUserId(configPath = DEFAULT_CONFIG_PATH): string {
+export function currentUserId(configPath = defaultConfigPath()): string {
 	return (loadConfigFile(configPath) ?? DEFAULT_CONFIG).userId;
 }
