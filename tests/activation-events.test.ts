@@ -214,11 +214,14 @@ describe("ActivationEventRecorder", () => {
 		await recorder.stop();
 	});
 
-	it("logs a failing write once and keeps accepting rows", async () => {
+	it("keeps a failed batch and writes it once the store recovers", async () => {
 		const logPath = join(dir, "server.log");
 		logger.init(logPath, "info");
-		const insert = mock(async () => {
-			throw new Error("disk gone");
+		let failing = true;
+		const written: ActivationEventRow[] = [];
+		const insert = mock(async (rows: ActivationEventRow[]) => {
+			if (failing) throw new Error("disk gone");
+			written.push(...rows);
 		});
 		const recorder = new ActivationEventRecorder(
 			{ insertActivationEvents: insert, pruneActivationEvents: async () => 0 },
@@ -228,14 +231,59 @@ describe("ActivationEventRecorder", () => {
 		await recorder.flush();
 		recorder.record(row());
 		await recorder.flush();
-		recorder.record(row());
-		await recorder.flush();
+		expect(recorder.pending).toBe(2);
 		const warnings = readFileSync(logPath, "utf8")
 			.split("\n")
 			.filter((l) => l.includes("Could not write activation_event"));
 		expect(warnings.length).toBe(1);
+
+		failing = false;
+		await recorder.flush();
 		expect(recorder.pending).toBe(0);
-		expect(insert).toHaveBeenCalledTimes(3);
+		expect(written.length).toBe(2);
+		expect(readFileSync(logPath, "utf8")).toContain("Writes recovered");
+	});
+
+	it("retries a failed batch on its own, without another record() or flush()", async () => {
+		let failing = true;
+		const insert = mock(async () => {
+			if (failing) {
+				failing = false;
+				throw new Error("disk gone");
+			}
+		});
+		const recorder = new ActivationEventRecorder(
+			{ insertActivationEvents: insert, pruneActivationEvents: async () => 0 },
+			{ flushDelayMs: 5 },
+		);
+		recorder.record(row());
+		// The retry is a real timer (flushDelayMs), so the test polls for it with a bound.
+		for (let i = 0; i < 400 && recorder.pending > 0; i++) {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setTimeout(resolve, 5);
+			await promise;
+		}
+		expect(recorder.pending).toBe(0);
+		expect(insert).toHaveBeenCalledTimes(2);
+	});
+
+	it("keeps at most maxQueued rows across failures and counts the rest as dropped", async () => {
+		const logPath = join(dir, "server.log");
+		logger.init(logPath, "info");
+		const insert = mock(async () => {
+			throw new Error("disk gone");
+		});
+		const recorder = new ActivationEventRecorder(
+			{ insertActivationEvents: insert, pruneActivationEvents: async () => 0 },
+			{ flushDelayMs: 60_000, maxQueued: 2 },
+		);
+		for (let i = 0; i < 3; i++) {
+			recorder.record(row());
+			await recorder.flush();
+		}
+		expect(recorder.pending).toBe(2);
+		await recorder.stop();
+		expect(readFileSync(logPath, "utf8")).toContain("Dropped 1 rows");
 	});
 
 	it("hashes session ids and never returns the raw id", () => {
