@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { basename } from "node:path";
+import { existsSync } from "node:fs";
 import { isProcessAlive } from "./process-lock.js";
 
 /**
@@ -18,7 +18,7 @@ export interface ProcessTable {
 
 /** Full command line of `pid` via `ps` (macOS and Linux), or null. */
 export function readCommand(pid: number): string | null {
-	const result = spawnSync("ps", ["-p", String(pid), "-o", "command="], {
+	const result = spawnSync("ps", ["-ww", "-p", String(pid), "-o", "command="], {
 		encoding: "utf8",
 		stdio: ["ignore", "pipe", "ignore"],
 	});
@@ -40,20 +40,46 @@ export function parsePid(raw: string): number | null {
 }
 
 /**
+ * PID file paths to check, in order: the configured path, then the legacy path
+ * when it is set and differs from it. Empty paths are dropped.
+ */
+export function pidFileCandidates(
+	primary: string,
+	legacy: string | null,
+): string[] {
+	const paths = [primary];
+	if (legacy && legacy !== primary) paths.push(legacy);
+	return paths.filter((p) => p !== "");
+}
+
+/** The first PID file candidate that exists, or null when none does. */
+export function locatePidFile(
+	primary: string,
+	legacy: string | null,
+): string | null {
+	return pidFileCandidates(primary, legacy).find((p) => existsSync(p)) ?? null;
+}
+
+/** Regex source matching `text` literally. */
+function literal(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+}
+
+/**
  * True when a command line runs the compiled `binary`, or runs `bun` on the
- * source `sourceEntry` (for example `src/index.ts`).
+ * source `sourceEntry` (for example `src/index.ts`). The executable path may
+ * contain spaces, so the match is on the whole command line, not on tokens.
  */
 export function isCommandOf(
 	command: string,
 	binary: string,
 	sourceEntry: string,
 ): boolean {
-	const tokens = command.trim().split(/\s+/);
-	const program = basename(tokens[0] ?? "");
-	if (program === binary) return true;
+	const cmd = command.trim();
+	if (new RegExp(`^(?:.*/)?${literal(binary)}(?:\\s|$)`).test(cmd)) return true;
 	return (
-		program.startsWith("bun") &&
-		tokens.some((t) => t === sourceEntry || t.endsWith(`/${sourceEntry}`))
+		/^(?:.*\/)?bun\s/.test(cmd) &&
+		new RegExp(`(?:^|[\\s/])${literal(sourceEntry)}(?:\\s|$)`).test(cmd)
 	);
 }
 

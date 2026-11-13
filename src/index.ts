@@ -35,6 +35,7 @@ import { tightenOwnedPrivatePaths } from "./private-files.js";
 import {
 	classifyPidFile,
 	isServerCommand,
+	locatePidFile,
 	systemProcessTable,
 } from "./process-identity.js";
 import { lockHolder } from "./process-lock.js";
@@ -113,12 +114,12 @@ async function main() {
 
 	// `knowledge-server stop`
 	if (subcommand === "stop") {
-		process.exit(await runStop(config.pidPath));
+		process.exit(await runStop(config.pidPath, null));
 	}
 
 	// `knowledge-server status`
 	if (subcommand === "status") {
-		await runStatus(config.pidPath);
+		await runStatus(config.pidPath, null);
 		process.exit(0);
 	}
 
@@ -361,9 +362,10 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	// PID still runs knowledge-server; a PID that is dead, reused by another program,
 	// or unreadable is stale and replaced. The actual write happens after serve()
 	// succeeds so the file only exists when a port is truly bound.
-	if (config.pidPath && existsSync(config.pidPath)) {
+	const located = locatePidFile(config.pidPath, null);
+	if (located !== null) {
 		const state = classifyPidFile(
-			readFileSync(config.pidPath, "utf8"),
+			readFileSync(located, "utf8"),
 			systemProcessTable,
 			isServerCommand,
 		);
@@ -377,7 +379,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		// a TOCTOU race where two concurrent starts both pass the check and the
 		// second unlinkSync hits ENOENT.
 		try {
-			unlinkSync(config.pidPath);
+			unlinkSync(located);
 		} catch (e) {
 			if (errCode(e) !== "ENOENT") throw e;
 		}

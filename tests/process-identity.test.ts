@@ -43,6 +43,20 @@ describe("isServerCommand and isDaemonCommand", () => {
 		);
 	});
 
+	it("matches an install path that contains spaces", () => {
+		expect(
+			isServerCommand("/Users/me/My Apps/libexec/knowledge-server --port 3179"),
+		).toBe(true);
+		expect(
+			isServerCommand("/opt/My Tools/bun run /Users/me/My Repo/src/index.ts"),
+		).toBe(true);
+		expect(
+			isDaemonCommand(
+				"/Users/me/My Apps/libexec/knowledge-daemon --interval=300",
+			),
+		).toBe(true);
+	});
+
 	it("keeps the server and the daemon apart", () => {
 		expect(isServerCommand("bun run /work/repo/src/daemon/index.ts")).toBe(
 			false,

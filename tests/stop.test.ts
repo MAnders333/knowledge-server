@@ -38,14 +38,18 @@ function fakeOs(procs: Record<number, Proc>) {
 }
 
 /** Runs `runStop` and captures what it prints. */
-async function stop(pidPath: string, deps: StopDeps) {
+async function stop(
+	pidPath: string,
+	deps: StopDeps,
+	legacyPidPath: string | null = null,
+) {
 	const out: string[] = [];
 	const log = console.log;
 	const error = console.error;
 	console.log = (...args: unknown[]) => out.push(args.join(" "));
 	console.error = (...args: unknown[]) => out.push(args.join(" "));
 	try {
-		const code = await runStop(pidPath, deps);
+		const code = await runStop(pidPath, legacyPidPath, deps);
 		return { code, out: out.join("\n") };
 	} finally {
 		console.log = log;
@@ -64,6 +68,18 @@ describe("runStop: PID file identity", () => {
 
 	afterEach(() => {
 		rmSync(dir, { recursive: true, force: true });
+	});
+
+	it("uses the legacy PID file when the configured one is missing", async () => {
+		const legacy = join(dir, "legacy.pid");
+		writeFileSync(legacy, String(PID));
+		const { deps, signals } = fakeOs({
+			[PID]: { command: SERVER, alive: true, exitsOnTerm: true },
+		});
+		const { code } = await stop(pidPath, deps, legacy);
+		expect(code).toBe(0);
+		expect(signals).toEqual([[PID, "SIGTERM"]]);
+		expect(existsSync(legacy)).toBe(false);
 	});
 
 	it("reports not running when there is no PID file", async () => {

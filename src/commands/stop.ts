@@ -3,6 +3,7 @@ import {
 	type ProcessTable,
 	classifyPidFile,
 	isServerCommand,
+	locatePidFile,
 	systemProcessTable,
 } from "../process-identity.js";
 import { errCode } from "../utils.js";
@@ -38,6 +39,7 @@ const defaultDeps: StopDeps = {
 
 export async function runStop(
 	pidPath: string,
+	legacyPidPath: string | null = null,
 	deps: StopDeps = defaultDeps,
 ): Promise<number> {
 	if (!pidPath) {
@@ -47,19 +49,20 @@ export async function runStop(
 		return 1;
 	}
 
-	if (!existsSync(pidPath)) {
+	const filePath = locatePidFile(pidPath, legacyPidPath);
+	if (filePath === null) {
 		console.log("Knowledge server is not running (no PID file found).");
 		return 0;
 	}
 
-	const raw = readFileSync(pidPath, "utf8");
+	const raw = readFileSync(filePath, "utf8");
 	const state = classifyPidFile(raw, deps.table, isServerCommand);
 
 	if (state.kind === "invalid") {
 		console.error(
 			`PID file contains invalid value: "${raw.trim()}". Removing it.`,
 		);
-		unlinkSync(pidPath);
+		unlinkSync(filePath);
 		return 1;
 	}
 
@@ -69,7 +72,7 @@ export async function runStop(
 				? `Knowledge server (PID ${state.pid}) is not running — removing stale PID file.`
 				: `PID ${state.pid} in the PID file is not a knowledge-server process — removing stale PID file.`,
 		);
-		unlinkSync(pidPath);
+		unlinkSync(filePath);
 		return 0;
 	}
 
@@ -77,7 +80,7 @@ export async function runStop(
 	if (state.kind === "unverified") {
 		console.error(
 			`Cannot verify that PID ${pid} is the knowledge server (its command line is unreadable), so it was not signalled. ` +
-				`If it is the server, stop it manually: kill ${pid}. Otherwise remove ${pidPath}.`,
+				`If it is the server, stop it manually: kill ${pid}. Otherwise remove ${filePath}.`,
 		);
 		return 1;
 	}
@@ -90,7 +93,7 @@ export async function runStop(
 		if (errCode(err) === "ESRCH") {
 			// Raced — process exited between the liveness check and the kill.
 			console.log("Server already stopped.");
-			if (existsSync(pidPath)) unlinkSync(pidPath);
+			if (existsSync(filePath)) unlinkSync(filePath);
 			return 0;
 		}
 		console.error(`Failed to send SIGTERM to PID ${pid}: ${err}`);
@@ -126,7 +129,7 @@ export async function runStop(
 		console.log("Knowledge server stopped.");
 		// The server cleans up its own PID file on graceful shutdown.
 		// If it crashed before doing so, clean up here.
-		if (existsSync(pidPath)) unlinkSync(pidPath);
+		if (existsSync(filePath)) unlinkSync(filePath);
 		return 0;
 	}
 
