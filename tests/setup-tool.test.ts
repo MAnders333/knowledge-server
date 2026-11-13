@@ -392,16 +392,25 @@ describe("setupCodex UserPromptSubmit hook", () => {
 				h.command?.includes("/hooks/claude-code/user-prompt?client=codex"),
 			);
 
-	it("writes a command hook that posts to the endpoint with a 5 s timeout and never fails the prompt", () => {
+	/** The script inside `/bin/sh -c '…'`, with the outer quoting undone. */
+	const innerScript = (command: string): string => {
+		const prefix = "/bin/sh -c '";
+		expect(command.startsWith(prefix)).toBe(true);
+		expect(command.endsWith("'")).toBe(true);
+		return command.slice(prefix.length, -1).replace(/'\\''/g, "'");
+	};
+
+	it("writes a command hook that runs under /bin/sh with a 5 s timeout and never fails the prompt", () => {
 		setupCodex();
 		const handlers = knowledgeHandlers();
 		expect(handlers).toHaveLength(1);
 		expect(handlers[0].type).toBe("command");
 		expect(handlers[0].timeout).toBe(5);
-		expect(handlers[0].command).toContain(
+		const script = innerScript(handlers[0].command ?? "");
+		expect(script).toContain(
 			"curl -s --noproxy '*' --fail --max-time 4 ${KNOWLEDGE_ADMIN_TOKEN:+-H @/dev/fd/3} --data-binary @-",
 		);
-		expect(handlers[0].command?.split("\n")[0].endsWith("|| true")).toBe(true);
+		expect(script.split("\n")[0].endsWith("|| true")).toBe(true);
 	});
 
 	it("is idempotent: a second run leaves hooks.json byte-identical", () => {
@@ -472,59 +481,96 @@ describe("setupCodex UserPromptSubmit hook", () => {
 		expect(readFileSync(HOOKS_PATH(), "utf8")).toBe("{ broken");
 	});
 
-	it("sends the admin bearer only when KNOWLEDGE_ADMIN_TOKEN is set, and never in curl's argv", async () => {
-		const token = "stable-admin-token-0123456789";
-		setupCodex();
-		const command = knowledgeHandlers()[0]?.command ?? "";
-		const received: Array<string | null> = [];
-		const server = Bun.serve({
-			hostname: "127.0.0.1",
-			port: 0,
-			fetch(req) {
-				received.push(req.headers.get("authorization"));
-				return Response.json({});
-			},
-		});
-		// A curl shim records the arguments it starts with, then runs the real curl.
-		const shimDir = mkdtempSync(join(tmpdir(), "setup-codex-curl-"));
-		const argvLog = join(shimDir, "argv.txt");
-		const realCurl = Bun.which("curl") ?? "/usr/bin/curl";
-		writeFileSync(
-			join(shimDir, "curl"),
-			`#!/bin/sh\nprintf '%s\\n' "$@" > "${argvLog}"\nexec "${realCurl}" "$@"\n`,
-		);
-		chmodSync(join(shimDir, "curl"), 0o755);
-		try {
-			// Only the origin changes: the command, header expansion included, runs as written.
-			// The hook runs asynchronously: a blocking spawn would stall the stub server.
-			const local = command.replace(
-				/'http:\/\/[^']+'/,
-				`'http://127.0.0.1:${server.port}/hooks/claude-code/user-prompt?client=codex'`,
+	// Codex starts the hook with the user's shell. Every shell installed here runs the
+	// same hook command against the stub server.
+	const SHELLS = ["sh", "bash", "zsh", "fish"].filter(
+		(name) => Bun.which(name) !== null,
+	);
+	for (const shell of SHELLS) {
+		it(`sends the admin bearer only when set, with ${shell} as the outer shell`, async () => {
+			const token = "stable-admin-token-0123456789";
+			setupCodex();
+			const command = knowledgeHandlers()[0]?.command ?? "";
+			const received: Array<string | null> = [];
+			const server = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				fetch(req) {
+					received.push(req.headers.get("authorization"));
+					return Response.json({});
+				},
+			});
+			// A curl shim records the arguments it starts with, then runs the real curl.
+			const shimDir = mkdtempSync(join(tmpdir(), "setup-codex-curl-"));
+			const argvLog = join(shimDir, "argv.txt");
+			const realCurl = Bun.which("curl") ?? "/usr/bin/curl";
+			writeFileSync(
+				join(shimDir, "curl"),
+				`#!/bin/sh\nprintf '%s\\n' "$@" > "${argvLog}"\nexec "${realCurl}" "$@"\n`,
 			);
-			const run = async (env: Record<string, string>): Promise<string[]> => {
-				const proc = Bun.spawn(["sh", "-c", local], {
-					env: {
-						PATH: `${shimDir}:${process.env.PATH ?? "/usr/bin:/bin"}`,
-						...env,
-					},
-					stdin: Buffer.from('{"prompt":"hello"}'),
-					stdout: "pipe",
-					stderr: "pipe",
-				});
-				await proc.exited;
-				return readFileSync(argvLog, "utf8").split("\n");
-			};
-			const argvUnset = await run({});
-			const argvSet = await run({ KNOWLEDGE_ADMIN_TOKEN: token });
+			chmodSync(join(shimDir, "curl"), 0o755);
+			try {
+				// Only the origin changes: the command runs as written.
+				const local = command.replace(
+					/http:\/\/[^\s']+/,
+					`http://127.0.0.1:${server.port}/hooks/claude-code/user-prompt?client=codex`,
+				);
+				const shellPath = Bun.which(shell) ?? shell;
+				const run = async (env: Record<string, string>): Promise<string[]> => {
+					const proc = Bun.spawn([shellPath, "-c", local], {
+						env: {
+							PATH: `${shimDir}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+							HOME: shimDir,
+							...env,
+						},
+						stdin: Buffer.from('{"prompt":"hello"}'),
+						stdout: "pipe",
+						stderr: "pipe",
+					});
+					await proc.exited;
+					return readFileSync(argvLog, "utf8").split("\n");
+				};
+				const argvUnset = await run({});
+				const argvSet = await run({ KNOWLEDGE_ADMIN_TOKEN: token });
 
-			expect(argvUnset).not.toContain("-H");
-			expect(argvSet).toContain("-H");
-			expect(argvSet.join("\n")).not.toContain(token);
-		} finally {
-			server.stop(true);
-			rmSync(shimDir, { recursive: true, force: true });
-		}
-		expect(received).toEqual([null, `Bearer ${token}`]);
+				expect(argvUnset).not.toContain("-H");
+				expect(argvSet).toContain("-H");
+				expect(argvSet.join("\n")).not.toContain(token);
+			} finally {
+				server.stop(true);
+				rmSync(shimDir, { recursive: true, force: true });
+			}
+			expect(received).toEqual([null, `Bearer ${token}`]);
+		});
+	}
+
+	it("replaces the one-line hook an earlier release wrote, and a re-run is byte-identical", () => {
+		writeFileSync(
+			HOOKS_PATH(),
+			JSON.stringify({
+				hooks: {
+					UserPromptSubmit: [
+						{
+							hooks: [
+								{
+									type: "command",
+									command:
+										"curl -s --noproxy '*' --fail --max-time 4 ${KNOWLEDGE_ADMIN_TOKEN:+-H @/dev/fd/3} --data-binary @- 'http://127.0.0.1:3179/hooks/claude-code/user-prompt?client=codex' || true",
+									timeout: 5,
+								},
+							],
+						},
+					],
+				},
+			}),
+		);
+		setupCodex();
+		const handlers = knowledgeHandlers();
+		expect(handlers).toHaveLength(1);
+		expect(handlers[0].command?.startsWith("/bin/sh -c '")).toBe(true);
+		const first = readFileSync(HOOKS_PATH(), "utf8");
+		setupCodex();
+		expect(readFileSync(HOOKS_PATH(), "utf8")).toBe(first);
 	});
 });
 
@@ -689,5 +735,58 @@ describe("setupOhMyPi", () => {
 		mkdirSync(join(ompRoot, "agent"), { recursive: true });
 		setupOhMyPi(ompRoot);
 		expect(existsSync(join(ompRoot, "agent", "settings.json"))).toBe(false);
+	});
+});
+
+// ── MCP entries for a source install ─────────────────────────────────────────
+
+describe("source-install MCP entries load .env", () => {
+	const cursorPath = () => join(isolation.home, ".cursor", "mcp.json");
+	const cursorEnv = () =>
+		(
+			JSON.parse(readFileSync(cursorPath(), "utf8")) as {
+				mcpServers: { knowledge: { env: Record<string, string> } };
+			}
+		).mcpServers.knowledge.env;
+
+	it("sets KNOWLEDGE_LOAD_ENV in the Cursor entry", () => {
+		setupCursor();
+		expect(cursorEnv()).toMatchObject({
+			KNOWLEDGE_HOST: expect.any(String),
+			KNOWLEDGE_PORT: expect.any(String),
+			KNOWLEDGE_LOAD_ENV: "1",
+		});
+	});
+
+	it("sets KNOWLEDGE_LOAD_ENV in the Codex config.toml entry", () => {
+		setupCodex();
+		expect(
+			readFileSync(join(isolation.home, ".codex", "config.toml"), "utf8"),
+		).toMatch(/env = \{ .*KNOWLEDGE_LOAD_ENV = "1" \}/);
+	});
+
+	it("sets KNOWLEDGE_LOAD_ENV in the opencode.jsonc entry", () => {
+		const dir = join(isolation.home, ".config", "opencode");
+		mkdirSync(dir, { recursive: true });
+		writeOpenCodeMcpEntry(dir);
+		const parsed = JSON.parse(
+			readFileSync(join(dir, "opencode.jsonc"), "utf8"),
+		) as { mcp: { knowledge: { environment: Record<string, string> } } };
+		expect(parsed.mcp.knowledge.environment).toMatchObject({
+			KNOWLEDGE_LOAD_ENV: "1",
+		});
+	});
+
+	it("upgrades a Cursor entry written before the variable existed", () => {
+		setupCursor();
+		const written = JSON.parse(readFileSync(cursorPath(), "utf8")) as {
+			mcpServers: { knowledge: { env: Record<string, string | undefined> } };
+		};
+		// An entry from before the variable: undefined is dropped by JSON.stringify.
+		written.mcpServers.knowledge.env.KNOWLEDGE_LOAD_ENV = undefined;
+		writeFileSync(cursorPath(), JSON.stringify(written));
+
+		setupCursor();
+		expect(cursorEnv().KNOWLEDGE_LOAD_ENV).toBe("1");
 	});
 });

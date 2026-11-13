@@ -122,6 +122,21 @@ function replaceConfigFile(path: string, content: string): void {
 	}
 }
 
+/**
+ * Environment for an MCP entry. A source install runs `bun run src/index.ts`, which
+ * does not load .env by itself (compiled binaries do), so the flag is set only for
+ * source installs. Without it the proxy would miss a stable KNOWLEDGE_ADMIN_TOKEN
+ * kept in .env.
+ */
+function mcpEnvironment(): Record<string, string> {
+	return {
+		// Thin HTTP proxy — only needs to locate the knowledge HTTP server.
+		KNOWLEDGE_HOST: resolvedHost,
+		KNOWLEDGE_PORT: String(resolvedPort),
+		...(isSourceInstall() ? { KNOWLEDGE_LOAD_ENV: "1" } : {}),
+	};
+}
+
 // ── OpenCode MCP config ────────────────────────────────────────────────────────
 
 /**
@@ -142,11 +157,7 @@ function makeOpenCodeMcpEntry(): { command: string[] } & Record<
 	string,
 	unknown
 > {
-	const env = {
-		// Thin HTTP proxy — only needs to locate the knowledge HTTP server.
-		KNOWLEDGE_HOST: resolvedHost,
-		KNOWLEDGE_PORT: String(resolvedPort),
-	};
+	const env = mcpEnvironment();
 
 	if (isSourceInstall()) {
 		const projectDir = getProjectDir();
@@ -279,17 +290,16 @@ export function writeOpenCodeMcpEntry(opencodeConfigDir: string): void {
 		| undefined;
 
 	if (existing) {
-		const existingCmd = JSON.stringify(existing.command);
-		const newCmd = JSON.stringify(entry.command);
-		if (existingCmd === newCmd) {
+		if (isDeepStrictEqual(existing, entry)) {
 			console.log(
 				"  ✓ MCP server 'knowledge' already in opencode.jsonc (no change)",
 			);
 			return;
 		}
-		// Command changed (e.g. project moved or reinstalled) — update in place.
+		// The command or environment changed (project moved, reinstalled, or a new
+		// variable such as KNOWLEDGE_LOAD_ENV) — update in place.
 		console.log(
-			"  ✓ MCP server 'knowledge' updated in opencode.jsonc (command changed)",
+			"  ✓ MCP server 'knowledge' updated in opencode.jsonc (entry changed)",
 		);
 	} else {
 		console.log("  ✓ MCP server 'knowledge' added to opencode.jsonc");
@@ -489,12 +499,7 @@ Setup complete!`);
  *   - The `mcp` subcommand is built into the main binary.
  */
 function makeClaudeMcpEntry() {
-	const env = {
-		// The MCP subcommand is a thin HTTP proxy — it only needs to locate the
-		// knowledge HTTP server. No LLM credentials required here.
-		KNOWLEDGE_HOST: resolvedHost,
-		KNOWLEDGE_PORT: String(resolvedPort),
-	};
+	const env = mcpEnvironment();
 	if (isSourceInstall()) {
 		const projectDir = getProjectDir();
 		// In source mode, process.execPath is the bun binary itself.
@@ -726,10 +731,7 @@ Setup complete!`);
  * Each entry: { command, args?, env? }
  */
 function makeCursorMcpEntry() {
-	const env = {
-		KNOWLEDGE_HOST: resolvedHost,
-		KNOWLEDGE_PORT: String(resolvedPort),
-	};
+	const env = mcpEnvironment();
 
 	if (isSourceInstall()) {
 		const projectDir = getProjectDir();
@@ -777,28 +779,20 @@ export function setupCursor(): void {
 
 	const entry = makeCursorMcpEntry();
 	const existing = mcpConfig.mcpServers.knowledge as
-		| { command: string; args?: string[] }
+		| Record<string, unknown>
 		| undefined;
 
 	let needsWrite = true;
 	if (existing) {
-		const existingCmd = JSON.stringify([
-			existing.command,
-			...(existing.args ?? []),
-		]);
-		const newCmd = JSON.stringify([entry.command, ...(entry.args ?? [])]);
-		if (existingCmd === newCmd) {
+		if (isDeepStrictEqual(existing, entry)) {
 			console.log(
 				"  ✓ MCP server 'knowledge' already in ~/.cursor/mcp.json (no change)",
-			);
-			console.log(
-				"    To update: remove the 'knowledge' entry from ~/.cursor/mcp.json and re-run this command.",
 			);
 			needsWrite = false;
 		} else {
 			mcpConfig.mcpServers.knowledge = entry;
 			console.log(
-				"  ✓ MCP server 'knowledge' updated in ~/.cursor/mcp.json (command changed)",
+				"  ✓ MCP server 'knowledge' updated in ~/.cursor/mcp.json (entry changed)",
 			);
 		}
 	} else {
@@ -850,6 +844,10 @@ const CODEX_HOOK_PATH_MARKER = "/hooks/claude-code/user-prompt?client=codex";
  * pipe; curl reads it with `-H @/dev/fd/3`. The token is therefore never in curl's
  * argv, where other local users can read it with `ps`.
  *
+ * Codex starts the command with the user's shell (`$SHELL -lc`), and zsh and fish do
+ * not split or parse it the same way. The script therefore runs under /bin/sh -c, and
+ * the outer quoting is the POSIX `'\''` form, which zsh and fish read the same way.
+ *
  * `--noproxy '*'`: loopback must never go through an HTTP proxy from the
  * environment (the prompt would leave the machine). `--fail`: an error body is
  * not handed to Codex as hook output. `|| true` matters: a command hook that exits
@@ -862,11 +860,13 @@ function codexHookCommand(): string {
 	// `${…:+…}` adds the header option only when the token is set. The here-document
 	// is unused otherwise.
 	const auth = "${KNOWLEDGE_ADMIN_TOKEN:+-H @/dev/fd/3}";
-	return [
+	const script = [
 		`curl -s --noproxy '*' --fail --max-time 4 ${auth} --data-binary @- ${quoted} 3<<KS_AUTH || true`,
 		"Authorization: Bearer $KNOWLEDGE_ADMIN_TOKEN",
 		"KS_AUTH",
+		"",
 	].join("\n");
+	return `/bin/sh -c '${script.replace(/'/g, "'\\''")}'`;
 }
 
 /**
@@ -985,10 +985,13 @@ export function setupCodex(): void {
 		commandToml = `command = "${mainBin.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"\nargs = ["mcp"]`;
 	}
 
+	const tomlEnv = Object.entries(mcpEnvironment())
+		.map(([key, value]) => `${key} = "${value}"`)
+		.join(", ");
 	const block = `
 [mcp_servers.knowledge]
 ${commandToml}
-env = { KNOWLEDGE_HOST = "${resolvedHost}", KNOWLEDGE_PORT = "${resolvedPort}" }
+env = { ${tomlEnv} }
 `;
 
 	// Check if the section already exists (simple string match on the header).
@@ -1043,10 +1046,7 @@ Setup complete!`);
  * profile's mcp.json. This avoids hardcoding profile-specific paths.
  */
 function makeVSCodeMcpEntry() {
-	const env = {
-		KNOWLEDGE_HOST: resolvedHost,
-		KNOWLEDGE_PORT: String(resolvedPort),
-	};
+	const env = mcpEnvironment();
 
 	if (isSourceInstall()) {
 		const projectDir = getProjectDir();
