@@ -559,17 +559,24 @@ Run \`knowledge-server help-advanced\` for additional commands.
 			}
 		}
 
+		// The spawned daemon uploads every 5 minutes, unless DAEMON_UPLOAD_INTERVAL_SECONDS
+		// is set. The daemon's --interval flag would override that variable, so the
+		// flag is passed only when the variable is not a positive number.
+		const spawnedIntervalArgs =
+			Number.parseInt(process.env.DAEMON_UPLOAD_INTERVAL_SECONDS ?? "", 10) > 0
+				? []
+				: ["--interval=300"];
 		const daemonCmd: string[] = isSourceRun
 			? process.argv[1]
 				? [
 						process.execPath,
 						"run",
 						join(dirname(process.argv[1]), "daemon", "index.ts"),
-						"--interval=300",
+						...spawnedIntervalArgs,
 					]
 				: [] // argv[1] missing — can't locate daemon entry point
 			: existsSync(daemonBinPath)
-				? [daemonBinPath, "--interval=300"]
+				? [daemonBinPath, ...spawnedIntervalArgs]
 				: [];
 
 		if (daemonCmd.length === 0) {
