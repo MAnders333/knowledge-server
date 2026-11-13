@@ -19,6 +19,12 @@ import {
 	pendingMigrations,
 } from "../migration-registry.js";
 import {
+	type ContradictionMergedData,
+	type ContradictionOp,
+	type ContradictionResolution,
+	planContradictionResolution,
+} from "../shared/contradiction-plan.js";
+import {
 	bufferToFloats,
 	byteaToFloat32,
 	floatsToBuffer,
@@ -1055,181 +1061,36 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	}
 
 	async applyContradictionResolution(
-		resolution: "supersede_old" | "supersede_new" | "merge" | "irresolvable",
+		resolution: ContradictionResolution,
 		newEntryId: string,
 		existingEntryId: string,
-		mergedData?: {
-			content: string;
-			type: string;
-			topics: string[];
-			confidence: number;
-		},
+		mergedData?: ContradictionMergedData,
 	): Promise<void> {
 		const now = Date.now();
-
 		await this.sql.begin(async (sql: TxSql) => {
-			switch (resolution) {
-				case "supersede_old": {
-					const loserPartner = await this.findConflictCounterpart(
+			// Partners are read before any status changes; the plan decides the writes
+			// (src/db/shared/contradiction-plan.ts).
+			const plan = planContradictionResolution(
+				resolution,
+				newEntryId,
+				existingEntryId,
+				{
+					newPartner: await this.findConflictCounterpart(sql, newEntryId),
+					existingPartner: await this.findConflictCounterpart(
 						sql,
 						existingEntryId,
-					);
-					const winnerPartner = await this.findConflictCounterpart(
-						sql,
-						newEntryId,
-					);
-					await sql`
-						UPDATE knowledge_entry
-						SET status = 'superseded', superseded_by = ${newEntryId}, updated_at = ${now}
-						WHERE id = ${existingEntryId}
-					`;
-					await sql`
-						INSERT INTO knowledge_relation (id, source_id, target_id, type, created_at)
-						VALUES (${randomUUID()}, ${newEntryId}, ${existingEntryId}, 'supersedes', ${now})
-						ON CONFLICT DO NOTHING
-					`;
-					if (loserPartner)
-						await this.restoreConflictCounterpart(
-							sql,
-							loserPartner,
-							existingEntryId,
-							now,
-						);
-					if (winnerPartner) {
-						await sql`
-							UPDATE knowledge_entry SET status = 'active', updated_at = ${now}
-							WHERE id = ${newEntryId} AND status = 'conflicted'
-						`;
-						await this.restoreConflictCounterpart(
-							sql,
-							winnerPartner,
-							newEntryId,
-							now,
-						);
-					}
-					break;
-				}
-
-				case "supersede_new": {
-					const loserPartner = await this.findConflictCounterpart(
-						sql,
-						newEntryId,
-					);
-					const winnerPartner = await this.findConflictCounterpart(
-						sql,
-						existingEntryId,
-					);
-					await sql`
-						UPDATE knowledge_entry
-						SET status = 'superseded', superseded_by = ${existingEntryId}, updated_at = ${now}
-						WHERE id = ${newEntryId}
-					`;
-					await sql`
-						INSERT INTO knowledge_relation (id, source_id, target_id, type, created_at)
-						VALUES (${randomUUID()}, ${existingEntryId}, ${newEntryId}, 'supersedes', ${now})
-						ON CONFLICT DO NOTHING
-					`;
-					if (loserPartner)
-						await this.restoreConflictCounterpart(
-							sql,
-							loserPartner,
-							newEntryId,
-							now,
-						);
-					if (winnerPartner) {
-						await sql`
-							UPDATE knowledge_entry SET status = 'active', updated_at = ${now}
-							WHERE id = ${existingEntryId} AND status = 'conflicted'
-						`;
-						await this.restoreConflictCounterpart(
-							sql,
-							winnerPartner,
-							existingEntryId,
-							now,
-						);
-					}
-					break;
-				}
-
-				case "merge": {
-					const existingPartner = await this.findConflictCounterpart(
-						sql,
-						existingEntryId,
-					);
-					const newPartner = await this.findConflictCounterpart(
-						sql,
-						newEntryId,
-					);
-					if (!mergedData) {
-						logger.warn(
-							`[pg-db] merge resolution missing mergedData — existingEntryId ${existingEntryId} ` +
-								`will be superseded but newEntryId ${newEntryId} content unchanged`,
-						);
-					} else {
-						const safeType = clampKnowledgeType(mergedData.type);
-						// Clear both vectors, as clearTombstonedEmbeddings() does. ANN search reads
-						// embedding_vec, so a stale copy would keep matching the old content.
-						const vecClause =
-							this.vecColumnDims !== null ? ", embedding_vec = NULL" : "";
-						await sql.unsafe(
-							`UPDATE knowledge_entry
-							SET content = $1, type = $2, topics = $3::jsonb, confidence = $4,
-							    embedding = NULL${vecClause}, updated_at = $5
-							WHERE id = $6`,
-							[
-								mergedData.content,
-								safeType,
-								sql.json(mergedData.topics),
-								mergedData.confidence,
-								now,
-								newEntryId,
-							] as postgres.ParameterOrJSON<never>[],
-						);
-					}
-					await sql`
-						UPDATE knowledge_entry
-						SET status = 'superseded', superseded_by = ${newEntryId}, updated_at = ${now}
-						WHERE id = ${existingEntryId}
-					`;
-					await sql`
-						INSERT INTO knowledge_relation (id, source_id, target_id, type, created_at)
-						VALUES (${randomUUID()}, ${newEntryId}, ${existingEntryId}, 'supersedes', ${now})
-						ON CONFLICT DO NOTHING
-					`;
-					if (existingPartner)
-						await this.restoreConflictCounterpart(
-							sql,
-							existingPartner,
-							existingEntryId,
-							now,
-						);
-					if (newPartner && mergedData) {
-						await sql`
-							UPDATE knowledge_entry SET status = 'active', updated_at = ${now}
-							WHERE id = ${newEntryId} AND status = 'conflicted'
-						`;
-						await this.restoreConflictCounterpart(
-							sql,
-							newPartner,
-							newEntryId,
-							now,
-						);
-					}
-					break;
-				}
-
-				case "irresolvable":
-					await sql`
-						INSERT INTO knowledge_relation (id, source_id, target_id, type, created_at)
-						VALUES (${randomUUID()}, ${newEntryId}, ${existingEntryId}, 'contradicts', ${now})
-						ON CONFLICT DO NOTHING
-					`;
-					await sql`
-						UPDATE knowledge_entry SET status = 'conflicted', updated_at = ${now}
-						WHERE id IN (${newEntryId}, ${existingEntryId})
-					`;
-					break;
+					),
+				},
+				mergedData,
+				now,
+			);
+			if (plan.missingMergedData) {
+				logger.warn(
+					`[pg-db] merge resolution missing mergedData — existingEntryId ${existingEntryId} ` +
+						`will be superseded but newEntryId ${newEntryId} content unchanged`,
+				);
 			}
+			for (const op of plan.ops) await this.applyContradictionOp(sql, op);
 		});
 	}
 
@@ -1248,22 +1109,72 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			: rows[0].source_id;
 	}
 
-	private async restoreConflictCounterpart(
+	/** Run one op of a contradiction plan inside the resolution's transaction. */
+	private async applyContradictionOp(
 		sql: TxSql,
-		counterpartId: string,
-		resolvedId: string,
-		now: number,
+		op: ContradictionOp,
 	): Promise<void> {
-		await sql`
-			UPDATE knowledge_entry SET status = 'active', updated_at = ${now}
-			WHERE id = ${counterpartId} AND status = 'conflicted'
-		`;
-		await sql`
-			DELETE FROM knowledge_relation
-			WHERE type = 'contradicts'
-			  AND ((source_id = ${resolvedId} AND target_id = ${counterpartId})
-			       OR (source_id = ${counterpartId} AND target_id = ${resolvedId}))
-		`;
+		switch (op.kind) {
+			case "mergeContent": {
+				// Clear both vectors, as clearTombstonedEmbeddings() does. ANN search reads
+				// embedding_vec, so a stale copy would keep matching the old content.
+				const vecClause =
+					this.vecColumnDims !== null ? ", embedding_vec = NULL" : "";
+				await sql.unsafe(
+					`UPDATE knowledge_entry
+					SET content = $1, type = $2, topics = $3::jsonb, confidence = $4,
+					    embedding = NULL${vecClause}, updated_at = $5
+					WHERE id = $6`,
+					[
+						op.content,
+						op.type,
+						sql.json(op.topics),
+						op.confidence,
+						op.at,
+						op.id,
+					] as postgres.ParameterOrJSON<never>[],
+				);
+				return;
+			}
+			case "supersede":
+				await sql`
+					UPDATE knowledge_entry
+					SET status = 'superseded', superseded_by = ${op.supersededBy}, updated_at = ${op.at}
+					WHERE id = ${op.id}
+				`;
+				return;
+			case "link":
+				await sql`
+					INSERT INTO knowledge_relation (id, source_id, target_id, type, created_at)
+					VALUES (${randomUUID()}, ${op.sourceId}, ${op.targetId}, ${op.relation}, ${op.at})
+					ON CONFLICT DO NOTHING
+				`;
+				return;
+			case "restoreCounterpart":
+				await sql`
+					UPDATE knowledge_entry SET status = 'active', updated_at = ${op.at}
+					WHERE id = ${op.counterpartId} AND status = 'conflicted'
+				`;
+				await sql`
+					DELETE FROM knowledge_relation
+					WHERE type = 'contradicts'
+					  AND ((source_id = ${op.resolvedId} AND target_id = ${op.counterpartId})
+					       OR (source_id = ${op.counterpartId} AND target_id = ${op.resolvedId}))
+				`;
+				return;
+			case "activateIfConflicted":
+				await sql`
+					UPDATE knowledge_entry SET status = 'active', updated_at = ${op.at}
+					WHERE id = ${op.id} AND status = 'conflicted'
+				`;
+				return;
+			case "markConflicted":
+				await sql`
+					UPDATE knowledge_entry SET status = 'conflicted', updated_at = ${op.at}
+					WHERE id IN (${op.ids[0]}, ${op.ids[1]})
+				`;
+				return;
+		}
 	}
 
 	async deleteEntry(id: string): Promise<boolean> {
