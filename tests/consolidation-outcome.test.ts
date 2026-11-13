@@ -341,7 +341,9 @@ describe("blocked rows at the head of the queue", () => {
 		expect(reader.getCandidateSessions(0, 10).map((c) => c.id)).toEqual([
 			"session-healthy",
 		]);
-	});
+		// 2,100 sequential inserts take ~8 s on a loaded CI runner: well over bun's
+		// 5 s default.
+	}, 60_000);
 });
 
 describe("store write failure", () => {
