@@ -483,10 +483,6 @@ export class EpisodeUploader {
 		onShutdown?: () => Promise<void>,
 		onCycle?: (outcome: CycleOutcome) => void,
 	): Promise<void> {
-		logger.log(
-			`[daemon] Starting. Upload interval: ${Math.round(intervalMs / 1000)}s. User: ${this.userId}`,
-		);
-
 		let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
 		let shuttingDown = false;
 
@@ -546,6 +542,12 @@ export class EpisodeUploader {
 		};
 		process.on("SIGTERM", () => void cleanup());
 		process.on("SIGINT", () => void cleanup());
+
+		// Announce only once the handlers exist: callers (and tests) treat this line
+		// as "a SIGTERM from now on is handled and releases the daemon lock".
+		logger.log(
+			`[daemon] Starting. Upload interval: ${Math.round(intervalMs / 1000)}s. User: ${this.userId}`,
+		);
 
 		// Run immediately on start, then self-schedule via scheduleNext.
 		await runCycle();
