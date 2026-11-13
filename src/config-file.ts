@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
-import { homedir, hostname } from "node:os";
+import { hostname } from "node:os";
 import { dirname, join } from "node:path";
+import { homeDir } from "./home.js";
 
 /**
  * Store configuration — one entry per knowledge database.
@@ -146,14 +147,14 @@ function parsePortEnvVar(raw: string | undefined, fallback: number): number {
 // ── Paths ─────────────────────────────────────────────────────────────────────
 
 export const DEFAULT_CONFIG_PATH = join(
-	homedir(),
+	homeDir(),
 	".config",
 	"knowledge-server",
 	"config.jsonc",
 );
 
 export const DEFAULT_SQLITE_PATH = join(
-	homedir(),
+	homeDir(),
 	".local",
 	"share",
 	"knowledge-server",
@@ -177,7 +178,7 @@ export function resolveDataDir(configPath = DEFAULT_CONFIG_PATH): string {
 
 /** Expand a leading `~` (alone or as `~/…`) to the home directory. */
 export function expandHome(p: string): string {
-	return p.replace(/^~(?=$|\/)/, homedir());
+	return p.replace(/^~(?=$|\/)/, homeDir());
 }
 
 // ── JSONC strip-comments ──────────────────────────────────────────────────────

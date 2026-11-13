@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { config } from "../config.js";
+import { DEFAULT_RERANK_MODEL, config } from "../config.js";
 import { logger } from "../logger.js";
 import {
 	BertWordPieceTokenizer,
@@ -106,9 +106,6 @@ interface LoadedModel {
 	tokenizer: BertWordPieceTokenizer;
 	session: OrtSession;
 }
-
-/** The model the reranker ships with (English-only). */
-const DEFAULT_RERANK_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2";
 
 /**
  * Hugging Face revisions and sha256 checksums for models we pin. Artifacts
