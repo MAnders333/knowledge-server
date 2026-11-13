@@ -524,7 +524,7 @@ Hosts of the models seen on the maintainer's gateway. Check the routing of your 
 | `jev-1.14.0`, `jev-latest` | TypeSafe (Jev) | Also reachable directly at `https://api.typesafe.ai/v1/systemone` with a TypeSafe key (`RERANK_REMOTE_URL` and `RERANK_REMOTE_API_KEY`). No `-eu` variant on the gateway |
 | `clef` | Cloudflare | `clef-eu` may exist on your gateway; confirm its hosting with your gateway administrator |
 | `decision-1` | Microsoft | `decision-1-eu` may exist on your gateway; confirm its hosting with your gateway administrator |
-| `pplx-decider` | Perplexity | |
+| `pplx-decider-v1-27b` | Perplexity | |
 
 The default name `jev-1.14.0` exists on the maintainer's gateway and on TypeSafe's direct API. Any other endpoint needs the model name it offers. Cost is per input token (output tokens are free). A per-1,000-activation cost has not been measured yet; compute it from the `input_tokens` value in the `[rerank]` log line.
 
@@ -538,12 +538,12 @@ The default name `jev-1.14.0` exists on the maintainer's gateway and on TypeSafe
 | `RERANK_TIMEOUT_MS` | `3000` | Budget for one local rerank call. On expiry the whole batch falls back to dense ordering (no partial scores) |
 | `RERANK_MAX_QUERY_TOKENS` | `128` | Last N tokens of the prompt used as the rerank query (remote: N × 4 characters) |
 | `RERANK_MAX_DOC_TOKENS` | `256` | First N tokens of each candidate that is scored (remote: N × 4 characters). Shorter caps lowered quality on long documents |
-| `RERANK_REMOTE_URL` | `${LLM_BASE_ENDPOINT}/decisions/v1/systemone` | Full System One URL. Direct TypeSafe: `https://api.typesafe.ai/v1/systemone`. A URL on another origin than `LLM_BASE_ENDPOINT` needs `RERANK_REMOTE_API_KEY` (startup error otherwise). Plain http to a non-loopback host logs a warning |
+| `RERANK_REMOTE_URL` | `${LLM_BASE_ENDPOINT}/decisions/v1/systemone` | Full System One URL. Direct TypeSafe: `https://api.typesafe.ai/v1/systemone`. A URL on another origin than `LLM_BASE_ENDPOINT` needs `RERANK_REMOTE_API_KEY`; without it remote reranking stays off and the local reranker runs. Plain http to a non-loopback host logs a warning |
 | `RERANK_REMOTE_API_KEY` | `LLM_API_KEY`, only on the `LLM_BASE_ENDPOINT` origin | Key for `RERANK_REMOTE_URL`. The gateway key is never sent to another origin |
-| `RERANK_REMOTE_MODEL` | `jev-1.14.0` | Decision model for `RERANK_PROVIDER=remote`, named as your endpoint names it. Use a versioned name: aliases move, and the calibrated floors are keyed by model name. The model the response names is logged and stored in `activation_event.rerank_model` |
+| `RERANK_REMOTE_MODEL` | `jev-1.14.0` | Decision model for `RERANK_PROVIDER=remote`, named as your endpoint names it. Use a versioned name. The gateway does not resolve an alias to a version (`jev-latest` comes back as `typesafe/jev-latest`), and calibrated floors are keyed by the configured name. `activation_event.rerank_model` stores `remote/<configured model>`, the floor key; the name the endpoint reports resolving to is logged as `resolved_model` |
 | `RERANK_REMOTE_TIMEOUT_MS` | `4000` | Budget for one call, including one retry after a 429 whose `Retry-After` fits in what is left. It sits inside the 5 s plugin budget; on expiry dense ordering is used |
 
-Remote mode needs an endpoint (`RERANK_REMOTE_URL`, or `LLM_BASE_ENDPOINT`) and a key (`RERANK_REMOTE_API_KEY`, or `LLM_API_KEY` for the gateway's own origin). If either is missing (or still a template placeholder), the server logs a warning at startup and uses the local reranker. Startup also rejects `RERANK_CANDIDATES` above 40, and any configuration whose request could exceed about 100,000 characters: `RERANK_CANDIDATES × (RERANK_MAX_DOC_TOKENS × 4 + 512) + RERANK_MAX_QUERY_TOKENS × 4`. The defaults give about 25,000.
+Remote mode needs an endpoint (`RERANK_REMOTE_URL`, or `LLM_BASE_ENDPOINT`) and a key (`RERANK_REMOTE_API_KEY`, or `LLM_API_KEY` for the gateway's own origin). If either is missing (or still a template placeholder), the server logs a warning at startup and uses the local reranker. When remote reranking is active, startup also rejects `RERANK_CANDIDATES` above 40, and any configuration whose request could exceed about 100,000 characters: `RERANK_CANDIDATES × (RERANK_MAX_DOC_TOKENS × 4 + 512) + RERANK_MAX_QUERY_TOKENS × 4`. The defaults give about 25,000.
 
 Pairs are scored one at a time and the event loop is yielded between them, so one long candidate no longer stalls other requests. Latency grows with the token caps. Measured on a 10-core Apple Silicon machine at a load average of about 12, 16 candidates at the defaults took a median of 2.5 s and 20 candidates took 3.2 s. With long prompts and long candidates on every pair, 16 candidates took 3.9 s, so those calls fall back to dense ordering. On slower CPUs lower `RERANK_CANDIDATES` or `RERANK_MAX_QUERY_TOKENS`, or raise `RERANK_TIMEOUT_MS`. Keep it well under 5 s, because the plugin gives up after that.
 

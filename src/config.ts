@@ -631,7 +631,7 @@ export const config = {
 			// Default on. RERANK_ENABLED=false restores pure dense ordering.
 			enabled: process.env.RERANK_ENABLED !== "false",
 			// "local" (default) runs the in-process cross-encoder below. "remote"
-			// scores candidates with a listwise decision model on the LLM gateway.
+			// scores candidates with the System One decision model at RERANK_REMOTE_URL.
 			// Remote sends the query tail and candidate text off-machine on every
 			// activation, so it runs only when set explicitly. See rerank-remote.ts.
 			// Unknown values are reported by validateConfig() and run as local.
