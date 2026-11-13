@@ -16,6 +16,7 @@ import type {
 } from "../../types.js";
 import { ensurePrivateFile } from "../../utils.js";
 import {
+	ID_PREFIX_PATTERN,
 	type IKnowledgeStore,
 	LAST_ACCESS_TOUCH_INTERVAL_MS,
 } from "../interface.js";
@@ -54,8 +55,11 @@ function qualifiedEntryColumns(alias: string): string {
  */
 export class KnowledgeDB implements IKnowledgeStore {
 	private db: Database;
-	/** Cross-process consolidation lock held for one store write (see tryAcquireConsolidationLock). */
-	private consolidationLock: LockHandle | null = null;
+	/**
+	 * The consolidation lock this store object holds (see tryAcquireConsolidationLock).
+	 * `file` is the lockfile, or null for an in-memory database, which has none.
+	 */
+	private consolidationLock: { file: LockHandle | null } | null = null;
 	/** Absolute path to the SQLite file — exposed for migration tooling. */
 	readonly dbPath: string;
 	/** Store ID — set by StoreRegistry; defaults to "sqlite" in standalone/test use. */
@@ -255,12 +259,37 @@ export class KnowledgeDB implements IKnowledgeStore {
 			.run(...values);
 	}
 
+	async setEmbedding(id: string, embedding: number[]): Promise<void> {
+		this.db
+			.prepare("UPDATE knowledge_entry SET embedding = ? WHERE id = ?")
+			.run(new Uint8Array(new Float32Array(embedding).buffer), id);
+	}
+
 	async getEntry(id: string): Promise<KnowledgeEntry | null> {
 		const row = this.db
 			.prepare(`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE id = ?`)
 			.get(id) as RawEntryRow | null;
 
 		return row ? this.rowToEntry(row) : null;
+	}
+
+	/**
+	 * Ids of entries (any status) whose id starts with `prefix`, ascending, at most
+	 * `limit`. See IKnowledgeStore.findIdsByPrefix.
+	 */
+	async findIdsByPrefix(prefix: string, limit: number): Promise<string[]> {
+		if (!ID_PREFIX_PATTERN.test(prefix)) return [];
+		// The binary-order range [prefix, next) holds exactly the ids that start with
+		// prefix, so this is a primary-key range scan with no LIKE involved.
+		const upper =
+			prefix.slice(0, -1) +
+			String.fromCharCode(prefix.charCodeAt(prefix.length - 1) + 1);
+		const rows = this.db
+			.prepare(
+				"SELECT id FROM knowledge_entry WHERE id >= ? AND id < ? ORDER BY id LIMIT ?",
+			)
+			.all(prefix, upper, limit) as Array<{ id: string }>;
+		return rows.map((r) => r.id);
 	}
 
 	async getEntryWithEmbedding(id: string): Promise<KnowledgeEntry | null> {
@@ -276,7 +305,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 	async getActiveEntries(): Promise<KnowledgeEntry[]> {
 		const rows = this.db
 			.prepare(
-				`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE status = 'active' ORDER BY strength DESC`,
+				`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE status = 'active'`,
 			)
 			.all() as RawEntryRow[];
 
@@ -545,8 +574,7 @@ export class KnowledgeDB implements IKnowledgeStore {
          FROM knowledge_entry ke, json_each(ke.topics) t
          WHERE ke.status IN ('active', 'conflicted')
            AND t.value IN (SELECT value FROM json_each(?))
-           AND ke.id NOT IN (SELECT value FROM json_each(?))
-         ORDER BY ke.strength DESC`,
+           AND ke.id NOT IN (SELECT value FROM json_each(?))`,
 			)
 			.all(JSON.stringify(topics), JSON.stringify(excludeIds)) as RawEntryRow[];
 
@@ -1324,17 +1352,29 @@ export class KnowledgeDB implements IKnowledgeStore {
 	// same file is refused for the duration of this store's write.
 
 	async tryAcquireConsolidationLock(): Promise<boolean> {
+		// A second acquire on the same store object is a missing release upstream.
+		// Throw, as the Postgres store does, so it is not mistaken for contention.
+		if (this.consolidationLock !== null) {
+			throw new Error(
+				"[db] tryAcquireConsolidationLock called while lock already held. " +
+					"Check for a missing releaseConsolidationLock() call.",
+			);
+		}
 		// In-memory databases are private to this process: nothing to lock across.
-		if (this.dbPath === "" || this.dbPath === ":memory:") return true;
-		if (this.consolidationLock !== null) return false;
-		this.consolidationLock = tryAcquireProcessLock(
+		if (this.dbPath === "" || this.dbPath === ":memory:") {
+			this.consolidationLock = { file: null };
+			return true;
+		}
+		const file = tryAcquireProcessLock(
 			sqliteConsolidationLockPath(this.dbPath),
 		);
-		return this.consolidationLock !== null;
+		if (file === null) return false;
+		this.consolidationLock = { file };
+		return true;
 	}
 
 	async releaseConsolidationLock(): Promise<void> {
-		this.consolidationLock?.release();
+		this.consolidationLock?.file?.release();
 		this.consolidationLock = null;
 	}
 

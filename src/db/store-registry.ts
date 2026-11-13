@@ -165,8 +165,9 @@ export class StoreRegistry {
 		}
 
 		// Create IServerStateDB — backed by local SQLite (default) or remote Postgres.
-		// Must run BEFORE knowledge stores initialize: schema v14 drops staging
-		// tables from Postgres, and the migration must copy them first.
+		// Must run BEFORE knowledge stores initialize. A Postgres state DB in the same
+		// schema must create state_schema_version first: migration v14 then recognises
+		// its staging tables as live and leaves them alone.
 		let serverStateDb: IServerStateDB;
 		try {
 			if (config.stateDb.kind === "postgres") {

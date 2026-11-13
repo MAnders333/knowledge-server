@@ -9,6 +9,7 @@ import type {
 	KnowledgeStatus,
 } from "../../types.js";
 import {
+	ID_PREFIX_PATTERN,
 	type IKnowledgeStore,
 	LAST_ACCESS_TOUCH_INTERVAL_MS,
 } from "../interface.js";
@@ -799,6 +800,26 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		);
 	}
 
+	async setEmbedding(id: string, embedding: number[]): Promise<void> {
+		const embeddingBuf = floatsToBuffer(embedding);
+		// Same column pair as updateEntry, without touching updated_at.
+		if (this.vecColumnDims !== null) {
+			await this.sql.unsafe(
+				"UPDATE knowledge_entry SET embedding = $1, embedding_vec = $2::vector WHERE id = $3",
+				[
+					embeddingBuf,
+					this.vecLiteralFor(embedding),
+					id,
+				] as postgres.ParameterOrJSON<never>[],
+			);
+		} else {
+			await this.sql.unsafe(
+				"UPDATE knowledge_entry SET embedding = $1 WHERE id = $2",
+				[embeddingBuf, id] as postgres.ParameterOrJSON<never>[],
+			);
+		}
+	}
+
 	async getEntry(id: string): Promise<KnowledgeEntry | null> {
 		const rows = await this.sql.unsafe(
 			`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE id = $1`,
@@ -806,6 +827,20 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		);
 		if (rows.length === 0) return null;
 		return this.rowToEntry(rows[0] as unknown as RawEntryRow);
+	}
+
+	/**
+	 * Ids of entries (any status) whose id starts with `prefix`, ascending, at most
+	 * `limit`. See IKnowledgeStore.findIdsByPrefix.
+	 */
+	async findIdsByPrefix(prefix: string, limit: number): Promise<string[]> {
+		if (!ID_PREFIX_PATTERN.test(prefix)) return [];
+		// The pattern admits no LIKE wildcard, so the prefix matches literally.
+		const rows = await this.sql.unsafe(
+			"SELECT id FROM knowledge_entry WHERE id LIKE $1 ORDER BY id LIMIT $2",
+			[`${prefix}%`, limit] as postgres.ParameterOrJSON<never>[],
+		);
+		return (rows as unknown as Array<{ id: string }>).map((r) => r.id);
 	}
 
 	async getEntryWithEmbedding(id: string): Promise<KnowledgeEntry | null> {
@@ -819,7 +854,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 
 	async getActiveEntries(): Promise<KnowledgeEntry[]> {
 		const rows = await this.sql.unsafe(
-			`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE status = 'active' ORDER BY strength DESC`,
+			`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE status = 'active'`,
 		);
 		return (rows as unknown as RawEntryRow[]).map((r) => this.rowToEntry(r));
 	}
@@ -1010,8 +1045,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			     jsonb_array_elements_text(ke.topics) AS t(value)
 			WHERE ke.status IN ('active', 'conflicted')
 			  AND t.value = ANY($1::text[])
-			  AND ke.id != ALL($2::text[])
-			ORDER BY ke.strength DESC`,
+			  AND ke.id != ALL($2::text[])`,
 			[topics, excludeIds],
 		);
 
@@ -1135,14 +1169,24 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 						);
 					} else {
 						const safeType = clampKnowledgeType(mergedData.type);
-						await sql`
-							UPDATE knowledge_entry
-							SET content = ${mergedData.content}, type = ${safeType},
-							    topics = ${sql.json(mergedData.topics)},
-							    confidence = ${mergedData.confidence},
-							    embedding = NULL, updated_at = ${now}
-							WHERE id = ${newEntryId}
-						`;
+						// Clear both vectors, as clearTombstonedEmbeddings() does. ANN search reads
+						// embedding_vec, so a stale copy would keep matching the old content.
+						const vecClause =
+							this.vecColumnDims !== null ? ", embedding_vec = NULL" : "";
+						await sql.unsafe(
+							`UPDATE knowledge_entry
+							SET content = $1, type = $2, topics = $3::jsonb, confidence = $4,
+							    embedding = NULL${vecClause}, updated_at = $5
+							WHERE id = $6`,
+							[
+								mergedData.content,
+								safeType,
+								sql.json(mergedData.topics),
+								mergedData.confidence,
+								now,
+								newEntryId,
+							] as postgres.ParameterOrJSON<never>[],
+						);
 					}
 					await sql`
 						UPDATE knowledge_entry

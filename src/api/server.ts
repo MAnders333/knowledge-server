@@ -356,19 +356,21 @@ export function createApp(
 			return findWritableEntry(ref);
 		}
 		const needle = ref.toLowerCase();
-		const matches: Array<{ entry: KnowledgeEntry; store: IKnowledgeStore }> =
-			[];
+		// Only matching ids are read, at most two per store: enough to tell one from many.
+		const matches: Array<{ id: string; store: IKnowledgeStore }> = [];
 		for (const store of readDbs) {
-			for (const entry of await store.getEntries({})) {
-				if (entry.id.toLowerCase().startsWith(needle)) {
-					matches.push({ entry, store });
-				}
+			for (const id of await store.findIdsByPrefix(needle, 2)) {
+				matches.push({ id, store });
 			}
 		}
 		if (matches.length === 0) return null;
 		if (matches.length > 1) return "ambiguous";
 		const [only] = matches;
-		return writableDbs.includes(only.store) ? only : "read-only";
+		const entry = await only.store.getEntry(only.id);
+		if (!entry) return null;
+		return writableDbs.includes(only.store)
+			? { entry, store: only.store }
+			: "read-only";
 	}
 
 	// -- Helpers --
