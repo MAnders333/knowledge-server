@@ -1,6 +1,7 @@
 import { config, resolveScopedApiKey } from "../config.js";
 import { componentHealth } from "../health.js";
 import { logger } from "../logger.js";
+import { providerErrorSuffix } from "../provider-error.js";
 import type { KnowledgeType } from "../types.js";
 
 /** Texts per /embeddings request. */
@@ -291,8 +292,13 @@ export class EmbeddingClient {
 
 		if (!response.ok) {
 			const body = await response.text();
+			// The body can echo the input, so the error keeps only the status and the
+			// provider's error code. The body goes to debug logs.
+			logger.debug(
+				`[embedding] HTTP ${response.status} response body: ${body.slice(0, 500)}`,
+			);
 			throw new EmbeddingError(
-				`Embedding API error ${response.status}: ${body.slice(0, 500)}`,
+				`Embedding API error ${response.status}${providerErrorSuffix(body)}`,
 				{
 					status: response.status,
 					retryable: isRetryableStatus(response.status),

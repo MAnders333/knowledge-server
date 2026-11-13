@@ -386,6 +386,36 @@ describe("EmbeddingClient.embedBatch response handling", () => {
 		expect(err.status).toBe(400);
 	});
 
+	it("keeps the status and the provider error code, not the echoed input", async () => {
+		const client = new EmbeddingClient({ timeoutMs: 50, retryBaseDelayMs: 0 });
+		const echoed = "PROMPT-TEXT-THAT-MUST-NOT-LEAK";
+		stubFetch(() =>
+			Response.json(
+				{ error: { code: "invalid_input", message: echoed }, input: echoed },
+				{ status: 422 },
+			),
+		);
+		const err = await errorOf(client.embedBatch(texts(3), { maxRetries: 2 }));
+		expect(err.message).toContain(
+			"Embedding API error 422 (error: invalid_input)",
+		);
+		expect(err.message).not.toContain(echoed);
+		expect(err.status).toBe(422);
+		expect(err.retryable).toBe(false);
+	});
+
+	it("keeps the retry classification of a 503 whose body echoes the input", async () => {
+		const client = new EmbeddingClient({ timeoutMs: 50, retryBaseDelayMs: 0 });
+		const echoed = "ANOTHER-PROMPT-THAT-MUST-NOT-LEAK";
+		const state = stubFetch(() => new Response(echoed, { status: 503 }), ok);
+		expect(await client.embedBatch(texts(3), { maxRetries: 1 })).toEqual([
+			vec(0),
+			vec(1),
+			vec(2),
+		]);
+		expect(state.count).toBe(2);
+	});
+
 	it("retries HTTP 429 and 503 until success", async () => {
 		const client = new EmbeddingClient({ timeoutMs: 50, retryBaseDelayMs: 0 });
 		const state = stubFetch(

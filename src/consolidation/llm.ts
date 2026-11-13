@@ -19,6 +19,7 @@ import {
 	untrustedList,
 } from "../domain/untrusted.js";
 import { logger } from "../logger.js";
+import { providerErrorSuffix } from "../provider-error.js";
 import type { Episode, KnowledgeType } from "../types.js";
 import {
 	type ContradictionConflict,
@@ -246,20 +247,36 @@ function createModel(modelString: string) {
 /** Consolidation call types; each has its own timeout in config.llm.timeoutsMs. */
 type LlmCallType = keyof typeof config.llm.timeoutsMs;
 
+/** The Vercel AI SDK wraps the failed HTTP call: AI_RetryError → lastError. */
+function innerLlmError(err: Error): Error {
+	return "lastError" in err && err.lastError instanceof Error
+		? err.lastError
+		: err;
+}
+
 /**
- * Unwrap the Vercel AI SDK's error chain to surface the actual HTTP status
- * code and response body, which are otherwise buried inside AI_RetryError.
- *
- * Chain: AI_RetryError { lastError: AI_APICallError { statusCode, responseBody } }
+ * A short description of a failed model call for logs and callers: the error class,
+ * the HTTP status and the provider's error code. The message and the provider body
+ * are left out, since they can echo the prompt. See llmErrorDetail for debug logs.
  */
-function formatLlmError(err: unknown): string {
+export function formatLlmError(err: unknown): string {
+	if (!(err instanceof Error)) return "non-Error failure";
+	const inner = innerLlmError(err);
+	const status =
+		"statusCode" in inner && inner.statusCode != null
+			? ` HTTP ${inner.statusCode}`
+			: "";
+	const label =
+		"responseBody" in inner && typeof inner.responseBody === "string"
+			? providerErrorSuffix(inner.responseBody)
+			: "";
+	return `${inner.name}${status}${label}`;
+}
+
+/** The full text of a failed model call. Debug logs only: it can echo the prompt. */
+function llmErrorDetail(err: unknown): string {
 	if (!(err instanceof Error)) return String(err);
-
-	// Unwrap AI_RetryError → lastError
-	const inner =
-		"lastError" in err && err.lastError instanceof Error ? err.lastError : err;
-
-	// Extract HTTP details from AI_APICallError
+	const inner = innerLlmError(err);
 	const status =
 		"statusCode" in inner && inner.statusCode != null
 			? ` HTTP ${inner.statusCode}`
@@ -268,7 +285,6 @@ function formatLlmError(err: unknown): string {
 		"responseBody" in inner && typeof inner.responseBody === "string"
 			? ` — ${inner.responseBody.slice(0, 500)}`
 			: "";
-
 	return `${inner.message}${status}${body}`;
 }
 
@@ -334,6 +350,9 @@ async function complete(
 				logger.warn(
 					`[llm] ${callType} call to ${modelString} failed on attempt ${attempt}/${maxAttempts} — retrying in ${delay / 1000}s. Error: ${formatLlmError(err)}`,
 				);
+				logger.debug(
+					`[llm] ${callType} call to ${modelString} attempt ${attempt} detail: ${llmErrorDetail(err)}`,
+				);
 				await new Promise((resolve) => setTimeout(resolve, delay));
 			}
 		} finally {
@@ -343,6 +362,9 @@ async function complete(
 
 	logger.error(
 		`[llm] ${callType} call to ${modelString} failed after ${maxAttempts} attempt(s) — giving up. Last error: ${formatLlmError(lastError)}`,
+	);
+	logger.debug(
+		`[llm] ${callType} call to ${modelString} last error detail: ${llmErrorDetail(lastError)}`,
 	);
 	throw lastError;
 }
