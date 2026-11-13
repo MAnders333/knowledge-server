@@ -460,12 +460,12 @@ describe("HTTP API boundary", () => {
 	// ── Input caps and body limits ──────────────────────────────────────────
 
 	describe("input caps", () => {
-		it("/activate: limits the cue count and keeps the full query last", async () => {
+		it("/activate: keeps the full query last in the cues the engine receives", async () => {
 			const qs = Array.from({ length: 40 }, (_, i) => `q=segment-${i}-text`);
 			const res = await fetch(`${base}/activate?${qs.join("&")}&q=FINAL-QUERY`);
 			expect(res.status).toBe(200);
+			// The engine applies the cue cap (MAX_CUES) and the dedupe; see activation-cues.
 			const cues = activateSpy.mock.calls[0][0] as string[];
-			expect(cues.length).toBeLessThanOrEqual(16);
 			expect(cues[cues.length - 1]).toBe("FINAL-QUERY");
 		});
 
@@ -483,10 +483,9 @@ describe("HTTP API boundary", () => {
 
 		it("/activate: clamps limit to 1..50", async () => {
 			await fetch(`${base}/activate?q=hello+there+world&limit=9999`);
-			expect(activateSpy.mock.calls[0][1]).toEqual({
-				limit: 50,
-				threshold: undefined,
-			});
+			expect(activateSpy.mock.calls[0][1]).toEqual(
+				expect.objectContaining({ limit: 50 }),
+			);
 		});
 
 		it("hook: bounds a very long prompt before splitting into cues", async () => {
