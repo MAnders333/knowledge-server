@@ -289,6 +289,19 @@ function llmErrorDetail(err: unknown): string {
 }
 
 /**
+ * A failed model call, thrown by complete(). Its message is formatLlmError(cause):
+ * the error class, the HTTP status and the provider's error code, which are safe to
+ * store and show. The provider's own error stays on `cause`, where the classifiers
+ * in consolidation/errors.ts read it. It is never printed.
+ */
+export class LlmCallError extends Error {
+	constructor(cause: unknown) {
+		super(formatLlmError(cause), { cause });
+		this.name = "LlmCallError";
+	}
+}
+
+/**
  * Send a prompt to a specific model. All LLM calls go through here.
  *
  * Resilience:
@@ -343,7 +356,7 @@ async function complete(
 				logger.error(
 					`[llm] ${callType} call to ${modelString} exceeded ${budget} timeout (attempt ${attempt}/${maxAttempts}) — not retrying`,
 				);
-				throw err;
+				throw new LlmCallError(err);
 			}
 			if (attempt < maxAttempts) {
 				const delay = Math.min(retryBaseDelayMs * 2 ** (attempt - 1), 60_000);
@@ -366,7 +379,7 @@ async function complete(
 	logger.debug(
 		`[llm] ${callType} call to ${modelString} last error detail: ${llmErrorDetail(lastError)}`,
 	);
-	throw lastError;
+	throw new LlmCallError(lastError);
 }
 
 /**

@@ -4,11 +4,16 @@
  * generateText is replaced with a spy, so each test sees the exact system and
  * user prompt that would have been sent, and the response the model "returned".
  */
-import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as aiModule from "ai";
-import { isDeterministicFailure } from "../src/consolidation/errors";
+import { config } from "../src/config";
+import {
+	isDeterministicFailure,
+	providerFailureClass,
+} from "../src/consolidation/errors";
 import {
 	ConsolidationLLM,
+	LlmCallError,
 	type MergeDecision,
 	formatEpisodes,
 } from "../src/consolidation/llm";
@@ -460,5 +465,86 @@ describe("output validation: synthesis", () => {
 		expect(results.map((r) => r.content)).toEqual(["P1", "P2"]);
 		expect(results[0].sourceIds).toEqual(["id1"]);
 		expect(results[1].confidence).toBe(0.85);
+	});
+});
+
+describe("provider failures through LlmCallError", () => {
+	// Provider text is assembled as data, the way a gateway returns it.
+	const ECHO = "PROMPT-TEXT-THAT-MUST-NOT-LEAK";
+	let savedRetries: number;
+
+	beforeEach(() => {
+		savedRetries = config.llm.maxRetries;
+		config.llm.maxRetries = 0;
+	});
+	afterEach(() => {
+		config.llm.maxRetries = savedRetries;
+	});
+
+	function providerError(message: string, statusCode: number, body: unknown) {
+		return Object.assign(new Error(message), {
+			name: "AI_APICallError",
+			statusCode,
+			responseBody: JSON.stringify(body),
+		});
+	}
+
+	/** The error extraction throws when the model call is rejected with `err`. */
+	async function extractionErrorFor(err: unknown): Promise<unknown> {
+		spy ??= spyOn(aiModule, "generateText");
+		spy.mockRejectedValue(err);
+		return new ConsolidationLLM().extractKnowledge("episodes").catch((e) => e);
+	}
+
+	it("a billing rejection (400) stays transient, so it is not dead-lettered", async () => {
+		const err = await extractionErrorFor(
+			providerError("Your credit balance is too low", 400, {
+				error: { message: "Your credit balance is too low" },
+			}),
+		);
+		expect(err).toBeInstanceOf(LlmCallError);
+		expect(isDeterministicFailure(err)).toBe(false);
+		expect(providerFailureClass(err)).toBe(
+			"billing or quota rejection (HTTP 400)",
+		);
+	});
+
+	it("a content rejection (422) stays deterministic", async () => {
+		const err = await extractionErrorFor(
+			providerError(`Invalid input: ${ECHO}`, 422, {
+				detail: [{ loc: ["body", "input"], msg: ECHO, type: "string_type" }],
+			}),
+		);
+		expect(isDeterministicFailure(err)).toBe(true);
+	});
+
+	it("a rate limit (429) is transient and classed by its status", async () => {
+		const err = await extractionErrorFor(
+			providerError("slow down", 429, { error: { type: "rate_limit" } }),
+		);
+		expect(isDeterministicFailure(err)).toBe(false);
+		expect(providerFailureClass(err)).toBe("rate limited (HTTP 429)");
+	});
+
+	it("a timed-out call is classed as a timeout through the wrapper", () => {
+		const abort = Object.assign(new Error("The operation was aborted"), {
+			name: "AbortError",
+		});
+		const wrapped = new LlmCallError(abort);
+		expect(providerFailureClass(wrapped)).toBe("request timed out");
+		expect(isDeterministicFailure(wrapped)).toBe(false);
+	});
+
+	it("the wrapper's message, string form and stack carry no provider text", async () => {
+		const err = (await extractionErrorFor(
+			providerError(`Invalid input: ${ECHO}`, 422, {
+				detail: [{ loc: ["body", "input"], msg: ECHO, type: "string_type" }],
+			}),
+		)) as Error;
+		expect(err.message).toBe("AI_APICallError HTTP 422 (error: string_type)");
+		expect(`${err}`).not.toContain(ECHO);
+		expect(String(err.stack)).not.toContain(ECHO);
+		// The provider error stays on the cause, where the classifiers read it.
+		expect(err.cause).toBeInstanceOf(Error);
 	});
 });
