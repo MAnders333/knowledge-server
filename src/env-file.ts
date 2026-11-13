@@ -15,7 +15,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import * as dotenv from "dotenv";
-import { defaultDataDir } from "./config-file.js";
+import { defaultDataDir } from "./home.js";
 
 /**
  * Keys a `.env` file may never set. These change how the process loads code or

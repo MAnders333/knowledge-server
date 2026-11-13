@@ -1,8 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
-import { FLAG_SPELLINGS, parseFlag } from "./env-flag.js";
-import { homeDir } from "./home.js";
+import { parseFlag } from "./env-flag.js";
+import { defaultDataDir, homeDir } from "./home.js";
 
 /**
  * Store configuration — one entry per knowledge database.
@@ -146,15 +146,6 @@ function parsePortEnvVar(raw: string | undefined, fallback: number): number {
 }
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
-
-/**
- * Default data directory: state.db, knowledge.db, the lockfiles, the daemon
- * status file, server.log and server.pid unless stateDb.path moves them. Resolved
- * on each call so it follows HOME at call time.
- */
-export function defaultDataDir(home: string = homeDir()): string {
-	return join(home, ".local", "share", "knowledge-server");
-}
 
 /** Default config.jsonc location. */
 export function defaultConfigPath(home: string = homeDir()): string {
@@ -444,16 +435,11 @@ function validateConfigFile(
 		}
 		daemonAutoSpawn = obj.daemonAutoSpawn as boolean;
 	}
+	// DAEMON_AUTO_SPAWN overrides config.jsonc. An unknown spelling keeps the
+	// config.jsonc value here, so non-server consumers (daemon, MCP proxy) still
+	// load; config.ts reports the spelling through validateConfig().
 	const envAutoSpawn = parseFlag(process.env.DAEMON_AUTO_SPAWN);
-	if (envAutoSpawn === null) {
-		throw new Error(
-			`DAEMON_AUTO_SPAWN must be one of ${FLAG_SPELLINGS} (got "${process.env.DAEMON_AUTO_SPAWN}").`,
-		);
-	}
-	if (envAutoSpawn !== undefined) {
-		daemonAutoSpawn = envAutoSpawn;
-	}
-
+	if (typeof envAutoSpawn === "boolean") daemonAutoSpawn = envAutoSpawn;
 	// stateDb — optional, defaults to local SQLite. STATE_DB_URI env var forces Postgres.
 	let stateDb: StateDbConfig = { kind: "sqlite" };
 	if (

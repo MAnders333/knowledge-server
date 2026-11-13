@@ -9,7 +9,7 @@ import {
 	getAccessToken,
 	hasOAuthTokens,
 } from "../auth/claude-oauth.js";
-import { config } from "../config.js";
+import { anthropicRouting, config } from "../config.js";
 import type { DomainContext } from "../domain/domain-router.js";
 import {
 	UNTRUSTED_DATA_RULE,
@@ -175,13 +175,7 @@ function createModel(modelString: string) {
 	switch (providerName) {
 		case "anthropic": {
 			// Per-provider credentials take precedence over unified endpoint.
-			// baseURL: per-provider override → unified proxy path → undefined (SDK uses api.anthropic.com)
-			const apiKey = config.llm.anthropic.apiKey || config.llm.apiKey;
-			const baseURL =
-				config.llm.anthropic.baseURL ||
-				(config.llm.baseEndpoint
-					? `${config.llm.baseEndpoint}/anthropic/v1`
-					: undefined);
+			const { apiKey, baseURL } = anthropicRouting();
 
 			// When no API key is configured, fall back to Claude subscription OAuth.
 			// The custom fetch wrapper injects Authorization + beta headers and handles

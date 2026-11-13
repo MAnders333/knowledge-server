@@ -1,16 +1,12 @@
 import { existsSync } from "node:fs";
 import { basename, join } from "node:path";
 import { isPlainHttpRemote } from "./activation/key-transport.js";
-import { hasOAuthTokens } from "./auth/claude-oauth.js";
-import {
-	defaultConfigPath,
-	defaultDataDir,
-	resolveDataDir,
-} from "./config-file.js";
+import { assertOAuthBaseUrl, hasOAuthTokens } from "./auth/claude-oauth.js";
+import { defaultConfigPath, resolveDataDir } from "./config-file.js";
 import { TYPE_HALF_LIFE_DAYS } from "./domain/strength.js";
 import { envFileCandidates, preferredEnvFile } from "./env-file.js";
 import { FLAG_SPELLINGS, parseFlag } from "./env-flag.js";
-import { homeDir } from "./home.js";
+import { defaultDataDir, homeDir } from "./home.js";
 import { DEFAULT_LOG_MAX_BYTES } from "./logger.js";
 
 /** The environment a config is parsed from. */
@@ -390,6 +386,9 @@ export function parseEnv(env: Env, configPath = defaultConfigPath()) {
 		apiKey: remoteEndpoint.apiKey,
 	});
 
+	// DAEMON_AUTO_SPAWN is applied by config-file.ts, which cannot import this module.
+	// It is validated here so an unknown spelling is reported by validateConfig().
+	r.optionalFlag("DAEMON_AUTO_SPAWN");
 	const config = {
 		// Server bind address (port/host) is resolved in config-file.ts (resolveServerAddress).
 		// Optional fixed admin token — set KNOWLEDGE_ADMIN_TOKEN to use a stable token
@@ -433,9 +432,6 @@ export function parseEnv(env: Env, configPath = defaultConfigPath()) {
 		// Upload interval of the daemon the server spawns (DAEMON_UPLOAD_INTERVAL_SECONDS),
 		// or null when unset. Read through spawnedDaemonIntervalArgs().
 		daemon: {
-			// DAEMON_AUTO_SPAWN when set, else null. config-file.ts applies it over
-			// config.jsonc daemonAutoSpawn (it cannot import this module).
-			autoSpawnOverride: r.optionalFlag("DAEMON_AUTO_SPAWN") ?? null,
 			uploadIntervalSeconds:
 				r.optionalInt("DAEMON_UPLOAD_INTERVAL_SECONDS", 1) ?? null,
 		},
@@ -1033,6 +1029,15 @@ export function validateConfig(): string[] {
 	// hasOAuthTokens() does a full JSON parse so a corrupt token file does not
 	// suppress the startup error while runtime LLM calls still fail.
 	const hasAnthropicOAuth = hasOAuthTokens();
+	// The OAuth fallback is used only when no Anthropic API key is set, and then its
+	// token goes to the routed base URL. Refuse a non-official URL at startup too.
+	if (hasAnthropicOAuth && !anthropicRouting().apiKey) {
+		try {
+			assertOAuthBaseUrl(anthropicRouting().baseURL);
+		} catch (e) {
+			errors.push(e instanceof Error ? e.message : String(e));
+		}
+	}
 
 	if (
 		!hasAnthropic &&
@@ -1168,4 +1173,24 @@ export function validateConfig(): string[] {
  */
 export function configEnvIssues(): string[] {
 	return [...parsed.issues];
+}
+
+/**
+ * How the anthropic provider authenticates: the API key (per-provider, else the
+ * unified key) and the base URL (per-provider override, else the unified proxy
+ * path). The request path (consolidation/llm.ts) and validateConfig() both use
+ * this, so the startup check cannot drift from what the model call does.
+ */
+export function anthropicRouting(): {
+	apiKey: string;
+	baseURL: string | undefined;
+} {
+	return {
+		apiKey: config.llm.anthropic.apiKey || config.llm.apiKey,
+		baseURL:
+			config.llm.anthropic.baseURL ||
+			(config.llm.baseEndpoint
+				? `${config.llm.baseEndpoint}/anthropic/v1`
+				: undefined),
+	};
 }

@@ -481,11 +481,9 @@ describe("parseEnv — REDACT_SECRETS and DAEMON_AUTO_SPAWN", () => {
 		expect(parsed.config.redactSecrets).toBe(true);
 	});
 
-	it("passes DAEMON_AUTO_SPAWN through as an override, null when unset", () => {
-		expect(
-			parse({ DAEMON_AUTO_SPAWN: "off" }).config.daemon.autoSpawnOverride,
-		).toBe(false);
-		expect(parse({}).config.daemon.autoSpawnOverride).toBeNull();
+	it("reports an unknown DAEMON_AUTO_SPAWN spelling and accepts the known ones", () => {
+		expect(parse({ DAEMON_AUTO_SPAWN: "off" }).issues).toEqual([]);
+		expect(parse({}).issues).toEqual([]);
 		const parsed = parse({ DAEMON_AUTO_SPAWN: "sometimes" });
 		expect(parsed.issues[0]).toContain("DAEMON_AUTO_SPAWN must be one of");
 	});
@@ -507,19 +505,18 @@ describe("loadConfigFile — DAEMON_AUTO_SPAWN spellings", () => {
 		rmSync(dir, { recursive: true, force: true });
 	});
 
-	it("applies 0 as false over the config file, and refuses an unknown spelling", () => {
+	it("applies 0 as false over the config file, and keeps the file value for an unknown spelling", () => {
 		const configPath = join(dir, "config.jsonc");
 		writeFileSync(
 			configPath,
 			JSON.stringify({
 				stores: [{ id: "main", kind: "sqlite", writable: true }],
+				daemonAutoSpawn: true,
 			}),
 		);
 		process.env.DAEMON_AUTO_SPAWN = "0";
 		expect(loadConfigFile(configPath).daemonAutoSpawn).toBe(false);
 		process.env.DAEMON_AUTO_SPAWN = "sometimes";
-		expect(() => loadConfigFile(configPath)).toThrow(
-			/DAEMON_AUTO_SPAWN must be one of/,
-		);
+		expect(loadConfigFile(configPath).daemonAutoSpawn).toBe(true);
 	});
 });

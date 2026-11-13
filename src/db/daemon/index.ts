@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { defaultDataDir } from "../../config-file.js";
+import { defaultDataDir } from "../../home.js";
 import { logger } from "../../logger.js";
 import type { DaemonCursor } from "../../types.js";
 import { ensurePrivateFile } from "../../utils.js";
