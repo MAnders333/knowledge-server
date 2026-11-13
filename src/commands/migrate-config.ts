@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { defaultConfigPath, defaultSqlitePath } from "../config-file.js";
 import { parseFlag } from "../env-flag.js";
@@ -140,9 +140,17 @@ ${daemonBlock}
 }
 `;
 
-	// Ensure directory exists
-	mkdirSync(dirname(defaultConfigPath()), { recursive: true });
-	writeFileSync(defaultConfigPath(), content, "utf8");
+	// The config holds store credentials, so its directory and the file are owner-only.
+	// writeFileSync applies its mode only when it creates the file, so chmod covers a
+	// file that already exists.
+	const configDir = dirname(defaultConfigPath());
+	mkdirSync(configDir, { recursive: true, mode: 0o700 });
+	chmodSync(configDir, 0o700);
+	writeFileSync(defaultConfigPath(), content, {
+		encoding: "utf8",
+		mode: 0o600,
+	});
+	chmodSync(defaultConfigPath(), 0o600);
 
 	console.log(`✓ Written to ${defaultConfigPath()}`);
 	console.log("");

@@ -123,6 +123,7 @@ describe("HTTP API boundary", () => {
 	function buildApp(
 		options: {
 			adminTokenIsStable?: boolean;
+			readsProtected?: boolean;
 			readDbs?: KnowledgeDB[];
 			writableDbs?: KnowledgeDB[];
 			extraAllowedHosts?: string[];
@@ -135,6 +136,7 @@ describe("HTTP API boundary", () => {
 			consolidation: consolidationStub(),
 			adminToken: TOKEN,
 			adminTokenIsStable: options.adminTokenIsStable ?? true,
+			readsProtected: options.readsProtected ?? false,
 			readDbs: options.readDbs ?? [db],
 			writableDbs: options.writableDbs ?? [db],
 			serverPort: port,
@@ -432,7 +434,7 @@ describe("HTTP API boundary", () => {
 		});
 
 		it("requires the admin token when one is configured", async () => {
-			buildApp({ adminTokenIsStable: true });
+			buildApp({ adminTokenIsStable: true, readsProtected: true });
 			const none = await post(initialize);
 			expect(none.status).toBe(401);
 

@@ -38,7 +38,7 @@ describe("admin token gate", () => {
 	let activation: ActivationEngine;
 	let app: Hono;
 
-	function build(adminTokenIsStable: boolean): void {
+	function build(adminTokenIsStable: boolean, readsProtected = false): void {
 		app = createApp({
 			db,
 			serverStateDb,
@@ -46,6 +46,7 @@ describe("admin token gate", () => {
 			consolidation: consolidationStub(),
 			adminToken: STABLE_TOKEN,
 			adminTokenIsStable,
+			readsProtected,
 		});
 	}
 
@@ -85,7 +86,7 @@ describe("admin token gate", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	describe("stable token", () => {
+	describe("stable token, reads protected", () => {
 		beforeEach(() => {
 			// The routes under test call the activation engine: stub it, no embedder.
 			spyOn(activation, "activate").mockResolvedValue({
@@ -93,7 +94,7 @@ describe("admin token gate", () => {
 				query: "",
 				totalActive: 0,
 			});
-			build(true);
+			build(true, true);
 		});
 
 		it("answers /health without a token", async () => {
@@ -241,6 +242,113 @@ describe("admin token gate", () => {
 			expect(
 				(await call("/entries", { token: STABLE_TOKEN }, "10.0.0.2")).status,
 			).toBe(200);
+		});
+	});
+
+	describe("stable token, reads open (default)", () => {
+		beforeEach(() => {
+			spyOn(activation, "activate").mockResolvedValue({
+				entries: [],
+				query: "",
+				totalActive: 0,
+			});
+			build(true, false);
+		});
+
+		it.each([
+			["GET", "/status", undefined, 200],
+			["GET", "/activate?q=churn", undefined, 200],
+			["GET", "/review", undefined, 200],
+			["GET", "/entries", undefined, 200],
+			["GET", "/entries/c0ffee00", undefined, 404],
+			["POST", "/entries/c0ffee00/flag", { reason: "wrong" }, 404],
+			[
+				"POST",
+				"/hooks/claude-code/user-prompt",
+				{ prompt: "how do we rotate the admin token" },
+				200,
+			],
+		])("answers %s %s without a token", async (method, path, body, status) => {
+			const res = await call(path, {
+				method,
+				headers: { "Content-Type": "application/json" },
+				body: body === undefined ? null : JSON.stringify(body),
+			});
+			expect(res.status).toBe(status);
+		});
+
+		it("answers /mcp without a token", async () => {
+			const res = await call("/mcp", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Accept: "application/json, text/event-stream",
+				},
+				body: JSON.stringify({
+					jsonrpc: "2.0",
+					id: 1,
+					method: "initialize",
+					params: {
+						protocolVersion: "2025-03-26",
+						capabilities: {},
+						clientInfo: { name: "auth-test", version: "1.0.0" },
+					},
+				}),
+			});
+			expect(res.status).toBe(200);
+		});
+
+		it.each([
+			["POST", "/consolidate", undefined, 200],
+			["POST", "/reinitialize?confirm=yes", undefined, 200],
+			["PATCH", "/entries/c0ffee00", { content: "edited" }, 404],
+			["DELETE", "/entries/c0ffee00", undefined, 404],
+			["POST", "/entries/c0ffee00/resolve", { resolution: "delete" }, 404],
+		])(
+			"requires the token for %s %s, and accepts it",
+			async (method, path, body, status) => {
+				const options = {
+					method,
+					headers: { "Content-Type": "application/json" },
+					body: body === undefined ? null : JSON.stringify(body),
+				};
+				expect((await call(path, options)).status).toBe(401);
+				expect(
+					(await call(path, { ...options, token: STABLE_TOKEN })).status,
+				).toBe(status);
+			},
+		);
+
+		it("keeps the flag route open without a token", async () => {
+			const res = await call("/entries/ffffffff/flag", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ reason: "wrong" }),
+			});
+			expect(res.status).toBe(404);
+		});
+
+		it("throttles failed attempts on admin routes, and never throttles reads", async () => {
+			const bad = { method: "DELETE", token: "wrong-token-0000" };
+			for (let i = 0; i < 10; i++) {
+				expect((await call("/entries/c0ffee00", bad, "10.0.0.1")).status).toBe(
+					401,
+				);
+			}
+			expect((await call("/entries/c0ffee00", bad, "10.0.0.1")).status).toBe(
+				429,
+			);
+			// A correct token still gets through on that address; reads are not gated.
+			expect(
+				(
+					await call(
+						"/entries/c0ffee00",
+						{ method: "DELETE", token: STABLE_TOKEN },
+						"10.0.0.1",
+					)
+				).status,
+			).toBe(404);
+			expect((await call("/entries", {}, "10.0.0.1")).status).toBe(200);
 		});
 	});
 

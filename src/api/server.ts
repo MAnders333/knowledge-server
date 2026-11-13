@@ -99,9 +99,11 @@ function clientAddressOf(c: Context): string {
  * Auth:
  * - Random token (default, per process): printed to the console once, and only when
  *   stdout is a terminal. Mutation routes require `Authorization: Bearer <token>`.
- *   Other routes are open to loopback clients that pass the Host and Origin checks.
- * - Stable token (KNOWLEDGE_ADMIN_TOKEN): every route except /health requires the same
- *   Bearer token. Failed attempts are throttled per client address (429, Retry-After).
+ *   Reads stay open to loopback clients that pass the Host and Origin checks.
+ * - Stable token (KNOWLEDGE_ADMIN_TOKEN): mutation routes require the Bearer token.
+ *   With KNOWLEDGE_PROTECT_READS, every route except /health requires it. Failed
+ *   attempts are throttled per client address (429, Retry-After). The throttle only
+ *   bounds noise; the token's entropy is what protects it.
  */
 /**
  * The request's JSON body when it is an object. Null for malformed JSON and for
@@ -160,6 +162,12 @@ export interface CreateAppOptions {
 	extraAllowedHosts?: readonly string[];
 	/** Where the daemon's lockfile and status file live; enables the daemon checks in /status. Default none. */
 	runtime?: StatusRuntime;
+	/**
+	 * Protect reads too: with a stable admin token, every route except /health needs it.
+	 * Default false: only the admin routes need it, and reads stay open under the
+	 * Host/Origin checks. Ignored without a stable token.
+	 */
+	readsProtected?: boolean;
 }
 
 export function createApp(options: CreateAppOptions): Hono {
@@ -178,6 +186,7 @@ export function createApp(options: CreateAppOptions): Hono {
 		bindHost = "127.0.0.1",
 		extraAllowedHosts = [],
 		runtime = {},
+		readsProtected = false,
 	} = options;
 	const app = new Hono();
 	const allowlist = buildHostAllowlist(bindHost, extraAllowedHosts);
@@ -230,15 +239,27 @@ export function createApp(options: CreateAppOptions): Hono {
 		return timingSafeEqual(provided, expectedTokenDigest);
 	}
 
-	// Stable admin token: every route except /health needs its Bearer token, reads
-	// included. A correct token always passes; the throttle never refuses it. Only
-	// failed attempts are counted, and a client with too many in the current window
-	// gets 429 until the window ends. In random-token mode reads stay open to loopback
-	// clients, and only the mutation routes check the token.
+	// Stable admin token. With readsProtected, every route except /health needs its Bearer
+	// token, reads included. Otherwise only the admin routes do: mutations need the token in
+	// both modes, and reads stay open under the Host/Origin checks. A correct token always
+	// passes. Only failed attempts are counted, and a client over its limit gets 429 until
+	// its window ends.
+	const adminRoutes = [
+		{ method: "POST", path: /^\/(consolidate|reinitialize)$/ },
+		{ method: "PATCH", path: /^\/entries\/[^/]+$/ },
+		{ method: "DELETE", path: /^\/entries\/[^/]+$/ },
+		{ method: "POST", path: /^\/entries\/[^/]+\/resolve$/ },
+	];
 	const authFailures = new AuthFailureThrottle();
 	if (adminTokenIsStable) {
 		app.use("*", async (c, next) => {
-			if (c.req.path === "/health" || requireAdminToken(c)) return next();
+			const path = c.req.path;
+			const needsToken = readsProtected
+				? path !== "/health"
+				: adminRoutes.some(
+						(r) => r.method === c.req.method && r.path.test(path),
+					);
+			if (!needsToken || requireAdminToken(c)) return next();
 			const client = clientAddressOf(c);
 			const blockedMs = authFailures.blockedForMs(client);
 			if (blockedMs > 0) {

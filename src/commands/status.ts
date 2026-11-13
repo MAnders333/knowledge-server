@@ -69,15 +69,20 @@ interface ServerHealth {
 }
 
 /**
- * Health verdict from a running server's GET /status. Null when the server does
- * not answer or the reply has no health field (for example an older server).
+ * Health verdict from a running server's GET /status. Null when the server does not
+ * answer or the reply has no health field (for example an older server). With a stable
+ * admin token the server may require it on /status (KNOWLEDGE_PROTECT_READS), so it is
+ * sent when given.
  */
 export async function fetchServerHealth(
 	baseUrl: string,
 	timeoutMs = 2000,
+	adminToken: string | null = null,
 ): Promise<ServerHealth | null> {
 	try {
 		const res = await fetch(`${baseUrl}/status`, {
+			headers:
+				adminToken === null ? {} : { Authorization: `Bearer ${adminToken}` },
 			signal: AbortSignal.timeout(timeoutMs),
 		});
 		if (!res.ok) return null;
@@ -124,6 +129,7 @@ export function serverStateLine(
 export async function runStatus(
 	pidPath: string,
 	legacyPidPath: string | null = null,
+	adminToken: string | null = null,
 ): Promise<void> {
 	// Server running state — detected via PID file.
 	const located = locatePidFile(pidPath, legacyPidPath);
@@ -135,6 +141,8 @@ export async function runStatus(
 	const address = resolveServerAddress();
 	const serverHealth = await fetchServerHealth(
 		`http://${address.host}:${address.port}`,
+		2000,
+		adminToken,
 	);
 	const healthLine = serverHealth
 		? serverHealth.reasons.length > 0
