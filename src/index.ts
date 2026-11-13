@@ -427,9 +427,8 @@ Run \`knowledge-server help-advanced\` for additional commands.
 
 	// Start server — PID file written after this succeeds so it only exists
 	// when a port is truly bound.
-	let server: ReturnType<typeof serve>;
 	try {
-		server = serve({
+		serve({
 			// The socket peer, not a forwarded header, keys the failed-auth throttle.
 			fetch: (req, bunServer) =>
 				app.fetch(req, { remoteAddress: bunServer.requestIP(req)?.address }),

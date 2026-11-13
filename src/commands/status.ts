@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import pkg from "../../package.json" with { type: "json" };
 import { resolveServerAddress } from "../config-file.js";
 import { StoreRegistry } from "../db/store-registry.js";
