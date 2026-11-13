@@ -775,3 +775,142 @@ describe("unavailable store and the batch window", () => {
 		}
 	});
 });
+
+describe("episodes blocked after extraction", () => {
+	/** Routing config: "work" is a configured domain whose store is unavailable. */
+	function workUnavailableRouter(workDb: KnowledgeDB): DomainRouter {
+		const homeDir = homedir();
+		const routedConfig = {
+			userId: "alice",
+			stores: [
+				{ id: "personal", kind: "sqlite", writable: true },
+				{ id: "work", kind: "sqlite", writable: true },
+			],
+			domains: [
+				{ id: "personal", description: "Personal", store: "personal" },
+				{ id: "work", description: "Work", store: "work" },
+			],
+			projects: [
+				{ path: `${homeDir}/work`, default_domain: "work" },
+				{ path: `${homeDir}/personal`, default_domain: "personal" },
+			],
+		} as unknown as KnowledgeServerConfig;
+		const stores = new Map<string, IKnowledgeStore>([
+			["personal", db],
+			["work", workDb],
+		]);
+		return new DomainRouter(routedConfig, stores, db, new Set(["work"]));
+	}
+
+	function routedEngine(router: DomainRouter): ConsolidationEngine {
+		const activation = new ActivationEngine(db);
+		spyOn(activation.embeddings, "embed").mockImplementation(async (text) =>
+			uniqueEmbedding(seenEmbeddings, text),
+		);
+		return new ConsolidationEngine(
+			db,
+			state,
+			activation,
+			[new PendingEpisodesReader(state)],
+			router,
+		);
+	}
+
+	it("an entry routed to the unavailable store is not extracted again in later batches of the drain", async () => {
+		const workDb = new KnowledgeDB(join(tempDir, "work-blocked.db"));
+		try {
+			const routed = routedEngine(workUnavailableRouter(workDb));
+			const home = homedir();
+			const now = Date.now();
+			// The blocked episode is the oldest, so it is settled first in the drain.
+			await state.insertPendingEpisode(
+				pendingRow({
+					id: "blocked",
+					sessionId: "session-blocked",
+					directory: `${home}/personal/notes`,
+					content: "ROUTE-TO-WORK the release notes.",
+					maxMessageTime: now - 5000,
+				}),
+			);
+			await state.insertPendingEpisode(
+				pendingRow({
+					id: "healthy",
+					sessionId: "session-healthy",
+					directory: `${home}/personal/notes`,
+					content: "Healthy session content.",
+					maxMessageTime: now - 1000,
+				}),
+			);
+			const extract = spyOn(
+				ConsolidationLLM.prototype,
+				"extractKnowledge",
+			).mockImplementation(async (summary: string) =>
+				summary.includes("ROUTE-TO-WORK")
+					? [entry("Ship the release on Fridays.", "work")]
+					: [entry("Use tabs for indentation.")],
+			);
+
+			// The drain loop: batches share one `attempted` set until a batch settles nothing.
+			const attempted = new Set<string>();
+			for (let batch = 0; batch < 5; batch++) {
+				const result = await routed.consolidate({ attempted });
+				if (result.sessionsProcessed === 0) break;
+			}
+
+			// One extraction for each episode. The blocked one is not paid for again.
+			expect(extract).toHaveBeenCalledTimes(2);
+			const waiting = await state.getPendingEpisodes(0);
+			expect(waiting.map((r) => r.id)).toEqual(["blocked"]);
+			expect(waiting[0].failedAttempts ?? 0).toBe(0);
+
+			// A later drain (a new `attempted` set) tries it again: it was deferred, not failed.
+			await routed.consolidate();
+			expect(extract).toHaveBeenCalledTimes(3);
+		} finally {
+			await workDb.close();
+		}
+	});
+
+	it("a store lock taken between the check and the write blocks the episode for the rest of the drain", async () => {
+		const now = Date.now();
+		await state.insertPendingEpisode(
+			pendingRow({
+				id: "locked-late",
+				sessionId: "session-locked-late",
+				content: "Late lock content.",
+				maxMessageTime: now - 5000,
+			}),
+		);
+		await state.insertPendingEpisode(
+			pendingRow({
+				id: "healthy",
+				sessionId: "session-healthy",
+				content: "Healthy session content.",
+				maxMessageTime: now - 1000,
+			}),
+		);
+		// Per chunk: one check before extraction (free, then released), one lock
+		// attempt at write time. The write attempt of the first chunk finds it held.
+		spyOn(db, "tryAcquireConsolidationLock")
+			.mockResolvedValueOnce(true)
+			.mockResolvedValueOnce(false)
+			.mockResolvedValueOnce(true)
+			.mockResolvedValueOnce(true)
+			.mockResolvedValue(true);
+		const extract = spyOn(
+			ConsolidationLLM.prototype,
+			"extractKnowledge",
+		).mockResolvedValue([entry("Use tabs for indentation.")]);
+
+		const attempted = new Set<string>();
+		for (let batch = 0; batch < 5; batch++) {
+			const result = await engine.consolidate({ attempted });
+			if (result.sessionsProcessed === 0) break;
+		}
+
+		expect(extract).toHaveBeenCalledTimes(2);
+		const waiting = await state.getPendingEpisodes(0);
+		expect(waiting.map((r) => r.id)).toEqual(["locked-late"]);
+		expect(waiting[0].failedAttempts ?? 0).toBe(0);
+	});
+});

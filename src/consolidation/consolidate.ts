@@ -50,12 +50,23 @@ const MAX_CHUNK_TOKENS = 150_000;
 /**
  * How a chunk ended in processChunk():
  * - completed: every store that received entries succeeded; episodes are recorded.
- * - deferred:  nothing was written because a store was unavailable or its lock
- *              was held by another process. Not counted as an attempt.
+ * - deferred:  stopped before extraction because a store was unavailable or its
+ *              lock was held by another process. No LLM call was made; the episodes
+ *              stay eligible for the next batch of the drain.
+ * - blocked:   extraction ran, but a store was unavailable or its lock was held.
+ *              Nothing was written. The episodes stay out of the rest of this drain,
+ *              so the same extraction is not paid again. Not an attempt.
+ * - transient: extraction or a store write failed for a retryable reason. The
+ *              episodes stay out of the rest of this drain. Not an attempt.
  * - failed:    extraction or a store write threw. The episodes stay pending and
  *              their failed-attempt count is incremented.
  */
-type ChunkOutcome = "completed" | "deferred" | "transient" | "failed";
+type ChunkOutcome =
+	| "completed"
+	| "deferred"
+	| "blocked"
+	| "transient"
+	| "failed";
 
 interface ChunkResult {
 	outcome: ChunkOutcome;
@@ -69,7 +80,7 @@ interface ChunkResult {
 	touchedStores: Set<IKnowledgeStore>;
 }
 
-/** Thrown when another process holds a store's consolidation lock. The chunk is deferred, not failed. */
+/** Thrown when another process holds a store's consolidation lock. The chunk is blocked, not failed. */
 class StoreLockHeldError extends Error {}
 
 /** Consolidation health as seen by this process (exposed through /status). */
@@ -280,6 +291,8 @@ export class ConsolidationEngine {
 
 	/**
 	 * Public entry point. Delegates to _consolidate().
+	 * `attempted` is the drain's set of episode keys to skip in later batches: the
+	 * caller passes the same set to every batch (see consolidateSource).
 	 *
 	 * **Two-layer locking contract:**
 	 *
@@ -639,10 +652,11 @@ export class ConsolidationEngine {
 					startMessageId: ep.startMessageId,
 					endMessageId: ep.endMessageId,
 				}));
-				// Only episodes that failed or hit a transient error are kept out of later
-				// batches of this drain. Deferred episodes (store locked or unavailable)
-				// stay eligible: a contended drain must not leave the backlog for the next
-				// poll tick.
+				// Episodes that failed, hit a transient error, or were blocked after
+				// extraction stay out of later batches of this drain. A blocked chunk (a
+				// store unavailable or locked once extraction had run) would otherwise pay
+				// for the same extraction again. Only "failed" counts as an attempt. A
+				// deferral before extraction (store locked or unavailable) stays eligible.
 				if (result.outcome === "completed") {
 					this._runProgress.completedChunks++;
 					outcome.completed.push(...keys);
@@ -657,6 +671,8 @@ export class ConsolidationEngine {
 						this._runProgress.transientChunks++;
 						this._runProgress.providerFailure = result.providerFailure;
 					}
+				} else if (result.outcome === "blocked") {
+					for (const key of keys) attempted.add(episodeKeyId(key));
 				}
 			}
 		}
@@ -762,9 +778,10 @@ export class ConsolidationEngine {
 	 * Outcome (see ChunkOutcome): the chunk is "completed" only when every store
 	 * that received entries succeeded. Only then are its episodes recorded in
 	 * consolidated_episode. A failed store makes the chunk "failed"; a store whose
-	 * lock was held makes it "deferred". Neither records anything, so the pending
-	 * rows stay for the next run. Re-extraction dedups against what was already
-	 * written, because reconsolidate() is idempotent via embedding similarity.
+	 * lock was held, or an unavailable domain store, makes it "blocked". Neither
+	 * records anything, so the pending rows stay for the next run. Re-extraction
+	 * dedups against what was already written, because reconsolidate() is
+	 * idempotent via embedding similarity.
 	 *
 	 * The outcome depends only on the stores the chunk's entries were written to,
 	 * not on each episode's own directory. An episode whose entries all landed in
@@ -846,7 +863,7 @@ export class ConsolidationEngine {
 			logger.warn(
 				`[consolidation/${source}] Deferring chunk — store for domain "${unavailableDomain}" is unavailable; nothing written, episodes kept for retry.`,
 			);
-			return { outcome: "deferred", ...none };
+			return { outcome: "blocked", ...none };
 		}
 
 		// Use the max message time of the chunk as the session timestamp for new entries.
@@ -920,7 +937,7 @@ export class ConsolidationEngine {
 		let outcome: ChunkOutcome = "completed";
 		if (failure !== undefined) outcome = "failed";
 		else if (transientFailure !== undefined) outcome = "transient";
-		else if (deferred) outcome = "deferred";
+		else if (deferred) outcome = "blocked";
 
 		if (outcome === "completed") {
 			// Only reached when every store that received entries succeeded, or when
@@ -1109,7 +1126,7 @@ export class ConsolidationEngine {
 			logger.log(
 				`[consolidation/${source}] Skipping store — consolidation lock held by another process. Episodes will be retried.`,
 			);
-			// Typed so processChunk defers this store (retry later, no attempt
+			// Typed so processChunk blocks this store (retry later, no attempt
 			// counted) instead of treating it as a failed write.
 			throw new StoreLockHeldError(
 				"consolidation lock held by another process",
