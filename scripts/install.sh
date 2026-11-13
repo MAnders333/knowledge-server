@@ -531,7 +531,11 @@ WRAPPER
   step=$((step + 1))
 
   echo "  $step. Verify it's running:"
-  echo "     curl http://127.0.0.1:3179/status"
+  if [ -n "${KNOWLEDGE_ADMIN_TOKEN:-}" ]; then
+    echo "     curl -H \"Authorization: Bearer \$KNOWLEDGE_ADMIN_TOKEN\" http://127.0.0.1:3179/status"
+  else
+    echo "     curl http://127.0.0.1:3179/status"
+  fi
   echo ""
   echo "The OpenCode plugin is already active — no restart needed."
   echo "The MCP 'activate' tool is available in any session once you add the config block above."

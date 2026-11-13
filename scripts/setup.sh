@@ -154,18 +154,23 @@ echo ""
 echo "Setup complete!"
 echo ""
 echo "Next steps:"
+# With a stable admin token, /status may need it, so the hint carries the header.
+status_curl="curl http://127.0.0.1:3179/status"
+if [ -n "${KNOWLEDGE_ADMIN_TOKEN:-}" ]; then
+  status_curl='curl -H "Authorization: Bearer $KNOWLEDGE_ADMIN_TOKEN" http://127.0.0.1:3179/status'
+fi
 if [ "$ENV_CONFIGURED" = "false" ]; then
   echo "  1. Edit $PROJECT_DIR/.env — set LLM_API_KEY and LLM_BASE_ENDPOINT"
   echo "  2. Add the MCP block above to ~/.config/opencode/opencode.jsonc"
   echo "  3. (Claude Code) Register the MCP server and hook:"
   echo "       bun run $PROJECT_DIR/src/index.ts setup-tool claude-code"
   echo "  4. Start the server:  cd $PROJECT_DIR && bun run start"
-  echo "  5. Check status:  curl http://127.0.0.1:3179/status"
+  echo "  5. Check status:  $status_curl"
 else
   echo "  1. Add the MCP block above to ~/.config/opencode/opencode.jsonc"
   echo "  2. (Claude Code) Register the MCP server and hook:"
   echo "       bun run $PROJECT_DIR/src/index.ts setup-tool claude-code"
   echo "  3. Start the server:  cd $PROJECT_DIR && bun run start"
-  echo "  4. Check status:  curl http://127.0.0.1:3179/status"
+  echo "  4. Check status:  $status_curl"
 fi
 echo ""

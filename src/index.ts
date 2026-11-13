@@ -119,7 +119,7 @@ async function main() {
 
 	// `knowledge-server status`
 	if (subcommand === "status") {
-		await runStatus(config.pidPath, config.legacyPidPath);
+		await runStatus(config.pidPath, config.legacyPidPath, config.adminToken);
 		process.exit(0);
 	}
 
@@ -405,6 +405,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		bindHost: registry.host,
 		extraAllowedHosts: config.allowedHosts,
 		runtime: { dataDir, daemonAutoSpawn: registry.daemonAutoSpawn },
+		readsProtected: config.protectReads,
 	});
 
 	// port/host/daemonAutoSpawn come from the registry (config.jsonc with env var override)
@@ -420,7 +421,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	const loopbackHosts = ["127.0.0.1", "::1", "localhost"];
 	if (!loopbackHosts.includes(bindHost)) {
 		logger.error(
-			`"host" is set to "${host}", which exposes the server on non-loopback interfaces with no authentication. Only use 127.0.0.1 unless you have added authentication and understand the security implications.`,
+			`"host" is set to "${host}", which exposes the server on non-loopback interfaces${config.protectReads ? "" : " with no authentication on reads"}. Only use 127.0.0.1 unless you have added authentication and understand the security implications.`,
 		);
 		process.exit(1);
 	}
@@ -462,6 +463,12 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		removeOwnPidFile(config.pidPath);
 	};
 
+	// Reads are protected only with a stable token and KNOWLEDGE_PROTECT_READS; the
+	// banner says which mode is running.
+	const readAuth =
+		adminTokenIsStable && config.protectReads
+			? "[admin token required]"
+			: "(open — local only)";
 	logger.raw(`\n✓ HTTP API listening on http://${host}:${port}`);
 	logger.raw("  GET  /activate?q=...                  — Activate knowledge");
 	logger.raw(
@@ -471,13 +478,19 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	logger.raw("  GET  /status                           — Health check");
 	logger.raw("  GET  /entries                          — List entries");
 	logger.raw(
-		"  POST /hooks/claude-code/user-prompt    — Claude Code hook (unauthenticated)",
+		`  POST /hooks/claude-code/user-prompt    — Claude Code hook ${readAuth}`,
 	);
 	logger.raw(
-		`  ALL  /mcp                              — MCP streamable-http${adminTokenIsStable ? " [admin token required]" : " (unauthenticated — local only)"}`,
+		`  ALL  /mcp                              — MCP streamable-http ${readAuth}`,
 	);
 	if (process.stdout.isTTY) {
-		logger.rawStdoutOnly(`\n  Admin token (keep this private): ${adminToken}`);
+		// Only a generated token is printed. A stable one is the user's own value, so the
+		// banner names its source and never echoes it.
+		logger.rawStdoutOnly(
+			adminTokenIsStable
+				? "\n  Admin token: from KNOWLEDGE_ADMIN_TOKEN (not printed)."
+				: `\n  Admin token (keep this private): ${adminToken}`,
+		);
 	} else {
 		// Non-terminal stdout is usually a log file (launchd/systemd/nohup redirect),
 		// so the token is never printed there.
