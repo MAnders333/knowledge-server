@@ -430,7 +430,9 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	let server: ReturnType<typeof serve>;
 	try {
 		server = serve({
-			fetch: app.fetch,
+			// The socket peer, not a forwarded header, keys the failed-auth throttle.
+			fetch: (req, bunServer) =>
+				app.fetch(req, { remoteAddress: bunServer.requestIP(req)?.address }),
 			port,
 			hostname: bindHost,
 			idleTimeout: 255, // max allowed by Bun — consolidation can take a while
