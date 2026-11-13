@@ -488,6 +488,17 @@ describe("HTTP API boundary", () => {
 			);
 		});
 
+		it("/activate: the client's budget reaches the engine (codex has less)", async () => {
+			await fetch(`${base}/activate?q=hello+there+world&client=codex`);
+			expect(activateSpy.mock.calls[0][1]).toEqual(
+				expect.objectContaining({ budgetMs: 3_500 }),
+			);
+			await fetch(`${base}/activate?q=hello+there+world&client=opencode`);
+			expect(activateSpy.mock.calls[1][1]).toEqual(
+				expect.objectContaining({ budgetMs: 4_500 }),
+			);
+		});
+
 		it("hook: bounds a very long prompt before splitting into cues", async () => {
 			const line = "a reasonably long prompt line of text\n";
 			const prompt = line.repeat(1000); // ~38k chars, ~1000 segments

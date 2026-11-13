@@ -11,6 +11,7 @@ import { splitIntoCues } from "../activation/activate.js";
 import {
 	CLIENT_HEADER,
 	type ClientTag,
+	activationBudgetMs,
 	parseClientTag,
 } from "../activation/client.js";
 import {
@@ -522,6 +523,7 @@ export function createApp(
 					threshold,
 					session: sessionDedupeKey(client, sessionId),
 					requestStartedAt: started,
+					budgetMs: activationBudgetMs(client),
 				},
 			);
 			const latencyMs = Math.round(performance.now() - started);
@@ -1222,6 +1224,7 @@ export function createApp(
 					limit: 8,
 					session: sessionDedupeKey(client, sessionId),
 					requestStartedAt: started,
+					budgetMs: activationBudgetMs(client),
 				});
 				const latencyMs = Math.round(performance.now() - started);
 				logActivation(client, prompt, result.entries);

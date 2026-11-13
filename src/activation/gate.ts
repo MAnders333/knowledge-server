@@ -10,8 +10,10 @@
  *      Any other ordering (rerank disabled, failed, skipped or out of time): the raw
  *      cosine must reach the similarity threshold plus a margin.
  *   2. Support sources. An entry pulled in by relation expansion inherits no
- *      rerank score. It is gated at 0.9× its parent's gate score, the same
- *      discount it carries in ranking, so expansion cannot bypass the floor.
+ *      rerank score. When a reranker scored the candidates, or ACTIVATION_DENSE_MARGIN
+ *      is set, it is gated at 0.9× its parent's gate score, the same discount it
+ *      carries in ranking, so expansion cannot bypass the floor. Otherwise sources
+ *      are not gated.
  *   3. Token budget. The block is capped at a token estimate. The top-ranked
  *      entry is always kept.
  *

@@ -341,6 +341,55 @@ describe("precision gate in the engine", () => {
 		expect(ids(kept)).toContain("source-entry");
 	});
 
+	it("at margin 0 without rerank, support sources are not gated", async () => {
+		gate.denseMargin = 0;
+		const parent = makeEntry({
+			id: "parent-principle",
+			type: "principle",
+			content: "zulu principle",
+			topics: [],
+			embedding: vecWithCos(0.45),
+		});
+		const source = makeEntry({
+			id: "source-entry",
+			type: "fact",
+			content: "yankee source",
+			topics: [],
+		});
+		const engine = engineFor({
+			entries: [parent],
+			sources: new Map([[parent.id, [source]]]),
+		});
+		// The parent clears the bare threshold. Gated at 0.9x it would score 0.405 and
+		// fail the floor, so the source is kept only because it is not gated.
+		const kept = await engine.activate(CUE, { threshold: 0.42 });
+		expect(ids(kept)).toEqual(["parent-principle", "source-entry"]);
+	});
+
+	it("with a dense margin, support sources are gated at 0.9x their parent", async () => {
+		gate.denseMargin = 0.01;
+		const parent = makeEntry({
+			id: "parent-principle",
+			type: "principle",
+			content: "zulu principle",
+			topics: [],
+			embedding: vecWithCos(0.45),
+		});
+		const source = makeEntry({
+			id: "source-entry",
+			type: "fact",
+			content: "yankee source",
+			topics: [],
+		});
+		const engine = engineFor({
+			entries: [parent],
+			sources: new Map([[parent.id, [source]]]),
+		});
+		// Floor 0.43: the parent (0.45) passes; its source (0.405) does not.
+		const kept = await engine.activate(CUE, { threshold: 0.42 });
+		expect(ids(kept)).toEqual(["parent-principle"]);
+	});
+
 	it("dense floor applies when rerank fails, and the response fails open", async () => {
 		gate.denseMargin = 0.1;
 		const engine = engineFor(

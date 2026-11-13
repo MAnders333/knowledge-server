@@ -29,6 +29,7 @@ import { ActivationEngine } from "../src/activation/activate";
 import { cosineSimilarity } from "../src/activation/embeddings";
 import type { RerankScorer } from "../src/activation/rerank";
 import { config } from "../src/config";
+import { logger } from "../src/logger";
 import type { IKnowledgeStore } from "../src/types";
 import type { KnowledgeEntry } from "../src/types";
 import { makeEntry } from "./fixtures";
@@ -327,39 +328,16 @@ describe("ActivationEngine rerank stage", () => {
 	});
 });
 
-describe("rerank time budget and session slots", () => {
-	const gate = config.activation.gate as {
-		enabled: boolean;
-		sessionTtlMs: number;
-	};
-	const rerankCfg = config.activation.rerank as { candidates: number };
-	let saved = { enabled: true, sessionTtlMs: 0, candidates: 16 };
+describe("rerank time budget", () => {
+	const gate = config.activation.gate as { enabled: boolean };
+	let gateWasOn = true;
 	beforeEach(() => {
-		saved = {
-			enabled: gate.enabled,
-			sessionTtlMs: gate.sessionTtlMs,
-			candidates: rerankCfg.candidates,
-		};
+		gateWasOn = gate.enabled;
 		gate.enabled = false;
-		gate.sessionTtlMs = 60_000;
 	});
 	afterEach(() => {
-		gate.enabled = saved.enabled;
-		gate.sessionTtlMs = saved.sessionTtlMs;
-		rerankCfg.candidates = saved.candidates;
+		gate.enabled = gateWasOn;
 	});
-
-	/** Embedding whose cosine with QUERY_EMB is `cos`. */
-	const withCos = (cos: number) => [
-		cos,
-		Math.sqrt(1 - cos * cos),
-		0,
-		0,
-		0,
-		0,
-		0,
-		0,
-	];
 
 	type Call = { docs: string[]; budgetMs?: number };
 	/** Scorer that records each call and scores every document 0.9. */
@@ -420,29 +398,15 @@ describe("rerank time budget and session slots", () => {
 		expect(scorer.calls[0]?.budgetMs).toBeUndefined();
 	});
 
-	it("an entry already shown in this session does not take one of the rerank slots", async () => {
-		rerankCfg.candidates = 3;
-		const entries = [
-			...makeEntries(),
-			makeEntry({ id: "x", content: "dense x", embedding: withCos(0.45) }),
-			makeEntry({ id: "y", content: "dense y", embedding: withCos(0.42) }),
-		] as Array<KnowledgeEntry & { embedding: number[] }>;
-		const store = makeStoreStub(entries, { supportAnn: true });
-		store.recordInjections = mock(() => Promise.resolve());
+	it("logs one info line when the request budget leaves no time for rerank", async () => {
+		const info = spyOn(logger, "log").mockImplementation(() => {});
 		const scorer = recordingScorer();
-		const engine = new ActivationEngine(store, undefined, undefined, scorer);
-		spyOn(engine.embeddings, "embedBatch").mockResolvedValue([QUERY_EMB]);
-
-		const first = await engine.activate("test query", { session: "s-1" });
-		engine.commitInjections(first.injection);
-		await engine.activate("test query", { session: "s-1" });
-
-		expect(scorer.calls[0].docs.some((d) => d.includes("dense high"))).toBe(
-			true,
+		await engineWith(makeEntries(), scorer).activate("test query", {
+			requestStartedAt: performance.now() - 4_400,
+		});
+		expect(scorer.calls).toHaveLength(0);
+		expect(info).toHaveBeenCalledWith(
+			expect.stringContaining("rerank skipped: request budget"),
 		);
-		const second = scorer.calls[1].docs.join("\n");
-		expect(second).toContain("dense x");
-		expect(second).toContain("dense y");
-		expect(second).not.toContain("dense high");
 	});
 });
