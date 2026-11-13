@@ -676,3 +676,41 @@ describe("validateConfig: remote reranker", () => {
 		expect(remoteErrors()).toEqual([]);
 	});
 });
+
+describe("default candidate pool", () => {
+	/** Candidate count read in a child process, so the config singleton loads fresh. */
+	function candidatesWith(env: Record<string, string>): number {
+		const childEnv = Object.fromEntries(
+			Object.entries(process.env).filter(
+				([name]) => name !== "RERANK_CANDIDATES" && name !== "RERANK_PROVIDER",
+			),
+		);
+		const configPath = new URL("../src/config.ts", import.meta.url).pathname;
+		const child = Bun.spawnSync({
+			cmd: [
+				process.execPath,
+				"-e",
+				`import { config } from ${JSON.stringify(configPath)}; console.log(config.activation.rerank.candidates);`,
+			],
+			env: { ...childEnv, ...env },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(child.exitCode).toBe(0);
+		return Number(child.stdout.toString().trim().split("\n").pop());
+	}
+
+	it("is 30 for the remote reranker when RERANK_CANDIDATES is unset", () => {
+		expect(candidatesWith({ RERANK_PROVIDER: "remote" })).toBe(30);
+	});
+
+	it("keeps an explicit RERANK_CANDIDATES for the remote reranker", () => {
+		expect(
+			candidatesWith({ RERANK_PROVIDER: "remote", RERANK_CANDIDATES: "16" }),
+		).toBe(16);
+	});
+
+	it("stays 16 for the local reranker", () => {
+		expect(candidatesWith({})).toBe(16);
+	});
+});
