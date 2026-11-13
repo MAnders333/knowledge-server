@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { EXTENSION_ASSETS } from "../src/commands/extension-targets";
+import { parseVersion } from "../src/commands/update";
 
 const ROOT = join(import.meta.dir, "..");
 const read = (rel: string): string => readFileSync(join(ROOT, rel), "utf8");
@@ -76,6 +77,29 @@ describe("release-please configuration", () => {
 		expect(config["release-type"]).toBe("node");
 		// Bun's toHaveProperty reads "." as a path separator, so check the keys.
 		expect(Object.keys(config.packages)).toContain(".");
+	});
+
+	it("the config keeps tags unprefixed by the package name, with a v prefix", () => {
+		const config = JSON.parse(read("release-please-config.json"));
+		// Release-please defaults include-component-in-tag to true, which would tag
+		// releases knowledge-server-vX.Y.Z; install.sh and update reject that form.
+		expect(config["include-component-in-tag"]).toBe(false);
+		expect(config["include-v-in-tag"]).toBe(true);
+	});
+
+	it("the tag the config yields for the next version is one install.sh and update accept", () => {
+		const config = JSON.parse(read("release-please-config.json"));
+		const pkg = JSON.parse(read("package.json"));
+		const componentPrefix = config["include-component-in-tag"]
+			? `${pkg.name}-`
+			: "";
+		const tag = `${componentPrefix}${config["include-v-in-tag"] ? "v" : ""}3.10.4`;
+		const installerPattern = /\[\[ ! "\$VERSION" =~ (\^[^ ]+\$) \]\]/.exec(
+			read("scripts/install.sh"),
+		)?.[1];
+		expect(installerPattern).toBeDefined();
+		expect(new RegExp(installerPattern ?? "").test(tag)).toBe(true);
+		expect(parseVersion(tag)).toEqual([3, 10, 4]);
 	});
 
 	it("the manifest tracks the package.json version", () => {
