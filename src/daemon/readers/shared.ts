@@ -150,7 +150,7 @@ export function episodeFrom(
  * in `messages` (compaction summaries, messages removed from the source) are
  * ignored here; the maximum index among the rest is the watermark.
  */
-export function watermarkIndex(
+function watermarkIndex(
 	messages: EpisodeMessage[],
 	processedRanges: ProcessedRange[],
 ): number {

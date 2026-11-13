@@ -7,9 +7,9 @@ import {
 /** How often a daemon that found the lock held retries it. */
 export const DAEMON_LOCK_RETRY_MS = 30_000;
 /** Random extra delay per retry, so several waiting daemons do not retry in step. */
-export const DAEMON_LOCK_JITTER_MS = 5_000;
+const DAEMON_LOCK_JITTER_MS = 5_000;
 
-export interface DaemonLockWaitOptions {
+interface DaemonLockWaitOptions {
 	retryMs?: number;
 	jitterMs?: number;
 	/** Called once, with the holder's PID (0 when unknown), before the first wait. */

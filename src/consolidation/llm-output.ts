@@ -17,11 +17,11 @@ import { clampKnowledgeType } from "../types.js";
 import { scrubUntrusted } from "./untrusted.js";
 
 /** Longest content string accepted from the model for storage. */
-export const MAX_STORED_CONTENT_CHARS = 8000;
+const MAX_STORED_CONTENT_CHARS = 8000;
 /** Most topics kept per entry. */
-export const MAX_TOPICS = 10;
+const MAX_TOPICS = 10;
 /** Longest single topic kept. Longer topics are dropped, not truncated. */
-export const MAX_TOPIC_CHARS = 100;
+const MAX_TOPIC_CHARS = 100;
 
 /** Thrown when a model response does not have the shape we asked for. */
 export class MalformedLlmOutputError extends SyntaxError {
@@ -150,14 +150,14 @@ export const synthesisItemSchema = z.object({
 
 // ── Contradiction (one batch per call, wrapper object) ──────────────────────
 
-export const CONTRADICTION_TYPES = [
+const CONTRADICTION_TYPES = [
 	"supersede_old",
 	"supersede_new",
 	"merge",
 	"irresolvable",
 ] as const;
 
-export type ContradictionType = (typeof CONTRADICTION_TYPES)[number];
+type ContradictionType = (typeof CONTRADICTION_TYPES)[number];
 
 /**
  * Reply shape. "verdicts" (default): one result per candidate, `no_conflict`

@@ -23,7 +23,7 @@ import {
 } from "./readers/shared.js";
 
 /** Result of one polling upload cycle, reported to the daemon's status file. */
-export interface CycleOutcome {
+interface CycleOutcome {
 	ok: boolean;
 	uploaded: number;
 	error?: string;

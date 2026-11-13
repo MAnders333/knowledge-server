@@ -38,7 +38,7 @@ export const UNTRUSTED_TAGS = [
 	"addrl-activated-knowledge",
 ] as const;
 
-export type UntrustedTag = (typeof UNTRUSTED_TAGS)[number];
+type UntrustedTag = (typeof UNTRUSTED_TAGS)[number];
 
 /**
  * Matches a `<` that opens or closes one of the guarded tag names. The gap

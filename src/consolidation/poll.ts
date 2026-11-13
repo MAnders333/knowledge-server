@@ -1,7 +1,7 @@
 import { logger } from "../logger.js";
 import type { ConsolidationEngine } from "./consolidate.js";
 
-export type DecayTickResult =
+type DecayTickResult =
 	| { status: "busy" }
 	| { status: "done"; archived: number }
 	| { status: "failed" };

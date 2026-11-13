@@ -84,7 +84,7 @@ interface ChunkResult {
 class StoreLockHeldError extends Error {}
 
 /** Consolidation health as seen by this process (exposed through /status). */
-export interface ConsolidationOutcome {
+interface ConsolidationOutcome {
 	consecutiveFailures: number;
 	lastError: string | null;
 	lastErrorAt: number | null;
@@ -431,7 +431,8 @@ export class ConsolidationEngine {
 		// store — to cover stores that may have received writes in prior runs but
 		// never had metadata recorded.
 		// Only seeds when metadata is absent — the model-change path is handled
-		// exclusively by checkAndReEmbed() at startup.
+		// by checkAndReEmbed(), which runs before consolidation starts (server
+		// startup, the drain loops and the CLI).
 		for (const store of this.knowledgeStores()) {
 			if (!(await store.getEmbeddingMetadata())) {
 				const sample = await store.getOneEntryWithEmbedding();
