@@ -17,7 +17,7 @@
  * the name must still be a loopback name. Origin is checked against the same list.
  */
 
-export interface HostAllowlist {
+interface HostAllowlist {
 	/** True when a raw Host header value names an allowed host. */
 	matchesHost(hostHeader: string): boolean;
 	/** True when a raw Origin header value is an http(s) origin on an allowed host. */
