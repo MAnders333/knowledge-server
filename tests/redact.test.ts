@@ -349,6 +349,29 @@ describe("redactSecrets: lowercase and mid-line credential assignments", () => {
 		});
 	}
 
+	it("redacts a 32-character hex value after api_key=, mid-line", () => {
+		const hex = "9f8e7d6c5b4a39281706f5e4d3c2b1a0";
+		const result = redactSecrets(`run with api_key=${hex}`);
+		expect(result.text).toBe("run with api_key=[REDACTED:keyed_entropy]");
+		expect(result.text).not.toContain(hex);
+	});
+
+	it("redacts a short secret that contains a digit, mid-line", () => {
+		expectRedacted(
+			`run with db_password=${["hunter2", "x9"].join("")}`,
+			"run with db_password=[REDACTED:keyed_secret]",
+			"keyed_secret",
+		);
+	});
+
+	it("redacts a secret assigned in a code-like line", () => {
+		expectRedacted(
+			`config.db_password = "${["hunter2", "x9"].join("")}"`,
+			'config.db_password = "[REDACTED:keyed_secret]"',
+			"keyed_secret",
+		);
+	});
+
 	const prose = [
 		"the auth_token: none",
 		"api_key: see the docs",
@@ -357,8 +380,22 @@ describe("redactSecrets: lowercase and mid-line credential assignments", () => {
 		"set db_password to the new value",
 		"pass_rate=0.5",
 	];
-	for (const input of prose) {
-		it(`keeps ordinary prose unchanged: ${input}`, () => {
+	const code = [
+		"primary_key=True",
+		"next_token=None",
+		"public_key=False",
+		"cache_key=build_key(x)",
+		"db_password=$DB_PASSWORD",
+		"sort_key=lambda r: r[0]",
+		"access_token = await fetchToken()",
+		"api_key = process.env.X",
+		"partition_key: user_id",
+		'"sort_key": "created_at"',
+		"ssh-key: ~/.ssh/id_ed25519",
+		"ssh-key: /home/me/id_ed25519",
+	];
+	for (const input of [...prose, ...code]) {
+		it(`keeps ordinary prose and code unchanged: ${input}`, () => {
 			expect(redactSecrets(input)).toEqual({ text: input, counts: {} });
 		});
 	}
