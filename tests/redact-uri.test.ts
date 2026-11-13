@@ -17,6 +17,12 @@ describe("redactUriCredentials", () => {
 		);
 	});
 
+	it("masks a password that contains a raw /", () => {
+		expect(redactUriCredentials("postgres://app:pa/ss9@db/k")).toBe(
+			"postgres://app:***@db/k",
+		);
+	});
+
 	it("masks a percent-encoded password", () => {
 		expect(redactUriCredentials("postgresql://u:p%40ss@host/db")).toBe(
 			"postgresql://u:***@host/db",
@@ -39,11 +45,19 @@ describe("redactUriCredentials", () => {
 		);
 	});
 
+	it("finds the userinfo end before a query that contains @", () => {
+		expect(redactUriCredentials("postgres://u:pw@h?x=a@b")).toBe(
+			"postgres://u:***@h?x=a@b",
+		);
+	});
+
 	it("keeps a URI without a password unchanged", () => {
 		for (const uri of [
 			"postgres://user@host/db",
 			"postgres://host:5432/db",
 			"postgres://host/db?sslmode=require",
+			"postgres://u@host:5432/db?x=a@b",
+			"postgres://host/db?x=a@b",
 		]) {
 			expect(redactUriCredentials(uri)).toBe(uri);
 		}
