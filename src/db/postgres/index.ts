@@ -1170,14 +1170,24 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 						);
 					} else {
 						const safeType = clampKnowledgeType(mergedData.type);
-						await sql`
-							UPDATE knowledge_entry
-							SET content = ${mergedData.content}, type = ${safeType},
-							    topics = ${sql.json(mergedData.topics)},
-							    confidence = ${mergedData.confidence},
-							    embedding = NULL, updated_at = ${now}
-							WHERE id = ${newEntryId}
-						`;
+						// Clear both vectors, as clearTombstonedEmbeddings() does. ANN search reads
+						// embedding_vec, so a stale copy would keep matching the old content.
+						const vecClause =
+							this.vecColumnDims !== null ? ", embedding_vec = NULL" : "";
+						await sql.unsafe(
+							`UPDATE knowledge_entry
+							SET content = $1, type = $2, topics = $3::jsonb, confidence = $4,
+							    embedding = NULL${vecClause}, updated_at = $5
+							WHERE id = $6`,
+							[
+								mergedData.content,
+								safeType,
+								sql.json(mergedData.topics),
+								mergedData.confidence,
+								now,
+								newEntryId,
+							] as postgres.ParameterOrJSON<never>[],
+						);
 					}
 					await sql`
 						UPDATE knowledge_entry

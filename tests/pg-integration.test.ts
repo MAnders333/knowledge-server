@@ -1697,6 +1697,31 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		expect(await pg.findIdsByPrefix("ab_", 5)).toEqual([]);
 		expect(await pg.findIdsByPrefix("AB12", 5)).toEqual([]);
 	});
+
+	it("merge resolution clears embedding_vec together with the BYTEA embedding", async () => {
+		const pg = db as PostgresKnowledgeDB;
+		await pg.setEmbeddingMetadata("m", 4);
+		await pg.insertEntry(makeEntry("merge-new", { embedding: unitVec(4, 0) }));
+		await pg.insertEntry(makeEntry("merge-old", { embedding: unitVec(4, 1) }));
+		const [before] = await truncSql`
+			SELECT embedding_vec IS NOT NULL AS has_vec FROM knowledge_entry
+			WHERE id = 'merge-new'
+		`;
+		expect(before.has_vec).toBe(true);
+
+		await pg.applyContradictionResolution("merge", "merge-new", "merge-old", {
+			content: "Merged content",
+			type: "fact",
+			topics: ["merged"],
+			confidence: 0.9,
+		});
+
+		const [after] = await truncSql`
+			SELECT embedding IS NULL AND embedding_vec IS NULL AS cleared
+			FROM knowledge_entry WHERE id = 'merge-new'
+		`;
+		expect(after.cleared).toBe(true);
+	});
 });
 
 // ── Migrations v16/v17: pgvector setup from a v15 store ──────────────────────
