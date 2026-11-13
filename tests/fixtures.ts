@@ -4,13 +4,21 @@
 import type { KnowledgeEntry } from "../src/types";
 
 /**
+ * One timestamp for every entry built in this process. Ranking multiplies
+ * similarity by live strength, which depends on the entry's age; with a fresh
+ * Date.now() per entry, a millisecond boundary crossed while a test builds its
+ * entries gives equally similar entries different strengths and reorders ties.
+ */
+const FIXTURE_NOW = Date.now();
+
+/**
  * Build a complete KnowledgeEntry with sensible defaults.
  * Pass overrides to customise only the fields relevant to your test.
  */
 export function makeEntry(
 	overrides: Partial<KnowledgeEntry> = {},
 ): KnowledgeEntry {
-	const now = Date.now();
+	const now = FIXTURE_NOW;
 	return {
 		id: "test",
 		type: "fact",
