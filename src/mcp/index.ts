@@ -56,22 +56,58 @@ export const flagInputSchema = {
 		),
 };
 
+/**
+ * Base URL of the knowledge HTTP server at `host:port`. The proxy sends cues over
+ * plain HTTP, so only loopback hosts are accepted, the same rule the plugins apply
+ * to KNOWLEDGE_SERVER_URL.
+ */
+export function loopbackBaseUrl(host: string, port: number): string {
+	const bare = host.replace(/^\[(.*)\]$/, "$1");
+	if (bare !== "127.0.0.1" && bare !== "localhost" && bare !== "::1") {
+		throw new Error(
+			`the knowledge server host "${host}" is not loopback (127.0.0.1, localhost or ::1). The MCP proxy refuses other hosts because it sends prompts over plain HTTP. Set KNOWLEDGE_HOST or "host" in config.jsonc to a loopback address.`,
+		);
+	}
+	return `http://${bare.includes(":") ? `[${bare}]` : bare}:${port}`;
+}
+
 /** Base URL of the knowledge HTTP server (config.jsonc / KNOWLEDGE_PORT, see resolveServerAddress). */
 function serverBaseUrl(): string {
 	const { host, port } = resolveServerAddress();
-	return `http://${host}:${port}`;
+	return loopbackBaseUrl(host, port);
 }
 
 /**
- * Check whether the knowledge HTTP server is reachable.
- * Returns true if it responds to GET /status within the given timeout.
+ * Headers for read calls. A stable KNOWLEDGE_ADMIN_TOKEN makes the server require it
+ * on every route except /health, so it is sent when set and never otherwise. Flagging
+ * is read-level too and sends the same header.
+ */
+function readCallHeaders(adminToken: string | null): Record<string, string> {
+	return adminToken ? { Authorization: `Bearer ${adminToken}` } : {};
+}
+
+/**
+ * Check whether the knowledge HTTP server is reachable within the given timeout.
+ * GET /health answers any server that has it, whatever its health. A server that
+ * predates /health answers 404 there, so the probe falls back to GET /status.
  */
 async function isServerReachable(
 	baseUrl: string,
 	timeoutMs = 2000,
 ): Promise<boolean> {
+	const headers = readCallHeaders(config.adminToken);
+	try {
+		const health = await fetch(`${baseUrl}/health`, {
+			headers,
+			signal: AbortSignal.timeout(timeoutMs),
+		});
+		if (health.status !== 404) return true;
+	} catch {
+		return false;
+	}
 	try {
 		const res = await fetch(`${baseUrl}/status`, {
+			headers,
 			signal: AbortSignal.timeout(timeoutMs),
 		});
 		return res.ok;
@@ -149,7 +185,13 @@ export async function main() {
 	// No validateConfig() call — LLM credentials are not needed here.
 	// The knowledge HTTP server holds those; this process is a thin proxy.
 	// Connection errors are surfaced per-call with a clear ECONNREFUSED message.
-	const baseUrl = serverBaseUrl();
+	let baseUrl: string;
+	try {
+		baseUrl = serverBaseUrl();
+	} catch (e) {
+		console.error(`[knowledge-server-mcp] ${(e as Error).message}`);
+		process.exit(1);
+	}
 
 	// Auto-start: if the HTTP server isn't reachable, try to launch it.
 	// This lets users skip the manual "start the server" step — the MCP process
@@ -179,7 +221,10 @@ export async function main() {
 					url.searchParams.set("threshold", String(threshold));
 
 				const response = await fetch(url, {
-					headers: { "x-knowledge-client": "mcp" },
+					headers: {
+						"x-knowledge-client": "mcp",
+						...readCallHeaders(config.adminToken),
+					},
 					signal: AbortSignal.timeout(15_000),
 				});
 
@@ -244,27 +289,16 @@ export async function main() {
 
 	server.tool(
 		"knowledge_flag",
-		"Report a recalled knowledge entry that is wrong, outdated or irrelevant, using the id shown in its injected line. The entry is queued for review and is no longer injected into sessions; nothing is deleted. Requires KNOWLEDGE_ADMIN_TOKEN in this process's environment.",
+		"Report a recalled knowledge entry that is wrong, outdated or irrelevant, using the id shown in its injected line. The entry is queued for review and is no longer injected into sessions; nothing is deleted.",
 		flagInputSchema,
 		async ({ id, reason }) => {
-			if (!config.adminToken) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: "knowledge_flag needs KNOWLEDGE_ADMIN_TOKEN set in the environment of the knowledge MCP process (the same stable token the server runs with). Nothing was flagged.",
-						},
-					],
-					isError: true,
-				};
-			}
 			try {
 				const response = await fetch(
 					`${baseUrl}/entries/${encodeURIComponent(id)}/flag`,
 					{
 						method: "POST",
 						headers: {
-							Authorization: `Bearer ${config.adminToken}`,
+							...readCallHeaders(config.adminToken),
 							"Content-Type": "application/json",
 						},
 						body: JSON.stringify({ reason }),

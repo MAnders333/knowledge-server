@@ -80,6 +80,8 @@ function item(content: string, type = "fact"): Item {
 }
 
 let activateBody: ActivateBody = {};
+/** URL of the last GET /activate the mock served. */
+let lastActivateUrl = "";
 const realFetch = globalThis.fetch;
 
 beforeAll(() => {
@@ -88,7 +90,10 @@ beforeAll(() => {
 		if (pathname === "/status") {
 			return Response.json({ knowledge: { active: 0, conflicted: 0 } });
 		}
-		if (pathname === "/activate") return Response.json(activateBody);
+		if (pathname === "/activate") {
+			lastActivateUrl = String(input);
+			return Response.json(activateBody);
+		}
 		return new Response("not found", { status: 404 });
 	}) as typeof fetch;
 });
@@ -308,4 +313,74 @@ describe("omp-knowledge.ts before_agent_start", () => {
 			true,
 		);
 	});
+});
+
+describe.each(drivers)("%s activation URL bounds", (_name, driver) => {
+	it("stays far below the 16 KiB request-line limit for a long ASCII prompt", async () => {
+		const prompt = Array.from(
+			{ length: 400 },
+			(_, i) => `line ${i} ${"word ".repeat(9)}`,
+		).join("\n");
+		expect(prompt.length).toBeGreaterThan(20_000);
+		await injected(driver, { entries: [item("Use port 4321.")] }, prompt);
+		expect(lastActivateUrl.length).toBeLessThan(12_000);
+	});
+
+	it("bounds a CJK prompt by its encoded size, not its character count", async () => {
+		const prompt = "日本語のテキストを書きます。".repeat(200);
+		await injected(driver, { entries: [item("Use port 4321.")] }, prompt);
+		expect(lastActivateUrl.length).toBeLessThan(12_000);
+	});
+
+	it("sends at most 12 cues: the segments first, the whole prompt last", async () => {
+		const lines = Array.from(
+			{ length: 30 },
+			(_, i) => `segment number ${i} for testing`,
+		);
+		const prompt = lines.join("\n");
+		await injected(driver, { entries: [item("Use port 4321.")] }, prompt);
+		const queries = new URL(lastActivateUrl).searchParams.getAll("q");
+		expect(queries).toHaveLength(12);
+		expect(queries[0]).toBe(lines[0]);
+		expect(queries[11]).toBe(prompt);
+	});
+
+	it("sends a single long line as one cue, not as a segment plus the prompt", async () => {
+		const line = "deployment notes for the staging cluster ".repeat(15).trim();
+		await injected(driver, { entries: [item("Use port 4321.")] }, line);
+		const queries = new URL(lastActivateUrl).searchParams.getAll("q");
+		expect(queries).toEqual([line]);
+	});
+
+	it("never ends the cue list with a short truncated fragment", async () => {
+		const lines = [
+			`0${"日".repeat(44)}`,
+			...Array.from({ length: 10 }, (_, i) => `${i + 1}${"日".repeat(70)}`),
+		];
+		const prompt = lines.join("\n");
+		await injected(driver, { entries: [item("Use port 4321.")] }, prompt);
+		const cues = new URL(lastActivateUrl).searchParams.getAll("q").slice(0, -1);
+		for (const cue of cues) {
+			const encoded = new URLSearchParams({ q: cue }).toString().length - 2;
+			expect(lines.includes(cue) || encoded >= 250).toBe(true);
+		}
+	});
+});
+
+// Each plugin is a standalone file, so the query builder is copied into all three.
+// This keeps the copies from drifting: the same prompt must produce the same URL.
+it("sends identical activation queries from every plugin", async () => {
+	const prompt = [
+		"Look at the deployment notes for the staging cluster.",
+		"日本語のテキストを書きます。".repeat(120),
+		Array.from({ length: 14 }, (_, i) => `follow-up line number ${i}`).join(
+			"\n",
+		),
+	].join("\n");
+	const urls: string[] = [];
+	for (const [, driver] of drivers) {
+		await injected(driver, { entries: [item("Use port 4321.")] }, prompt);
+		urls.push(lastActivateUrl);
+	}
+	expect(new Set(urls).size).toBe(1);
 });

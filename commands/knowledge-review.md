@@ -4,26 +4,24 @@ description: Review and resolve knowledge entries needing attention — conflict
 
 Review the knowledge graph and resolve entries that need human attention.
 
-## Step 1 — Fetch review data
+## Step 1 — Load the admin token and fetch review data
+
+Load the token before any call. Take it from the environment, else from `.env`. It stays in a shell variable and is never printed. Reads send it only when it is set, because a server with a stable token requires it on every route:
 
 ```bash
-curl -s http://127.0.0.1:3179/review | python3 -m json.tool
-```
-
-Also load the admin token into a shell variable — this keeps it out of shell history while
-allowing the curl commands below to reference it:
-
-```bash
-# Load token from .env (preferred — token never appears in history)
-TOKEN="$(grep '^KNOWLEDGE_ADMIN_TOKEN=' ~/.config/knowledge-server/.env 2>/dev/null | cut -d= -f2-)"
+TOKEN="${KNOWLEDGE_ADMIN_TOKEN:-}"
+# Not in the environment: read it from .env (the grep output goes only into TOKEN)
+if [ -z "$TOKEN" ]; then
+  TOKEN="$(grep '^KNOWLEDGE_ADMIN_TOKEN=' ~/.config/knowledge-server/.env 2>/dev/null | cut -d= -f2-)"
+fi
 # Legacy location fallback for older installs
 if [ -z "$TOKEN" ]; then
   TOKEN="$(grep '^KNOWLEDGE_ADMIN_TOKEN=' ~/.local/share/knowledge-server/.env 2>/dev/null | cut -d= -f2-)"
 fi
-# If not set in .env, the token was printed at server startup only when it ran in a terminal; otherwise set KNOWLEDGE_ADMIN_TOKEN in .env and reload:
-# TOKEN="paste-token-here"
-echo "Token loaded: ${#TOKEN} chars"
+curl -s ${TOKEN:+-H "Authorization: Bearer $TOKEN"} http://127.0.0.1:3179/review | python3 -m json.tool
 ```
+
+If the shell was reset, run the load block again before the calls below. Flagging an entry (the `knowledge_flag` MCP tool) needs the same auth as reads: with the default random per-start token it needs no token; with a stable `KNOWLEDGE_ADMIN_TOKEN` the server requires it on every route, so the MCP process must have that variable set. Only the resolve, PATCH and DELETE calls below change the knowledge base.
 
 ## Step 2 — Work through each section
 

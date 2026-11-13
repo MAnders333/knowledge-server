@@ -22,6 +22,8 @@
  * Configuration:
  *   Set KNOWLEDGE_SERVER_URL, or KNOWLEDGE_PORT / "port" in
  *   ~/.config/knowledge-server/config.jsonc (default: 3179)
+ *   KNOWLEDGE_ADMIN_TOKEN is sent as a Bearer on read calls, only when it is set
+ *   (a server with a stable token requires it)
  *
  * Design principle: NEVER throw. All errors are caught and silently swallowed.
  * A broken knowledge extension must never affect oh-my-pi's core functionality.
@@ -123,6 +125,14 @@ const KNOWLEDGE_SERVER_URL_SAFE =
 	(_parsedUrl.hostname === "127.0.0.1" ||
 		_parsedUrl.hostname === "localhost" ||
 		_parsedUrl.hostname === "[::1]");
+
+/**
+ * Headers for read calls. A stable KNOWLEDGE_ADMIN_TOKEN makes the server require it
+ * on every route except /health, so it is sent when set and never otherwise.
+ */
+const AUTH_HEADERS: Record<string, string> = process.env.KNOWLEDGE_ADMIN_TOKEN
+	? { Authorization: `Bearer ${process.env.KNOWLEDGE_ADMIN_TOKEN}` }
+	: {};
 
 /** Response shape of GET /activate (mirrors plugin/knowledge.ts). */
 interface ActivateResponse {
@@ -275,6 +285,93 @@ function formatActivatedKnowledgeFallback(entries: ActivateEntry[]): string {
 	].join("\n");
 }
 
+/**
+ * Activation queries for one prompt, bounded so the GET /activate URL stays far
+ * below Bun's 16 KiB request-line limit: over it the server answers 431 and the
+ * plugin drops the prompt. Mirrors boundCues in src/api/input-limits.ts: at most
+ * MAX_CUES cues, the first ones plus the holistic prompt last. Limits apply to
+ * characters and to encoded length, the size the URL carries (a CJK character
+ * encodes to 9 characters).
+ */
+const PROMPT_MAX_CHARS = 4000;
+const SEGMENT_MAX_CHARS = 500;
+const PROMPT_MAX_ENCODED = 5000;
+const SEGMENT_MAX_ENCODED = 500;
+const SEGMENT_MIN_ENCODED = SEGMENT_MAX_ENCODED / 2;
+const QUERIES_MAX_ENCODED = 10000;
+const MAX_CUES = 12;
+const QUERY_TRUNCATION_MARKER = "\n…\n";
+
+/** Length of `value` as it appears in a query string, without the `q=` prefix. */
+function encodedLength(value: string): number {
+	return new URLSearchParams({ q: value }).toString().length - 2;
+}
+
+/** Keeps the head and tail of `text` around a marker, so its weight is at most `max`. */
+function keepHeadAndTail(
+	text: string,
+	max: number,
+	weight: (ch: string) => number,
+): string {
+	const chars = [...text];
+	if (chars.reduce((sum, ch) => sum + weight(ch), 0) <= max) return text;
+	const markerWeight = [...QUERY_TRUNCATION_MARKER].reduce(
+		(sum, ch) => sum + weight(ch),
+		0,
+	);
+	const room = max - markerWeight;
+	let head = 0;
+	let headWeight = 0;
+	while (head < chars.length && headWeight + weight(chars[head]) <= room / 2) {
+		headWeight += weight(chars[head]);
+		head++;
+	}
+	let tail = chars.length;
+	let tailWeight = 0;
+	while (
+		tail > head &&
+		tailWeight + weight(chars[tail - 1]) <= room - headWeight
+	) {
+		tailWeight += weight(chars[tail - 1]);
+		tail--;
+	}
+	return `${chars.slice(0, head).join("")}${QUERY_TRUNCATION_MARKER}${chars.slice(tail).join("")}`;
+}
+
+/** Activation queries for one prompt: its unique segments, then the whole prompt last. */
+function activationQueries(prompt: string): string[] {
+	// Dedupe the uncut segments against the whole prompt first, so a single long line
+	// is one cue. The character and encoded caps apply afterwards.
+	const segments = prompt
+		.split("\n")
+		.map((s) => s.trim())
+		.filter((s) => s.length >= 15);
+	const unique = [...new Set([...segments, prompt.trim()])];
+	const bounded =
+		unique.length <= MAX_CUES
+			? unique
+			: [...unique.slice(0, MAX_CUES - 1), unique[unique.length - 1]];
+
+	const holistic = keepHeadAndTail(
+		keepHeadAndTail(bounded[bounded.length - 1], PROMPT_MAX_CHARS, () => 1),
+		PROMPT_MAX_ENCODED,
+		encodedLength,
+	);
+	let budget = QUERIES_MAX_ENCODED - encodedLength(holistic);
+	const queries: string[] = [];
+	for (const raw of bounded.slice(0, -1)) {
+		const segment = keepHeadAndTail(raw, SEGMENT_MAX_CHARS, () => 1);
+		const capped = keepHeadAndTail(segment, SEGMENT_MAX_ENCODED, encodedLength);
+		// A segment cut to the remaining budget must keep at least half the encoded
+		// cap; a shorter fragment says little, so the list stops instead.
+		if (encodedLength(capped) > budget && budget < SEGMENT_MIN_ENCODED) break;
+		const fitted = keepHeadAndTail(capped, budget, encodedLength);
+		queries.push(fitted);
+		budget -= encodedLength(fitted);
+	}
+	return [...queries, holistic];
+}
+
 export default function knowledgeExtension(pi: ExtensionAPI) {
 	// Refuse to operate if KNOWLEDGE_SERVER_URL points to a non-loopback host.
 	// The extension sends user prompt content to this URL — external hosts are not allowed.
@@ -294,6 +391,7 @@ export default function knowledgeExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		try {
 			const health = await fetch(`${KNOWLEDGE_SERVER_URL}/status`, {
+				headers: AUTH_HEADERS,
 				signal: AbortSignal.timeout(2000),
 			});
 			if (health.ok) {
@@ -321,30 +419,17 @@ export default function knowledgeExtension(pi: ExtensionAPI) {
 			// Skip very short prompts (greetings, confirmations, "yes", "continue")
 			if (queryText.length < 15) return;
 
-			// Build a set of activation queries:
-			//   1. Per-line segments — each newline (shift+enter) is a topic boundary.
-			//      Short segments (< 15 chars) are skipped — they're usually connective
-			//      phrases, not substantive cues.
-			//   2. The full prompt as a holistic cue — captures overall intent that
-			//      no individual segment may express on its own.
-			// All queries are embedded in a single batched API call server-side.
-			// No truncation — let the embedding model handle long inputs natively.
-			const segments = queryText
-				.split("\n")
-				.map((s) => s.trim())
-				.filter((s) => s.length >= 15);
-
-			// Union: unique segments + full prompt (deduplicated if prompt == single segment).
-			const allQueries = [...new Set([...segments, queryText.trim()])];
-
+			// Activation queries: each line is a topic boundary (shift+enter) and the
+			// whole prompt is a holistic cue. activationQueries keeps the URL under the
+			// server's request-line limit.
 			const params = new URLSearchParams();
-			for (const q of allQueries) params.append("q", q);
+			for (const q of activationQueries(queryText)) params.append("q", q);
 			params.set("limit", "8"); // passive injection: up from 5 to reduce silent misses
 
 			const response = await fetch(
 				`${KNOWLEDGE_SERVER_URL}/activate?${params.toString()}`,
 				{
-					headers: { "x-knowledge-client": "omp" },
+					headers: { "x-knowledge-client": "omp", ...AUTH_HEADERS },
 					signal: AbortSignal.timeout(5000),
 				},
 			);

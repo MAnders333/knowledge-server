@@ -11,7 +11,11 @@
  */
 import { describe, expect, it } from "bun:test";
 import { z } from "zod";
-import { activateInputSchema, flagInputSchema } from "../src/mcp/index";
+import {
+	activateInputSchema,
+	flagInputSchema,
+	loopbackBaseUrl,
+} from "../src/mcp/index";
 
 const activateSchema = z.object(activateInputSchema);
 
@@ -182,5 +186,22 @@ describe("MCP knowledge_flag schema", () => {
 		expect(flagSchema.safeParse({ id: "0f1e", reason: "wrong" }).success).toBe(
 			false,
 		);
+	});
+});
+
+// ── server host ───────────────────────────────────────────────────────────────
+
+describe("MCP proxy server host", () => {
+	it("builds the base URL for each loopback host the plugins accept", () => {
+		expect(loopbackBaseUrl("127.0.0.1", 3179)).toBe("http://127.0.0.1:3179");
+		expect(loopbackBaseUrl("localhost", 3179)).toBe("http://localhost:3179");
+		expect(loopbackBaseUrl("::1", 3179)).toBe("http://[::1]:3179");
+		expect(loopbackBaseUrl("[::1]", 3179)).toBe("http://[::1]:3179");
+	});
+
+	it("refuses a non-loopback host, including the wildcard bind address", () => {
+		for (const host of ["0.0.0.0", "192.168.1.20", "example.com", "::"]) {
+			expect(() => loopbackBaseUrl(host, 3179)).toThrow(/not loopback/);
+		}
 	});
 });
