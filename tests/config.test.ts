@@ -323,3 +323,17 @@ describe("parseEnv — data directory", () => {
 		);
 	});
 });
+
+describe("parseEnv — per-type LLM timeouts", () => {
+	it("reports a zero per-type timeout and falls back to LLM_TIMEOUT_MS", () => {
+		const parsed = parse({
+			LLM_TIMEOUT_EXTRACTION_MS: "0",
+			LLM_TIMEOUT_MS: "45000",
+		});
+		expect(parsed.issues).toHaveLength(1);
+		expect(parsed.issues[0]).toContain(
+			"LLM_TIMEOUT_EXTRACTION_MS must be an integer ≥ 1",
+		);
+		expect(parsed.config.llm.timeoutsMs.extraction).toBe(45_000);
+	});
+});

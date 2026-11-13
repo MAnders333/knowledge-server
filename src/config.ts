@@ -566,7 +566,7 @@ export function parseEnv(env: Env, configPath = DEFAULT_CONFIG_PATH) {
 			// (not across retries). A timed-out attempt is not retried. Defaults suit
 			// hosted models; slow local models (Ollama) should raise the value for the
 			// affected call types. Precedence per type: LLM_TIMEOUT_<TYPE>_MS >
-			// LLM_TIMEOUT_MS > default. Minimum 1 ms enforced.
+			// LLM_TIMEOUT_MS > default. A value below 1 ms or not a number is reported by validateConfig().
 			timeoutsMs: {
 				contradiction: r.int(
 					"LLM_TIMEOUT_CONTRADICTION_MS",
