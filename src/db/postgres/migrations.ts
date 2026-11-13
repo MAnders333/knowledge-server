@@ -365,6 +365,9 @@ export const PG_MIGRATIONS: Array<{
 					WHERE table_schema = current_schema() AND table_name = ${table}
 				`;
 				if (exists.length === 0) continue;
+				// The lock is held until this transaction commits, so no row can land
+				// between the count and the drop or rename.
+				await sql.unsafe(`LOCK TABLE ${table} IN ACCESS EXCLUSIVE MODE`);
 				const [{ n }] = await sql.unsafe(
 					`SELECT COUNT(*)::int AS n FROM ${table}`,
 				);

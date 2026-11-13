@@ -81,8 +81,10 @@
  * v14: Drop staging tables from Postgres knowledge stores.
  * - consolidated_episode, consolidation_state, pending_episodes now live
  *   exclusively in state.db (ServerStateDB local SQLite).
- * - Empty tables are dropped from Postgres on migration; tables holding rows are
- *   renamed to legacy_* and kept (see src/db/postgres/migrations.ts).
+ * - Postgres: a state DB in the same schema (detected by state_schema_version)
+ *   owns the staging tables, so v14 leaves them alone. Otherwise empty tables are
+ *   dropped, and tables holding rows are renamed to legacy_* and kept
+ *   (see src/db/postgres/migrations.ts).
  * - SQLite knowledge.db: no change — these tables were already handled in v13.
  */
 /**
