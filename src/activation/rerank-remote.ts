@@ -174,29 +174,50 @@ export function parseRetryAfterMs(
 	return Math.max(0, date - nowMs);
 }
 
+/** A plain identifier (error type or code); anything else is free text and is dropped. */
+const ERROR_LABEL = /^[A-Za-z0-9_.-]{1,64}$/;
+
+function boundedText(text: string): string {
+	return text.replace(/\s+/g, " ").trim().slice(0, ERROR_BODY_MAX_CHARS);
+}
+
+function suffixOf(text: string): string {
+	const bounded = boundedText(text);
+	return bounded ? `: ${bounded}` : "";
+}
+
 /**
- * Bounded, content-free summary of an error body. The `detail` text is used when the
- * gateway sends one. Validation entries keep their location and message only, because
- * the rejected input they echo can be candidate text.
+ * Content-free suffix for an HTTP error message. A string `detail` is used as given,
+ * bounded. Validation entries keep their location and message only, since the rejected
+ * input they echo can be candidate text. An object `detail` is reduced to its error
+ * type or code: its free text is never logged.
  */
 async function summarizeErrorBody(response: Response): Promise<string> {
 	const text = await response.text().catch(() => "");
-	let summary = text;
+	let parsed: unknown;
 	try {
-		const { detail } = JSON.parse(text) as { detail?: unknown };
-		if (typeof detail === "string") {
-			summary = detail;
-		} else if (Array.isArray(detail)) {
-			summary = (detail as Array<{ loc?: unknown[]; msg?: unknown }>)
+		parsed = JSON.parse(text);
+	} catch {
+		// Not JSON (for example an HTML error page): the bounded raw text.
+		return suffixOf(text);
+	}
+	const detail = (parsed as { detail?: unknown } | null)?.detail;
+	if (typeof detail === "string") return suffixOf(detail);
+	if (Array.isArray(detail)) {
+		return suffixOf(
+			(detail as Array<{ loc?: unknown[]; msg?: unknown }>)
 				.map(
 					(item) => `${(item.loc ?? []).join(".")}: ${String(item.msg ?? "")}`,
 				)
-				.join("; ");
-		}
-	} catch {
-		// Not JSON: the raw text, bounded below.
+				.join("; "),
+		);
 	}
-	return summary.replace(/\s+/g, " ").trim().slice(0, ERROR_BODY_MAX_CHARS);
+	const { code, type } = (detail ?? {}) as { code?: unknown; type?: unknown };
+	const label = [code, type].find(
+		(value): value is string =>
+			typeof value === "string" && ERROR_LABEL.test(value),
+	);
+	return label ? ` (error: ${label})` : "";
 }
 
 export interface RemoteRerankerOptions {
@@ -315,10 +336,8 @@ export class RemoteReranker implements RerankScorer {
 				}
 			}
 			if (!response.ok) {
-				const detail = await summarizeErrorBody(response);
-				throw new Error(
-					`gateway returned HTTP ${response.status}${detail ? `: ${detail}` : ""}`,
-				);
+				const suffix = await summarizeErrorBody(response);
+				throw new Error(`gateway returned HTTP ${response.status}${suffix}`);
 			}
 			// Read as text so a timeout while reading the body surfaces as a timeout.
 			const text = await response.text();
