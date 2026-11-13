@@ -344,6 +344,27 @@ describe.each(drivers)("%s activation URL bounds", (_name, driver) => {
 		expect(queries[0]).toBe(lines[0]);
 		expect(queries[11]).toBe(prompt);
 	});
+
+	it("sends a single long line as one cue, not as a segment plus the prompt", async () => {
+		const line = "deployment notes for the staging cluster ".repeat(15).trim();
+		await injected(driver, { entries: [item("Use port 4321.")] }, line);
+		const queries = new URL(lastActivateUrl).searchParams.getAll("q");
+		expect(queries).toEqual([line]);
+	});
+
+	it("never ends the cue list with a short truncated fragment", async () => {
+		const lines = [
+			`0${"日".repeat(44)}`,
+			...Array.from({ length: 10 }, (_, i) => `${i + 1}${"日".repeat(70)}`),
+		];
+		const prompt = lines.join("\n");
+		await injected(driver, { entries: [item("Use port 4321.")] }, prompt);
+		const cues = new URL(lastActivateUrl).searchParams.getAll("q").slice(0, -1);
+		for (const cue of cues) {
+			const encoded = new URLSearchParams({ q: cue }).toString().length - 2;
+			expect(lines.includes(cue) || encoded >= 250).toBe(true);
+		}
+	});
 });
 
 // Each plugin is a standalone file, so the query builder is copied into all three.

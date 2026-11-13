@@ -297,6 +297,7 @@ const PROMPT_MAX_CHARS = 4000;
 const SEGMENT_MAX_CHARS = 500;
 const PROMPT_MAX_ENCODED = 5000;
 const SEGMENT_MAX_ENCODED = 500;
+const SEGMENT_MIN_ENCODED = SEGMENT_MAX_ENCODED / 2;
 const QUERIES_MAX_ENCODED = 10000;
 const MAX_CUES = 12;
 const QUERY_TRUNCATION_MARKER = "\n…\n";
@@ -339,38 +340,36 @@ function keepHeadAndTail(
 
 /** Activation queries for one prompt: its unique segments, then the whole prompt last. */
 function activationQueries(prompt: string): string[] {
+	// Dedupe the uncut segments against the whole prompt first, so a single long line
+	// is one cue. The character and encoded caps apply afterwards.
 	const segments = prompt
 		.split("\n")
 		.map((s) => s.trim())
-		.filter((s) => s.length >= 15)
-		.map((s) => keepHeadAndTail(s, SEGMENT_MAX_CHARS, () => 1));
-	const holistic = keepHeadAndTail(prompt.trim(), PROMPT_MAX_CHARS, () => 1);
-
-	// Union: unique segments + full prompt (deduplicated if prompt == single segment).
-	const unique = [...new Set([...segments, holistic])];
+		.filter((s) => s.length >= 15);
+	const unique = [...new Set([...segments, prompt.trim()])];
 	const bounded =
 		unique.length <= MAX_CUES
 			? unique
 			: [...unique.slice(0, MAX_CUES - 1), unique[unique.length - 1]];
 
-	const last = keepHeadAndTail(
-		bounded[bounded.length - 1],
+	const holistic = keepHeadAndTail(
+		keepHeadAndTail(bounded[bounded.length - 1], PROMPT_MAX_CHARS, () => 1),
 		PROMPT_MAX_ENCODED,
 		encodedLength,
 	);
-	let budget = QUERIES_MAX_ENCODED - encodedLength(last);
+	let budget = QUERIES_MAX_ENCODED - encodedLength(holistic);
 	const queries: string[] = [];
-	for (const segment of bounded.slice(0, -1)) {
-		const fitted = keepHeadAndTail(
-			segment,
-			Math.min(SEGMENT_MAX_ENCODED, budget),
-			encodedLength,
-		);
-		if (encodedLength(fitted) > budget) break;
+	for (const raw of bounded.slice(0, -1)) {
+		const segment = keepHeadAndTail(raw, SEGMENT_MAX_CHARS, () => 1);
+		const capped = keepHeadAndTail(segment, SEGMENT_MAX_ENCODED, encodedLength);
+		// A segment cut to the remaining budget must keep at least half the encoded
+		// cap; a shorter fragment says little, so the list stops instead.
+		if (encodedLength(capped) > budget && budget < SEGMENT_MIN_ENCODED) break;
+		const fitted = keepHeadAndTail(capped, budget, encodedLength);
 		queries.push(fitted);
 		budget -= encodedLength(fitted);
 	}
-	return [...queries, last];
+	return [...queries, holistic];
 }
 
 export default function knowledgeExtension(pi: ExtensionAPI) {
