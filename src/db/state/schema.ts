@@ -23,6 +23,15 @@ export const SERVER_LOCAL_MIGRATIONS = [
 	{ version: 1, label: "baseline state schema" },
 	{ version: 2, label: "pending_episode_attempts table" },
 	{ version: 3, label: "activation_event table (content-free measurement)" },
+	{ version: 4, label: "activation_event gate and budget counts" },
+] as const;
+
+/** activation_event columns added in v4. Existing state.db files get them via ALTER (see state/index.ts). */
+export const ACTIVATION_EVENT_V4_COLUMNS = [
+	"gate_dropped",
+	"budget_dropped",
+	"deduped",
+	"injected_tokens",
 ] as const;
 
 export const SERVER_LOCAL_SCHEMA_VERSION = latestVersion(
@@ -93,7 +102,11 @@ export const SERVER_LOCAL_CREATE_TABLES = `
     rerank_scores            TEXT,
     gate_mode                TEXT    NOT NULL CHECK(gate_mode IN ('rerank', 'dense', 'off')),
     latency_ms               INTEGER NOT NULL,
-    client_deadline_exceeded INTEGER NOT NULL DEFAULT 0
+    client_deadline_exceeded INTEGER NOT NULL DEFAULT 0,
+    gate_dropped INTEGER NOT NULL DEFAULT 0,
+    budget_dropped INTEGER NOT NULL DEFAULT 0,
+    deduped INTEGER NOT NULL DEFAULT 0,
+    injected_tokens INTEGER NOT NULL DEFAULT 0
   );
 
   CREATE INDEX IF NOT EXISTS idx_activation_event_ts

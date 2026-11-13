@@ -15,7 +15,10 @@ import type {
 	KnowledgeStatus,
 } from "../../types.js";
 import { ensurePrivateFile } from "../../utils.js";
-import type { IKnowledgeStore } from "../interface.js";
+import {
+	type IKnowledgeStore,
+	LAST_ACCESS_TOUCH_INTERVAL_MS,
+} from "../interface.js";
 import {
 	assertNotNewerThanCode,
 	pendingMigrations,
@@ -455,17 +458,22 @@ export class KnowledgeDB implements IKnowledgeStore {
 	}
 
 	/**
-	 * Record an access (bump access_count and last_accessed_at).
-	 * Retrieval-only signal — never called during consolidation.
+	 * Record one activation's injections in a single transaction (see
+	 * IKnowledgeStore.recordInjections). Retrieval-only: never called during
+	 * consolidation.
 	 */
-	async recordAccess(id: string): Promise<void> {
-		this.db
-			.prepare(
-				`UPDATE knowledge_entry 
-         SET access_count = access_count + 1, last_accessed_at = ?, updated_at = ?
+	async recordInjections(ids: string[], now: number): Promise<void> {
+		if (ids.length === 0) return;
+		const cutoff = now - LAST_ACCESS_TOUCH_INTERVAL_MS;
+		const stmt = this.db.prepare(
+			`UPDATE knowledge_entry
+         SET injection_count = injection_count + 1,
+             last_accessed_at = CASE WHEN last_accessed_at <= ? THEN ? ELSE last_accessed_at END
          WHERE id = ?`,
-			)
-			.run(Date.now(), Date.now(), id);
+		);
+		this.db.transaction(() => {
+			for (const id of new Set(ids)) stmt.run(cutoff, now, id);
+		})();
 	}
 
 	/**

@@ -161,6 +161,18 @@ afterEach(() => {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe("ActivationEngine rerank stage", () => {
+	// These tests check candidate ordering. The precision gate has its own tests
+	// (activation-gate.test.ts), so the gate is off here.
+	const gate = config.activation.gate as { enabled: boolean };
+	let gateWasOn = true;
+	beforeEach(() => {
+		gateWasOn = gate.enabled;
+		gate.enabled = false;
+	});
+	afterEach(() => {
+		gate.enabled = gateWasOn;
+	});
+
 	it("orders by rerankScore × strength, not dense similarity (Path A)", async () => {
 		const store = makeStoreStub(makeEntries(), { supportAnn: true });
 		const scorer = makeInvertingScorer();

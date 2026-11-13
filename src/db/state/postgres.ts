@@ -43,6 +43,35 @@ const PG_STATE_MIGRATIONS: Array<{
 			await tx.unsafe(PG_ACTIVATION_EVENT_TABLE);
 		},
 	},
+	{
+		version: 4,
+		label: "activation_event gate and budget counts (precision gate)",
+		up: async (tx: TxSql) => {
+			// Only add what is missing: a non-owner role cannot ALTER a table another
+			// role created, and fresh installs already have the columns (v3 DDL).
+			// pg_attribute, not information_schema: the latter hides columns from roles
+			// without privileges on the table, which would look like "missing".
+			const present = new Set(
+				(
+					await tx`SELECT a.attname FROM pg_attribute a
+					         WHERE a.attrelid = to_regclass('activation_event')
+					           AND a.attnum > 0 AND NOT a.attisdropped`
+				).map((r: { attname: string }) => r.attname),
+			);
+			for (const column of [
+				"gate_dropped",
+				"budget_dropped",
+				"deduped",
+				"injected_tokens",
+			]) {
+				if (!present.has(column)) {
+					await tx.unsafe(
+						`ALTER TABLE activation_event ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`,
+					);
+				}
+			}
+		},
+	},
 ];
 const STATE_SCHEMA_VERSION = latestVersion(PG_STATE_MIGRATIONS);
 
@@ -71,7 +100,11 @@ const PG_ACTIVATION_EVENT_TABLE = `
     rerank_scores            TEXT,
     gate_mode                TEXT      NOT NULL CHECK (gate_mode IN ('rerank', 'dense', 'off')),
     latency_ms               INTEGER   NOT NULL,
-    client_deadline_exceeded BOOLEAN   NOT NULL DEFAULT FALSE
+    client_deadline_exceeded BOOLEAN   NOT NULL DEFAULT FALSE,
+    gate_dropped             INTEGER   NOT NULL DEFAULT 0,
+    budget_dropped           INTEGER   NOT NULL DEFAULT 0,
+    deduped                  INTEGER   NOT NULL DEFAULT 0,
+    injected_tokens          INTEGER   NOT NULL DEFAULT 0
   );
 
   -- CREATE INDEX checks table ownership before IF NOT EXISTS skips, so an
@@ -169,6 +202,10 @@ function activationEventColumns(r: ActivationEventRow) {
 		gate_mode: r.gateMode,
 		latency_ms: r.latencyMs,
 		client_deadline_exceeded: r.clientDeadlineExceeded,
+		gate_dropped: r.gateDropped,
+		budget_dropped: r.budgetDropped,
+		deduped: r.deduped,
+		injected_tokens: r.injectedTokens,
 	};
 }
 

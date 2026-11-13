@@ -3,24 +3,34 @@
  * Replay harness for activation metrics (MR-M).
  *
  * Replays prompts against the configured knowledge stores with `dryRun`, so no
- * access counts change and no activation_event rows are written. It prints the
+ * injection writes happen and no activation_event rows are written. It prints the
  * metrics table used by plan-review §3.1 (cap-hit, zero-hit by prompt bucket,
- * n_returned, hub concentration, latency).
+ * n_returned, tokens, hub concentration, repeat-in-session, latency).
  *
  * Usage:
  *   bun run bench/replay-activation.ts <prompts.jsonl> [--limit 8] [--json]
+ *                                      [--sessions] [--dump <out.jsonl>]
  *
- * Input: one JSON object per line with a `prompt` string:
- *   {"prompt": "how do I rotate the admin token?"}
+ * Input: one JSON object per line with a `prompt` string and an optional `ts`
+ * (ISO time or epoch ms):
+ *   {"prompt": "how do I rotate the admin token?", "ts": "2026-03-23T13:32:01Z"}
  * Prompts are supplied by you. None ship with the repo. Keep the file outside
  * the repo; it may contain private text. The harness prints aggregates only.
  *
+ * --sessions  groups prompts into 30-minute windows by `ts` and passes each window
+ *             as a session key, so the server's per-session dedupe applies and
+ *             repeat-in-session is measured the way production sees it.
+ * --dump      writes one JSON line per prompt with the candidate scores (entry id,
+ *             raw cosine, rerank score, returned or not). Private output: keep it
+ *             outside the repo. Use with --limit 16 and the gate off to see the
+ *             whole rerank pool.
+ *
  * Cues are built the same way as the claude-code hook: splitIntoCues(prompt).
- * Stores and reranker come from config, as for the server. Activation runs with
- * dryRun, so this does not record access or write telemetry.
+ * Stores and reranker come from config, as for the server.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { ActivationEngine, splitIntoCues } from "../src/activation/activate.js";
+import { formatKnowledgeLine } from "../src/activation/format.js";
 import { createRerankerFromConfig } from "../src/activation/rerank.js";
 import { StoreRegistry } from "../src/db/store-registry.js";
 import { logger } from "../src/logger.js";
@@ -29,16 +39,20 @@ interface Args {
 	file: string;
 	limit: number;
 	json: boolean;
+	sessions: boolean;
+	dump: string | null;
 }
+
+const VALUE_FLAGS = new Set(["--limit", "--dump"]);
 
 function parseArgs(argv: string[]): Args {
 	const positional = argv.filter(
-		(a, i) => !a.startsWith("--") && argv[i - 1] !== "--limit",
+		(a, i) => !a.startsWith("--") && !VALUE_FLAGS.has(argv[i - 1] ?? ""),
 	);
 	const file = positional[0];
 	if (!file) {
 		console.error(
-			"Usage: bun run bench/replay-activation.ts <prompts.jsonl> [--limit 8] [--json]",
+			"Usage: bun run bench/replay-activation.ts <prompts.jsonl> [--limit 8] [--json] [--sessions] [--dump out.jsonl]",
 		);
 		process.exit(1);
 	}
@@ -49,24 +63,49 @@ function parseArgs(argv: string[]): Args {
 		console.error("--limit must be a positive integer");
 		process.exit(1);
 	}
-	return { file, limit, json: argv.includes("--json") };
+	const dumpIdx = argv.indexOf("--dump");
+	return {
+		file,
+		limit,
+		json: argv.includes("--json"),
+		sessions: argv.includes("--sessions"),
+		dump: dumpIdx >= 0 ? (argv[dumpIdx + 1] ?? null) : null,
+	};
 }
 
-export function loadPrompts(path: string): string[] {
-	const out: string[] = [];
+export interface PromptRecord {
+	prompt: string;
+	/** Epoch ms, when the prompt file carries a timestamp. */
+	ts?: number;
+}
+
+export function loadPromptRecords(path: string): PromptRecord[] {
+	const out: PromptRecord[] = [];
 	for (const [i, line] of readFileSync(path, "utf8").split("\n").entries()) {
 		if (!line.trim()) continue;
-		let prompt: unknown;
+		let parsed: { prompt?: unknown; ts?: unknown };
 		try {
-			prompt = (JSON.parse(line) as { prompt?: unknown }).prompt;
+			parsed = JSON.parse(line) as { prompt?: unknown; ts?: unknown };
 		} catch {
 			throw new Error(`line ${i + 1}: not JSON`);
 		}
+		const prompt = parsed.prompt;
 		if (typeof prompt !== "string")
 			throw new Error(`line ${i + 1}: missing "prompt" string`);
-		if (prompt.trim()) out.push(prompt);
+		if (!prompt.trim()) continue;
+		const ts =
+			typeof parsed.ts === "string"
+				? Date.parse(parsed.ts)
+				: typeof parsed.ts === "number"
+					? parsed.ts
+					: Number.NaN;
+		out.push(Number.isFinite(ts) ? { prompt, ts } : { prompt });
 	}
 	return out;
+}
+
+export function loadPrompts(path: string): string[] {
+	return loadPromptRecords(path).map((r) => r.prompt);
 }
 
 export const PROMPT_BUCKETS = [
@@ -81,12 +120,22 @@ export function bucketOf(chars: number): string {
 	return b?.name ?? "unknown";
 }
 
+/** Session window for --sessions: prompts within the same 30-minute slot share a session. */
+export const SESSION_WINDOW_MS = 30 * 60 * 1000;
+
 export interface ReplayRecord {
 	promptChars: number;
 	nReturned: number;
 	entryIds: string[];
 	latencyMs: number;
 	gateMode: string;
+	/** Estimated tokens of the injected entry lines. */
+	injectedTokens?: number;
+	gateDropped?: number;
+	budgetDropped?: number;
+	deduped?: number;
+	/** Session key (only with --sessions). Records sharing a key are one session. */
+	session?: string;
 }
 
 /** Metrics from replay records. Pure, so it can be tested on synthetic data. */
@@ -103,6 +152,10 @@ export function summarize(records: ReplayRecord[], limit: number) {
 		const hi = Math.min(lo + 1, s.length - 1);
 		return Math.round((s[lo] + (s[hi] - s[lo]) * (k - lo)) * 10) / 10;
 	};
+	const mean = (xs: number[]) =>
+		xs.length === 0
+			? null
+			: Math.round((xs.reduce((a, b) => a + b, 0) / xs.length) * 100) / 100;
 	const slots = new Map<string, number>();
 	let totalSlots = 0;
 	for (const r of records) {
@@ -127,9 +180,28 @@ export function summarize(records: ReplayRecord[], limit: number) {
 			zeroHitPct: pct(inB.filter((r) => r.nReturned === 0).length, inB.length),
 		};
 	});
+	// Repeat-in-session: an activation shares an entry with an earlier activation of
+	// the same session key.
+	const seenBySession = new Map<string, Set<string>>();
+	let repeats = 0;
+	let sessioned = 0;
+	for (const r of records) {
+		if (r.session === undefined) continue;
+		sessioned++;
+		let seen = seenBySession.get(r.session);
+		if (!seen) {
+			seen = new Set();
+			seenBySession.set(r.session, seen);
+		}
+		if (r.entryIds.some((id) => seen?.has(id))) repeats++;
+		for (const id of r.entryIds) seen.add(id);
+	}
 	const latencies = records.map((r) => r.latencyMs);
 	const gate: Record<string, number> = {};
 	for (const r of records) gate[r.gateMode] = (gate[r.gateMode] ?? 0) + 1;
+	const tokens = records
+		.map((r) => r.injectedTokens)
+		.filter((t): t is number => t !== undefined);
 	return {
 		activations: n,
 		capHitPct: pct(records.filter((r) => r.nReturned === limit).length, n),
@@ -139,9 +211,25 @@ export function summarize(records: ReplayRecord[], limit: number) {
 				? null
 				: Math.round((records.reduce((a, r) => a + r.nReturned, 0) / n) * 100) /
 					100,
+		tokensMean: mean(tokens),
+		tokensP50: quantile(tokens, 0.5),
 		top1SlotPct: topShare(1),
 		top20SlotPct: topShare(20),
 		distinctEntries: slots.size,
+		repeatInSessionPct: sessioned === 0 ? null : pct(repeats, sessioned),
+		gateDroppedMean: mean(
+			records
+				.map((r) => r.gateDropped)
+				.filter((x): x is number => x !== undefined),
+		),
+		budgetDroppedMean: mean(
+			records
+				.map((r) => r.budgetDropped)
+				.filter((x): x is number => x !== undefined),
+		),
+		dedupedMean: mean(
+			records.map((r) => r.deduped).filter((x): x is number => x !== undefined),
+		),
 		latencyMsP50: quantile(latencies, 0.5),
 		latencyMsP95: quantile(latencies, 0.95),
 		gateMode: gate,
@@ -160,9 +248,12 @@ export function renderTable(
 		`| Cap-hit (n == ${limit}) % | ${s.capHitPct ?? "n/a"} |`,
 		`| Zero-hit % | ${s.zeroHitPct ?? "n/a"} |`,
 		`| Mean n_returned | ${s.meanReturned ?? "n/a"} |`,
+		`| Tokens per activation mean / p50 (est.) | ${s.tokensMean ?? "n/a"} / ${s.tokensP50 ?? "n/a"} |`,
 		`| Top-1 share of slots % | ${s.top1SlotPct ?? "n/a"} |`,
 		`| Top-20 share of slots % | ${s.top20SlotPct ?? "n/a"} |`,
 		`| Distinct entries injected | ${s.distinctEntries} |`,
+		`| Repeat-in-session % | ${s.repeatInSessionPct ?? "n/a"} |`,
+		`| Mean gate-dropped / budget-dropped / deduped | ${s.gateDroppedMean ?? "n/a"} / ${s.budgetDroppedMean ?? "n/a"} / ${s.dedupedMean ?? "n/a"} |`,
 		`| Latency p50 / p95 (ms) | ${s.latencyMsP50 ?? "n/a"} / ${s.latencyMsP95 ?? "n/a"} |`,
 		`| Gate mode | ${JSON.stringify(s.gateMode)} |`,
 		"",
@@ -179,8 +270,9 @@ async function main(): Promise<void> {
 	const args = parseArgs(process.argv.slice(2));
 	// Keep stdout to the table: only warnings and errors from the stores.
 	logger.init("", "warn");
-	const prompts = loadPrompts(args.file);
+	const prompts = loadPromptRecords(args.file);
 	const registry = await StoreRegistry.create();
+	const dumpLines: string[] = [];
 	try {
 		const engine = new ActivationEngine(
 			registry.writableStore(),
@@ -189,11 +281,16 @@ async function main(): Promise<void> {
 			createRerankerFromConfig(),
 		);
 		const records: ReplayRecord[] = [];
-		for (const prompt of prompts) {
+		for (const { prompt, ts } of prompts) {
+			const session =
+				args.sessions && ts !== undefined
+					? `replay\u0000${Math.floor(ts / SESSION_WINDOW_MS)}`
+					: undefined;
 			const started = performance.now();
 			const result = await engine.activate(splitIntoCues(prompt), {
 				limit: args.limit,
 				dryRun: true,
+				session,
 			});
 			records.push({
 				promptChars: prompt.length,
@@ -201,8 +298,34 @@ async function main(): Promise<void> {
 				entryIds: result.entries.map((e) => e.entry.id),
 				latencyMs: performance.now() - started,
 				gateMode: result.telemetry?.gateMode ?? "off",
+				injectedTokens: result.telemetry?.injectedTokens,
+				gateDropped: result.telemetry?.gateDropped,
+				budgetDropped: result.telemetry?.budgetDropped,
+				deduped: result.telemetry?.deduped,
+				session,
 			});
+			if (args.dump) {
+				dumpLines.push(
+					JSON.stringify({
+						promptChars: prompt.length,
+						gateMode: result.telemetry?.gateMode ?? "off",
+						candidates: result.entries.map((e) => ({
+							id: e.entry.id,
+							type: e.entry.type,
+							raw: e.rawSimilarity,
+							rerank: e.rerankScore ?? null,
+							tokens: formatKnowledgeLine({
+								entry: e.entry,
+								staleness: e.staleness,
+								contradiction: e.contradiction,
+							}).length,
+						})),
+					}),
+				);
+			}
 		}
+		if (args.dump)
+			writeFileSync(args.dump, `${dumpLines.join("\n")}\n`, { mode: 0o600 });
 		const summary = summarize(records, args.limit);
 		console.log(
 			args.json

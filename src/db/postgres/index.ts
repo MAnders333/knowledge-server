@@ -8,7 +8,10 @@ import type {
 	KnowledgeRelation,
 	KnowledgeStatus,
 } from "../../types.js";
-import type { IKnowledgeStore } from "../interface.js";
+import {
+	type IKnowledgeStore,
+	LAST_ACCESS_TOUCH_INTERVAL_MS,
+} from "../interface.js";
 import {
 	assertNotNewerThanCode,
 	pendingMigrations,
@@ -947,12 +950,19 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		return (rows as unknown as RawEntryRow[]).map((r) => this.rowToEntry(r));
 	}
 
-	async recordAccess(id: string): Promise<void> {
-		const now = Date.now();
+	/**
+	 * Record one activation's injections in one statement (see
+	 * IKnowledgeStore.recordInjections). Retrieval-only: never called during
+	 * consolidation.
+	 */
+	async recordInjections(ids: string[], now: number): Promise<void> {
+		if (ids.length === 0) return;
 		await this.sql`
 			UPDATE knowledge_entry
-			SET access_count = access_count + 1, last_accessed_at = ${now}, updated_at = ${now}
-			WHERE id = ${id}
+			SET injection_count = injection_count + 1,
+			    last_accessed_at = CASE WHEN last_accessed_at <= ${now - LAST_ACCESS_TOUCH_INTERVAL_MS}
+			                       THEN ${now} ELSE last_accessed_at END
+			WHERE id = ANY(${[...new Set(ids)]}::text[])
 		`;
 	}
 

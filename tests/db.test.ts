@@ -90,8 +90,9 @@ describe("KnowledgeDB", () => {
 		expect(entry?.supersededBy).toBe("test-3");
 	});
 
-	it("should record access and increment count", async () => {
-		const now = Date.now();
+	it("records injections: injection_count grows, access_count is frozen, last_accessed_at moves at most daily", async () => {
+		const day = 24 * 60 * 60 * 1000;
+		const t0 = Date.now() - 3 * day;
 		await db.insertEntry({
 			id: "test-3",
 			type: "principle",
@@ -101,22 +102,39 @@ describe("KnowledgeDB", () => {
 			source: "test",
 			status: "active",
 			strength: 1.0,
-			createdAt: now,
-			updatedAt: now,
-			lastAccessedAt: now,
-			accessCount: 0,
+			createdAt: t0,
+			updatedAt: t0,
+			lastAccessedAt: t0,
+			accessCount: 4,
 			observationCount: 1,
 			supersededBy: null,
 			derivedFrom: [],
 		});
 
-		await db.recordAccess("test-3");
-		await db.recordAccess("test-3");
-		await db.recordAccess("test-3");
+		const t1 = t0 + 2 * day;
+		await db.recordInjections(["test-3"], t1);
+		// Within 24 h of the last bump: counted, but freshness does not move.
+		await db.recordInjections(["test-3", "test-3"], t1 + 60_000);
+		// A day later the freshness moves again.
+		await db.recordInjections(["test-3"], t1 + day + 1);
 
 		const entry = await db.getEntry("test-3");
-		expect(entry?.accessCount).toBe(3);
-		expect(entry?.lastAccessedAt).toBeGreaterThanOrEqual(now);
+		expect(entry?.accessCount).toBe(4);
+		expect(entry?.lastAccessedAt).toBe(t1 + day + 1);
+
+		const raw = new Database(join(tempDir, "test.db"), { readonly: true });
+		const row = raw
+			.prepare(
+				"SELECT injection_count FROM knowledge_entry WHERE id = 'test-3'",
+			)
+			.get() as { injection_count: number };
+		raw.close();
+		// Each id counts once per batch: 1 + 1 (duplicate id in one batch) + 1.
+		expect(row.injection_count).toBe(3);
+	});
+
+	it("recordInjections is a no-op for an empty batch", async () => {
+		await db.recordInjections([], Date.now());
 	});
 
 	it("should filter entries by status", async () => {

@@ -69,7 +69,11 @@ function cleanForBlock(text: string, maxChars: number): string {
 /** Characters of the entry id shown in each line. Enough to find the entry via `knowledge_flag`. */
 export const SHORT_ID_CHARS = 8;
 
-function formatLine(item: ActivatedKnowledgeItem): string {
+/**
+ * One entry as it appears in the injected block (without the block wrapper).
+ * The token budget measures entries with this function, so it counts what is sent.
+ */
+export function formatKnowledgeLine(item: ActivatedKnowledgeItem): string {
 	const id = cleanForBlock(
 		item.entry.id.slice(0, SHORT_ID_CHARS),
 		SHORT_ID_CHARS,
@@ -95,7 +99,7 @@ export function formatActivatedKnowledge(
 	const lines: string[] = [];
 	let used = 0;
 	for (const item of items) {
-		const line = formatLine(item);
+		const line = formatKnowledgeLine(item);
 		if (lines.length > 0 && used + line.length > MAX_CONTEXT_CHARS) break;
 		lines.push(line);
 		used += line.length + 1;

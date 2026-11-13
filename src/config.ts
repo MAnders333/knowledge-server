@@ -131,6 +131,10 @@ export const DEFAULT_CONTRADICTION_MIN_SIMILARITY = 0.4;
 export const DEFAULT_CONTRADICTION_MAX_CANDIDATES = Number.POSITIVE_INFINITY;
 /** Minimum raw cosine similarity to activate an entry. */
 export const DEFAULT_ACTIVATION_SIMILARITY_THRESHOLD = 0.42;
+// Precision gate defaults. Conservative and NOT replay-calibrated (see gate.ts).
+export const DEFAULT_RERANK_REL_FRAC = 0.35;
+export const DEFAULT_DENSE_MARGIN = 0;
+export const DEFAULT_TOKEN_BUDGET = 2000;
 /**
  * Cosine similarity threshold for assigning an entry to an existing cluster
  * during greedy clustering. Below this threshold a new cluster is started.
@@ -613,6 +617,44 @@ export const config = {
 					100,
 				),
 			},
+		},
+		// Precision gate: decides how many candidates are injected (see gate.ts).
+		gate: {
+			// ACTIVATION_PRECISION_GATE=off disables the floors and the token budget.
+			enabled: process.env.ACTIVATION_PRECISION_GATE !== "off",
+			// RERANK_FLOOR overrides the absolute rerank floor of the configured scorer.
+			// Unset: the per-model default in gate.ts. A model without one uses the relative rule only.
+			rerankFloor: process.env.RERANK_FLOOR
+				? parseFloatEnv(process.env.RERANK_FLOOR, 0)
+				: null,
+			// A candidate must reach this fraction of the best rerank score.
+			rerankRelFrac: parseFloatEnv(
+				process.env.RERANK_REL_FRAC,
+				DEFAULT_RERANK_REL_FRAC,
+			),
+			// Dense-only ordering (rerank did not run): raw cosine must clear the similarity
+			// threshold by this margin.
+			denseMargin: parseFloatEnv(
+				process.env.ACTIVATION_DENSE_MARGIN,
+				DEFAULT_DENSE_MARGIN,
+			),
+			// Token budget for the injected entries (estimate: characters / 4). The top
+			// entry is always kept. Codex truncates hook output near 2,500 tokens, so the
+			// default stays at or below 2,000.
+			tokenBudget: parseIntEnv(
+				process.env.ACTIVATION_TOKEN_BUDGET,
+				DEFAULT_TOKEN_BUDGET,
+				1,
+			),
+			// Per-session dedupe TTL, measured from each injection. 0 disables suppression.
+			sessionTtlMs: parseIntEnv(
+				process.env.ACTIVATION_SESSION_TTL_MS,
+				1_800_000,
+				0,
+			),
+			// Rank-time freshness dampening: rerank × (0.5 + 0.5·strength) instead of
+			// rerank × strength. Off by default.
+			strengthDampening: process.env.ACTIVATION_STRENGTH_DAMPENING === "true",
 		},
 	},
 } as const;

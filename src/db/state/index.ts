@@ -21,7 +21,10 @@ import {
 } from "../migration-registry.js";
 import { SQLITE_BUSY_TIMEOUT_MS } from "../sqlite-busy.js";
 import { runStateMigrations } from "./migrations.js";
-import { SERVER_LOCAL_MIGRATIONS } from "./schema.js";
+import {
+	ACTIVATION_EVENT_V4_COLUMNS,
+	SERVER_LOCAL_MIGRATIONS,
+} from "./schema.js";
 import {
 	SERVER_LOCAL_CREATE_TABLES,
 	SERVER_LOCAL_SCHEMA_VERSION,
@@ -132,6 +135,24 @@ export class ServerStateDB implements IServerStateDB {
       );
     `);
 
+		// v4: activation_event gate and budget counts. CREATE TABLE IF NOT EXISTS does
+		// not add columns to a table that already exists, so add any that are missing.
+		const eventColumns = new Set(
+			(
+				this.db.prepare("PRAGMA table_info(activation_event)").all() as Array<{
+					name: string;
+				}>
+			).map((c) => c.name),
+		);
+		if (eventColumns.size > 0) {
+			for (const column of ACTIVATION_EVENT_V4_COLUMNS) {
+				if (!eventColumns.has(column)) {
+					this.db.exec(
+						`ALTER TABLE activation_event ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`,
+					);
+				}
+			}
+		}
 		// Fresh DB or already at current version — create/verify tables.
 		// Always run CREATE TABLE IF NOT EXISTS for all tables — additive and
 		// idempotent. Schema migrations for state.db are always additive; tables
@@ -484,8 +505,9 @@ export class ServerStateDB implements IServerStateDB {
 		const stmt = this.db.prepare(
 			`INSERT INTO activation_event
 			   (ts, client, session_hash, prompt_chars, cue_count, n_candidates, n_returned,
-			    entry_ids, raw_sims, rerank_scores, gate_mode, latency_ms, client_deadline_exceeded)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			    entry_ids, raw_sims, rerank_scores, gate_mode, latency_ms, client_deadline_exceeded,
+			    gate_dropped, budget_dropped, deduped, injected_tokens)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		);
 		this.db.transaction(() => {
 			for (const r of rows) {
@@ -503,6 +525,10 @@ export class ServerStateDB implements IServerStateDB {
 					r.gateMode,
 					r.latencyMs,
 					r.clientDeadlineExceeded ? 1 : 0,
+					r.gateDropped,
+					r.budgetDropped,
+					r.deduped,
+					r.injectedTokens,
 				);
 			}
 		})();

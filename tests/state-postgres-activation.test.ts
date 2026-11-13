@@ -40,6 +40,10 @@ function row(overrides: Partial<ActivationEventRow> = {}): ActivationEventRow {
 		gateMode: "rerank",
 		latencyMs: 35,
 		clientDeadlineExceeded: false,
+		gateDropped: 0,
+		budgetDropped: 0,
+		deduped: 0,
+		injectedTokens: 0,
 		...overrides,
 	};
 }
@@ -98,14 +102,14 @@ describe.skipIf(!PG_URI)("PostgresServerStateDB activation_event", () => {
 		});
 	}
 
-	it("fresh init stamps schema v3 and creates activation_event", async () => {
+	it("fresh init stamps schema v4 and creates activation_event", async () => {
 		const state = new PostgresServerStateDB(testUri);
 		try {
 			await state.initialize();
 		} finally {
 			await state.close();
 		}
-		expect(await schemaVersions()).toEqual([3]);
+		expect(await schemaVersions()).toEqual([4]);
 		expect(await activationTableExists()).toBe(true);
 	});
 
@@ -135,7 +139,7 @@ describe.skipIf(!PG_URI)("PostgresServerStateDB activation_event", () => {
 		} finally {
 			await state.close();
 		}
-		expect(await schemaVersions()).toEqual([2, 3]);
+		expect(await schemaVersions()).toEqual([2, 3, 4]);
 		expect(await activationTableExists()).toBe(true);
 	});
 

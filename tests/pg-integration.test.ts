@@ -234,17 +234,25 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		expect(entry?.supersededBy).toBe("test-3");
 	});
 
-	it("records access and increments count", async () => {
-		const now = Date.now();
-		await db.insertEntry(makeEntry("test-3"));
+	it("records injections: injection_count grows, access_count frozen, last_accessed_at at most daily", async () => {
+		const day = 24 * 60 * 60 * 1000;
+		const t0 = Date.now() - 3 * day;
+		await db.insertEntry(
+			makeEntry("test-3", { lastAccessedAt: t0, accessCount: 4 }),
+		);
 
-		await db.recordAccess("test-3");
-		await db.recordAccess("test-3");
-		await db.recordAccess("test-3");
+		const t1 = t0 + 2 * day;
+		await db.recordInjections(["test-3"], t1);
+		await db.recordInjections(["test-3", "test-3"], t1 + 60_000);
+		await db.recordInjections(["test-3"], t1 + day + 1);
 
 		const entry = await db.getEntry("test-3");
-		expect(entry?.accessCount).toBe(3);
-		expect(entry?.lastAccessedAt).toBeGreaterThanOrEqual(now);
+		expect(entry?.accessCount).toBe(4);
+		expect(entry?.lastAccessedAt).toBe(t1 + day + 1);
+		const [row] =
+			await truncSql`SELECT injection_count FROM knowledge_entry WHERE id = 'test-3'`;
+		// Each id counts once per batch: 1 + 1 (duplicate id in one batch) + 1.
+		expect(Number(row.injection_count)).toBe(3);
 	});
 
 	it("reinforces observation", async () => {

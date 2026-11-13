@@ -540,4 +540,20 @@ export const PG_MIGRATIONS: Array<{
 			await sql`ALTER TABLE knowledge_entry SET (fillfactor = 85)`;
 		},
 	},
+	{
+		version: 19,
+		label: "add injection_count to knowledge_entry (access_count frozen)",
+		up: async (sql: TxSql) => {
+			// Check first: a role that does not own the table cannot ALTER it, and the
+			// column is already there when the table was created by the owner.
+			const present = await sql`
+				SELECT 1 FROM pg_attribute a
+				WHERE a.attrelid = to_regclass('knowledge_entry')
+				  AND a.attname = 'injection_count' AND a.attnum > 0 AND NOT a.attisdropped
+			`;
+			if (present.length === 0) {
+				await sql`ALTER TABLE knowledge_entry ADD COLUMN injection_count INTEGER NOT NULL DEFAULT 0`;
+			}
+		},
+	},
 ];

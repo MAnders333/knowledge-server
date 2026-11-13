@@ -207,3 +207,18 @@ describe("version guard on SQLite stores", () => {
 		}
 	});
 });
+
+describe("precision gate migrations", () => {
+	it("knowledge.db and Postgres add injection_count as v19, after the v18 registry", () => {
+		expect(MIGRATIONS.map((m) => m.version).slice(-2)).toEqual([18, 19]);
+		expect(PG_MIGRATIONS.map((m) => m.version).slice(-2)).toEqual([18, 19]);
+		expect(SCHEMA_VERSION).toBe(19);
+	});
+
+	it("state DB adds the activation_event gate counts as v4", () => {
+		expect(SERVER_LOCAL_MIGRATIONS.map((m) => m.version).slice(-1)).toEqual([
+			4,
+		]);
+		expect(SERVER_LOCAL_SCHEMA_VERSION).toBe(4);
+	});
+});
