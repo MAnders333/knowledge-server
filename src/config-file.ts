@@ -146,38 +146,42 @@ function parsePortEnvVar(raw: string | undefined, fallback: number): number {
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
 
-export const DEFAULT_CONFIG_PATH = join(
-	homeDir(),
-	".config",
-	"knowledge-server",
-	"config.jsonc",
-);
+/**
+ * Default data directory: state.db, knowledge.db, the lockfiles, the daemon
+ * status file, server.log and server.pid unless stateDb.path moves them. Resolved
+ * on each call so it follows HOME at call time.
+ */
+export function defaultDataDir(home: string = homeDir()): string {
+	return join(home, ".local", "share", "knowledge-server");
+}
 
-export const DEFAULT_SQLITE_PATH = join(
-	homeDir(),
-	".local",
-	"share",
-	"knowledge-server",
-	"knowledge.db",
-);
+/** Default config.jsonc location. */
+export function defaultConfigPath(home: string = homeDir()): string {
+	return join(home, ".config", "knowledge-server", "config.jsonc");
+}
+
+/** Default knowledge.db: the SQLite store used when none is configured. */
+export function defaultSqlitePath(home: string = homeDir()): string {
+	return join(defaultDataDir(home), "knowledge.db");
+}
 
 /**
  * Directory that holds state.db, the default knowledge.db, the lockfiles
  * (daemon.lock, consolidate.lock), the daemon status file and daemon.log.
  * Follows `stateDb.path` from config.jsonc, else the default location.
  */
-export function resolveDataDir(configPath = DEFAULT_CONFIG_PATH): string {
+export function resolveDataDir(configPath = defaultConfigPath()): string {
 	let stateDbPath: string | undefined;
 	try {
 		stateDbPath = loadConfigFile(configPath)?.stateDb.path;
 	} catch {
 		// A malformed config is reported by the component that needs it.
 	}
-	return dirname(stateDbPath ?? DEFAULT_SQLITE_PATH);
+	return dirname(stateDbPath ?? defaultSqlitePath());
 }
 
 /** Expand a leading `~` (alone or as `~/…`) to the home directory. */
-export function expandHome(p: string): string {
+function expandHome(p: string): string {
 	return p.replace(/^~(?=$|\/)/, homeDir());
 }
 
@@ -255,7 +259,7 @@ function stripJsoncComments(jsonc: string): string {
  * @param configPath Override path — used in tests and by migrate-config.
  */
 export function loadConfigFile(
-	configPath = DEFAULT_CONFIG_PATH,
+	configPath = defaultConfigPath(),
 ): KnowledgeServerConfig | null {
 	if (!existsSync(configPath)) {
 		return null;
@@ -662,7 +666,7 @@ export function resolvePostgresUri(store: StoreConfig): string {
  * Falls back to the default path if not specified.
  */
 export function resolveSqlitePath(store: StoreConfig): string {
-	return store.path ?? DEFAULT_SQLITE_PATH;
+	return store.path ?? defaultSqlitePath();
 }
 
 /**
@@ -682,7 +686,7 @@ export function resolveLegacyKnowledgeDbPath(
  * Same precedence as loadConfigFile(): KNOWLEDGE_PORT / KNOWLEDGE_HOST env →
  * config.jsonc → defaults (127.0.0.1:3179).
  */
-export function resolveServerAddress(configPath = DEFAULT_CONFIG_PATH): {
+export function resolveServerAddress(configPath = defaultConfigPath()): {
 	host: string;
 	port: number;
 } {

@@ -2,7 +2,12 @@ import { existsSync } from "node:fs";
 import { basename, join } from "node:path";
 import { isPlainHttpRemote } from "./activation/key-transport.js";
 import { hasOAuthTokens } from "./auth/claude-oauth.js";
-import { DEFAULT_CONFIG_PATH, resolveDataDir } from "./config-file.js";
+import {
+	defaultConfigPath,
+	defaultDataDir,
+	resolveDataDir,
+} from "./config-file.js";
+import { TYPE_HALF_LIFE_DAYS } from "./domain/strength.js";
 import { envFileCandidates, preferredEnvFile } from "./env-file.js";
 import { homeDir } from "./home.js";
 import { DEFAULT_LOG_MAX_BYTES } from "./logger.js";
@@ -358,20 +363,14 @@ const EXPLICIT_PATH_VARS = [
  * Parse the environment into the config object. Pure: the same env always gives
  * the same result. The module-level `config` is parseEnv(process.env).config.
  */
-export function parseEnv(env: Env, configPath = DEFAULT_CONFIG_PATH) {
+export function parseEnv(env: Env, configPath = defaultConfigPath()) {
 	const r = new EnvReader(env);
 	const dataDir = resolveDataDir(configPath);
 	const explicitPidPath = env.KNOWLEDGE_PID_PATH;
 	const pidPath = explicitPidPath ?? join(dataDir, "server.pid");
-	const legacyPidDefault = join(
-		homeDir(),
-		".local",
-		"share",
-		"knowledge-server",
-		"server.pid",
-	);
+	const legacyPidDefault = join(defaultDataDir(), "server.pid");
 
-	const rerankEnabled = env.RERANK_ENABLED !== "false";
+	const rerankEnabled = r.flag("RERANK_ENABLED", true);
 	const rerankProvider = rerankProviderFromEnv(env);
 	const rawRerankProvider = env.RERANK_PROVIDER?.trim().toLowerCase();
 	if (
@@ -503,15 +502,15 @@ export function parseEnv(env: Env, configPath = DEFAULT_CONFIG_PATH) {
 		ompSessionsRoot: env.OMP_SESSIONS_ROOT || join(homeDir(), ".omp"),
 
 		// Explicit source enable/disable.
-		// All default to true (auto-detect); set to "false" to hard-disable a source.
-		opencodeEnabled: env.OPENCODE_ENABLED !== "false",
-		claudeEnabled: env.CLAUDE_ENABLED !== "false",
-		cursorEnabled: env.CURSOR_ENABLED !== "false",
-		codexEnabled: env.CODEX_ENABLED !== "false",
-		vscodeEnabled: env.VSCODE_ENABLED !== "false",
-		localFilesEnabled: env.LOCAL_FILES_ENABLED !== "false",
-		piEnabled: env.PI_ENABLED !== "false",
-		ompEnabled: env.OMP_ENABLED !== "false",
+		// All default to true (auto-detect); false, 0, no or off hard-disables a source.
+		opencodeEnabled: r.flag("OPENCODE_ENABLED", true),
+		claudeEnabled: r.flag("CLAUDE_ENABLED", true),
+		cursorEnabled: r.flag("CURSOR_ENABLED", true),
+		codexEnabled: r.flag("CODEX_ENABLED", true),
+		vscodeEnabled: r.flag("VSCODE_ENABLED", true),
+		localFilesEnabled: r.flag("LOCAL_FILES_ENABLED", true),
+		piEnabled: r.flag("PI_ENABLED", true),
+		ompEnabled: r.flag("OMP_ENABLED", true),
 
 		// LLM credentials — three tiers, evaluated per-provider at call time:
 		//
@@ -667,7 +666,7 @@ export function parseEnv(env: Env, configPath = DEFAULT_CONFIG_PATH) {
 		// State database (server-side pending_episodes staging and bookkeeping).
 		// Its location is config.jsonc stateDb (see config-file.ts).
 		postgres: {
-			// Maximum pool connections for each knowledge store on Postgres. Useful for
+			// Maximum pool connections for each Postgres pool (knowledge stores and the state DB). Useful for
 			// hosted services with tight connection limits (Supabase free, Railway, Neon).
 			poolMax: r.int("POSTGRES_POOL_MAX", 10, 1),
 		},
@@ -683,13 +682,7 @@ export function parseEnv(env: Env, configPath = DEFAULT_CONFIG_PATH) {
 			// Set to 0 to disable.
 			intervalMs: r.int("DECAY_INTERVAL_MS", 86_400_000, 0),
 			// Type-specific decay rates (higher = slower decay)
-			typeHalfLife: {
-				fact: 30, // facts go stale in ~30 days
-				principle: 180, // principles last ~6 months
-				pattern: 90, // patterns last ~3 months
-				decision: 120, // decisions last ~4 months
-				procedure: 365, // procedures are very stable
-			} as Record<string, number>,
+			typeHalfLife: TYPE_HALF_LIFE_DAYS,
 		},
 
 		// Consolidation
@@ -1007,7 +1000,7 @@ export function remoteRerankIsActive(): boolean {
  * on the parsed config and on the credentials.
  */
 export function validateConfig(): string[] {
-	const errors: string[] = [...parsed.issues];
+	const errors: string[] = configEnvIssues();
 
 	const envPath = resolveEnvFilePath();
 
@@ -1164,4 +1157,12 @@ export function validateConfig(): string[] {
 	}
 
 	return errors;
+}
+
+/**
+ * Invalid environment values found while parsing (the same list validateConfig()
+ * starts with). The daemon reports these; it does not run the credential checks.
+ */
+export function configEnvIssues(): string[] {
+	return [...parsed.issues];
 }

@@ -9,9 +9,16 @@ import {
 	hasOAuthTokens,
 } from "../auth/claude-oauth.js";
 import { config } from "../config.js";
+import type { DomainContext } from "../domain/domain-router.js";
+import {
+	UNTRUSTED_DATA_RULE,
+	escapeUntrusted,
+	untrustedField,
+	untrustedLine,
+	untrustedList,
+} from "../domain/untrusted.js";
 import { logger } from "../logger.js";
 import type { Episode, KnowledgeType } from "../types.js";
-import type { DomainContext } from "./domain-router.js";
 import {
 	type ContradictionConflict,
 	type ContradictionReplyFormat,
@@ -22,13 +29,6 @@ import {
 	parseItems,
 	synthesisItemSchema,
 } from "./llm-output.js";
-import {
-	UNTRUSTED_DATA_RULE,
-	escapeUntrusted,
-	untrustedField,
-	untrustedLine,
-	untrustedList,
-} from "./untrusted.js";
 
 /**
  * LLM interface for consolidation.

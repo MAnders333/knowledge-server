@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import postgres from "postgres";
 import { config } from "../../config.js";
-import { computeStrength } from "../../consolidation/decay.js";
+import { computeStrength } from "../../domain/strength.js";
 import { logger } from "../../logger.js";
 import { clampKnowledgeType } from "../../types.js";
 import type {

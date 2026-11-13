@@ -1,4 +1,3 @@
-import { homedir } from "node:os";
 import { normalize } from "node:path";
 import type {
 	DomainConfig,
@@ -6,6 +5,7 @@ import type {
 	ProjectConfig,
 } from "../config-file.js";
 import type { IKnowledgeStore } from "../db/interface.js";
+import { homeDir } from "../home.js";
 import { logger } from "../logger.js";
 
 /**
@@ -134,7 +134,7 @@ export class DomainRouter {
 
 		// Find the best matching project (longest path prefix match).
 		const normalizedDir = directory
-			? normalize(directory.replace(/^~/, homedir()))
+			? normalize(directory.replace(/^~/, homeDir()))
 			: "";
 		const matchedProject = this.bestProjectMatch(normalizedDir);
 

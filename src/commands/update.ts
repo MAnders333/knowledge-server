@@ -54,10 +54,7 @@ export interface ReleaseAsset {
  * Run a binary with `args` and report whether it exits 0. Output is discarded.
  * Never throws: a binary that cannot be executed counts as a failed smoke test.
  */
-export async function smokeTest(
-	path: string,
-	args: string[],
-): Promise<boolean> {
+async function smokeTest(path: string, args: string[]): Promise<boolean> {
 	try {
 		const proc = Bun.spawn([path, ...args], {
 			stdout: "ignore",

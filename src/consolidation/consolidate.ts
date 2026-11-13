@@ -2,8 +2,13 @@ import type { ActivationEngine } from "../activation/activate.js";
 import { formatEmbeddingText } from "../activation/embeddings.js";
 import { cosineSimilarity } from "../activation/embeddings.js";
 import { config } from "../config.js";
-import { approxTokens } from "../daemon/readers/shared.js";
 import type { IKnowledgeStore, IServerStateDB } from "../db/index.js";
+import type {
+	DomainResolution,
+	DomainRouter,
+} from "../domain/domain-router.js";
+import { computeStrength } from "../domain/strength.js";
+import { approxTokens } from "../domain/tokens.js";
 import { componentHealth } from "../health.js";
 import { logger } from "../logger.js";
 import {
@@ -27,8 +32,6 @@ import type {
 } from "../types.js";
 import { clampKnowledgeType, episodeKeyId } from "../types.js";
 import { ContradictionScanner } from "./contradiction.js";
-import { computeStrength } from "./decay.js";
-import type { DomainResolution, DomainRouter } from "./domain-router.js";
 import { isDeterministicFailure, providerFailureClass } from "./errors.js";
 import { ConsolidationLLM, formatEpisodes } from "./llm.js";
 import type { ExtractedKnowledge } from "./llm.js";

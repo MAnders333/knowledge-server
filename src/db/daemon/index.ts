@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { defaultDataDir } from "../../config-file.js";
 import { logger } from "../../logger.js";
 import type { DaemonCursor } from "../../types.js";
 import { ensurePrivateFile } from "../../utils.js";
@@ -12,13 +12,9 @@ import { SQLITE_BUSY_TIMEOUT_MS } from "../sqlite-busy.js";
  * Always a local SQLite file on the machine where knowledge-daemon runs.
  * Never shared or remote.
  */
-export const DEFAULT_DAEMON_DB_PATH = join(
-	homedir(),
-	".local",
-	"share",
-	"knowledge-server",
-	"daemon.db",
-);
+export function defaultDaemonDbPath(): string {
+	return join(defaultDataDir(), "daemon.db");
+}
 
 const CREATE_TABLES = `
   CREATE TABLE IF NOT EXISTS schema_version (
@@ -85,7 +81,7 @@ const SESSION_LOOKUP_CHUNK = 500;
 export class DaemonDB {
 	private readonly db: Database;
 
-	constructor(dbPath = DEFAULT_DAEMON_DB_PATH) {
+	constructor(dbPath = defaultDaemonDbPath()) {
 		const dir = dirname(dbPath);
 		if (!existsSync(dir)) {
 			mkdirSync(dir, { recursive: true });

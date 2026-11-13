@@ -5,13 +5,13 @@ import {
 	formatEmbeddingText,
 } from "../activation/embeddings.js";
 import { config } from "../config.js";
-import { approxTokens } from "../daemon/readers/shared.js";
 import type { IKnowledgeStore } from "../db/index.js";
+import { computeStrength } from "../domain/strength.js";
+import { approxTokens } from "../domain/tokens.js";
 import { logger } from "../logger.js";
 import { redactSecrets } from "../redact.js";
 import { clampKnowledgeType } from "../types.js";
 import type { KnowledgeEntry } from "../types.js";
-import { computeStrength } from "./decay.js";
 import type { ConsolidationLLM, ExtractedKnowledge } from "./llm.js";
 
 /**

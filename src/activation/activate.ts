@@ -1,6 +1,6 @@
 import { config } from "../config.js";
-import { computeStrength } from "../consolidation/decay.js";
 import type { IKnowledgeStore } from "../db/index.js";
+import { computeStrength } from "../domain/strength.js";
 import { componentHealth } from "../health.js";
 import { logger } from "../logger.js";
 import type {

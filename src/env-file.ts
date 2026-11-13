@@ -15,6 +15,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import * as dotenv from "dotenv";
+import { defaultDataDir } from "./config-file.js";
 
 /**
  * Keys a `.env` file may never set. These change how the process loads code or
@@ -80,7 +81,7 @@ export function envFileCandidates(
 		candidates.push(join(env.KNOWLEDGE_CONFIG_HOME, ".env"));
 	}
 	candidates.push(preferredEnvFile(env, home));
-	candidates.push(join(home, ".local", "share", "knowledge-server", ".env"));
+	candidates.push(join(defaultDataDir(home), ".env"));
 	return candidates;
 }
 

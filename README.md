@@ -260,7 +260,7 @@ Configuration is split across two files:
 
 **`~/.config/knowledge-server/config.jsonc`** — store topology (which databases to use and where). Created automatically on first run (default: local SQLite). Edit this for Postgres or multi-store setups.
 
-**Invalid values fail at startup.** The server refuses to start when a value is not a number, is outside its range, or is not a recognised flag spelling; the message names the variable. An empty value means the default. The daemon and the MCP proxy skip this check. `ACTIVATION_PRECISION_GATE`, `ACTIVATION_STRENGTH_DAMPENING` and `CONTRADICTION_CONFLICTS_ONLY` accept `true`/`false`, `on`/`off`, `yes`/`no` and `1`/`0`. The `*_ENABLED` switches and `RERANK_ENABLED` are off only for `false`.
+**Invalid values fail at startup.** The server refuses to start when a value is not a number, is outside its range, or is not a recognised flag spelling; the message names the variable. An empty value means the default. The daemon logs these as warnings and keeps running; the MCP proxy does not check them. Flags take `true`/`false`, `on`/`off`, `yes`/`no` or `1`/`0` (case-insensitive): `ACTIVATION_PRECISION_GATE`, `ACTIVATION_STRENGTH_DAMPENING`, `CONTRADICTION_CONFLICTS_ONLY`, `RERANK_ENABLED` and the `*_ENABLED` source switches.
 
 ### Editor validation (`$schema`)
 
@@ -443,6 +443,7 @@ Credentials and paths stay in `.env`:
 |---|---|---|
 | `KNOWLEDGE_ADMIN_TOKEN` | *(random per process)* | Fixed admin token for scripted use (≥16 chars; the template placeholder `your-stable-token-here` is rejected). When set, every route except `/health` requires it as a Bearer token |
 | `KNOWLEDGE_ALLOWED_HOSTS` | *(empty)* | Extra `Host` names the API accepts, comma-separated (`name` or `name:port`). `localhost`, `127.0.0.1`, `[::1]` and the bind host are always accepted. Needed when a reverse proxy forwards a different hostname. |
+| `POSTGRES_POOL_MAX` | `10` | Connections per Postgres pool: each Postgres knowledge store and the state DB |
 | `REDACT_SECRETS` | `true` | Scrub credentials (private keys, cloud/SaaS/LLM API tokens, JWTs, `Authorization` headers, `*_SECRET`/`*_TOKEN`/`*_PASSWORD`/`*_API_KEY` values, URL passwords, long keyed secrets) from transcript text before it is staged, sent to an LLM or embedding API, or stored. Set `false` to disable. Counts are logged per run; values are never logged. |
 | `KNOWLEDGE_LOG_PATH` | `server.log` in the data directory: the directory of `stateDb.path` (default `~/.local/share/knowledge-server`) | Log file. Set to `""` to disable. When stdout or stderr already points at this file (the launchd plist does this), each line is written once. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. `info` logs lengths, ids, counts and similarity scores; entry and episode text is logged only at `debug`. `warn` suppresses info lines. |
@@ -457,21 +458,21 @@ All sources are auto-detected. Override paths or disable sources via environment
 | Variable | Default | Description |
 |---|---|---|
 | `OPENCODE_DB_PATH` | `~/.local/share/opencode/opencode.db` | OpenCode SQLite DB |
-| `OPENCODE_ENABLED` | `true` | Set to `false` to disable |
+| `OPENCODE_ENABLED` | `true` | Set to `false` (or `0`, `no`, `off`) to disable |
 | `CLAUDE_DB_PATH` | `~/.claude` | Claude Code JSONL root dir |
-| `CLAUDE_ENABLED` | `true` | Set to `false` to disable |
+| `CLAUDE_ENABLED` | `true` | Set to `false` (or `0`, `no`, `off`) to disable |
 | `CODEX_SESSIONS_DIR` | *(auto-detected)* | Codex CLI sessions root |
-| `CODEX_ENABLED` | `true` | Set to `false` to disable |
+| `CODEX_ENABLED` | `true` | Set to `false` (or `0`, `no`, `off`) to disable |
 | `CURSOR_DB_PATH` | *(auto-detected)* | Cursor `state.vscdb` path |
-| `CURSOR_ENABLED` | `true` | Set to `false` to disable |
+| `CURSOR_ENABLED` | `true` | Set to `false` (or `0`, `no`, `off`) to disable |
 | `VSCODE_DATA_DIR` | *(auto-detected)* | VSCode data directory |
-| `VSCODE_ENABLED` | `true` | Set to `false` to disable |
+| `VSCODE_ENABLED` | `true` | Set to `false` (or `0`, `no`, `off`) to disable |
 | `LOCAL_FILES_DIR` | `~/knowledge` | Markdown files to ingest |
-| `LOCAL_FILES_ENABLED` | `true` | Set to `false` to disable |
+| `LOCAL_FILES_ENABLED` | `true` | Set to `false` (or `0`, `no`, `off`) to disable |
 | `PI_SESSIONS_ROOT` | `~/.pi` | pi sessions root (scans `<root>/*/sessions`) |
-| `PI_ENABLED` | `true` | Set to `false` to disable |
+| `PI_ENABLED` | `true` | Set to `false` (or `0`, `no`, `off`) to disable |
 | `OMP_SESSIONS_ROOT` | `~/.omp` | oh-my-pi sessions root (scans shared + profile layers) |
-| `OMP_ENABLED` | `true` | Set to `false` to disable |
+| `OMP_ENABLED` | `true` | Set to `false` (or `0`, `no`, `off`) to disable |
 
 #### Daemon upload behaviour
 
@@ -546,7 +547,7 @@ The default name `jev-1.14.0` exists on the maintainer's gateway and on TypeSafe
 
 | Variable | Default | Description |
 |---|---|---|
-| `RERANK_ENABLED` | `true` | `false` restores dense-only ordering |
+| `RERANK_ENABLED` | `true` | `false` (or `0`, `no`, `off`) restores dense-only ordering |
 | `RERANK_PROVIDER` | `local` | `local` or `remote`. Any other value fails validation. `remote` sends content off this machine (see the privacy note) |
 | `RERANK_MODEL` | `Xenova/ms-marco-MiniLM-L-6-v2` | Local Hugging Face ONNX cross-encoder. **The default is English-only.** For other languages use a multilingual ONNX export with a WordPiece `tokenizer.json`. Other models are fetched from `main` without a checksum |
 | `RERANK_MODELS_DIR` | `models` in the data directory (see `KNOWLEDGE_LOG_PATH`) | Local model cache |

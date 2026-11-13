@@ -153,7 +153,7 @@ const ACTIVATED_KNOWLEDGE_NOTICE =
 const MAX_ENTRY_CHARS = 1000;
 const MAX_CONTEXT_CHARS = 6000;
 
-/** Wrapper tag names guarded in untrusted text. MUST match UNTRUSTED_TAGS in src/consolidation/untrusted.ts. */
+/** Wrapper tag names guarded in untrusted text. MUST match UNTRUSTED_TAGS in src/domain/untrusted.ts. */
 const UNTRUSTED_TAGS = [
 	"episode-content",
 	"episode-title",
@@ -178,7 +178,7 @@ const UNTRUSTED_TAGS = [
 
 // One character class with a star, not a whitespace star, optional slash and another
 // whitespace star: adjacent runs split a whitespace run in O(n²) ways when the name fails.
-// Mirrors src/consolidation/untrusted.ts.
+// Mirrors src/domain/untrusted.ts.
 const GUARDED_TAG_START = new RegExp(
 	`<(?=[\\s/]*(?:${UNTRUSTED_TAGS.join("|")})(?![\\w-]))`,
 	"gi",
@@ -187,7 +187,7 @@ const GUARDED_TAG_START = new RegExp(
 /** Control and format code points kept on purpose: TAB, LF, CR, and ZWNJ/ZWJ (see dropJoinersNextToAscii). */
 const KEPT_CONTROL_CODE_POINTS = new Set([0x09, 0x0a, 0x0d, 0x200c, 0x200d]);
 
-/** Drops each ZWNJ/ZWJ run that has an ASCII neighbour. Mirrors src/consolidation/untrusted.ts. */
+/** Drops each ZWNJ/ZWJ run that has an ASCII neighbour. Mirrors src/domain/untrusted.ts. */
 const JOINER_RUN = /[\u200C\u200D]+/g;
 
 function dropJoinersNextToAscii(text: string): string {

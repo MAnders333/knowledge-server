@@ -432,3 +432,32 @@ describe("validateConfig — an invalid value fails startup", () => {
 		);
 	});
 });
+
+describe("parseEnv — enable switches use the same spellings as the other flags", () => {
+	it.each(["false", "0", "no", "off"])(
+		"%s disables RERANK_ENABLED and a source",
+		(value) => {
+			const parsed = parse({ RERANK_ENABLED: value, CODEX_ENABLED: value });
+			expect(parsed.issues).toEqual([]);
+			expect(parsed.config.activation.rerank.enabled).toBe(false);
+			expect(parsed.config.codexEnabled).toBe(false);
+		},
+	);
+
+	it.each(["true", "1", "yes", "on"])("%s enables a source", (value) => {
+		expect(parse({ PI_ENABLED: value }).config.piEnabled).toBe(true);
+	});
+
+	it("reports an unknown spelling instead of enabling the source", () => {
+		const parsed = parse({ OMP_ENABLED: "disabled" });
+		expect(parsed.issues).toHaveLength(1);
+		expect(parsed.issues[0]).toContain("OMP_ENABLED must be one of");
+		expect(parsed.config.ompEnabled).toBe(true);
+	});
+});
+
+describe("parseEnv — state DB pool", () => {
+	it("sizes the state DB pool from POSTGRES_POOL_MAX", () => {
+		expect(parse({ POSTGRES_POOL_MAX: "4" }).config.postgres.poolMax).toBe(4);
+	});
+});

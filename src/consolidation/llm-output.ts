@@ -12,9 +12,9 @@
  * chunk-level error classifier treats it as a deterministic failure.
  */
 import { z } from "zod";
+import { scrubUntrusted } from "../domain/untrusted.js";
 import { logger } from "../logger.js";
 import { clampKnowledgeType } from "../types.js";
-import { scrubUntrusted } from "./untrusted.js";
 
 /** Longest content string accepted from the model for storage. */
 const MAX_STORED_CONTENT_CHARS = 8000;

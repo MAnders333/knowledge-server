@@ -1,4 +1,5 @@
 import postgres from "postgres";
+import { config } from "../../config.js";
 import { logger } from "../../logger.js";
 import type {
 	ActivationEventRow,
@@ -271,12 +272,12 @@ export class PostgresServerStateDB implements IServerStateDB {
 	private readonly sql: postgres.Sql;
 	private initPromise: Promise<void> | null = null;
 
-	constructor(uri: string) {
+	constructor(uri: string, poolMax = config.postgres.poolMax) {
 		const tls = resolvePostgresTls(uri);
 		warnNoTlsOnce(tls.warnNoTls);
 		this.sql = postgres(tls.uri, {
 			...(tls.ssl ? { ssl: tls.ssl } : {}),
-			max: 10,
+			max: poolMax,
 			idle_timeout: 30,
 			connect_timeout: 10,
 		});

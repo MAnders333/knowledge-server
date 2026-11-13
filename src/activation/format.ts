@@ -6,7 +6,7 @@
  * `formatActivatedKnowledge`. The passive plugins prefer that `context` field and
  * fall back to a copy of this logic when talking to an older server.
  */
-import { escapeUntrusted, scrubUntrusted } from "../consolidation/untrusted.js";
+import { escapeUntrusted, scrubUntrusted } from "../domain/untrusted.js";
 
 /** Tag that wraps injected knowledge. Kept as-is for compatibility with installed hooks and plugins. */
 export const ACTIVATED_KNOWLEDGE_TAG = "addrl-activated-knowledge";

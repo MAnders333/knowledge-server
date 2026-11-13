@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { defaultDataDir } from "../../config-file.js";
 import { logger } from "../../logger.js";
 import { tryAcquireProcessLock } from "../../process-lock.js";
 import type {
@@ -42,15 +42,11 @@ function sqliteBinding(value: ActivationEventValue): string | number | null {
  * Default path for state.db — the server-local staging/bookkeeping database.
  * Always a local SQLite file on the machine where knowledge-server runs.
  */
-export const DEFAULT_SERVER_STATE_PATH = join(
-	homedir(),
-	".local",
-	"share",
-	"knowledge-server",
-	"state.db",
-);
+export function defaultStateDbPath(): string {
+	return join(defaultDataDir(), "state.db");
+}
 /** Outcome of ServerStateDB.compactIfNeeded(). */
-export interface CompactionResult {
+interface CompactionResult {
 	ran: boolean;
 	reason: string;
 	freedPages?: number;
@@ -83,10 +79,7 @@ export class ServerStateDB implements IServerStateDB {
 	 * @param legacyKnowledgeDbPath knowledge.db to copy v3 staging tables from
 	 *   (and drop them from). Omit to skip — no other file is ever touched.
 	 */
-	constructor(
-		dbPath = DEFAULT_SERVER_STATE_PATH,
-		legacyKnowledgeDbPath?: string,
-	) {
+	constructor(dbPath = defaultStateDbPath(), legacyKnowledgeDbPath?: string) {
 		const dir = dirname(dbPath);
 		if (!existsSync(dir)) {
 			mkdirSync(dir, { recursive: true });

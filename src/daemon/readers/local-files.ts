@@ -8,9 +8,10 @@ import {
 } from "node:fs";
 import { basename, extname, join } from "node:path";
 import { config } from "../../config.js";
+import { approxTokens } from "../../domain/tokens.js";
 import { logger } from "../../logger.js";
 import type { Episode, IEpisodeReader, ProcessedRange } from "../../types.js";
-import { MAX_TOKENS_PER_EPISODE, approxTokens, recordSkip } from "./shared.js";
+import { MAX_TOKENS_PER_EPISODE, recordSkip } from "./shared.js";
 
 /**
  * Reads Markdown files from a local directory as knowledge episodes.

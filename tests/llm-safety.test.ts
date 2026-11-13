@@ -6,14 +6,14 @@
  */
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as aiModule from "ai";
-import type { DomainContext } from "../src/consolidation/domain-router";
 import { isDeterministicFailure } from "../src/consolidation/errors";
 import {
 	ConsolidationLLM,
 	type MergeDecision,
 	formatEpisodes,
 } from "../src/consolidation/llm";
-import { UNTRUSTED_DATA_RULE } from "../src/consolidation/untrusted";
+import type { DomainContext } from "../src/domain/domain-router";
+import { UNTRUSTED_DATA_RULE } from "../src/domain/untrusted";
 import type { Episode } from "../src/types";
 
 let spy: ReturnType<typeof spyOn<typeof aiModule, "generateText">> | null =
