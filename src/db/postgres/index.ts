@@ -676,77 +676,46 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		const embeddingBuf = entry.embedding
 			? floatsToBuffer(entry.embedding)
 			: null;
-		// Include embedding_vec in the INSERT only when the column exists — it is
-		// created by ensureVectorColumn() once embedding_metadata is set. Naming a
-		// non-existent column is an immediate SQL error regardless of the value.
+		// embedding_vec is named only when the column exists (ensureVectorColumn() creates
+		// it once embedding_metadata is set). Naming a missing column is an SQL error
+		// regardless of the value.
+		const cols: Array<
+			[name: string, value: unknown, cast?: "jsonb" | "vector"]
+		> = [
+			["id", entry.id],
+			["type", entry.type],
+			["content", entry.content],
+			["topics", this.sql.json(entry.topics), "jsonb"],
+			["confidence", entry.confidence],
+			["source", entry.source],
+			["status", entry.status],
+			["strength", entry.strength],
+			["created_at", entry.createdAt],
+			["updated_at", entry.updatedAt],
+			["last_accessed_at", entry.lastAccessedAt],
+			["access_count", entry.accessCount],
+			["injection_count", entry.injectionCount ?? 0],
+			["observation_count", entry.observationCount],
+			["superseded_by", entry.supersededBy],
+			["derived_from", this.sql.json(entry.derivedFrom), "jsonb"],
+			["is_synthesized", entry.isSynthesized ? 1 : 0],
+			["embedding", embeddingBuf],
+		];
 		if (this.vecColumnDims !== null) {
-			const embeddingVec = this.vecLiteralFor(entry.embedding);
-			await this.sql.unsafe(
-				`INSERT INTO knowledge_entry
-				(id, type, content, topics, confidence, source, status, strength,
-				 created_at, updated_at, last_accessed_at, access_count, injection_count,
-				 observation_count, superseded_by, derived_from, is_synthesized, embedding,
-				 embedding_vec)
-				VALUES (
-					$1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-					$15, $16::jsonb, $17, $18, $19::vector
-				)`,
-				[
-					entry.id,
-					entry.type,
-					entry.content,
-					this.sql.json(entry.topics),
-					entry.confidence,
-					entry.source,
-					entry.status,
-					entry.strength,
-					entry.createdAt,
-					entry.updatedAt,
-					entry.lastAccessedAt,
-					entry.accessCount,
-					entry.injectionCount ?? 0,
-					entry.observationCount,
-					entry.supersededBy,
-					this.sql.json(entry.derivedFrom),
-					entry.isSynthesized ? 1 : 0,
-					embeddingBuf,
-					embeddingVec,
-				] as postgres.ParameterOrJSON<never>[],
-			);
-		} else {
-			await this.sql.unsafe(
-				`INSERT INTO knowledge_entry
-				(id, type, content, topics, confidence, source, status, strength,
-				 created_at, updated_at, last_accessed_at, access_count, injection_count,
-				 observation_count, superseded_by, derived_from, is_synthesized, embedding)
-				VALUES (
-					$1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-					$15, $16::jsonb, $17, $18
-				)`,
-				[
-					entry.id,
-					entry.type,
-					entry.content,
-					this.sql.json(entry.topics),
-					entry.confidence,
-					entry.source,
-					entry.status,
-					entry.strength,
-					entry.createdAt,
-					entry.updatedAt,
-					entry.lastAccessedAt,
-					entry.accessCount,
-					entry.injectionCount ?? 0,
-					entry.observationCount,
-					entry.supersededBy,
-					this.sql.json(entry.derivedFrom),
-					entry.isSynthesized ? 1 : 0,
-					embeddingBuf,
-				] as postgres.ParameterOrJSON<never>[],
-			);
+			cols.push([
+				"embedding_vec",
+				this.vecLiteralFor(entry.embedding),
+				"vector",
+			]);
 		}
+		await this.sql.unsafe(
+			`INSERT INTO knowledge_entry (${cols.map(([name]) => name).join(", ")})
+			VALUES (${cols
+				.map(([, , cast], i) => (cast ? `$${i + 1}::${cast}` : `$${i + 1}`))
+				.join(", ")})`,
+			cols.map(([, value]) => value) as postgres.ParameterOrJSON<never>[],
+		);
 	}
-
 	async updateEntry(
 		id: string,
 		updates: Partial<KnowledgeEntry>,
