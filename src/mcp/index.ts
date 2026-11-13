@@ -56,10 +56,25 @@ export const flagInputSchema = {
 		),
 };
 
+/**
+ * Base URL of the knowledge HTTP server at `host:port`. The proxy sends cues over
+ * plain HTTP, so only loopback hosts are accepted, the same rule the plugins apply
+ * to KNOWLEDGE_SERVER_URL.
+ */
+export function loopbackBaseUrl(host: string, port: number): string {
+	const bare = host.replace(/^\[(.*)\]$/, "$1");
+	if (bare !== "127.0.0.1" && bare !== "localhost" && bare !== "::1") {
+		throw new Error(
+			`the knowledge server host "${host}" is not loopback (127.0.0.1, localhost or ::1). The MCP proxy refuses other hosts because it sends prompts over plain HTTP. Set KNOWLEDGE_HOST or "host" in config.jsonc to a loopback address.`,
+		);
+	}
+	return `http://${bare.includes(":") ? `[${bare}]` : bare}:${port}`;
+}
+
 /** Base URL of the knowledge HTTP server (config.jsonc / KNOWLEDGE_PORT, see resolveServerAddress). */
 function serverBaseUrl(): string {
 	const { host, port } = resolveServerAddress();
-	return `http://${host}:${port}`;
+	return loopbackBaseUrl(host, port);
 }
 
 /**
@@ -149,7 +164,13 @@ export async function main() {
 	// No validateConfig() call — LLM credentials are not needed here.
 	// The knowledge HTTP server holds those; this process is a thin proxy.
 	// Connection errors are surfaced per-call with a clear ECONNREFUSED message.
-	const baseUrl = serverBaseUrl();
+	let baseUrl: string;
+	try {
+		baseUrl = serverBaseUrl();
+	} catch (e) {
+		console.error(`[knowledge-server-mcp] ${(e as Error).message}`);
+		process.exit(1);
+	}
 
 	// Auto-start: if the HTTP server isn't reachable, try to launch it.
 	// This lets users skip the manual "start the server" step — the MCP process
