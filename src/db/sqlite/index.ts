@@ -302,7 +302,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 	async getActiveEntries(): Promise<KnowledgeEntry[]> {
 		const rows = this.db
 			.prepare(
-				`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE status = 'active' ORDER BY strength DESC`,
+				`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE status = 'active'`,
 			)
 			.all() as RawEntryRow[];
 
@@ -571,8 +571,7 @@ export class KnowledgeDB implements IKnowledgeStore {
          FROM knowledge_entry ke, json_each(ke.topics) t
          WHERE ke.status IN ('active', 'conflicted')
            AND t.value IN (SELECT value FROM json_each(?))
-           AND ke.id NOT IN (SELECT value FROM json_each(?))
-         ORDER BY ke.strength DESC`,
+           AND ke.id NOT IN (SELECT value FROM json_each(?))`,
 			)
 			.all(JSON.stringify(topics), JSON.stringify(excludeIds)) as RawEntryRow[];
 

@@ -854,7 +854,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 
 	async getActiveEntries(): Promise<KnowledgeEntry[]> {
 		const rows = await this.sql.unsafe(
-			`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE status = 'active' ORDER BY strength DESC`,
+			`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE status = 'active'`,
 		);
 		return (rows as unknown as RawEntryRow[]).map((r) => this.rowToEntry(r));
 	}
@@ -1045,8 +1045,7 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			     jsonb_array_elements_text(ke.topics) AS t(value)
 			WHERE ke.status IN ('active', 'conflicted')
 			  AND t.value = ANY($1::text[])
-			  AND ke.id != ALL($2::text[])
-			ORDER BY ke.strength DESC`,
+			  AND ke.id != ALL($2::text[])`,
 			[topics, excludeIds],
 		);
 
