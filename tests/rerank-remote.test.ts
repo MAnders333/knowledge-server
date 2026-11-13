@@ -727,7 +727,23 @@ describe("RemoteReranker transport and privacy", () => {
 			makeReranker({ timeoutMs: 2_000 }).scoreBatch("q", ["a"], {
 				budgetMs: 100,
 			}),
-		).rejects.toThrow("timed out after 100ms");
+		).rejects.toThrow("request budget");
+	});
+
+	it("a call the request budget cut short is skipped, and the breaker does not count it", async () => {
+		respond = async () => {
+			await Bun.sleep(500);
+			return systemOne({ D00: 0.5 });
+		};
+		const reranker = makeReranker({ timeoutMs: 2_000 });
+		for (let i = 0; i < 3; i++) {
+			await expect(
+				reranker.scoreBatch("q", ["a"], { budgetMs: 100 }),
+			).rejects.toBeInstanceOf(RerankSkippedError);
+		}
+		respond = () => systemOne({ D00: 0.5 });
+		// The breaker is still closed: a call with no budget reaches the endpoint.
+		expect(await reranker.scoreBatch("q", ["a"])).toEqual([0.5]);
 	});
 
 	it("scrubs secrets from the query and the documents before the call", async () => {
@@ -739,15 +755,6 @@ describe("RemoteReranker transport and privacy", () => {
 		const sent = JSON.stringify(requests[0].body);
 		expect(sent).not.toContain(secret);
 		expect(sent).toContain("[REDACTED:keyed_entropy]");
-	});
-
-	it("refuses to send the key over plain http to a non-loopback host, and makes no call", async () => {
-		await expect(
-			makeReranker({
-				url: "http://gateway.example.net/v1/systemone",
-			}).scoreBatch("q", ["a"]),
-		).rejects.toThrow("plain http");
-		expect(requests).toHaveLength(0);
 	});
 
 	it("does not follow a redirect, so the key is not sent to the redirect target", async () => {

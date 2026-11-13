@@ -13,9 +13,10 @@ import {
 	describe,
 	expect,
 	it,
+	spyOn,
 } from "bun:test";
 import { EmbeddingClient } from "../src/activation/embeddings";
-import { config } from "../src/config";
+import { config, validateConfig } from "../src/config";
 
 // `config` is typed readonly (as const); tests set the resolved key at runtime.
 const mutableEmbedding = config.embedding as unknown as {
@@ -137,13 +138,77 @@ describe("EmbeddingClient key scope and transport", () => {
 		await new EmbeddingClient({ retryBaseDelayMs: 1 }).embed("hello");
 		expect(seenAuth).toEqual([null, "Bearer llm-key"]);
 	});
+});
 
-	it("refuses to send a key over plain http to a non-loopback host", async () => {
+describe("startup warnings for a key sent over plain http", () => {
+	const embedding = config.embedding as unknown as {
+		baseURL: string;
+		apiKey: string;
+	};
+	const llm = config.llm as unknown as {
+		baseEndpoint: string;
+		apiKey: string;
+		openai: { baseURL: string; apiKey: string };
+	};
+	let saved: {
+		embedding: { baseURL: string; apiKey: string };
+		llm: { baseEndpoint: string; apiKey: string };
+		openai: { baseURL: string; apiKey: string };
+	};
+
+	beforeEach(() => {
+		saved = {
+			embedding: { baseURL: embedding.baseURL, apiKey: embedding.apiKey },
+			llm: { baseEndpoint: llm.baseEndpoint, apiKey: llm.apiKey },
+			openai: { ...llm.openai },
+		};
+	});
+
+	afterEach(() => {
+		Object.assign(embedding, saved.embedding);
+		Object.assign(llm, saved.llm);
+		Object.assign(llm.openai, saved.openai);
+	});
+
+	it("warns for EMBEDDING_BASE_URL only when a key is configured", () => {
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
 		embedding.baseURL = "http://embeddings.example.net/v1";
 		embedding.apiKey = "embed-key";
-		await expect(
-			new EmbeddingClient({ retryBaseDelayMs: 1 }).embed("hello"),
-		).rejects.toThrow("plain http");
-		expect(seenAuth).toEqual([]);
+		validateConfig();
+		expect(warn).toHaveBeenCalledWith(
+			expect.stringContaining(
+				"EMBEDDING_BASE_URL uses plain http on a non-loopback host",
+			),
+		);
+		warn.mockClear();
+		embedding.apiKey = "";
+		validateConfig();
+		expect(warn).not.toHaveBeenCalledWith(
+			expect.stringContaining("EMBEDDING_BASE_URL uses plain http"),
+		);
+	});
+
+	it("warns for LLM_BASE_ENDPOINT and OPENAI_BASE_URL with their keys", () => {
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		llm.baseEndpoint = "http://gateway.example.net";
+		llm.apiKey = "llm-key";
+		llm.openai.baseURL = "http://openai.example.net/v1";
+		validateConfig();
+		expect(warn).toHaveBeenCalledWith(
+			expect.stringContaining("LLM_BASE_ENDPOINT uses plain http"),
+		);
+		expect(warn).toHaveBeenCalledWith(
+			expect.stringContaining("OPENAI_BASE_URL uses plain http"),
+		);
+	});
+
+	it("does not warn on loopback", () => {
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		embedding.baseURL = "http://127.0.0.1:11434/v1";
+		embedding.apiKey = "embed-key";
+		validateConfig();
+		expect(warn).not.toHaveBeenCalledWith(
+			expect.stringContaining("EMBEDDING_BASE_URL uses plain http"),
+		);
 	});
 });

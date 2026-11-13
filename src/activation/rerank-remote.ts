@@ -6,7 +6,6 @@ import {
 } from "../config.js";
 import { logger } from "../logger.js";
 import { redactSecrets } from "../redact.js";
-import { assertKeyTransport } from "./key-transport.js";
 import type { RerankIdentity, RerankScorer } from "./rerank.js";
 
 /**
@@ -40,8 +39,14 @@ const CHARS_PER_TOKEN = 4;
 /** Error bodies are logged only up to this length. */
 const ERROR_BODY_MAX_CHARS = 200;
 
-/** Thrown while the breaker is open. The call never reached the endpoint. */
+/**
+ * Thrown while the breaker is open, or when the request budget cut a call short and
+ * the call then timed out. Neither is an endpoint failure.
+ */
 export class RerankSkippedError extends Error {}
+
+/** The call's deadline ran out: the configured timeout, or a shorter request budget. */
+class RerankTimeoutError extends Error {}
 
 /**
  * Question wording from hev/reranker prompt.yaml, version generic-1. Changing any of
@@ -313,6 +318,9 @@ export class RemoteReranker implements RerankScorer {
 			this.timeoutMs,
 			options?.budgetMs ?? this.timeoutMs,
 		);
+		// A call the request budget shortens, and that then times out, is not a failure
+		// of the endpoint: it is refused as skipped and leaves the breaker alone.
+		const budgetCut = timeoutMs < this.timeoutMs;
 		const started = performance.now();
 		try {
 			const result = await this.request(query, documents, {
@@ -325,6 +333,9 @@ export class RemoteReranker implements RerankScorer {
 			);
 			return result.scores;
 		} catch (err) {
+			if (budgetCut && err instanceof RerankTimeoutError) {
+				throw new RerankSkippedError("request budget");
+			}
 			this.recordFailure(err);
 			throw err;
 		}
@@ -376,7 +387,7 @@ export class RemoteReranker implements RerankScorer {
 				err instanceof Error &&
 				(err.name === "TimeoutError" || err.name === "AbortError")
 			) {
-				throw new Error(`timed out after ${budget.timeoutMs}ms`);
+				throw new RerankTimeoutError(`timed out after ${budget.timeoutMs}ms`);
 			}
 			throw err;
 		}
@@ -386,11 +397,9 @@ export class RemoteReranker implements RerankScorer {
 	private async post(body: unknown, budget: CallBudget): Promise<Response> {
 		const remaining = budget.deadline - performance.now();
 		if (remaining <= 0) {
-			throw new Error(`timed out after ${budget.timeoutMs}ms`);
+			throw new RerankTimeoutError(`timed out after ${budget.timeoutMs}ms`);
 		}
-		// The key goes in a header, so it is sent only over https or to loopback, and
-		// a redirect is an error rather than a second request with the key.
-		assertKeyTransport(this.url, this.apiKey);
+		// A redirect is an error rather than a second request that carries the key.
 		return fetch(this.url, {
 			method: "POST",
 			headers: {

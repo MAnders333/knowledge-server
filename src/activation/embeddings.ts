@@ -2,7 +2,6 @@ import { config, resolveScopedApiKey } from "../config.js";
 import { componentHealth } from "../health.js";
 import { logger } from "../logger.js";
 import type { KnowledgeType } from "../types.js";
-import { assertKeyTransport } from "./key-transport.js";
 
 /** Texts per /embeddings request. */
 const CHUNK_SIZE = 100;
@@ -272,7 +271,6 @@ export class EmbeddingClient {
 		};
 		// Local endpoints (Ollama, llama.cpp) run without a key: send none rather than "Bearer ".
 		if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
-		assertKeyTransport(this.endpoint, this.apiKey);
 		const response = await fetch(`${this.endpoint}/embeddings`, {
 			method: "POST",
 			headers,

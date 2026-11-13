@@ -368,6 +368,7 @@ export class LocalReranker implements RerankScorer {
 			this.timeoutMs,
 			options?.budgetMs ?? this.timeoutMs,
 		);
+		const budgetCut = timeoutMs < this.timeoutMs;
 		const deadline = performance.now() + timeoutMs;
 		// Set by the timeout timer itself. setTimeout and performance.now() use
 		// different clock granularity, so the timer can fire a millisecond before
@@ -383,6 +384,13 @@ export class LocalReranker implements RerankScorer {
 		}, timeoutMs);
 		try {
 			return await Promise.race([work, expired]);
+		} catch (err) {
+			// A call the request budget cut short, and that then ran out, is refused as
+			// skipped: the budget, not the scorer, ended it.
+			if (budgetCut && (state.expired || performance.now() >= deadline)) {
+				throw new RerankSkippedError("request budget");
+			}
+			throw err;
 		} finally {
 			clearTimeout(timer);
 		}
