@@ -14,8 +14,8 @@
 import { describe, expect, it } from "bun:test";
 import { existsSync } from "node:fs";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { BertWordPieceTokenizer } from "../src/activation/bert-tokenizer";
 
 // ── Synthetic tokenizer.json (mini BERT vocab) ───────────────────────────────
@@ -98,7 +98,10 @@ describe("BertWordPieceTokenizer (synthetic vocab)", () => {
 
 	it("batch-encodes with right padding and attention masks", () => {
 		const tok = makeTokenizer();
-		const enc = tok.batchEncodePairs(["hello", "hello world"], ["world", "hello"]);
+		const enc = tok.batchEncodePairs(
+			["hello", "hello world"],
+			["world", "hello"],
+		);
 		// Pair 1: [CLS] hello [SEP] world [SEP]  (5)
 		// Pair 2: [CLS] hello world [SEP] hello [SEP] (6) → seqLen 6
 		expect(enc.dims).toEqual([2, 6]);
@@ -144,7 +147,13 @@ describe("BertWordPieceTokenizer parity with AutoTokenizer", () => {
 
 	itIfModel("produces identical token IDs on tricky inputs", async () => {
 		const { AutoTokenizer, env } = await import("@huggingface/transformers");
-		env.cacheDir = join(homedir(), ".local", "share", "knowledge-server", "models");
+		env.cacheDir = join(
+			homedir(),
+			".local",
+			"share",
+			"knowledge-server",
+			"models",
+		);
 		const ref = await AutoTokenizer.from_pretrained(
 			"Xenova/ms-marco-MiniLM-L-6-v2",
 		);
@@ -157,7 +166,11 @@ describe("BertWordPieceTokenizer parity with AutoTokenizer", () => {
 				(await ref(text)).input_ids.data as BigInt64Array,
 				Number,
 			);
-			const mineIds = [refIds[0], ...mine.encode(text), refIds[refIds.length - 1]];
+			const mineIds = [
+				refIds[0],
+				...mine.encode(text),
+				refIds[refIds.length - 1],
+			];
 			expect(mineIds).toEqual(refIds);
 		}
 	});

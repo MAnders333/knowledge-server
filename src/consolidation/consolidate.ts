@@ -1,7 +1,9 @@
 import type { ActivationEngine } from "../activation/activate.js";
+import { formatEmbeddingText } from "../activation/embeddings.js";
+import { cosineSimilarity } from "../activation/embeddings.js";
 import { config } from "../config.js";
+import { approxTokens } from "../daemon/readers/shared.js";
 import type { IKnowledgeStore, IServerStateDB } from "../db/index.js";
-import type { DomainResolution, DomainRouter } from "./domain-router.js";
 import { logger } from "../logger.js";
 import type {
 	ConsolidationResult,
@@ -9,14 +11,12 @@ import type {
 	IEpisodeReader,
 	KnowledgeEntry,
 } from "../types.js";
+import { clampKnowledgeType } from "../types.js";
 import { ContradictionScanner } from "./contradiction.js";
 import { computeStrength } from "./decay.js";
+import type { DomainResolution, DomainRouter } from "./domain-router.js";
 import { ConsolidationLLM, formatEpisodes } from "./llm.js";
-import { formatEmbeddingText } from "../activation/embeddings.js";
 import type { ExtractedKnowledge } from "./llm.js";
-import { cosineSimilarity } from "../activation/embeddings.js";
-import { clampKnowledgeType } from "../types.js";
-import { approxTokens } from "../daemon/readers/shared.js";
 import { Reconsolidator } from "./reconsolidate.js";
 
 /**
@@ -849,6 +849,9 @@ export class ConsolidationEngine {
 				nearestEntry: (KnowledgeEntry & { embedding: number[] }) | null;
 				nearestSimilarity: number;
 			};
+			type CandidateEntry = EntryWithEmbedding & {
+				nearestEntry: KnowledgeEntry & { embedding: number[] };
+			};
 			const classified: EntryWithEmbedding[] = entries.map((entry, i) => {
 				const embedding = embeddings[i];
 				let nearestEntry: (KnowledgeEntry & { embedding: number[] }) | null =
@@ -870,8 +873,8 @@ export class ConsolidationEngine {
 					c.nearestSimilarity < config.consolidation.reconsolidationThreshold,
 			);
 			const candidates = classified.filter(
-				(c) =>
-					c.nearestEntry &&
+				(c): c is CandidateEntry =>
+					!!c.nearestEntry &&
 					c.nearestSimilarity >= config.consolidation.reconsolidationThreshold,
 			);
 
@@ -917,8 +920,7 @@ export class ConsolidationEngine {
 			// newly-inserted novel entries). Candidates whose nearest match was below
 			// threshold but now has a newly-inserted near-duplicate become candidates again.
 			const reclassifiedCandidates = candidates.map((c) => {
-				let nearestEntry: (KnowledgeEntry & { embedding: number[] }) | null =
-					c.nearestEntry;
+				let nearestEntry: CandidateEntry["nearestEntry"] = c.nearestEntry;
 				let nearestSimilarity = c.nearestSimilarity;
 				for (const existing of entriesMap.values()) {
 					if (c.nearestEntry && existing.id === c.nearestEntry.id) continue; // already checked
@@ -941,10 +943,10 @@ export class ConsolidationEngine {
 					...(await this.llm.batchDecideMerge(
 						reclassifiedCandidates.map((c) => ({
 							existing: {
-								content: c.nearestEntry!.content,
-								type: c.nearestEntry!.type,
-								topics: c.nearestEntry!.topics,
-								confidence: c.nearestEntry!.confidence,
+								content: c.nearestEntry.content,
+								type: c.nearestEntry.type,
+								topics: c.nearestEntry.topics,
+								confidence: c.nearestEntry.confidence,
 							},
 							extracted: {
 								content: c.entry.content,
@@ -964,7 +966,7 @@ export class ConsolidationEngine {
 			for (let i = 0; i < reclassifiedCandidates.length; i++) {
 				const c = reclassifiedCandidates[i];
 				const decision = mergeDecisions[i];
-				const nearest = c.nearestEntry!;
+				const nearest = c.nearestEntry;
 				try {
 					logger.log(
 						`[consolidation/${source}] Reconsolidation candidate (sim=${c.nearestSimilarity.toFixed(3)}): ${JSON.stringify(c.entry.content)} vs ${JSON.stringify(nearest.content)}`,

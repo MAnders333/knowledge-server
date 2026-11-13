@@ -274,12 +274,13 @@ export class PostgresServerStateDB implements IServerStateDB {
 		const map = new Map<string, ProcessedRange[]>();
 		for (const r of rows) {
 			const sid = r.session_id as string;
-			if (!map.has(sid)) map.set(sid, []);
-			map.get(sid)!.push({
+			const ranges = map.get(sid) ?? [];
+			ranges.push({
 				source: r.source as string,
 				startMessageId: r.start_message_id as string,
 				endMessageId: r.end_message_id as string,
 			});
+			map.set(sid, ranges);
 		}
 		return map;
 	}

@@ -20,9 +20,9 @@ import { join } from "node:path";
 import { ActivationEngine } from "../src/activation/activate";
 import { ConsolidationEngine } from "../src/consolidation/consolidate";
 import { ConsolidationLLM } from "../src/consolidation/llm";
-import type { Episode, IEpisodeReader } from "../src/types";
 import { KnowledgeDB } from "../src/db/sqlite/index";
 import { ServerStateDB } from "../src/db/state/index";
+import type { Episode, IEpisodeReader } from "../src/types";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -1514,7 +1514,7 @@ describe("ConsolidationLLM.batchDecideMerge()", () => {
 	it("returns one decision per pair in order for multiple pairs", async () => {
 		// Mock the underlying complete() call by stubbing the LLM method directly
 		spyOn(
-			llm as any,
+			llm as unknown as Record<string, (...args: never[]) => Promise<unknown>>,
 			"complete" in llm ? "complete" : "_complete",
 		).mockResolvedValue(
 			JSON.stringify([{ action: "keep" }, { action: "insert" }]),

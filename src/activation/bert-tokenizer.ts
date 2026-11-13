@@ -85,7 +85,11 @@ export class BertWordPieceTokenizer {
 				clean_text?: boolean;
 				handle_chinese_chars?: boolean;
 			};
-			model?: { type?: string; unk_token?: string; vocab?: Record<string, number> };
+			model?: {
+				type?: string;
+				unk_token?: string;
+				vocab?: Record<string, number>;
+			};
 		};
 
 		if (json.model?.type !== "WordPiece" || !json.model.vocab) {
@@ -128,16 +132,14 @@ export class BertWordPieceTokenizer {
 			// Remove control characters (keep tab/newline/carriage return) and
 			// U+FFFD replacement chars; normalize whitespace to single spaces.
 			out = out
+				// biome-ignore lint/suspicious/noControlCharactersInRegex: intentional control-char stripping (mirrors BertNormalizer clean_text)
 				.replace(/[\u0000-\u0008\u000B\u000E-\u001F\u007F]/g, "")
 				.replace(/\uFFFD/g, "")
 				.replace(/\s+/g, " ");
 		}
 		if (this.cfg.handleChineseChars) {
 			// Put spaces around CJK ideographs so they become standalone tokens.
-			out = out.replace(
-				/([一-鿿㐀-䶿豈-﫿])/g,
-				" $1 ",
-			);
+			out = out.replace(/([一-鿿㐀-䶿豈-﫿])/g, " $1 ");
 		}
 		if (this.cfg.lowercase) out = out.toLowerCase();
 		if (this.cfg.stripAccents) {

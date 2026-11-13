@@ -238,9 +238,7 @@ export async function runReinitialize(args: string[]): Promise<void> {
 			);
 		} else {
 			console.log(
-				`  Deleted ${totalEntries} entries from ${storeLabel}.\n` +
-					"  Episodes will be re-uploaded and re-consolidated on the next run.\n" +
-					"  Trigger consolidation when ready: knowledge-server consolidate",
+				`  Deleted ${totalEntries} entries from ${storeLabel}.\n  Episodes will be re-uploaded and re-consolidated on the next run.\n  Trigger consolidation when ready: knowledge-server consolidate`,
 			);
 		}
 	} finally {

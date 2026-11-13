@@ -16,10 +16,18 @@
  *   - Single-candidate shortcut: scorer not called
  *   - Null reranker: unchanged dense behavior (limit = maxResults)
  */
-import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
 import { ActivationEngine } from "../src/activation/activate";
-import type { RerankScorer } from "../src/activation/rerank";
 import { cosineSimilarity } from "../src/activation/embeddings";
+import type { RerankScorer } from "../src/activation/rerank";
 import { config } from "../src/config";
 import type { IKnowledgeStore } from "../src/types";
 import type { KnowledgeEntry } from "../src/types";
@@ -113,11 +121,7 @@ function makeInvertingScorer(): RerankScorer & { calls: string[][] } {
 			// Documents arrive as formatEmbeddingText: "[fact] <content> (topics: ...)"
 			return Promise.resolve(
 				documents.map((d) =>
-					d.includes("dense low")
-						? 0.99
-						: d.includes("dense mid")
-							? 0.5
-							: 0.1,
+					d.includes("dense low") ? 0.99 : d.includes("dense mid") ? 0.5 : 0.1,
 				),
 			);
 		}),
@@ -145,7 +149,12 @@ describe("ActivationEngine rerank stage", () => {
 	it("orders by rerankScore × strength, not dense similarity (Path A)", async () => {
 		const store = makeStoreStub(makeEntries(), { supportAnn: true });
 		const scorer = makeInvertingScorer();
-		const activation = new ActivationEngine(store, undefined, undefined, scorer);
+		const activation = new ActivationEngine(
+			store,
+			undefined,
+			undefined,
+			scorer,
+		);
 		spyOn(activation.embeddings, "embedBatch").mockResolvedValue([QUERY_EMB]);
 
 		const result = await activation.activate("test query");
@@ -164,7 +173,12 @@ describe("ActivationEngine rerank stage", () => {
 	it("overfetches: ANN limit becomes rerank.candidates, not maxResults", async () => {
 		const store = makeStoreStub(makeEntries(), { supportAnn: true });
 		const scorer = makeInvertingScorer();
-		const activation = new ActivationEngine(store, undefined, undefined, scorer);
+		const activation = new ActivationEngine(
+			store,
+			undefined,
+			undefined,
+			scorer,
+		);
 		spyOn(activation.embeddings, "embedBatch").mockResolvedValue([QUERY_EMB]);
 
 		await activation.activate("test query");
@@ -208,9 +222,7 @@ describe("ActivationEngine rerank stage", () => {
 				undefined,
 				scorer,
 			);
-			spyOn(activation.embeddings, "embedBatch").mockResolvedValue([
-				QUERY_EMB,
-			]);
+			spyOn(activation.embeddings, "embedBatch").mockResolvedValue([QUERY_EMB]);
 
 			const result = await activation.activate("test query");
 
@@ -232,7 +244,12 @@ describe("ActivationEngine rerank stage", () => {
 			{ supportAnn: true },
 		);
 		const scorer = makeInvertingScorer();
-		const activation = new ActivationEngine(store, undefined, undefined, scorer);
+		const activation = new ActivationEngine(
+			store,
+			undefined,
+			undefined,
+			scorer,
+		);
 		spyOn(activation.embeddings, "embedBatch").mockResolvedValue([QUERY_EMB]);
 
 		const result = await activation.activate("test query");
@@ -245,7 +262,12 @@ describe("ActivationEngine rerank stage", () => {
 	it("works on the in-process full-scan path (Path B)", async () => {
 		const store = makeStoreStub(makeEntries()); // no findSimilarEntries
 		const scorer = makeInvertingScorer();
-		const activation = new ActivationEngine(store, undefined, undefined, scorer);
+		const activation = new ActivationEngine(
+			store,
+			undefined,
+			undefined,
+			scorer,
+		);
 		spyOn(activation.embeddings, "embedBatch").mockResolvedValue([QUERY_EMB]);
 
 		const result = await activation.activate("test query");

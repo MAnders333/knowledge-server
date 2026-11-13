@@ -11,23 +11,23 @@ import { createRerankerFromConfig } from "./activation/rerank.js";
 import { createApp } from "./api/server.js";
 import { runActivate } from "./commands/activate.js";
 import { runCalibrate } from "./commands/calibrate.js";
-import { runConsolidate } from "./commands/consolidate.js";
-import { runProcessInbox } from "./commands/process-inbox.js";
 import { runClaudeAuth } from "./commands/claude-auth.js";
+import { runConsolidate } from "./commands/consolidate.js";
 import { runMigrateConfig } from "./commands/migrate-config.js";
+import { runProcessInbox } from "./commands/process-inbox.js";
 import { runReinitialize } from "./commands/reinitialize.js";
 import { runReview } from "./commands/review.js";
+import { runSetupTool } from "./commands/setup-tool.js";
 import { runStatus } from "./commands/status.js";
+import { runStop } from "./commands/stop.js";
+import { downloadAndInstallDaemon, runUpdate } from "./commands/update.js";
 import { config, validateConfig } from "./config.js";
 import { ConsolidationEngine } from "./consolidation/consolidate.js";
 import { PendingEpisodesReader } from "./consolidation/readers/pending.js";
 import { StoreRegistry } from "./db/store-registry.js";
 import { logger } from "./logger.js";
-import { errCode } from "./utils.js";
 import { main as mcpMain } from "./mcp/index.js";
-import { runSetupTool } from "./commands/setup-tool.js";
-import { runStop } from "./commands/stop.js";
-import { downloadAndInstallDaemon, runUpdate } from "./commands/update.js";
+import { errCode } from "./utils.js";
 
 // Bun normalises process.argv the same way for both compiled binaries and `bun run`:
 //   argv[0] = "bun"

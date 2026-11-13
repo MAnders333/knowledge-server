@@ -22,7 +22,6 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import { createServer } from "node:http";
 import {
 	existsSync,
 	mkdirSync,
@@ -30,6 +29,7 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
+import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -39,8 +39,7 @@ export const ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 export const ANTHROPIC_AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
 
-export const ANTHROPIC_TOKEN_URL =
-	"https://platform.claude.com/v1/oauth/token";
+export const ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 
 export const ANTHROPIC_OAUTH_SCOPES =
 	"org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
@@ -88,7 +87,9 @@ export function loadOAuthTokens(): OAuthTokens | null {
 	const filePath = getOAuthFilePath();
 	if (!existsSync(filePath)) return null;
 	try {
-		const data = JSON.parse(readFileSync(filePath, "utf-8")) as Partial<OAuthTokens>;
+		const data = JSON.parse(
+			readFileSync(filePath, "utf-8"),
+		) as Partial<OAuthTokens>;
 		if (
 			typeof data.refresh_token === "string" &&
 			typeof data.access_token === "string" &&
@@ -140,7 +141,9 @@ function generateChallenge(verifier: string): string {
  * Exchange a refresh token for a new access token.
  * Throws on HTTP errors — the caller is responsible for retry logic.
  */
-export async function refreshTokens(refreshToken: string): Promise<OAuthTokens> {
+export async function refreshTokens(
+	refreshToken: string,
+): Promise<OAuthTokens> {
 	const response = await fetch(ANTHROPIC_TOKEN_URL, {
 		method: "POST",
 		headers: {
@@ -250,7 +253,9 @@ export async function runOAuthFlow(): Promise<OAuthTokens> {
 
 	// Box so the server handler closure can reference the timeout handle
 	// that is assigned after server.listen().
-	const timerRef = { current: undefined as ReturnType<typeof setTimeout> | undefined };
+	const timerRef = {
+		current: undefined as ReturnType<typeof setTimeout> | undefined,
+	};
 
 	const server = createServer((req, res) => {
 		const url = new URL(req.url ?? "/", "http://localhost");

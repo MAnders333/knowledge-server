@@ -2,17 +2,17 @@ import { createAnthropic } from "@ai-sdk/anthropic";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateText } from "ai";
-import { config } from "../config.js";
-import type { DomainContext } from "./domain-router.js";
-import { logger } from "../logger.js";
-import { clampKnowledgeType } from "../types.js";
-import type { Episode, KnowledgeType } from "../types.js";
 import {
 	ANTHROPIC_BETA_HEADERS,
 	ANTHROPIC_OAUTH_USER_AGENT,
 	getAccessToken,
 	hasOAuthTokens,
 } from "../auth/claude-oauth.js";
+import { config } from "../config.js";
+import { logger } from "../logger.js";
+import { clampKnowledgeType } from "../types.js";
+import type { Episode, KnowledgeType } from "../types.js";
+import type { DomainContext } from "./domain-router.js";
 
 /**
  * LLM interface for consolidation.
@@ -81,7 +81,10 @@ function createAnthropicOAuthFetch(): typeof globalThis.fetch {
 		// Merge required beta feature flags with any the SDK already added.
 		const existingBeta = headers.get("anthropic-beta") ?? "";
 		const betaSet = new Set([
-			...existingBeta.split(",").map((s) => s.trim()).filter(Boolean),
+			...existingBeta
+				.split(",")
+				.map((s) => s.trim())
+				.filter(Boolean),
 			...ANTHROPIC_BETA_HEADERS,
 		]);
 		headers.set("anthropic-beta", [...betaSet].join(","));

@@ -30,12 +30,12 @@
 
 // Load .env from default config location for binary installs — must be first.
 import "../env.js";
-import { createEpisodeReaders } from "./readers/index.js";
+import { resolveUserId } from "../config-file.js";
 import { DaemonDB } from "../db/daemon/index.js";
 import { createServerStateDB } from "../db/state/factory.js";
-import { resolveUserId } from "../config-file.js";
-import { EpisodeUploader } from "./uploader.js";
 import { logger } from "../logger.js";
+import { createEpisodeReaders } from "./readers/index.js";
+import { EpisodeUploader } from "./uploader.js";
 
 // Parse CLI args
 const args = process.argv.slice(2);

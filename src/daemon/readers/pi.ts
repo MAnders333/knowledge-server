@@ -374,7 +374,9 @@ export class PiEpisodeReader implements IEpisodeReader {
 			const text = this.extractTextParts(rec.message.content);
 			if (text.trim()) {
 				firstUserText =
-					text.trim().length > 60 ? `${text.trim().slice(0, 60)}…` : text.trim();
+					text.trim().length > 60
+						? `${text.trim().slice(0, 60)}…`
+						: text.trim();
 				break;
 			}
 		}
@@ -653,7 +655,8 @@ export class PiEpisodeReader implements IEpisodeReader {
 		return content
 			.filter(
 				(p) =>
-					(p.type === "text" && p.text) || (p.type === "thinking" && p.thinking),
+					(p.type === "text" && p.text) ||
+					(p.type === "thinking" && p.thinking),
 			)
 			.map((p) => (p.type === "thinking" ? (p.thinking ?? "") : (p.text ?? "")))
 			.join("\n");

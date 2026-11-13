@@ -14,12 +14,12 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 // @ts-ignore — Bun supports JSON imports natively
 import pkg from "../../package.json" with { type: "json" };
-import { config } from "../config.js";
 import {
 	DEFAULT_CONFIG,
 	DEFAULT_CONFIG_PATH,
 	loadConfigFile,
 } from "../config-file.js";
+import { config } from "../config.js";
 
 // Resolve port/host from config.jsonc (with env var override via KNOWLEDGE_PORT/KNOWLEDGE_HOST).
 // Falls back to the env-var-only config for installs that have no config.jsonc yet.
@@ -1109,9 +1109,7 @@ function setupPi(): void {
 				downloadAssetSync("pi-knowledge.ts", extDst);
 				console.log("done");
 			} catch (err) {
-				console.error(
-					`failed: ${err instanceof Error ? err.message : err}`,
-				);
+				console.error(`failed: ${err instanceof Error ? err.message : err}`);
 				console.error(
 					"    Extension is required for pi integration — aborting.",
 				);
@@ -1185,7 +1183,10 @@ Setup complete!${registered > 0 ? ` (${registered} layer settings updated)` : ""
  * settings.json. Returns true if the file was modified or already contained
  * the path; false on parse errors (warns and skips — manual fix is trivial).
  */
-function registerPiExtension(settingsPath: string, extensionPath: string): boolean {
+function registerPiExtension(
+	settingsPath: string,
+	extensionPath: string,
+): boolean {
 	let raw: string;
 	try {
 		raw = readFileSync(settingsPath, "utf8");

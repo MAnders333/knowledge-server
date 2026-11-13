@@ -4,8 +4,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { KnowledgeDB } from "../src/db/sqlite/index";
-import { ServerStateDB } from "../src/db/state/index";
 import { CREATE_TABLES, EXPECTED_TABLE_COLUMNS } from "../src/db/sqlite/schema";
+import { ServerStateDB } from "../src/db/state/index";
 
 describe("KnowledgeDB", () => {
 	let db: KnowledgeDB;

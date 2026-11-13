@@ -837,8 +837,7 @@ describe("resolveWorkspaceFolder", () => {
 
 	it("returns empty string for a Dev Container URI when hex decoding fails", () => {
 		// Malformed hex payload — should return "" not the container-internal path
-		const uri =
-			"vscode-remote://dev-container%2Bnotvalidhex/opt/app";
+		const uri = "vscode-remote://dev-container%2Bnotvalidhex/opt/app";
 		expect(resolveWorkspaceFolder(uri)).toBe("");
 	});
 

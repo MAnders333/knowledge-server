@@ -25,7 +25,10 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { config } from "../src/config";
-import { PiEpisodeReader, resolvePiSessionsDirs } from "../src/daemon/readers/pi";
+import {
+	PiEpisodeReader,
+	resolvePiSessionsDirs,
+} from "../src/daemon/readers/pi";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -141,7 +144,11 @@ function writeSession(lines: string[]): void {
 /** Four plain messages — enough to pass minSessionMessages (default 4). */
 function fourMessages(startDelta = 0): string[] {
 	return [
-		msgRecord({ role: "user", timestamp: ts(BASE, startDelta), content: "hello" }),
+		msgRecord({
+			role: "user",
+			timestamp: ts(BASE, startDelta),
+			content: "hello",
+		}),
 		msgRecord({
 			role: "assistant",
 			timestamp: ts(BASE, startDelta + 1000),
@@ -273,13 +280,22 @@ describe("PiEpisodeReader.getNewEpisodes (no compaction)", () => {
 	it("includes assistant thinking parts but skips toolCall arguments", () => {
 		writeSession([
 			headerRecord({ id: SESSION_UUID, timestamp: ts(BASE, 0) }),
-			msgRecord({ role: "user", timestamp: ts(BASE, 0), content: "fix the bug" }),
+			msgRecord({
+				role: "user",
+				timestamp: ts(BASE, 0),
+				content: "fix the bug",
+			}),
 			msgRecord({
 				role: "assistant",
 				timestamp: ts(BASE, 1000),
 				content: [
 					{ type: "thinking", thinking: "THINKING TRACE" },
-					{ type: "toolCall", id: "tc1", name: "bash", arguments: { command: "rm -rf /" } },
+					{
+						type: "toolCall",
+						id: "tc1",
+						name: "bash",
+						arguments: { command: "rm -rf /" },
+					},
 					{ type: "text", text: "Done." },
 				],
 			}),
@@ -487,7 +503,11 @@ describe("PiEpisodeReader tool output extraction", () => {
 		try {
 			writeSession([
 				headerRecord({ id: SESSION_UUID, timestamp: ts(BASE, 0) }),
-				msgRecord({ role: "user", timestamp: ts(BASE, 0), content: "read the file" }),
+				msgRecord({
+					role: "user",
+					timestamp: ts(BASE, 0),
+					content: "read the file",
+				}),
 				msgRecord({
 					role: "toolResult",
 					timestamp: ts(BASE, 1000),

@@ -518,7 +518,13 @@ export function validateConfig(): string[] {
 	// suppress the startup error while runtime LLM calls still fail.
 	const hasAnthropicOAuth = hasOAuthTokens();
 
-	if (!hasAnthropic && !hasOpenAI && !hasGoogle && !hasUnified && !hasAnthropicOAuth) {
+	if (
+		!hasAnthropic &&
+		!hasOpenAI &&
+		!hasGoogle &&
+		!hasUnified &&
+		!hasAnthropicOAuth
+	) {
 		// Provide a more specific hint when the user has set half of the unified pair.
 		// Guard against placeholder values — a key equal to PLACEHOLDER_API_KEY means
 		// the .env was never edited, so it should not trigger the "key set but endpoint
