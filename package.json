@@ -39,6 +39,11 @@
 		"typescript": "7.0.2"
 	},
 	"overrides": {
-		"zod": "^4.6.6"
+		"zod": "^4.6.6",
+		"undici": "^8.12.4",
+		"sharp": "^0.35.5",
+		"adm-zip": "^0.6.1",
+		"glob": "^14.0.6",
+		"minimatch": "^11.0.8"
 	}
 }
