@@ -208,10 +208,13 @@ export async function main() {
 		version: pkg.version,
 	});
 
-	server.tool(
+	server.registerTool(
 		"activate",
-		"Activate associated knowledge by providing cues. Returns knowledge entries that are semantically related to the provided cues. Use this when you need to recall what has been learned from prior sessions about a specific topic. Provide descriptive cues — topics, questions, or keywords — and receive relevant knowledge entries ranked by association strength.",
-		activateInputSchema,
+		{
+			description:
+				"Activate associated knowledge by providing cues. Returns knowledge entries that are semantically related to the provided cues. Use this when you need to recall what has been learned from prior sessions about a specific topic. Provide descriptive cues — topics, questions, or keywords — and receive relevant knowledge entries ranked by association strength.",
+			inputSchema: activateInputSchema,
+		},
 		async ({ cues, limit, threshold }) => {
 			try {
 				const url = new URL(`${baseUrl}/activate`);
@@ -287,10 +290,13 @@ export async function main() {
 		},
 	);
 
-	server.tool(
+	server.registerTool(
 		"knowledge_flag",
-		"Report a recalled knowledge entry that is wrong, outdated or irrelevant, using the id shown in its injected line. The entry is queued for review and is no longer injected into sessions; nothing is deleted.",
-		flagInputSchema,
+		{
+			description:
+				"Report a recalled knowledge entry that is wrong, outdated or irrelevant, using the id shown in its injected line. The entry is queued for review and is no longer injected into sessions; nothing is deleted.",
+			inputSchema: flagInputSchema,
+		},
 		async ({ id, reason }) => {
 			try {
 				const response = await fetch(
