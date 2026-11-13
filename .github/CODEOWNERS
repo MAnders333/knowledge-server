@@ -1,0 +1,8 @@
+# Every change is owned by the maintainer. The release trust root (workflows,
+# the installer and the release configuration) is listed explicitly so it keeps
+# an owner even if the default rule changes.
+* @MAnders333
+/.github/ @MAnders333
+/scripts/install.sh @MAnders333
+/release-please-config.json @MAnders333
+/.release-please-manifest.json @MAnders333
