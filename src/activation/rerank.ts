@@ -84,16 +84,6 @@ export interface RerankIdentity {
 	model: string;
 }
 
-/** Scores for one batch, in input order, and the scorer that produced them. */
-export interface RerankBatch {
-	scores: number[];
-	/**
-	 * Provider and model that produced the scores. For remote, `model` is the version
-	 * the gateway reports resolving to, when it reports one.
-	 */
-	scorer: RerankIdentity;
-}
-
 /**
  * Minimal scorer interface used by ActivationEngine. Kept separate from
  * LocalReranker so tests can inject deterministic fakes without loading a
@@ -104,9 +94,9 @@ export interface RerankScorer {
 	readonly identity: RerankIdentity;
 	/**
 	 * Score each document's relevance to the query, in input order, normalized to
-	 * [0, 1]. `scorer` names the model that produced them.
+	 * [0, 1].
 	 */
-	scoreBatch(query: string, documents: string[]): Promise<RerankBatch>;
+	scoreBatch(query: string, documents: string[]): Promise<number[]>;
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: ort session type via dynamic import
@@ -354,8 +344,8 @@ export class LocalReranker implements RerankScorer {
 	 * is refused at once with RerankSkippedError. The timeout covers queue wait
 	 * too, and a queued call whose deadline has passed never starts scoring.
 	 */
-	async scoreBatch(query: string, documents: string[]): Promise<RerankBatch> {
-		if (documents.length === 0) return { scores: [], scorer: this.identity };
+	async scoreBatch(query: string, documents: string[]): Promise<number[]> {
+		if (documents.length === 0) return [];
 		// Admission is decided before any await, so refusals follow call order.
 		// `admitted` includes the running call, hence the comparison.
 		if (this.admitted > MAX_QUEUED_CALLS) {
@@ -375,8 +365,7 @@ export class LocalReranker implements RerankScorer {
 			this.timeoutMs,
 		);
 		try {
-			const scores = await Promise.race([work, expired]);
-			return { scores, scorer: this.identity };
+			return await Promise.race([work, expired]);
 		} finally {
 			clearTimeout(timer);
 		}

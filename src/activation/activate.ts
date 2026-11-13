@@ -25,6 +25,7 @@ import {
 	denseFloor,
 	estimateTokens,
 	rerankFloor,
+	scorerKey,
 } from "./gate.js";
 import { RerankSkippedError } from "./rerank-remote.js";
 import type { RerankScorer } from "./rerank.js";
@@ -773,10 +774,7 @@ export class ActivationEngine {
 				const documents = scored.map((s) =>
 					formatEmbeddingText(s.entry.type, s.entry.content, s.entry.topics),
 				);
-				const { scores, scorer } = await this.reranker.scoreBatch(
-					primaryQuery,
-					documents,
-				);
+				const scores = await this.reranker.scoreBatch(primaryQuery, documents);
 				for (let i = 0; i < scored.length; i++) {
 					scored[i].rerankScore = scores[i];
 					scored[i].gateScore = scores[i];
@@ -787,7 +785,7 @@ export class ActivationEngine {
 							: scored[i].staleness.strength);
 				}
 				gateMode = "rerank";
-				rerankModel = `${scorer.provider}/${scorer.model}`;
+				rerankModel = scorerKey(this.reranker.identity);
 				componentHealth.recordSuccess("rerank");
 			} catch (err) {
 				componentHealth.recordFailure("rerank", err);

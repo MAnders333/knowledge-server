@@ -6,7 +6,7 @@ import {
 	config,
 } from "../config.js";
 import { logger } from "../logger.js";
-import type { RerankBatch, RerankIdentity, RerankScorer } from "./rerank.js";
+import type { RerankIdentity, RerankScorer } from "./rerank.js";
 
 /**
  * Remote second-stage reranker: one System One call per activation (TypeSafe's
@@ -247,13 +247,12 @@ export class RemoteReranker implements RerankScorer {
 	}
 
 	/**
-	 * Score every document in one call. Returns probabilities in input order, with the
-	 * scorer that produced them (the gateway's resolved model when it reported one).
-	 * Throws on timeout, HTTP error, malformed or partial response, and while the
-	 * breaker is open (RerankSkippedError).
+	 * Score every document in one call. Returns probabilities in input order. Throws
+	 * on timeout, HTTP error, malformed or partial response, and while the breaker is
+	 * open (RerankSkippedError).
 	 */
-	async scoreBatch(query: string, documents: string[]): Promise<RerankBatch> {
-		if (documents.length === 0) return { scores: [], scorer: this.identity };
+	async scoreBatch(query: string, documents: string[]): Promise<number[]> {
+		if (documents.length === 0) return [];
 		if (documents.length > REMOTE_RERANK_MAX_CANDIDATES) {
 			throw new Error(
 				`remote rerank scores at most ${REMOTE_RERANK_MAX_CANDIDATES} candidates per call (got ${documents.length})`,
@@ -281,13 +280,7 @@ export class RemoteReranker implements RerankScorer {
 			logger.log(
 				`[rerank] provider=remote model=${this.identity.model} resolved_model=${result.model ?? "unknown"} gate_mode=rerank candidates=${documents.length} input_tokens=${result.inputTokens ?? "unknown"} elapsed_ms=${Math.round(performance.now() - started)}`,
 			);
-			return {
-				scores: result.scores,
-				scorer: {
-					provider: "remote",
-					model: result.model ?? this.identity.model,
-				},
-			};
+			return result.scores;
 		} catch (err) {
 			this.recordFailure(err);
 			throw err;
