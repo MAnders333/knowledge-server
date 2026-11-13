@@ -460,7 +460,7 @@ export function storedNorm(v: Float32Array): number {
 }
 
 /** A query vector normalised once, for scoring against many stored vectors. */
-interface PreparedQuery {
+export interface PreparedQuery {
 	/** Unit-length copy of the query (Float64, so scores match cosineSimilarity). */
 	readonly unit: Float64Array;
 	readonly zero: boolean;
