@@ -1,14 +1,13 @@
 /**
- * RemoteReranker against a stub gateway (tests/stub HTTP server, no network).
+ * RemoteReranker against a stub System One endpoint (local Bun.serve, no network).
  *
  * Covered:
- *   - Happy path: one listwise call, scores returned in input order
- *   - Request shape: model, questions template, query tail, document heads
- *   - Malformed responses, partial scores, out-of-range probabilities
- *   - 503 error body is reported with its cause
- *   - Timeout aborts the request and rejects (caller falls back to dense)
- *   - Circuit breaker: opens after 3 failures, skips while open, one probe after cooldown
- *   - Candidate cap (40) and unconfigured gateway (no remote reranker)
+ *   - Request shape: state (query tail, document heads), one Noul per id, id order
+ *   - Happy path, resolved model, partial and malformed answers, out-of-range scores
+ *   - Errors: 400 max_tokens_exceeded, 401, 422 (no echo of rejected input), 429 with
+ *     and without Retry-After, 529, timeout
+ *   - Circuit breaker: opens, skips, probe, recovery, failed probe restarts cooldown
+ *   - Key scoping and configuration: createRemoteRerankerFromConfig, validateConfig
  */
 import {
 	afterAll,
@@ -21,16 +20,24 @@ import {
 	spyOn,
 } from "bun:test";
 import {
-	REMOTE_RERANK_MAX_DOCUMENTS,
 	RemoteReranker,
 	RerankSkippedError,
 	createRemoteRerankerFromConfig,
+	parseRetryAfterMs,
 } from "../src/activation/rerank-remote";
-import { PLACEHOLDER_API_KEY, config } from "../src/config";
-import { logger } from "../src/logger";
+import {
+	PLACEHOLDER_API_KEY,
+	PLACEHOLDER_ENDPOINT,
+	REMOTE_RERANK_MAX_CANDIDATES,
+	REMOTE_RERANK_REQUEST_CHAR_BUDGET,
+	config,
+	validateConfig,
+} from "../src/config";
 
 // Built at runtime so no secret-shaped literal lands in the source.
 const API_KEY = ["stub", "gateway", String(process.pid)].join("-");
+const MODEL = "jev-1.14.0";
+const ROUTE = "/decisions/v1/systemone";
 
 // Request bodies are inspected loosely: the test asserts on fields of the wire format.
 // biome-ignore lint/suspicious/noExplicitAny: arbitrary JSON from the wire
@@ -68,36 +75,26 @@ afterAll(() => {
 
 beforeEach(() => {
 	requests = [];
-	respond = () => completion({});
+	respond = () => systemOne({});
 });
 
-afterEach(() => {
-	config.llm.baseEndpoint = "";
-	config.llm.apiKey = "";
-});
-
-/** A gateway completion whose message content carries the per-question answers. */
-function completion(
-	answers: Record<string, number | string>,
-	usage: { prompt_tokens: number; cost: number } = {
-		prompt_tokens: 8200,
-		cost: 0.00197,
-	},
+/** A System One response: one noul answer per id, plus the model and usage. */
+function systemOne(
+	answers: Record<string, unknown>,
+	model: string | null = MODEL,
 ): Response {
-	const content = Object.fromEntries(
-		Object.entries(answers).map(([id, p]) => [id, { noul: p, type: "noul" }]),
-	);
 	return Response.json({
-		model: "stub/clef",
-		choices: [
-			{ message: { role: "assistant", content: JSON.stringify(content) } },
-		],
-		usage,
+		...(model === null ? {} : { model }),
+		answers: Object.fromEntries(
+			Object.entries(answers).map(([id, noul]) => [id, { type: "noul", noul }]),
+		),
+		usage: { input_tokens: 8200, output_tokens: 12 },
 	});
 }
 
 function makeReranker(
 	opts: {
+		url?: string;
 		timeoutMs?: number;
 		maxDocTokens?: number;
 		maxQueryTokens?: number;
@@ -105,9 +102,9 @@ function makeReranker(
 	} = {},
 ): RemoteReranker {
 	return new RemoteReranker({
-		baseEndpoint: `http://127.0.0.1:${server.port}`,
+		url: `http://127.0.0.1:${server.port}${ROUTE}`,
 		apiKey: API_KEY,
-		model: "clef",
+		model: MODEL,
 		timeoutMs: 2_000,
 		maxDocTokens: 256,
 		maxQueryTokens: 128,
@@ -115,10 +112,19 @@ function makeReranker(
 	});
 }
 
-describe("RemoteReranker request and response", () => {
-	it("scores all candidates from one call, in input order", async () => {
-		respond = () => completion({ D00: 0.12, D01: 0.91, D02: 0.5 });
-		const scores = await makeReranker().scoreBatch("rotate the keys", [
+/** Scores only, for tests that do not inspect the scorer identity. */
+async function scoresOf(
+	reranker: RemoteReranker,
+	query: string,
+	documents: string[],
+): Promise<number[]> {
+	return (await reranker.scoreBatch(query, documents)).scores;
+}
+
+describe("RemoteReranker request", () => {
+	it("posts to the System One route with the bearer key, once per call", async () => {
+		respond = () => systemOne({ D00: 0.12, D01: 0.91, D02: 0.5 });
+		const scores = await scoresOf(makeReranker(), "rotate the keys", [
 			"alpha doc",
 			"beta doc",
 			"gamma doc",
@@ -126,222 +132,513 @@ describe("RemoteReranker request and response", () => {
 
 		expect(scores).toEqual([0.12, 0.91, 0.5]);
 		expect(requests).toHaveLength(1);
-		expect(requests[0].path).toBe("/openai/v1/chat/completions");
+		expect(requests[0].path).toBe(ROUTE);
 		expect(requests[0].auth).toBe(`Bearer ${API_KEY}`);
 	});
 
-	it("sends the questions template with one Noul per document id", async () => {
-		respond = () => completion({ D00: 0.5, D01: 0.5 });
-		await makeReranker().scoreBatch("q", ["first", "second"]);
+	it("sends the model, a state with the query and documents, and one noul question per id", async () => {
+		respond = () => systemOne({ D00: 0.5, D01: 0.5 });
+		await scoresOf(makeReranker(), "q", ["first", "second"]);
 
 		const body = requests[0].body;
-		expect(body.model).toBe("clef");
-		expect(body.response_format.type).toBe("questions");
-		const questions = body.response_format.questions;
-		expect(Object.keys(questions)).toEqual(["D00", "D01"]);
-		expect(questions.D01.type).toBe("noul");
-		expect(questions.D01.instructions).toContain("`documents.D01`");
-		expect(questions.D01.criteria.true).toContain("answers the query");
-		expect(questions.D01.criteria.false).toContain("loosely related");
-
-		const content = JSON.parse(body.messages[0].content);
-		expect(content.query).toBe("q");
-		expect(Object.keys(content.documents)).toEqual(["D00", "D01"]);
-		expect(content.documents.D01).toEqual({ title: "", text: "second" });
+		expect(body.model).toBe(MODEL);
+		expect(Object.keys(body.state.documents)).toEqual(["D00", "D01"]);
+		expect(Object.keys(body.questions)).toEqual(["D00", "D01"]);
+		expect(body.questions.D01).toEqual({
+			type: "noul",
+			instructions:
+				"Document `documents.D01` is relevant to `query`: it contains information that answers or directly addresses it.",
+			criteria: {
+				true: "The document contains information that answers the query or directly addresses what it asks about.",
+				false:
+					"The document is only loosely related, on a similar topic, or does not address what the query asks.",
+			},
+		});
+		expect(body.state.query).toBe("q");
 	});
 
-	it("keeps the query tail and the document head within the token caps", async () => {
-		respond = () => completion({ D00: 0.5 });
-		// 1 token = 4 characters in the remote backend.
-		await makeReranker({ maxDocTokens: 2, maxQueryTokens: 1 }).scoreBatch(
-			"0123456789",
+	it("keeps candidate ids in the order given, so D00 is the first document", async () => {
+		respond = () => systemOne({ D00: 0.9, D01: 0.1 });
+		await scoresOf(makeReranker(), "q", ["best dense", "second dense"]);
+
+		expect(requests[0].body.state.documents.D00.text).toBe("best dense");
+		expect(requests[0].body.state.documents.D01.text).toBe("second dense");
+	});
+
+	it("sends the last maxQueryTokens x 4 characters of the query and the first maxDocTokens x 4 of each document", async () => {
+		respond = () => systemOne({ D00: 0.5 });
+		await scoresOf(
+			makeReranker({ maxDocTokens: 2, maxQueryTokens: 2 }),
+			"0123456789abcdef",
 			["abcdefghijklmnop"],
 		);
 
-		const content = JSON.parse(requests[0].body.messages[0].content);
-		expect(content.query).toBe("6789");
-		expect(content.documents.D00.text).toBe("abcdefgh");
+		expect(requests[0].body.state.query).toBe("89abcdef");
+		expect(requests[0].body.state.documents.D00.text).toBe("abcdefgh");
 	});
 
-	it("accepts a code-fenced JSON message", async () => {
-		respond = () =>
-			Response.json({
-				choices: [
-					{
-						message: {
-							content: '```json\n{"D00": {"noul": 0.25, "type": "noul"}}\n```',
-						},
-					},
-				],
-			});
-		expect(await makeReranker().scoreBatch("q", ["doc"])).toEqual([0.25]);
-	});
-
-	it("rejects a non-JSON message content", async () => {
-		respond = () =>
-			Response.json({
-				choices: [{ message: { content: "I think doc one is best." } }],
-			});
-		await expect(makeReranker().scoreBatch("q", ["doc"])).rejects.toThrow(
-			"not JSON",
+	it("never splits a surrogate pair at the query or document cut", async () => {
+		respond = () => systemOne({ D00: 0.5 });
+		// Head cut: 8 characters would end on the high surrogate of the emoji, so 7 are sent.
+		// Tail cut: the last 8 characters start on the low surrogate, so the tail begins after it.
+		await scoresOf(
+			makeReranker({ maxDocTokens: 2, maxQueryTokens: 2 }),
+			"abc😀defghij",
+			["aaaaaaa😀"],
 		);
+
+		expect(requests[0].body.state.query).toBe("defghij");
+		expect(requests[0].body.state.documents.D00.text).toBe("aaaaaaa");
 	});
 
-	it("rejects a response without choices", async () => {
-		respond = () => Response.json({ model: "stub/clef" });
-		await expect(makeReranker().scoreBatch("q", ["doc"])).rejects.toThrow(
-			"malformed gateway response",
-		);
+	it("returns no scores and makes no call for an empty candidate list", async () => {
+		expect(await scoresOf(makeReranker(), "q", [])).toEqual([]);
+		expect(requests).toHaveLength(0);
 	});
 
-	it("rejects a score outside [0, 1]", async () => {
-		respond = () => completion({ D00: 1.7 });
-		await expect(makeReranker().scoreBatch("q", ["doc"])).rejects.toThrow(
-			"malformed gateway response",
-		);
-	});
-
-	it("rejects partial scores instead of mixing them with dense order", async () => {
-		respond = () => completion({ D00: 0.9, D01: 0.1 });
-		await expect(
-			makeReranker().scoreBatch("q", ["one", "two", "three"]),
-		).rejects.toThrow("no score for D02");
-	});
-
-	it("reports a 503 with the cause from the error body", async () => {
-		respond = () =>
-			new Response(
-				JSON.stringify({
-					error: {
-						message: "upstream StatusCode: TooManyRequests, retry later",
-					},
-				}),
-				{ status: 503 },
-			);
-		await expect(makeReranker().scoreBatch("q", ["doc"])).rejects.toThrow(
-			/HTTP 503.*TooManyRequests/,
-		);
-	});
-
-	it("aborts at the timeout and rejects", async () => {
-		// The gateway never answers. The client budget is a real timer
-		// (AbortSignal.timeout), so this test necessarily runs on the platform clock.
-		respond = () => new Promise<Response>(() => {});
-		await expect(
-			makeReranker({ timeoutMs: 100 }).scoreBatch("q", ["doc"]),
-		).rejects.toThrow("timed out after 100ms");
-	});
-
-	it("refuses more candidates than one call carries, without sending", async () => {
+	it("rejects more than the candidate cap without calling the endpoint", async () => {
 		const docs = Array.from(
-			{ length: REMOTE_RERANK_MAX_DOCUMENTS + 1 },
+			{ length: REMOTE_RERANK_MAX_CANDIDATES + 1 },
 			(_, i) => `doc ${i}`,
 		);
 		await expect(makeReranker().scoreBatch("q", docs)).rejects.toThrow(
-			"at most 40",
+			/at most 40 candidates per call/,
 		);
 		expect(requests).toHaveLength(0);
 	});
+});
 
-	it("returns an empty result for no documents without a request", async () => {
-		expect(await makeReranker().scoreBatch("q", [])).toEqual([]);
-		expect(requests).toHaveLength(0);
+describe("RemoteReranker response", () => {
+	it("returns the scores in input order and the resolved model as the scorer", async () => {
+		respond = () => systemOne({ D00: 0.2, D01: 0.8 }, "jev-1.14.1");
+		const batch = await makeReranker().scoreBatch("q", ["a", "b"]);
+
+		expect(batch.scores).toEqual([0.2, 0.8]);
+		expect(batch.scorer).toEqual({ provider: "remote", model: "jev-1.14.1" });
 	});
 
-	it("exposes provider and model as its identity", () => {
-		expect(makeReranker().identity).toEqual({
-			provider: "remote",
-			model: "clef",
-		});
+	it("falls back to the configured model when the response does not name one", async () => {
+		respond = () => systemOne({ D00: 0.4 }, null);
+		const batch = await makeReranker().scoreBatch("q", ["a"]);
+
+		expect(batch.scorer).toEqual({ provider: "remote", model: MODEL });
+	});
+
+	it("ignores extra noul answers for ids it did not ask about", async () => {
+		respond = () => systemOne({ D00: 0.3, D09: 0.99 });
+		expect(await scoresOf(makeReranker(), "q", ["a"])).toEqual([0.3]);
+	});
+
+	it("fails the whole batch when an id has no answer", async () => {
+		respond = () => systemOne({ D00: 0.3 });
+		await expect(makeReranker().scoreBatch("q", ["a", "b"])).rejects.toThrow(
+			"gateway response has no answer for D01",
+		);
+	});
+
+	it("fails the whole batch when one answer is not a noul", async () => {
+		respond = () =>
+			Response.json({
+				model: MODEL,
+				answers: {
+					D00: { type: "noul", noul: 0.3 },
+					D01: { type: "choice", choice: "a", confidence: 0.5 },
+				},
+				usage: { input_tokens: 1, output_tokens: 1 },
+			});
+		await expect(makeReranker().scoreBatch("q", ["a", "b"])).rejects.toThrow(
+			/malformed gateway response/,
+		);
+	});
+
+	it("rejects a probability above 1", async () => {
+		respond = () => systemOne({ D00: 1.5 });
+		await expect(makeReranker().scoreBatch("q", ["a"])).rejects.toThrow(
+			/malformed gateway response/,
+		);
+	});
+
+	it("rejects a negative probability", async () => {
+		respond = () => systemOne({ D00: -0.1 });
+		await expect(makeReranker().scoreBatch("q", ["a"])).rejects.toThrow(
+			/malformed gateway response/,
+		);
+	});
+
+	it("rejects a null score (what a non-finite number serializes to)", async () => {
+		respond = () => systemOne({ D00: null });
+		await expect(makeReranker().scoreBatch("q", ["a"])).rejects.toThrow(
+			/malformed gateway response/,
+		);
+	});
+
+	it("rejects a body that is not JSON", async () => {
+		respond = () => new Response("<html>gateway page</html>", { status: 200 });
+		await expect(makeReranker().scoreBatch("q", ["a"])).rejects.toThrow(
+			"body is not JSON",
+		);
+	});
+});
+
+describe("RemoteReranker errors", () => {
+	it("reports a 400 max_tokens_exceeded with its detail, without making a retry", async () => {
+		respond = () =>
+			Response.json(
+				{ detail: "max_tokens_exceeded: request is longer than the context" },
+				{ status: 400 },
+			);
+		await expect(makeReranker().scoreBatch("q", ["a"])).rejects.toThrow(
+			"gateway returned HTTP 400: max_tokens_exceeded: request is longer than the context",
+		);
+		expect(requests).toHaveLength(1);
+	});
+
+	it("keeps validation locations and messages from a 422, but not the rejected input they echo", async () => {
+		respond = () =>
+			Response.json(
+				{
+					detail: [
+						{
+							loc: ["body", "questions", "D01", "type"],
+							msg: "Input should be 'noul'",
+							type: "literal_error",
+							input: "SECRET-CANDIDATE-TEXT",
+						},
+					],
+				},
+				{ status: 422 },
+			);
+		const err = await makeReranker()
+			.scoreBatch("q", ["a", "b"])
+			.catch((e: unknown) => e);
+
+		expect(err).toBeInstanceOf(Error);
+		const message = (err as Error).message;
+		expect(message).toContain("HTTP 422");
+		expect(message).toContain(
+			"body.questions.D01.type: Input should be 'noul'",
+		);
+		expect(message).not.toContain("SECRET-CANDIDATE-TEXT");
+	});
+
+	it("reports a 401 and does not retry", async () => {
+		respond = () =>
+			Response.json({ detail: "Invalid API key" }, { status: 401 });
+		await expect(makeReranker().scoreBatch("q", ["a"])).rejects.toThrow(
+			"gateway returned HTTP 401: Invalid API key",
+		);
+		expect(requests).toHaveLength(1);
+	});
+
+	it("429 without Retry-After fails fast", async () => {
+		respond = () => new Response("slow down", { status: 429 });
+		await expect(makeReranker().scoreBatch("q", ["a"])).rejects.toThrow(
+			"gateway returned HTTP 429",
+		);
+		expect(requests).toHaveLength(1);
+	});
+
+	it("429 with a Retry-After that fits the budget retries once and succeeds", async () => {
+		let calls = 0;
+		respond = () => {
+			calls++;
+			return calls === 1
+				? new Response("slow down", {
+						status: 429,
+						headers: { "retry-after": "0" },
+					})
+				: systemOne({ D00: 0.7 });
+		};
+		expect(await scoresOf(makeReranker(), "q", ["a"])).toEqual([0.7]);
+		expect(requests).toHaveLength(2);
+	});
+
+	it("429 whose Retry-After exceeds the remaining budget fails fast", async () => {
+		respond = () =>
+			new Response("slow down", {
+				status: 429,
+				headers: { "retry-after": "60" },
+			});
+		await expect(makeReranker().scoreBatch("q", ["a"])).rejects.toThrow(
+			"gateway returned HTTP 429",
+		);
+		expect(requests).toHaveLength(1);
+	});
+
+	it("a second 429 after the retry fails the batch", async () => {
+		respond = () =>
+			new Response("slow down", {
+				status: 429,
+				headers: { "retry-after": "0" },
+			});
+		await expect(makeReranker().scoreBatch("q", ["a"])).rejects.toThrow(
+			"gateway returned HTTP 429",
+		);
+		expect(requests).toHaveLength(2);
+	});
+
+	it("529 Overloaded fails the batch without a retry", async () => {
+		respond = () => Response.json({ detail: "Overloaded" }, { status: 529 });
+		await expect(makeReranker().scoreBatch("q", ["a"])).rejects.toThrow(
+			"gateway returned HTTP 529: Overloaded",
+		);
+		expect(requests).toHaveLength(1);
+	});
+
+	it("aborts a call that outlives the budget", async () => {
+		// Real clock on purpose: the abort comes from AbortSignal.timeout, which fake
+		// timers cannot drive. The stub answers after the budget has run out.
+		respond = async () => {
+			await Bun.sleep(500);
+			return systemOne({ D00: 0.5 });
+		};
+		await expect(
+			makeReranker({ timeoutMs: 100 }).scoreBatch("q", ["a"]),
+		).rejects.toThrow("timed out after 100ms");
+	});
+});
+
+describe("RemoteReranker parseRetryAfterMs", () => {
+	const now = 1_700_000_000_000;
+
+	it("reads delay-seconds, including fractions", () => {
+		expect(parseRetryAfterMs("2", now)).toBe(2_000);
+		expect(parseRetryAfterMs("1.5", now)).toBe(1_500);
+		expect(parseRetryAfterMs("0", now)).toBe(0);
+	});
+
+	it("reads an HTTP-date relative to now, never negative", () => {
+		expect(parseRetryAfterMs(new Date(now + 5_000).toUTCString(), now)).toBe(
+			5_000,
+		);
+		expect(parseRetryAfterMs(new Date(now - 5_000).toUTCString(), now)).toBe(0);
+	});
+
+	it("returns null when absent or unreadable", () => {
+		expect(parseRetryAfterMs(null, now)).toBeNull();
+		expect(parseRetryAfterMs("soon", now)).toBeNull();
 	});
 });
 
 describe("RemoteReranker circuit breaker", () => {
-	it("opens after 3 failures, skips while open, probes once after the cooldown", async () => {
-		let clock = 1_000_000;
-		const warn = spyOn(logger, "warn").mockImplementation(() => {});
-		const log = spyOn(logger, "log").mockImplementation(() => {});
-		try {
-			respond = () => new Response("unavailable", { status: 503 });
-			const reranker = makeReranker({ now: () => clock });
+	it("opens after 3 failures, skips while open, probes after the cooldown, and recovers", async () => {
+		let clock = 0;
+		const reranker = makeReranker({ now: () => clock });
+		respond = () => new Response("boom", { status: 500 });
 
-			for (let i = 0; i < 3; i++) {
-				await expect(reranker.scoreBatch("q", ["doc"])).rejects.toThrow(
-					"HTTP 503",
-				);
-			}
-			expect(requests).toHaveLength(3);
-			expect(warn).toHaveBeenCalledTimes(1);
+		for (let i = 0; i < 3; i++) {
+			await expect(reranker.scoreBatch("q", ["a"])).rejects.toThrow(
+				"gateway returned HTTP 500",
+			);
+		}
+		expect(requests).toHaveLength(3);
 
-			// Open: no request leaves the process.
-			await expect(reranker.scoreBatch("q", ["doc"])).rejects.toBeInstanceOf(
-				RerankSkippedError,
-			);
-			expect(requests).toHaveLength(3);
+		await expect(reranker.scoreBatch("q", ["a"])).rejects.toBeInstanceOf(
+			RerankSkippedError,
+		);
+		expect(requests).toHaveLength(3);
 
-			// Cooldown over: one probe goes out; it fails and the breaker stays open quietly.
-			clock += 60_000;
-			await expect(reranker.scoreBatch("q", ["doc"])).rejects.toThrow(
-				"HTTP 503",
-			);
-			expect(requests).toHaveLength(4);
-			expect(warn).toHaveBeenCalledTimes(1);
-			await expect(reranker.scoreBatch("q", ["doc"])).rejects.toBeInstanceOf(
-				RerankSkippedError,
-			);
-			expect(requests).toHaveLength(4);
+		clock = 60_000;
+		respond = () => systemOne({ D00: 0.6 });
+		expect(await scoresOf(reranker, "q", ["a"])).toEqual([0.6]);
+		expect(requests).toHaveLength(4);
+		expect(await scoresOf(reranker, "q", ["a"])).toEqual([0.6]);
+		expect(requests).toHaveLength(5);
+	});
 
-			// Next probe succeeds: breaker closes, one recovery log, calls flow again.
-			clock += 60_000;
-			respond = () => completion({ D00: 0.3 });
-			expect(await reranker.scoreBatch("q", ["doc"])).toEqual([0.3]);
-			expect(await reranker.scoreBatch("q", ["doc"])).toEqual([0.3]);
-			expect(requests).toHaveLength(6);
-			const recovered = log.mock.calls.filter((args) =>
-				String(args[0]).includes("recovered"),
-			);
-			expect(recovered).toHaveLength(1);
-			expect(warn).toHaveBeenCalledTimes(1);
-		} finally {
-			warn.mockRestore();
-			log.mockRestore();
+	it("a failed probe restarts the cooldown", async () => {
+		let clock = 0;
+		const reranker = makeReranker({ now: () => clock });
+		respond = () => new Response("boom", { status: 500 });
+		for (let i = 0; i < 3; i++) {
+			await reranker.scoreBatch("q", ["a"]).catch(() => undefined);
+		}
+
+		clock = 60_000;
+		await expect(reranker.scoreBatch("q", ["a"])).rejects.toThrow(
+			"gateway returned HTTP 500",
+		);
+		expect(requests).toHaveLength(4);
+
+		clock = 119_999;
+		await expect(reranker.scoreBatch("q", ["a"])).rejects.toBeInstanceOf(
+			RerankSkippedError,
+		);
+		expect(requests).toHaveLength(4);
+
+		clock = 120_000;
+		respond = () => systemOne({ D00: 0.2 });
+		expect(await scoresOf(reranker, "q", ["a"])).toEqual([0.2]);
+	});
+});
+
+describe("createRemoteRerankerFromConfig", () => {
+	const mutable = config.activation.rerank.remote as unknown as {
+		url: string;
+		apiKey: string;
+		model: string;
+	};
+	const saved = { ...mutable };
+
+	afterEach(() => {
+		Object.assign(mutable, saved);
+	});
+
+	it("is null without a URL, without a key, or with template placeholders", () => {
+		mutable.url = "";
+		mutable.apiKey = API_KEY;
+		expect(createRemoteRerankerFromConfig()).toBeNull();
+
+		mutable.url = `http://127.0.0.1:${server.port}${ROUTE}`;
+		mutable.apiKey = "";
+		expect(createRemoteRerankerFromConfig()).toBeNull();
+
+		mutable.url = `${PLACEHOLDER_ENDPOINT}/decisions/v1/systemone`;
+		mutable.apiKey = API_KEY;
+		expect(createRemoteRerankerFromConfig()).toBeNull();
+
+		mutable.url = `http://127.0.0.1:${server.port}${ROUTE}`;
+		mutable.apiKey = PLACEHOLDER_API_KEY;
+		expect(createRemoteRerankerFromConfig()).toBeNull();
+	});
+
+	it("builds a reranker on the configured URL and model", async () => {
+		mutable.url = `http://127.0.0.1:${server.port}${ROUTE}`;
+		mutable.apiKey = API_KEY;
+		mutable.model = MODEL;
+		const reranker = createRemoteRerankerFromConfig();
+		expect(reranker?.identity).toEqual({ provider: "remote", model: MODEL });
+
+		respond = () => systemOne({ D00: 0.33 });
+		expect(await scoresOf(reranker as RemoteReranker, "q", ["a"])).toEqual([
+			0.33,
+		]);
+		expect(requests[0].path).toBe(ROUTE);
+	});
+});
+
+describe("validateConfig: remote reranker", () => {
+	const mutable = config.activation.rerank as unknown as {
+		provider: "local" | "remote";
+		candidates: number;
+		maxDocTokens: number;
+		maxQueryTokens: number;
+		remote: { url: string; apiKey: string };
+	};
+	const saved = {
+		provider: mutable.provider,
+		candidates: mutable.candidates,
+		maxDocTokens: mutable.maxDocTokens,
+		maxQueryTokens: mutable.maxQueryTokens,
+		remote: { ...mutable.remote },
+	};
+	const envNames = [
+		"RERANK_REMOTE_URL",
+		"RERANK_REMOTE_API_KEY",
+		"LLM_BASE_ENDPOINT",
+		"LLM_API_KEY",
+	] as const;
+	const savedEnv: Record<string, string | undefined> = {};
+
+	beforeEach(() => {
+		for (const name of envNames) savedEnv[name] = process.env[name];
+		for (const name of envNames) delete process.env[name];
+		mutable.provider = "remote";
+		mutable.candidates = 16;
+		mutable.maxDocTokens = 256;
+		mutable.maxQueryTokens = 128;
+		mutable.remote.url = "https://gateway.example.org/decisions/v1/systemone";
+		mutable.remote.apiKey = API_KEY;
+	});
+
+	afterEach(() => {
+		Object.assign(mutable, { ...saved, remote: { ...saved.remote } });
+		for (const name of envNames) {
+			if (savedEnv[name] === undefined) delete process.env[name];
+			else process.env[name] = savedEnv[name];
 		}
 	});
 
-	it("does not open on fewer than 3 consecutive failures", async () => {
-		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+	/** Remote-reranker errors only; other config checks are out of scope here. */
+	function remoteErrors(): string[] {
+		return validateConfig().filter((e) =>
+			/remote|RERANK_CANDIDATES|RERANK_REMOTE/.test(e),
+		);
+	}
+
+	it("passes the default layout: gateway route, same origin, no key needed", () => {
+		process.env.LLM_BASE_ENDPOINT = "https://gateway.example.org";
+		process.env.LLM_API_KEY = API_KEY;
+		expect(remoteErrors()).toEqual([]);
+	});
+
+	it("needs a dedicated key for an explicit URL on another origin", () => {
+		process.env.LLM_BASE_ENDPOINT = "https://gateway.example.org";
+		process.env.RERANK_REMOTE_URL = "https://api.typesafe.ai/v1/systemone";
+		expect(remoteErrors()).toEqual([
+			expect.stringContaining("different origin than LLM_BASE_ENDPOINT"),
+		]);
+
+		process.env.RERANK_REMOTE_API_KEY = API_KEY;
+		expect(remoteErrors()).toEqual([]);
+	});
+
+	it("accepts a direct TypeSafe URL with its own key and no gateway at all", () => {
+		process.env.RERANK_REMOTE_URL = "https://api.typesafe.ai/v1/systemone";
+		process.env.RERANK_REMOTE_API_KEY = API_KEY;
+		mutable.remote.url = "https://api.typesafe.ai/v1/systemone";
+		mutable.remote.apiKey = API_KEY;
+		expect(remoteErrors()).toEqual([]);
+	});
+
+	it("warns on plain http to a non-loopback host, not on loopback", () => {
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
 		try {
-			const reranker = makeReranker();
-			respond = () => new Response("unavailable", { status: 503 });
-			await expect(reranker.scoreBatch("q", ["doc"])).rejects.toThrow();
-			await expect(reranker.scoreBatch("q", ["doc"])).rejects.toThrow();
-			respond = () => completion({ D00: 0.4 });
-			expect(await reranker.scoreBatch("q", ["doc"])).toEqual([0.4]);
+			mutable.remote.url = "http://models.example.org/decisions/v1/systemone";
+			expect(remoteErrors()).toEqual([]);
+			expect(warn).toHaveBeenCalledWith(
+				expect.stringContaining("plain http on a non-loopback host"),
+			);
+			warn.mockClear();
+			mutable.remote.url = "http://127.0.0.1:8080/decisions/v1/systemone";
+			expect(remoteErrors()).toEqual([]);
 			expect(warn).not.toHaveBeenCalled();
 		} finally {
 			warn.mockRestore();
 		}
 	});
-});
 
-describe("createRemoteRerankerFromConfig", () => {
-	it("returns null when the gateway endpoint or key is missing or a placeholder", () => {
-		config.llm.baseEndpoint = "";
-		config.llm.apiKey = "key";
-		expect(createRemoteRerankerFromConfig()).toBeNull();
-
-		config.llm.baseEndpoint = `http://127.0.0.1:${server.port}`;
-		config.llm.apiKey = "";
-		expect(createRemoteRerankerFromConfig()).toBeNull();
-
-		config.llm.apiKey = PLACEHOLDER_API_KEY;
-		expect(createRemoteRerankerFromConfig()).toBeNull();
+	it("rejects a URL that is not absolute http(s)", () => {
+		mutable.remote.url = "gateway.example.org/systemone";
+		expect(remoteErrors()).toEqual([
+			expect.stringContaining("must be an absolute http or https URL"),
+		]);
 	});
 
-	it("builds a reranker from the unified gateway settings", () => {
-		config.llm.baseEndpoint = `http://127.0.0.1:${server.port}/`;
-		config.llm.apiKey = API_KEY;
-		const reranker = createRemoteRerankerFromConfig();
-		expect(reranker?.identity.provider).toBe("remote");
+	it("rejects more candidates than one call can carry", () => {
+		mutable.candidates = REMOTE_RERANK_MAX_CANDIDATES + 1;
+		expect(remoteErrors()).toEqual([
+			expect.stringContaining(`at most ${REMOTE_RERANK_MAX_CANDIDATES}`),
+		]);
+	});
+
+	it("rejects a request that could exceed the character budget, and accepts the defaults", () => {
+		expect(remoteErrors()).toEqual([]);
+
+		mutable.candidates = REMOTE_RERANK_MAX_CANDIDATES;
+		mutable.maxDocTokens = 1024;
+		expect(remoteErrors()).toEqual([
+			expect.stringContaining(
+				`above the ${REMOTE_RERANK_REQUEST_CHAR_BUDGET}-character budget`,
+			),
+		]);
+	});
+
+	it("checks nothing when the local provider is active", () => {
+		mutable.provider = "local";
+		mutable.candidates = REMOTE_RERANK_MAX_CANDIDATES + 1;
+		mutable.remote.url = "not a url";
+		process.env.RERANK_REMOTE_URL = "https://api.typesafe.ai/v1/systemone";
+		expect(remoteErrors()).toEqual([]);
 	});
 });

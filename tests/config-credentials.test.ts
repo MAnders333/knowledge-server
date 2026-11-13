@@ -1,23 +1,23 @@
 /**
  * Credential routing and admin-token validation.
  *
- * resolveEmbeddingApiKey is pure. validateConfig reads the frozen config
+ * resolveScopedApiKey is pure. validateConfig reads the frozen config
  * singleton, so the admin-token cases mutate it and restore it afterwards.
  */
 import { afterEach, describe, expect, it } from "bun:test";
-import { config, resolveEmbeddingApiKey, validateConfig } from "../src/config";
+import { config, resolveScopedApiKey, validateConfig } from "../src/config";
 
 // `config` is typed readonly (as const); tests swap the admin token at runtime.
 const mutableConfig = config as unknown as { adminToken: string | null };
 
-describe("resolveEmbeddingApiKey", () => {
+describe("resolveScopedApiKey", () => {
 	const llmEndpoint = "https://llm-proxy.example.com";
 
-	it("uses EMBEDDING_API_KEY for a dedicated endpoint", () => {
+	it("uses the dedicated key for a dedicated endpoint", () => {
 		expect(
-			resolveEmbeddingApiKey({
-				embeddingBaseURL: "https://embed.example.org/v1",
-				embeddingApiKey: "embed-key",
+			resolveScopedApiKey({
+				endpointUrl: "https://embed.example.org/v1",
+				dedicatedApiKey: "embed-key",
 				llmBaseEndpoint: llmEndpoint,
 				llmApiKey: "llm-key",
 			}),
@@ -26,15 +26,15 @@ describe("resolveEmbeddingApiKey", () => {
 
 	it("never forwards LLM_API_KEY to a dedicated endpoint on another origin", () => {
 		expect(
-			resolveEmbeddingApiKey({
-				embeddingBaseURL: "https://embed.example.org/v1",
+			resolveScopedApiKey({
+				endpointUrl: "https://embed.example.org/v1",
 				llmBaseEndpoint: llmEndpoint,
 				llmApiKey: "llm-key",
 			}),
 		).toBe("");
 		expect(
-			resolveEmbeddingApiKey({
-				embeddingBaseURL: "http://localhost:11434/v1",
+			resolveScopedApiKey({
+				endpointUrl: "http://localhost:11434/v1",
 				llmApiKey: "llm-key",
 			}),
 		).toBe("");
@@ -42,23 +42,48 @@ describe("resolveEmbeddingApiKey", () => {
 
 	it("forwards LLM_API_KEY when the endpoint shares LLM_BASE_ENDPOINT's origin", () => {
 		expect(
-			resolveEmbeddingApiKey({
-				embeddingBaseURL: `${llmEndpoint}/openai/v1`,
+			resolveScopedApiKey({
+				endpointUrl: `${llmEndpoint}/openai/v1`,
 				llmBaseEndpoint: llmEndpoint,
 				llmApiKey: "llm-key",
 			}),
 		).toBe("llm-key");
 	});
 
+	it("gives the gateway's systemone route the LLM key, and direct TypeSafe only its own key", () => {
+		expect(
+			resolveScopedApiKey({
+				endpointUrl: `${llmEndpoint}/decisions/v1/systemone`,
+				llmBaseEndpoint: llmEndpoint,
+				llmApiKey: "llm-key",
+			}),
+		).toBe("llm-key");
+		expect(
+			resolveScopedApiKey({
+				endpointUrl: "https://api.typesafe.ai/v1/systemone",
+				llmBaseEndpoint: llmEndpoint,
+				llmApiKey: "llm-key",
+			}),
+		).toBe("");
+		expect(
+			resolveScopedApiKey({
+				endpointUrl: "https://api.typesafe.ai/v1/systemone",
+				dedicatedApiKey: "typesafe-key",
+				llmBaseEndpoint: llmEndpoint,
+				llmApiKey: "llm-key",
+			}),
+		).toBe("typesafe-key");
+	});
+
 	it("does not treat a lookalike host or a different port as the same origin", () => {
-		for (const embeddingBaseURL of [
+		for (const endpointUrl of [
 			"https://llm-proxy.example.com.evil.net/v1",
 			"https://llm-proxy.example.com:8443/v1",
 			"http://llm-proxy.example.com/v1",
 		]) {
 			expect(
-				resolveEmbeddingApiKey({
-					embeddingBaseURL,
+				resolveScopedApiKey({
+					endpointUrl,
 					llmBaseEndpoint: llmEndpoint,
 					llmApiKey: "llm-key",
 				}),
@@ -67,7 +92,7 @@ describe("resolveEmbeddingApiKey", () => {
 	});
 
 	it("returns an empty key when no endpoint is configured", () => {
-		expect(resolveEmbeddingApiKey({ llmApiKey: "llm-key" })).toBe("");
+		expect(resolveScopedApiKey({ llmApiKey: "llm-key" })).toBe("");
 	});
 });
 

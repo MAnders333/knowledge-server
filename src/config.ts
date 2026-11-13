@@ -61,28 +61,84 @@ function originOf(url: string | undefined): string | null {
 }
 
 /**
- * Choose the API key for a dedicated EMBEDDING_BASE_URL.
+ * Choose the API key for a dedicated endpoint (EMBEDDING_BASE_URL, RERANK_REMOTE_URL).
  *
- * EMBEDDING_API_KEY is used when set. LLM_API_KEY is forwarded only when the
- * embedding endpoint has the same origin as LLM_BASE_ENDPOINT (the same trust
- * domain). Any other endpoint gets no key, so the generic LLM credential never
- * leaves its configured provider.
+ * The dedicated key (EMBEDDING_API_KEY, RERANK_REMOTE_API_KEY) is used when set.
+ * LLM_API_KEY is forwarded only when the endpoint has the same origin as
+ * LLM_BASE_ENDPOINT (the same trust domain). Any other endpoint gets no key, so the
+ * generic LLM credential never leaves its configured provider.
  */
-export function resolveEmbeddingApiKey(env: {
-	embeddingBaseURL?: string;
-	embeddingApiKey?: string;
+export function resolveScopedApiKey(env: {
+	endpointUrl?: string;
+	dedicatedApiKey?: string;
 	llmBaseEndpoint?: string;
 	llmApiKey?: string;
 }): string {
-	const dedicated = env.embeddingApiKey?.trim();
+	const dedicated = env.dedicatedApiKey?.trim();
 	if (dedicated) return dedicated;
 	const llmKey = env.llmApiKey?.trim();
-	if (!env.embeddingBaseURL || !llmKey) return "";
-	const embeddingOrigin = originOf(env.embeddingBaseURL);
-	return embeddingOrigin !== null &&
-		embeddingOrigin === originOf(env.llmBaseEndpoint)
+	if (!env.endpointUrl || !llmKey) return "";
+	const endpointOrigin = originOf(env.endpointUrl);
+	return endpointOrigin !== null &&
+		endpointOrigin === originOf(env.llmBaseEndpoint)
 		? llmKey
 		: "";
+}
+
+// ── Remote reranker ──────────────────────────────────────────────────────────
+
+/**
+ * Default decision model. A versioned ID: aliases move under the same name, and
+ * the calibrated floors are keyed by model name.
+ */
+const DEFAULT_RERANK_REMOTE_MODEL = "jev-1.14.0";
+
+/**
+ * Candidates one remote rerank call carries. The remote reranker never splits the
+ * pool, so a larger RERANK_CANDIDATES is a startup error (see validateConfig).
+ */
+export const REMOTE_RERANK_MAX_CANDIDATES = 40;
+
+/**
+ * Conservative character budget for one remote rerank request: the query tail, the
+ * head of every document and the question text. hev's reference state budget is
+ * 100k characters; the gateway's own limits are far higher.
+ */
+export const REMOTE_RERANK_REQUEST_CHAR_BUDGET = 100_000;
+
+/** Upper bound, in characters, on the question text sent with each candidate. */
+export const REMOTE_RERANK_QUESTION_CHARS = 512;
+
+/**
+ * Remote endpoint and its key: RERANK_REMOTE_URL, or the System One route on the
+ * LLM gateway. The URL is blank when neither LLM_BASE_ENDPOINT nor RERANK_REMOTE_URL
+ * is set; the reranker then stays off.
+ */
+function resolveRerankRemoteEndpoint(): { url: string; apiKey: string } {
+	const llmBaseEndpoint = process.env.LLM_BASE_ENDPOINT ?? "";
+	const gateway = llmBaseEndpoint.trim().replace(/\/+$/, "");
+	const url =
+		process.env.RERANK_REMOTE_URL?.trim() ||
+		(gateway ? `${gateway}/decisions/v1/systemone` : "");
+	return {
+		url,
+		apiKey: resolveScopedApiKey({
+			endpointUrl: url,
+			dedicatedApiKey: process.env.RERANK_REMOTE_API_KEY,
+			llmBaseEndpoint,
+			llmApiKey: process.env.LLM_API_KEY,
+		}),
+	};
+}
+
+/** True for an absolute http or https URL. */
+function isHttpUrl(url: string): boolean {
+	try {
+		const { protocol } = new URL(url);
+		return protocol === "http:" || protocol === "https:";
+	} catch {
+		return false;
+	}
 }
 
 /** True for an http:// URL whose host is not loopback (localhost, 127.0.0.0/8, ::1). */
@@ -379,9 +435,9 @@ export const config = {
 	// Example for Ollama: EMBEDDING_BASE_URL=http://localhost:11434/v1
 	embedding: {
 		baseURL: process.env.EMBEDDING_BASE_URL || "",
-		apiKey: resolveEmbeddingApiKey({
-			embeddingBaseURL: process.env.EMBEDDING_BASE_URL,
-			embeddingApiKey: process.env.EMBEDDING_API_KEY,
+		apiKey: resolveScopedApiKey({
+			endpointUrl: process.env.EMBEDDING_BASE_URL,
+			dedicatedApiKey: process.env.EMBEDDING_API_KEY,
 			llmBaseEndpoint: process.env.LLM_BASE_ENDPOINT,
 			llmApiKey: process.env.LLM_API_KEY,
 		}),
@@ -610,11 +666,14 @@ export const config = {
 			// SciFact abstracts; memory entries are mostly short, so 256 keeps
 			// nearly all of them whole.
 			maxDocTokens: parseIntEnv(process.env.RERANK_MAX_DOC_TOKENS, 256, 1),
-			// Remote listwise decision model, used only when provider is "remote".
+			// Remote System One reranker, used only when provider is "remote": one call
+			// per activation. The URL defaults to the systemone route on LLM_BASE_ENDPOINT;
+			// direct TypeSafe (https://api.typesafe.ai/v1/systemone) needs RERANK_REMOTE_API_KEY.
 			remote: {
-				model: process.env.RERANK_REMOTE_MODEL || "clef",
-				// Budget for the whole gateway request. It sits inside the 5 s plugin
-				// budget; on expiry the batch uses dense ordering.
+				...resolveRerankRemoteEndpoint(),
+				model: process.env.RERANK_REMOTE_MODEL || DEFAULT_RERANK_REMOTE_MODEL,
+				// Budget for the whole gateway request, retry included. It sits inside the 5 s
+				// plugin budget; on expiry the batch uses dense ordering.
 				timeoutMs: parseIntEnv(
 					process.env.RERANK_REMOTE_TIMEOUT_MS,
 					4_000,
@@ -830,6 +889,46 @@ export function validateConfig(): string[] {
 		errors.push(
 			`RERANK_PROVIDER must be "local" or "remote" (got "${process.env.RERANK_PROVIDER}").`,
 		);
+	}
+
+	// Remote reranking sends the query tail and candidate text to its endpoint, so its
+	// settings are checked only when it is the active provider.
+	if (config.activation.rerank.provider === "remote") {
+		const { remote, candidates, maxDocTokens, maxQueryTokens } =
+			config.activation.rerank;
+		const explicitUrl = process.env.RERANK_REMOTE_URL?.trim();
+		if (remote.url && !isHttpUrl(remote.url)) {
+			errors.push(
+				"The remote reranker URL (RERANK_REMOTE_URL, or LLM_BASE_ENDPOINT + /decisions/v1/systemone) must be an absolute http or https URL.",
+			);
+		}
+		if (
+			explicitUrl &&
+			!process.env.RERANK_REMOTE_API_KEY?.trim() &&
+			originOf(explicitUrl) !== originOf(process.env.LLM_BASE_ENDPOINT)
+		) {
+			errors.push(
+				"RERANK_REMOTE_URL is on a different origin than LLM_BASE_ENDPOINT, so LLM_API_KEY is not sent to it. Set RERANK_REMOTE_API_KEY for that endpoint.",
+			);
+		}
+		if (remote.url && isPlainHttpRemote(remote.url)) {
+			console.warn(
+				"[config] The remote reranker URL uses plain http on a non-loopback host; the query, candidate text and API key cross the network unencrypted. Use https.",
+			);
+		}
+		if (candidates > REMOTE_RERANK_MAX_CANDIDATES) {
+			errors.push(
+				`RERANK_CANDIDATES must be at most ${REMOTE_RERANK_MAX_CANDIDATES} with RERANK_PROVIDER=remote (got ${candidates}): the remote reranker scores the whole candidate pool in one call.`,
+			);
+		}
+		const requestChars =
+			candidates * (maxDocTokens * 4 + REMOTE_RERANK_QUESTION_CHARS) +
+			maxQueryTokens * 4;
+		if (requestChars > REMOTE_RERANK_REQUEST_CHAR_BUDGET) {
+			errors.push(
+				`The remote rerank request could reach ${requestChars} characters (RERANK_CANDIDATES × (RERANK_MAX_DOC_TOKENS × 4 + ${REMOTE_RERANK_QUESTION_CHARS}) + RERANK_MAX_QUERY_TOKENS × 4), above the ${REMOTE_RERANK_REQUEST_CHAR_BUDGET}-character budget. Lower RERANK_CANDIDATES or RERANK_MAX_DOC_TOKENS.`,
+			);
+		}
 	}
 
 	// Error only when the user explicitly configured OPENCODE_DB_PATH but the file

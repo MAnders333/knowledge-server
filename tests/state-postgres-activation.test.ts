@@ -37,6 +37,7 @@ function row(overrides: Partial<ActivationEventRow> = {}): ActivationEventRow {
 		entryIds: ["e1", "e2"],
 		rawSims: [0.81, 0.62],
 		rerankScores: [0.9, 0.4],
+		rerankModel: "remote/jev-1.14.0",
 		gateMode: "rerank",
 		latencyMs: 35,
 		clientDeadlineExceeded: false,
@@ -102,14 +103,14 @@ describe.skipIf(!PG_URI)("PostgresServerStateDB activation_event", () => {
 		});
 	}
 
-	it("fresh init stamps schema v4 and creates activation_event", async () => {
+	it("fresh init stamps schema v5 and creates activation_event", async () => {
 		const state = new PostgresServerStateDB(testUri);
 		try {
 			await state.initialize();
 		} finally {
 			await state.close();
 		}
-		expect(await schemaVersions()).toEqual([4]);
+		expect(await schemaVersions()).toEqual([5]);
 		expect(await activationTableExists()).toBe(true);
 	});
 
@@ -139,8 +140,42 @@ describe.skipIf(!PG_URI)("PostgresServerStateDB activation_event", () => {
 		} finally {
 			await state.close();
 		}
-		expect(await schemaVersions()).toEqual([2, 3, 4]);
+		expect(await schemaVersions()).toEqual([2, 3, 4, 5]);
 		expect(await activationTableExists()).toBe(true);
+	});
+
+	it("upgrades a v4 state DB by adding rerank_model and keeps its rows", async () => {
+		const seed = new PostgresServerStateDB(testUri);
+		try {
+			await seed.initialize();
+			await seed.insertActivationEvents([row({ ts: 1_000 })]);
+		} finally {
+			await seed.close();
+		}
+		// Rewind to v4: the column is absent and the schema is stamped v4 only.
+		await withDb(async (sql) => {
+			await sql.unsafe("ALTER TABLE activation_event DROP COLUMN rerank_model");
+			await sql`DELETE FROM state_schema_version`;
+			await sql`INSERT INTO state_schema_version (version, applied_at) VALUES (4, 0)`;
+		});
+
+		const state = new PostgresServerStateDB(testUri);
+		try {
+			await state.initialize();
+			await state.insertActivationEvents([
+				row({ ts: 2_000, rerankModel: "local/Xenova/ms-marco-MiniLM-L-6-v2" }),
+			]);
+		} finally {
+			await state.close();
+		}
+		expect(await schemaVersions()).toEqual([4, 5]);
+		const stored = await withDb(
+			(sql) => sql`SELECT ts, rerank_model FROM activation_event ORDER BY ts`,
+		);
+		expect(stored.map((r) => r.rerank_model)).toEqual([
+			null,
+			"local/Xenova/ms-marco-MiniLM-L-6-v2",
+		]);
 	});
 
 	it("inserts a batch and counts activations by client", async () => {
@@ -155,6 +190,7 @@ describe.skipIf(!PG_URI)("PostgresServerStateDB activation_event", () => {
 					client: "claude-code",
 					sessionHash: null,
 					rerankScores: null,
+					rerankModel: null,
 					gateMode: "dense",
 				}),
 				row({
@@ -182,7 +218,7 @@ describe.skipIf(!PG_URI)("PostgresServerStateDB activation_event", () => {
 		// Arrays are JSON text, the same encoding the SQLite backend uses.
 		const stored = await withDb(
 			(sql) => sql`
-				SELECT ts, entry_ids, raw_sims, rerank_scores, session_hash,
+				SELECT ts, entry_ids, raw_sims, rerank_scores, rerank_model, session_hash,
 				       gate_mode, client_deadline_exceeded
 				FROM activation_event ORDER BY ts
 			`,
@@ -191,9 +227,11 @@ describe.skipIf(!PG_URI)("PostgresServerStateDB activation_event", () => {
 		expect(stored[0].entry_ids).toBe(JSON.stringify(["e1", "e2"]));
 		expect(stored[0].raw_sims).toBe(JSON.stringify([0.81, 0.62]));
 		expect(stored[0].rerank_scores).toBe(JSON.stringify([0.9, 0.4]));
+		expect(stored[0].rerank_model).toBe("remote/jev-1.14.0");
 		expect(stored[0].session_hash).toBe("abc123");
 		expect(stored[0].client_deadline_exceeded).toBe(false);
 		expect(stored[1].rerank_scores).toBeNull();
+		expect(stored[1].rerank_model).toBeNull();
 		expect(stored[1].session_hash).toBeNull();
 		expect(stored[1].gate_mode).toBe("dense");
 		expect(stored[2].entry_ids).toBe("[]");

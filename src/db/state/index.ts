@@ -153,6 +153,10 @@ export class ServerStateDB implements IServerStateDB {
 				}
 			}
 		}
+		// v5: the scorer that produced rerank_scores. Nullable: earlier rows have none.
+		if (eventColumns.size > 0 && !eventColumns.has("rerank_model")) {
+			this.db.exec("ALTER TABLE activation_event ADD COLUMN rerank_model TEXT");
+		}
 		// Fresh DB or already at current version — create/verify tables.
 		// Always run CREATE TABLE IF NOT EXISTS for all tables — additive and
 		// idempotent. Schema migrations for state.db are always additive; tables
@@ -505,9 +509,9 @@ export class ServerStateDB implements IServerStateDB {
 		const stmt = this.db.prepare(
 			`INSERT INTO activation_event
 			   (ts, client, session_hash, prompt_chars, cue_count, n_candidates, n_returned,
-			    entry_ids, raw_sims, rerank_scores, gate_mode, latency_ms, client_deadline_exceeded,
+			    entry_ids, raw_sims, rerank_scores, rerank_model, gate_mode, latency_ms, client_deadline_exceeded,
 			    gate_dropped, budget_dropped, deduped, injected_tokens)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		);
 		this.db.transaction(() => {
 			for (const r of rows) {
@@ -522,6 +526,7 @@ export class ServerStateDB implements IServerStateDB {
 					JSON.stringify(r.entryIds),
 					JSON.stringify(r.rawSims),
 					r.rerankScores === null ? null : JSON.stringify(r.rerankScores),
+					r.rerankModel,
 					r.gateMode,
 					r.latencyMs,
 					r.clientDeadlineExceeded ? 1 : 0,

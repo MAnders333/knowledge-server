@@ -2,7 +2,7 @@
  * What the embedding client sends to a dedicated EMBEDDING_BASE_URL.
  *
  * The client reads the resolved key from config.embedding.apiKey (see
- * resolveEmbeddingApiKey in config.ts). These tests point it at a local
+ * resolveScopedApiKey in config.ts). These tests point it at a local
  * capturing server and check the Authorization header on the wire.
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";

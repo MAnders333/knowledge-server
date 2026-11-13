@@ -31,6 +31,7 @@ function row(overrides: Partial<ActivationEventRow> = {}): ActivationEventRow {
 		entryIds: ["entry-1"],
 		rawSims: [0.5],
 		rerankScores: null,
+		rerankModel: null,
 		gateMode: "off",
 		latencyMs: 12,
 		clientDeadlineExceeded: false,
@@ -92,14 +93,15 @@ describe("activation_event schema", () => {
 				"prompt_chars",
 				"raw_sims",
 				"rerank_scores",
+				"rerank_model",
 				"session_hash",
 				"ts",
 			].sort(),
 		);
 	});
 
-	it("state DB is at the registered v4 schema", () => {
-		expect(SERVER_LOCAL_SCHEMA_VERSION).toBe(4);
+	it("state DB is at the registered v5 schema", () => {
+		expect(SERVER_LOCAL_SCHEMA_VERSION).toBe(5);
 	});
 
 	it("upgrading a v2 state DB adds the table", async () => {
@@ -118,6 +120,29 @@ describe("activation_event schema", () => {
 			.get();
 		check.close();
 		expect(found).not.toBeNull();
+	});
+
+	it("upgrading a v4 state DB adds rerank_model and keeps its rows", async () => {
+		await state.insertActivationEvents([row({ ts: 1_000 })]);
+		await state.close();
+		const raw = new Database(statePath);
+		raw.exec("ALTER TABLE activation_event DROP COLUMN rerank_model");
+		raw.exec("DELETE FROM schema_version WHERE version = 5");
+		raw.close();
+
+		state = new ServerStateDB(statePath);
+		await state.insertActivationEvents([
+			row({ ts: 2_000, rerankModel: "local/Xenova/ms-marco-MiniLM-L-6-v2" }),
+		]);
+		const check = openRaw(statePath);
+		const stored = check
+			.prepare("SELECT ts, rerank_model FROM activation_event ORDER BY ts")
+			.all() as Array<{ ts: number; rerank_model: string | null }>;
+		check.close();
+		expect(stored).toEqual([
+			{ ts: 1_000, rerank_model: null },
+			{ ts: 2_000, rerank_model: "local/Xenova/ms-marco-MiniLM-L-6-v2" },
+		]);
 	});
 });
 

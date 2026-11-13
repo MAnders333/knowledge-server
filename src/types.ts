@@ -336,6 +336,8 @@ export interface ActivationTelemetry {
 	budgetDropped: number;
 	deduped: number;
 	injectedTokens: number;
+	/** Scorer `provider/model` when the rerank stage scored the candidates; undefined or null otherwise. */
+	rerankModel?: string | null;
 }
 
 /**
@@ -367,6 +369,8 @@ export interface ActivationEventRow {
 	rawSims: number[];
 	/** Cross-encoder score per returned entry (null for support sources); null when no rerank ran. */
 	rerankScores: Array<number | null> | null;
+	/** Scorer that produced rerank_scores, as `provider/model` (the resolved model for remote); null when no rerank ran. */
+	rerankModel: string | null;
 	gateMode: GateMode;
 	latencyMs: number;
 	clientDeadlineExceeded: boolean;

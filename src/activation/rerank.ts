@@ -84,6 +84,16 @@ export interface RerankIdentity {
 	model: string;
 }
 
+/** Scores for one batch, in input order, and the scorer that produced them. */
+export interface RerankBatch {
+	scores: number[];
+	/**
+	 * Provider and model that produced the scores. For remote, `model` is the version
+	 * the gateway reports resolving to, when it reports one.
+	 */
+	scorer: RerankIdentity;
+}
+
 /**
  * Minimal scorer interface used by ActivationEngine. Kept separate from
  * LocalReranker so tests can inject deterministic fakes without loading a
@@ -93,10 +103,10 @@ export interface RerankScorer {
 	/** Provider and model that produced the scores. */
 	readonly identity: RerankIdentity;
 	/**
-	 * Score each document's relevance to the query.
-	 * Returns one score per document (same order), normalized to [0, 1].
+	 * Score each document's relevance to the query, in input order, normalized to
+	 * [0, 1]. `scorer` names the model that produced them.
 	 */
-	scoreBatch(query: string, documents: string[]): Promise<number[]>;
+	scoreBatch(query: string, documents: string[]): Promise<RerankBatch>;
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: ort session type via dynamic import
@@ -344,8 +354,8 @@ export class LocalReranker implements RerankScorer {
 	 * is refused at once with RerankSkippedError. The timeout covers queue wait
 	 * too, and a queued call whose deadline has passed never starts scoring.
 	 */
-	async scoreBatch(query: string, documents: string[]): Promise<number[]> {
-		if (documents.length === 0) return [];
+	async scoreBatch(query: string, documents: string[]): Promise<RerankBatch> {
+		if (documents.length === 0) return { scores: [], scorer: this.identity };
 		// Admission is decided before any await, so refusals follow call order.
 		// `admitted` includes the running call, hence the comparison.
 		if (this.admitted > MAX_QUEUED_CALLS) {
@@ -365,7 +375,8 @@ export class LocalReranker implements RerankScorer {
 			this.timeoutMs,
 		);
 		try {
-			return await Promise.race([work, expired]);
+			const scores = await Promise.race([work, expired]);
+			return { scores, scorer: this.identity };
 		} finally {
 			clearTimeout(timer);
 		}
@@ -461,12 +472,12 @@ export function createRerankerFromConfig(): RerankScorer | null {
 		const remote = createRemoteRerankerFromConfig();
 		if (remote) {
 			logger.log(
-				`[rerank] Enabled: provider "remote", model "${remote.identity.model}" via LLM_BASE_ENDPOINT. Each activation sends the query tail and candidate text to the gateway. Timeout ${rerank.remote.timeoutMs}ms; candidates ${rerank.candidates}; document ≤${rerank.maxDocTokens} tokens.`,
+				`[rerank] Enabled: provider "remote", model "${remote.identity.model}" via RERANK_REMOTE_URL or LLM_BASE_ENDPOINT. Each activation sends the query tail and candidate text to that endpoint. Timeout ${rerank.remote.timeoutMs}ms; candidates ${rerank.candidates}; document ≤${rerank.maxDocTokens} tokens.`,
 			);
 			return remote;
 		}
 		logger.warn(
-			"[rerank] RERANK_PROVIDER=remote needs LLM_BASE_ENDPOINT and LLM_API_KEY (unset or still the template placeholder) — using the local reranker.",
+			"[rerank] RERANK_PROVIDER=remote needs an endpoint (RERANK_REMOTE_URL, or LLM_BASE_ENDPOINT) and a key (RERANK_REMOTE_API_KEY, or LLM_API_KEY on the gateway); unset or still a template placeholder — using the local reranker.",
 		);
 	}
 	const pin = PINNED_MODELS[rerank.model];

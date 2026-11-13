@@ -448,6 +448,10 @@ export function createApp(
 							)
 						: null,
 				gateMode,
+				rerankModel:
+					gateMode === "rerank"
+						? (result.telemetry?.rerankModel ?? null)
+						: null,
 				latencyMs,
 				clientDeadlineExceeded: clientGaveUp,
 				gateDropped: result.telemetry?.gateDropped ?? 0,

@@ -2,107 +2,106 @@ import { z } from "zod";
 import {
 	PLACEHOLDER_API_KEY,
 	PLACEHOLDER_ENDPOINT,
+	REMOTE_RERANK_MAX_CANDIDATES,
 	config,
 } from "../config.js";
 import { logger } from "../logger.js";
-import type { RerankIdentity, RerankScorer } from "./rerank.js";
+import type { RerankBatch, RerankIdentity, RerankScorer } from "./rerank.js";
 
 /**
- * Remote second-stage reranker: one listwise decision-model call per activation,
- * sent through the LLM gateway behind LLM_BASE_ENDPOINT (the same credentials as
- * the LLM and embedding clients).
+ * Remote second-stage reranker: one System One call per activation (TypeSafe's
+ * decision-model API, reached through the LLM gateway unless RERANK_REMOTE_URL
+ * points elsewhere).
  *
- * Privacy: every call sends the query tail and the candidate text to the gateway,
- * which forwards them to the hosting provider of the model. This backend runs only
- * when RERANK_PROVIDER=remote is set explicitly.
+ * The request follows hev/reranker (Apache-2.0; hev_rerank/prompt.yaml, version
+ * generic-1, and schema/state.schema.json): the query and every candidate travel in
+ * one `state`, and each candidate gets one Noul question, answered with the
+ * probability that it is relevant.
+ *
+ * Privacy: each call sends the query tail and the head of every candidate to the
+ * endpoint, which forwards them to the hosting provider of the model. This backend
+ * runs only when RERANK_PROVIDER=remote is set explicitly.
  *
  * Failure philosophy matches the local reranker: any failure throws from
- * scoreBatch() and the caller keeps dense ordering. No retries. A circuit breaker
- * stops calls after repeated failures, so a dead gateway costs one timeout per
- * cooldown rather than one per activation.
+ * scoreBatch() and the caller keeps dense ordering. Retries: at most one, and only
+ * after a 429 whose Retry-After fits in the remaining budget. A circuit breaker stops
+ * calls after repeated failures, so a dead endpoint costs one timeout per cooldown
+ * rather than one per activation. Health is recorded by the caller (activate.ts) only.
  */
 
-/** Largest candidate list one listwise call carries. */
-export const REMOTE_RERANK_MAX_DOCUMENTS = 40;
 /** Consecutive failures that open the breaker. */
 const BREAKER_FAILURE_THRESHOLD = 3;
 /** Time the breaker stays open before one probe call is allowed. */
 const BREAKER_COOLDOWN_MS = 60_000;
 /** Approximate characters per token, mapping the token caps to characters. */
 const CHARS_PER_TOKEN = 4;
-/** Gateway error bodies are logged only up to this length. */
+/** Error bodies are logged only up to this length. */
 const ERROR_BODY_MAX_CHARS = 200;
 
-/** Thrown while the breaker is open. The call never reached the gateway. */
+/** Thrown while the breaker is open. The call never reached the endpoint. */
 export class RerankSkippedError extends Error {}
 
-// Question wording from the decision-model benchmark template. Changing it changes the scores.
+/**
+ * Question wording from hev/reranker prompt.yaml, version generic-1. Changing any of
+ * it changes the scores, and with them the calibrated floors.
+ */
+const QUESTION_TEMPLATE =
+	"Document `documents.{id}` is relevant to `query`: it contains information that answers or directly addresses it.";
 const TRUE_CRITERION =
 	"The document contains information that answers the query or directly addresses what it asks about.";
 const FALSE_CRITERION =
 	"The document is only loosely related, on a similar topic, or does not address what the query asks.";
 
-const completionSchema = z.object({
-	choices: z
-		.array(
-			z.object({
-				message: z.object({
-					content: z.union([z.string(), z.record(z.string(), z.unknown())]),
-				}),
-			}),
-		)
-		.min(1),
-	usage: z
-		.object({
-			prompt_tokens: z.number().nullish(),
-			cost: z.number().nullish(),
-		})
-		.nullish(),
+/**
+ * A System One answer set. Every answer must be a noul with a probability in [0, 1];
+ * an answer of any other type fails the whole response. Extra noul answers are ignored.
+ */
+const responseSchema = z.object({
+	model: z.string().nullish(),
+	answers: z.record(
+		z.string(),
+		z.object({
+			type: z.literal("noul"),
+			noul: z.number().min(0).max(1),
+		}),
+	),
+	usage: z.object({ input_tokens: z.number().nullish() }).nullish(),
 });
 
-/** One answer per document id. Extra keys are ignored; scores must be probabilities. */
-const answersSchema = z.record(
-	z.string(),
-	z.object({ noul: z.number().min(0).max(1) }),
-);
-
-interface ListwiseResult {
+interface RemoteResult {
 	scores: number[];
-	promptTokens: number | null;
-	costUsd: number | null;
+	/** Model the gateway answered with (the resolved version), when it said. */
+	model: string | null;
+	inputTokens: number | null;
 }
 
-/** Build the request: the benchmark's questions template, one Noul per document id. */
+/** The System One body: one state with the query and the documents, one Noul per document. */
 function buildRequestBody(
 	model: string,
 	query: string,
 	documents: string[],
-	ids: string[],
 	maxQueryChars: number,
 	maxDocChars: number,
-) {
-	const docs: Record<string, { title: string; text: string }> = {};
+): { ids: string[]; body: unknown } {
+	// Document ids are D00, D01, ... in the order the documents were given.
+	const ids = documents.map((_, i) => `D${String(i).padStart(2, "0")}`);
+	const docs: Record<string, { text: string }> = {};
 	const questions: Record<string, unknown> = {};
 	ids.forEach((id, i) => {
-		docs[id] = { title: "", text: headChars(documents[i], maxDocChars) };
+		docs[id] = { text: headChars(documents[i], maxDocChars) };
 		questions[id] = {
 			type: "noul",
-			instructions: `Document \`documents.${id}\` is relevant to \`query\`: it contains information that answers or directly addresses it.`,
+			instructions: QUESTION_TEMPLATE.replace("{id}", id),
 			criteria: { true: TRUE_CRITERION, false: FALSE_CRITERION },
 		};
 	});
 	return {
-		model,
-		messages: [
-			{
-				role: "user",
-				content: JSON.stringify({
-					query: tailChars(query, maxQueryChars),
-					documents: docs,
-				}),
-			},
-		],
-		response_format: { type: "questions", questions },
+		ids,
+		body: {
+			model,
+			state: { query: tailChars(query, maxQueryChars), documents: docs },
+			questions,
+		},
 	};
 }
 
@@ -129,45 +128,27 @@ function isLowSurrogate(code: number): boolean {
 }
 
 /**
- * Read the per-document scores from a gateway response. Lenient about the
- * wrapper (code fences around the JSON, an already-parsed message object, extra
- * fields) and strict about the scores: every id must have a probability in [0, 1].
- * A partial answer is an error, because scores for a subset cannot be ranked
- * against dense order.
+ * Read the per-document scores from a System One response. Every candidate id must
+ * have a noul probability in [0, 1]. A partial answer is an error, because scores for
+ * a subset cannot be ranked against dense order.
  */
-function parseListwiseResponse(body: unknown, ids: string[]): ListwiseResult {
-	const completion = completionSchema.safeParse(body);
-	if (!completion.success) {
+function parseResponse(body: unknown, ids: string[]): RemoteResult {
+	const parsed = responseSchema.safeParse(body);
+	if (!parsed.success) {
 		throw new Error(
-			`malformed gateway response: ${describeIssue(completion.error)}`,
+			`malformed gateway response: ${describeIssue(parsed.error)}`,
 		);
 	}
-	const { content } = completion.data.choices[0].message;
-	let raw: unknown = content;
-	if (typeof content === "string") {
-		try {
-			raw = JSON.parse(content.trim().replace(/^```(?:json)?\s*|\s*```$/g, ""));
-		} catch {
-			throw new Error(
-				"malformed gateway response: message content is not JSON",
-			);
-		}
-	}
-	const answers = answersSchema.safeParse(raw);
-	if (!answers.success) {
-		throw new Error(
-			`malformed gateway response: ${describeIssue(answers.error)}`,
-		);
-	}
+	const { answers } = parsed.data;
 	const scores = ids.map((id) => {
-		const answer = answers.data[id];
-		if (!answer) throw new Error(`gateway response has no score for ${id}`);
+		const answer = answers[id];
+		if (!answer) throw new Error(`gateway response has no answer for ${id}`);
 		return answer.noul;
 	});
 	return {
 		scores,
-		promptTokens: completion.data.usage?.prompt_tokens ?? null,
-		costUsd: completion.data.usage?.cost ?? null,
+		model: parsed.data.model || null,
+		inputTokens: parsed.data.usage?.input_tokens ?? null,
 	};
 }
 
@@ -178,15 +159,56 @@ function describeIssue(error: z.ZodError): string {
 		: "unexpected shape";
 }
 
+/**
+ * Milliseconds in a Retry-After header (delay-seconds or an HTTP-date), or null when
+ * the header is absent or unreadable. Never negative.
+ */
+export function parseRetryAfterMs(
+	value: string | null,
+	nowMs: number,
+): number | null {
+	if (value === null) return null;
+	const trimmed = value.trim();
+	if (/^\d+(\.\d+)?$/.test(trimmed)) return Number(trimmed) * 1000;
+	const date = Date.parse(trimmed);
+	if (Number.isNaN(date)) return null;
+	return Math.max(0, date - nowMs);
+}
+
+/**
+ * Bounded, content-free summary of an error body. The `detail` text is used when the
+ * gateway sends one. Validation entries keep their location and message only, because
+ * the rejected input they echo can be candidate text.
+ */
+async function summarizeErrorBody(response: Response): Promise<string> {
+	const text = await response.text().catch(() => "");
+	let summary = text;
+	try {
+		const { detail } = JSON.parse(text) as { detail?: unknown };
+		if (typeof detail === "string") {
+			summary = detail;
+		} else if (Array.isArray(detail)) {
+			summary = (detail as Array<{ loc?: unknown[]; msg?: unknown }>)
+				.map(
+					(item) => `${(item.loc ?? []).join(".")}: ${String(item.msg ?? "")}`,
+				)
+				.join("; ");
+		}
+	} catch {
+		// Not JSON: the raw text, bounded below.
+	}
+	return summary.replace(/\s+/g, " ").trim().slice(0, ERROR_BODY_MAX_CHARS);
+}
+
 export interface RemoteRerankerOptions {
-	/** Gateway root, as in LLM_BASE_ENDPOINT. Defaults to config. */
-	baseEndpoint?: string;
+	/** Full System One URL, as in RERANK_REMOTE_URL. Defaults to config. */
+	url?: string;
 	apiKey?: string;
 	model?: string;
 	timeoutMs?: number;
 	maxDocTokens?: number;
 	maxQueryTokens?: number;
-	/** Clock for the breaker cooldown. Tests inject one. */
+	/** Clock for the breaker cooldown and Retry-After dates. Tests inject one. */
 	now?: () => number;
 }
 
@@ -205,11 +227,10 @@ export class RemoteReranker implements RerankScorer {
 	private lastError = "";
 
 	constructor(opts: RemoteRerankerOptions = {}) {
-		const base = (opts.baseEndpoint ?? config.llm.baseEndpoint)
-			.trim()
-			.replace(/\/+$/, "");
-		this.url = `${base}/openai/v1/chat/completions`;
-		this.apiKey = (opts.apiKey ?? config.llm.apiKey).trim();
+		this.url = (opts.url ?? config.activation.rerank.remote.url).trim();
+		this.apiKey = (
+			opts.apiKey ?? config.activation.rerank.remote.apiKey
+		).trim();
 		this.identity = {
 			provider: "remote",
 			model: opts.model ?? config.activation.rerank.remote.model,
@@ -226,15 +247,16 @@ export class RemoteReranker implements RerankScorer {
 	}
 
 	/**
-	 * Score every document in one gateway call. Returns probabilities in input
-	 * order. Throws on timeout, HTTP error, malformed or partial response, and
-	 * while the breaker is open (RerankSkippedError).
+	 * Score every document in one call. Returns probabilities in input order, with the
+	 * scorer that produced them (the gateway's resolved model when it reported one).
+	 * Throws on timeout, HTTP error, malformed or partial response, and while the
+	 * breaker is open (RerankSkippedError).
 	 */
-	async scoreBatch(query: string, documents: string[]): Promise<number[]> {
-		if (documents.length === 0) return [];
-		if (documents.length > REMOTE_RERANK_MAX_DOCUMENTS) {
+	async scoreBatch(query: string, documents: string[]): Promise<RerankBatch> {
+		if (documents.length === 0) return { scores: [], scorer: this.identity };
+		if (documents.length > REMOTE_RERANK_MAX_CANDIDATES) {
 			throw new Error(
-				`remote rerank scores at most ${REMOTE_RERANK_MAX_DOCUMENTS} candidates per call (got ${documents.length})`,
+				`remote rerank scores at most ${REMOTE_RERANK_MAX_CANDIDATES} candidates per call (got ${documents.length})`,
 			);
 		}
 		if (this.breakerOpen) {
@@ -250,49 +272,71 @@ export class RemoteReranker implements RerankScorer {
 
 		const started = performance.now();
 		try {
-			const result = await this.request(query, documents);
+			const result = await this.request(
+				query,
+				documents,
+				started + this.timeoutMs,
+			);
 			this.recordSuccess();
 			logger.log(
-				`[rerank] provider=remote model=${this.identity.model} gate_mode=rerank candidates=${documents.length} prompt_tokens=${result.promptTokens ?? "unknown"} cost_usd=${result.costUsd ?? "unknown"} elapsed_ms=${Math.round(performance.now() - started)}`,
+				`[rerank] provider=remote model=${this.identity.model} resolved_model=${result.model ?? "unknown"} gate_mode=rerank candidates=${documents.length} input_tokens=${result.inputTokens ?? "unknown"} elapsed_ms=${Math.round(performance.now() - started)}`,
 			);
-			return result.scores;
+			return {
+				scores: result.scores,
+				scorer: {
+					provider: "remote",
+					model: result.model ?? this.identity.model,
+				},
+			};
 		} catch (err) {
 			this.recordFailure(err);
 			throw err;
 		}
 	}
 
+	/** One call, plus one retry after a 429 whose Retry-After fits in the budget. */
 	private async request(
 		query: string,
 		documents: string[],
-	): Promise<ListwiseResult> {
-		const ids = documents.map((_, i) => `D${String(i).padStart(2, "0")}`);
-		const body = buildRequestBody(
+		deadline: number,
+	): Promise<RemoteResult> {
+		const { ids, body } = buildRequestBody(
 			this.identity.model,
 			query,
 			documents,
-			ids,
 			this.maxQueryChars,
 			this.maxDocChars,
 		);
 		try {
-			const response = await fetch(this.url, {
-				method: "POST",
-				headers: {
-					"Content-Type": "application/json",
-					Authorization: `Bearer ${this.apiKey}`,
-				},
-				body: JSON.stringify(body),
-				signal: AbortSignal.timeout(this.timeoutMs),
-			});
+			let response = await this.post(body, deadline);
+			if (response.status === 429) {
+				const waitMs = parseRetryAfterMs(
+					response.headers.get("retry-after"),
+					this.now(),
+				);
+				if (waitMs !== null && waitMs < deadline - performance.now()) {
+					await response.text().catch(() => "");
+					const { promise, resolve } = Promise.withResolvers<void>();
+					setTimeout(resolve, waitMs);
+					await promise;
+					response = await this.post(body, deadline);
+				}
+			}
 			if (!response.ok) {
-				// The gateway wraps upstream errors in the body; the status alone is not enough.
-				const detail = await response.text().catch(() => "");
+				const detail = await summarizeErrorBody(response);
 				throw new Error(
-					`gateway returned HTTP ${response.status}: ${detail.replace(/\s+/g, " ").trim().slice(0, ERROR_BODY_MAX_CHARS)}`,
+					`gateway returned HTTP ${response.status}${detail ? `: ${detail}` : ""}`,
 				);
 			}
-			return parseListwiseResponse(await response.json(), ids);
+			// Read as text so a timeout while reading the body surfaces as a timeout.
+			const text = await response.text();
+			let raw: unknown;
+			try {
+				raw = JSON.parse(text);
+			} catch {
+				throw new Error("malformed gateway response: body is not JSON");
+			}
+			return parseResponse(raw, ids);
 		} catch (err) {
 			if (
 				err instanceof Error &&
@@ -302,6 +346,21 @@ export class RemoteReranker implements RerankScorer {
 			}
 			throw err;
 		}
+	}
+
+	/** One POST. The budget is whatever remains of the call's deadline. */
+	private async post(body: unknown, deadline: number): Promise<Response> {
+		const remaining = deadline - performance.now();
+		if (remaining <= 0) throw new Error(`timed out after ${this.timeoutMs}ms`);
+		return fetch(this.url, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${this.apiKey}`,
+			},
+			body: JSON.stringify(body),
+			signal: AbortSignal.timeout(remaining),
+		});
 	}
 
 	private recordSuccess(): void {
@@ -333,25 +392,19 @@ export class RemoteReranker implements RerankScorer {
 }
 
 /**
- * Remote reranker from the unified gateway settings (LLM_BASE_ENDPOINT and
- * LLM_API_KEY). Returns null when either is missing or still a template placeholder.
+ * Remote reranker from the resolved settings (RERANK_REMOTE_URL, or the gateway route
+ * on LLM_BASE_ENDPOINT, and its key). Returns null when the URL or key is missing or
+ * still a template placeholder.
  */
 export function createRemoteRerankerFromConfig(): RemoteReranker | null {
-	const endpoint = config.llm.baseEndpoint.trim();
-	const apiKey = config.llm.apiKey.trim();
+	const { url, apiKey } = config.activation.rerank.remote;
 	if (
-		!endpoint ||
+		!url ||
 		!apiKey ||
-		endpoint === PLACEHOLDER_ENDPOINT ||
+		url.startsWith(PLACEHOLDER_ENDPOINT) ||
 		apiKey === PLACEHOLDER_API_KEY
 	) {
 		return null;
-	}
-	const { candidates } = config.activation.rerank;
-	if (candidates > REMOTE_RERANK_MAX_DOCUMENTS) {
-		logger.warn(
-			`[rerank] RERANK_CANDIDATES=${candidates} is above the remote limit of ${REMOTE_RERANK_MAX_DOCUMENTS}; larger candidate pools fall back to dense ordering.`,
-		);
 	}
 	return new RemoteReranker();
 }
