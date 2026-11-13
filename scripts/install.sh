@@ -122,6 +122,7 @@ BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
 
 mkdir -p "$INSTALL_DIR/libexec"
 mkdir -p "$CONFIG_DIR"
+chmod 700 "$CONFIG_DIR"
 mkdir -p "$BIN_DIR"
 mkdir -p "$PLUGIN_DIR"
 mkdir -p "$COMMAND_DIR"
@@ -198,6 +199,7 @@ echo "$VERSION" > "$INSTALL_DIR/version"
 # ENV_FILE and LEGACY_ENV_FILE are defined at the top of the script.
 
 if [ -f "$ENV_FILE" ]; then
+  chmod 600 "$ENV_FILE"
   echo "  ✓ .env already exists at $ENV_FILE — not overwritten"
 elif [ -f "$LEGACY_ENV_FILE" ]; then
   echo "  ✓ .env found at legacy location $LEGACY_ENV_FILE — not overwritten"
@@ -210,6 +212,8 @@ else
   # The resulting file contains the literal string "$HOME" which is correct —
   # users can uncomment these lines and the shell will expand $HOME at runtime.
   # Use $HOME rather than ~ — tilde is not expanded in sourced variable assignments.
+  # Create owner-only (0600) before writing: the file holds API keys.
+  install -m 600 /dev/null "$ENV_FILE"
   cat > "$ENV_FILE" << 'EOF'
 # knowledge-server credentials
 # Set ONE of the following options, then start with: knowledge-server

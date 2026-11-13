@@ -5,6 +5,7 @@ import { z } from "zod";
 // @ts-ignore — Bun supports JSON imports natively
 import pkg from "../../package.json" with { type: "json" };
 import { contradictionTagBlock, staleTag } from "../activation/format.js";
+import { resolveServerAddress } from "../config-file.js";
 import { config } from "../config.js";
 import type { ActivationResult } from "../types.js";
 
@@ -37,9 +38,10 @@ export const activateInputSchema = {
 		),
 };
 
-/** Base URL of the knowledge HTTP server, derived from KNOWLEDGE_HOST / KNOWLEDGE_PORT. */
+/** Base URL of the knowledge HTTP server (config.jsonc / KNOWLEDGE_PORT, see resolveServerAddress). */
 function serverBaseUrl(): string {
-	return `http://${config.host}:${config.port}`;
+	const { host, port } = resolveServerAddress();
+	return `http://${host}:${port}`;
 }
 
 /**

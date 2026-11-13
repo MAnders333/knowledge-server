@@ -1246,8 +1246,12 @@ function registerPiExtension(
  *     retries — standard service behaviour for infrastructure dependencies.
  */
 function maybeSetupDaemon(): void {
+	// `bun test` sets NODE_ENV=test from any cwd. Never register a launchd or
+	// systemd service from a test run: it would run this checkout's daemon.
+	if (process.env.NODE_ENV === "test") return;
 	const platform = process.platform;
-	const home = homedir();
+	// HOME (not os.homedir(), which Bun fixes at process start) so tests can point service paths at a temp dir.
+	const home = process.env.HOME || homedir();
 
 	let serviceFilePath: string;
 	if (platform === "darwin") {
@@ -1297,7 +1301,7 @@ function maybeSetupDaemon(): void {
  */
 function setupDaemon(): void {
 	const platform = process.platform;
-	const home = homedir();
+	const home = process.env.HOME || homedir();
 
 	// Shown on successful service registration — tells the user to disable auto-spawn.
 	const autoSpawnNoteSuccess =

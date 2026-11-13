@@ -20,7 +20,7 @@ TOKEN="$(grep '^KNOWLEDGE_ADMIN_TOKEN=' ~/.config/knowledge-server/.env 2>/dev/n
 if [ -z "$TOKEN" ]; then
   TOKEN="$(grep '^KNOWLEDGE_ADMIN_TOKEN=' ~/.local/share/knowledge-server/.env 2>/dev/null | cut -d= -f2-)"
 fi
-# If not set in .env, the token was printed at server startup — paste it here:
+# If not set in .env, the token was printed at server startup only when it ran in a terminal; otherwise set KNOWLEDGE_ADMIN_TOKEN in .env and reload:
 # TOKEN="paste-token-here"
 echo "Token loaded: ${#TOKEN} chars"
 ```

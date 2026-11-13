@@ -23,6 +23,10 @@ import {
 	setupCursor,
 	stripJsoncComments,
 } from "../src/commands/setup-tool";
+import {
+	type SetupIsolation,
+	isolateSetupTool,
+} from "./support/setup-isolation";
 
 describe("stripJsoncComments", () => {
 	// ── Basic comment stripping ───────────────────────────────────────────────
@@ -308,5 +312,27 @@ describe("setupCodex", () => {
 		expect(content).toContain('name = "o4-mini"');
 		// New section appended
 		expect(content).toContain("[mcp_servers.knowledge]");
+	});
+});
+
+// ── Test isolation ─────────────────────────────────────────────────────────────
+
+// Every test in this file runs with HOME and PATH isolated, independent of cwd.
+let isolation: SetupIsolation;
+beforeEach(() => {
+	isolation = isolateSetupTool();
+});
+afterEach(() => {
+	isolation.restore();
+});
+
+describe("setup runs never register a background service", () => {
+	it("calls no launchctl/systemctl and writes no service file under HOME", () => {
+		setupCursor();
+		setupCodex();
+
+		expect(existsSync(isolation.callsLog)).toBe(false);
+		expect(existsSync(join(isolation.home, "Library"))).toBe(false);
+		expect(existsSync(join(isolation.home, ".config", "systemd"))).toBe(false);
 	});
 });

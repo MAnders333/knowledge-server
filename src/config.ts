@@ -75,9 +75,7 @@ export const DEFAULT_CLUSTER_ASSIGNMENT_THRESHOLD = 0.5;
 export const DEFAULT_CLUSTER_MIN_MEMBERS = 5;
 
 export const config = {
-	// Server
-	port: parseIntEnv(process.env.KNOWLEDGE_PORT, 3179, 1),
-	host: process.env.KNOWLEDGE_HOST || "127.0.0.1",
+	// Server bind address (port/host) is resolved in config-file.ts (resolveServerAddress).
 	// Optional fixed admin token — set KNOWLEDGE_ADMIN_TOKEN to use a stable token
 	// instead of a random one generated at startup. Useful for scripted/automated use.
 	// Leave unset in production for better security (random token per process lifetime).

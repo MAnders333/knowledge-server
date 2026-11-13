@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { type AddressInfo, type Socket, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ActivationEngine } from "../src/activation/activate";
+import { DEFAULT_CONFIG } from "../src/config-file";
 import { KnowledgeDB } from "../src/db/sqlite/index";
 import { StoreRegistry } from "../src/db/store-registry";
 import * as loggerModule from "../src/logger";
@@ -20,16 +21,31 @@ describe("StoreRegistry", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	// ── No config file (default) ───────────────────────────────────────────────
+	// ── No config file (fallback) ──────────────────────────────────────────────
 
-	it("creates a single default SQLite store when no config file exists", async () => {
+	it("with no config file, opens the fallback config's stores and state DB", async () => {
+		const knowledgePath = join(tempDir, "knowledge.db");
+		const statePath = join(tempDir, "state.db");
 		const registry = await StoreRegistry.create(
 			join(tempDir, "nonexistent.jsonc"),
+			{
+				...DEFAULT_CONFIG,
+				stores: [
+					{
+						id: "default",
+						kind: "sqlite",
+						writable: true,
+						path: knowledgePath,
+					},
+				],
+				stateDb: { kind: "sqlite", path: statePath },
+			},
 		);
 		try {
-			expect(registry.writableStore()).toBeDefined();
+			expect(registry.writableStore()).toBeInstanceOf(KnowledgeDB);
 			expect(registry.readStores()).toHaveLength(1);
-			expect(registry.readStores()[0]).toBe(registry.writableStore());
+			expect(existsSync(knowledgePath)).toBe(true);
+			expect(existsSync(statePath)).toBe(true);
 		} finally {
 			await registry.close();
 		}
@@ -43,6 +59,7 @@ describe("StoreRegistry", () => {
 		writeFileSync(
 			configPath,
 			JSON.stringify({
+				stateDb: { kind: "sqlite", path: join(tempDir, "state.db") },
 				stores: [{ id: "main", kind: "sqlite", path: dbPath, writable: true }],
 			}),
 		);
@@ -67,6 +84,7 @@ describe("StoreRegistry", () => {
 		writeFileSync(
 			configPath,
 			JSON.stringify({
+				stateDb: { kind: "sqlite", path: join(tempDir, "state.db") },
 				stores: [
 					{ id: "primary", kind: "sqlite", path: db1Path, writable: true },
 					{ id: "secondary", kind: "sqlite", path: db2Path, writable: false },
@@ -93,6 +111,7 @@ describe("StoreRegistry", () => {
 		writeFileSync(
 			configPath,
 			JSON.stringify({
+				stateDb: { kind: "sqlite", path: join(tempDir, "state.db") },
 				stores: [
 					{ id: "a", kind: "sqlite", path: db1Path, writable: true },
 					{ id: "b", kind: "sqlite", path: db2Path, writable: false },
@@ -148,6 +167,7 @@ describe("StoreRegistry", () => {
 		writeFileSync(
 			configPath,
 			JSON.stringify({
+				stateDb: { kind: "sqlite", path: join(tempDir, "state.db") },
 				stores: [
 					{
 						id: "tunnel",
@@ -195,6 +215,7 @@ describe("StoreRegistry", () => {
 		writeFileSync(
 			configPath,
 			JSON.stringify({
+				stateDb: { kind: "sqlite", path: join(tempDir, "state.db") },
 				stores: [
 					{
 						id: "only",

@@ -84,7 +84,7 @@ The design is loosely inspired by how human memory consolidates experience. Thre
 
 **High extraction bar.** The LLM reads session transcripts and asks whether each thing learned would still be useful months from now. Most sessions produce nothing. The store only grows when something genuinely new was established — a confirmed fact, a decision made, a procedure that worked.
 
-**Reconsolidation instead of accumulation.** Before a new entry is inserted, it's embedded and compared to the nearest existing entry. If similarity ≥ 0.82, a focused LLM call decides whether to keep, update, replace, or insert both. Entries in the 0.4–0.82 band (related but not near-duplicate) get a contradiction scan: if two entries make mutually exclusive claims, the system resolves it. The store updates rather than appends.
+**Reconsolidation instead of accumulation.** Before a new entry is inserted, it's embedded and compared to the nearest existing entry. If similarity ≥ 0.78, a focused LLM call decides whether to keep, update, replace, or insert both. Entries in the 0.4–0.78 band (related but not near-duplicate) get a contradiction scan: if two entries make mutually exclusive claims, the system resolves it. The store updates rather than appends.
 
 **Cue-dependent activation.** Nothing is retrieved proactively. When a new message arrives, its text is embedded and matched against all stored entries. Only semantically similar entries activate. The query is the retrieval cue — entries that have no bearing on the current conversation stay silent.
 
@@ -347,7 +347,7 @@ Provider-specific credentials take precedence over the unified endpoint.
 |---|---|---|
 | `LLM_EXTRACTION_MODEL` | `anthropic/claude-sonnet-4-6` | Episode → knowledge extraction |
 | `LLM_MERGE_MODEL` | `anthropic/claude-haiku-4-5` | Near-duplicate merge decisions (cheaper) |
-| `LLM_CONTRADICTION_MODEL` | `anthropic/claude-sonnet-4-6` | Contradiction detection and resolution |
+| `LLM_CONTRADICTION_MODEL` | `anthropic/claude-haiku-4-5` | Contradiction detection and resolution |
 | `LLM_SYNTHESIS_MODEL` | *(inherits `LLM_EXTRACTION_MODEL`)* | Cross-session principle synthesis |
 | `LLM_TIMEOUT_MS` | `300000` | Per-call LLM timeout in ms |
 | `LLM_MAX_RETRIES` | `2` | Retry attempts on timeout/error |
@@ -419,7 +419,7 @@ All sources are auto-detected. Override paths or disable sources via environment
 | `CONSOLIDATION_MAX_SESSIONS` | `50` | Sessions per consolidation batch |
 | `CONSOLIDATION_CHUNK_SIZE` | `10` | Episodes per LLM extraction call |
 | `CONSOLIDATION_MIN_MESSAGES` | `4` | Minimum messages for a session to be eligible |
-| `RECONSOLIDATION_SIMILARITY_THRESHOLD` | `0.82` | Near-duplicate merge cutoff |
+| `RECONSOLIDATION_SIMILARITY_THRESHOLD` | `0.78` | Near-duplicate merge cutoff |
 | `CONTRADICTION_MIN_SIMILARITY` | `0.4` | Lower bound of the contradiction scan band |
 
 ### Decay
@@ -434,7 +434,7 @@ All sources are auto-detected. Override paths or disable sources via environment
 | Variable | Default | Description |
 |---|---|---|
 | `ACTIVATION_MAX_RESULTS` | `10` | Max entries returned per activation |
-| `ACTIVATION_SIMILARITY_THRESHOLD` | `0.3` | Minimum cosine similarity to activate |
+| `ACTIVATION_SIMILARITY_THRESHOLD` | `0.42` | Minimum cosine similarity to activate |
 
 ## Usage
 
@@ -569,7 +569,7 @@ You work across multiple machines and want a single knowledge base that spans al
 
 ## Security
 
-**Admin token** — Mutation endpoints require an admin token. A random token is generated at startup and printed to stdout. Set `KNOWLEDGE_ADMIN_TOKEN` in `.env` (≥16 chars) for a stable token across restarts.
+**Admin token** — Mutation endpoints require an admin token. A random token is generated at startup. It is printed only when the server's stdout is a terminal; under launchd, systemd or redirected output it is not printed and never written to `server.log`. For service or scripted use, set `KNOWLEDGE_ADMIN_TOKEN` in `.env` (≥16 chars) for a stable token across restarts.
 
 **Localhost only** — The server binds to `127.0.0.1` by default and refuses to start if `KNOWLEDGE_HOST` is set to a non-loopback address. No TLS — not designed for network exposure.
 

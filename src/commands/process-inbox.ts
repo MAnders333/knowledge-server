@@ -20,7 +20,6 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { ActivationEngine } from "../activation/activate.js";
-import { resolveUserId } from "../config-file.js";
 import { ConsolidationEngine } from "../consolidation/consolidate.js";
 import { PendingEpisodesReader } from "../consolidation/readers/pending.js";
 import { LocalFilesEpisodeReader } from "../daemon/readers/local-files.js";
@@ -28,6 +27,7 @@ import { EpisodeUploader } from "../daemon/uploader.js";
 import { DaemonDB } from "../db/daemon/index.js";
 import { StoreRegistry } from "../db/store-registry.js";
 import { logger } from "../logger.js";
+import { currentUserId } from "../user-id.js";
 import {
 	drainConsolidation,
 	runEmbeddingCheck,
@@ -64,7 +64,7 @@ export async function runProcessInbox(args: string[]): Promise<void> {
 	// DaemonDB tracks the file cursor across runs so previously-processed files
 	// are not re-uploaded (same as the long-running daemon).
 	const daemonDb = new DaemonDB();
-	const userId = resolveUserId();
+	const userId = currentUserId();
 
 	const reader = new LocalFilesEpisodeReader(inboxDir);
 	const uploader = new EpisodeUploader(

@@ -8,6 +8,7 @@ import type {
 	PendingEpisode,
 	ProcessedRange,
 } from "../../types.js";
+import { ensurePrivateFile } from "../../utils.js";
 import type { IServerStateDB } from "../interface.js";
 import { runStateMigrations } from "./migrations.js";
 import {
@@ -42,19 +43,28 @@ export const DEFAULT_SERVER_STATE_PATH = join(
  */
 export class ServerStateDB implements IServerStateDB {
 	private readonly db: Database;
-	constructor(dbPath = DEFAULT_SERVER_STATE_PATH) {
+	/**
+	 * @param dbPath state.db file; created with mode 0600 when missing.
+	 * @param legacyKnowledgeDbPath knowledge.db to copy v3 staging tables from
+	 *   (and drop them from). Omit to skip — no other file is ever touched.
+	 */
+	constructor(
+		dbPath = DEFAULT_SERVER_STATE_PATH,
+		legacyKnowledgeDbPath?: string,
+	) {
 		const dir = dirname(dbPath);
 		if (!existsSync(dir)) {
 			mkdirSync(dir, { recursive: true });
 		}
+		ensurePrivateFile(dbPath);
 		this.db = new Database(dbPath);
 		this.db.exec("PRAGMA journal_mode=WAL");
 		this.db.exec("PRAGMA foreign_keys=ON");
-		this.initialize();
+		this.initialize(legacyKnowledgeDbPath);
 		logger.log(`[db] Server state DB: SQLite at ${dbPath}`);
 	}
 
-	private initialize(): void {
+	private initialize(legacyKnowledgeDbPath: string | undefined): void {
 		this.db.exec(`
       CREATE TABLE IF NOT EXISTS schema_version (
         version INTEGER NOT NULL,
@@ -101,7 +111,7 @@ export class ServerStateDB implements IServerStateDB {
 			}
 		}
 		// Run one-time data migrations (idempotent — each guards itself via applied_migrations).
-		runStateMigrations(this.db);
+		runStateMigrations(this.db, legacyKnowledgeDbPath);
 	}
 
 	// ── Pending Episodes ──────────────────────────────────────────────────────

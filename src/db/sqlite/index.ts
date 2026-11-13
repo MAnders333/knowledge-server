@@ -11,6 +11,7 @@ import type {
 	KnowledgeRelation,
 	KnowledgeStatus,
 } from "../../types.js";
+import { ensurePrivateFile } from "../../utils.js";
 import type { IKnowledgeStore } from "../interface.js";
 import { MIGRATIONS } from "./migrations.js";
 import {
@@ -50,6 +51,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 			mkdirSync(dir, { recursive: true });
 		}
 
+		ensurePrivateFile(path);
 		this.db = new Database(path);
 		this.db.exec("PRAGMA journal_mode = WAL");
 		// With WAL mode, NORMAL synchronous is safe and ~3x faster than FULL.

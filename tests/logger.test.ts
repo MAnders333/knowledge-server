@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { logger } from "../src/logger";
 
 describe("logger error serialization", () => {
@@ -31,5 +34,20 @@ describe("logger error serialization", () => {
 
 	it("still renders the stack for ordinary errors", () => {
 		expect(captureError(new Error("boom"))).toContain("Error: boom");
+	});
+});
+
+describe("logger log file", () => {
+	it("creates the log file with mode 0600 (it can hold sensitive output)", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ks-logger-test-"));
+		const logPath = join(dir, "server.log");
+		try {
+			logger.init(logPath);
+			logger.log("hello");
+			expect(statSync(logPath).mode & 0o777).toBe(0o600);
+		} finally {
+			logger.init("");
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
