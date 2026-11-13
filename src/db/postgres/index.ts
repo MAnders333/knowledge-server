@@ -1269,58 +1269,33 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 		const embeddingVec = this.vecLiteralFor(embedding);
 		const now = Date.now();
 
-		// Two branches, keyed on whether the embedding_vec column exists:
-		//   A) column present → write BYTEA and vector together; a missing or
-		//      mis-sized embedding leaves both NULL (keeps them in sync)
-		//   B) column absent  → omit embedding_vec
-		if (this.vecColumnDims !== null) {
-			await this.sql.unsafe(
-				`UPDATE knowledge_entry
-				SET content = $1, type = $2,
-				    topics = $3::jsonb,
-				    confidence = $4,
-				    derived_from = $5::jsonb,
-				    updated_at = $6, last_accessed_at = $6,
-				    observation_count = observation_count + 1,
-				    embedding = $7,
-				    embedding_vec = $8::vector
-				WHERE id = $9`,
-				[
-					updates.content,
-					safeType,
-					this.sql.json(updates.topics),
-					updates.confidence,
-					this.sql.json(mergedSources),
-					now,
-					embeddingBuf,
-					embeddingVec,
-					id,
-				] as postgres.ParameterOrJSON<never>[],
-			);
-		} else {
-			// embedding_vec column doesn't exist yet — omit it entirely.
-			await this.sql.unsafe(
-				`UPDATE knowledge_entry
-				SET content = $1, type = $2,
-				    topics = $3::jsonb,
-				    confidence = $4,
-				    derived_from = $5::jsonb,
-				    updated_at = $6, last_accessed_at = $6,
-				    observation_count = observation_count + 1,
-				    embedding = $7
-				WHERE id = $8`,
-				[
-					updates.content,
-					safeType,
-					this.sql.json(updates.topics),
-					updates.confidence,
-					this.sql.json(mergedSources),
-					now,
-					embeddingBuf,
-					id,
-				] as postgres.ParameterOrJSON<never>[],
-			);
-		}
+		// embedding_vec is written only when the column exists (see insertEntry). A
+		// missing or mis-sized embedding leaves both vector columns NULL, so they stay in sync.
+		const params: unknown[] = [
+			updates.content,
+			safeType,
+			this.sql.json(updates.topics),
+			updates.confidence,
+			this.sql.json(mergedSources),
+			now,
+			embeddingBuf,
+		];
+		const vecSet =
+			this.vecColumnDims !== null ? ", embedding_vec = $8::vector" : "";
+		if (this.vecColumnDims !== null) params.push(embeddingVec);
+		params.push(id);
+		await this.sql.unsafe(
+			`UPDATE knowledge_entry
+			SET content = $1, type = $2,
+			    topics = $3::jsonb,
+			    confidence = $4,
+			    derived_from = $5::jsonb,
+			    updated_at = $6, last_accessed_at = $6,
+			    observation_count = observation_count + 1,
+			    embedding = $7${vecSet}
+			WHERE id = $${params.length}`,
+			params as postgres.ParameterOrJSON<never>[],
+		);
 		return true;
 	}
 
