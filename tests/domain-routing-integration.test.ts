@@ -169,6 +169,72 @@ describe("Domain routing via DomainRouter + ConsolidationEngine", () => {
 		expect(personalEntries.length).toBe(0);
 	});
 
+	it("defers the chunk when the LLM-chosen domain's store is unavailable, without writing to the default store", async () => {
+		const now = Date.now();
+		const config = makeMultiStoreConfig("personal", "work");
+		// "work" is configured but its store is down. The session is unmatched, so
+		// its default domain is "personal", which is available.
+		const router = new DomainRouter(
+			config,
+			new Map([["personal", personalDb]]),
+			personalDb,
+			new Set(["work"]),
+		);
+		const activation = new ActivationEngine(personalDb, [personalDb]);
+		const reader = new OpenCodeEpisodeReader(fakeOpenCodeDbPath);
+		const engine = new ConsolidationEngine(
+			personalDb,
+			serverStateDb,
+			activation,
+			[reader],
+			router,
+		);
+
+		spyOn(activation.embeddings, "embedBatch").mockResolvedValue([
+			fakeEmbedding("team entry"),
+		]);
+		spyOn(activation.embeddings, "embed").mockResolvedValue(
+			fakeEmbedding("team entry"),
+		);
+		const extract = spyOn(
+			ConsolidationLLM.prototype,
+			"extractKnowledge",
+		).mockResolvedValue([
+			{
+				type: "fact" as const,
+				content: "The team uses Conventional Commits",
+				topics: ["git"],
+				confidence: 0.9,
+				source: "test",
+				domain: "work",
+			},
+		]);
+		spyOn(
+			OpenCodeEpisodeReader.prototype,
+			"getCandidateSessions",
+		).mockReturnValue([{ id: "session-unmatched-1", maxMessageTime: now }]);
+		spyOn(OpenCodeEpisodeReader.prototype, "getNewEpisodes").mockReturnValue([
+			{
+				sessionId: "session-unmatched-1",
+				startMessageId: "msg-start",
+				endMessageId: "msg-end",
+				sessionTitle: "Unmatched Session",
+				projectName: "elsewhere",
+				directory: "/tmp/unmatched-project",
+				timeCreated: now,
+				maxMessageTime: now,
+				content: "session content about git conventions",
+				contentType: "messages" as const,
+				approxTokens: 20,
+			},
+		]);
+
+		await engine.consolidate();
+
+		expect(extract).toHaveBeenCalledTimes(1);
+		expect(await personalDb.getActiveEntries()).toHaveLength(0);
+	});
+
 	it("overrides project default domain when LLM assigns a different domain", async () => {
 		const now = Date.now();
 		const config = makeMultiStoreConfig("personal", "work");

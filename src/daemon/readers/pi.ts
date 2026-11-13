@@ -1,5 +1,6 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { containsInjectedKnowledge } from "../../activation/format.js";
 import { config } from "../../config.js";
 import type {
 	Episode,
@@ -583,12 +584,12 @@ export class PiEpisodeReader implements IEpisodeReader {
 	 * Extract a single EpisodeMessage from a `message` entry.
 	 * Returns null for non-message entries and messages with no extractable content.
 	 *
-	 * Role mapping (EpisodeMessage only allows "user" | "assistant"):
+	 * Role mapping (EpisodeMessage allows "user" | "assistant" | "tool"):
 	 * - user → user
 	 * - assistant → assistant (text + thinking; toolCall arguments skipped,
 	 *   same as the Claude reader skipping tool_use input)
-	 * - toolResult → user, prefixed `[tool: <name>]`, allowlist-filtered
-	 * - bashExecution → user, as `[tool: bash]` ($ command + output),
+	 * - toolResult → tool, prefixed `[tool: <name>]`, allowlist-filtered
+	 * - bashExecution → tool, as `[tool: bash]` ($ command + output),
 	 *   allowlist-filtered; skipped when excludeFromContext (`!!`)
 	 */
 	private extractMessage(rec: PiRecord): EpisodeMessage | null {
@@ -598,7 +599,7 @@ export class PiEpisodeReader implements IEpisodeReader {
 		const timestampMs = rec.timestamp ? Date.parse(rec.timestamp) : 0;
 		const includeToolOutputs = config.consolidation.includeToolOutputs;
 
-		let role: "user" | "assistant";
+		let role: EpisodeMessage["role"];
 		let content = "";
 
 		if (msg.role === "user") {
@@ -608,14 +609,14 @@ export class PiEpisodeReader implements IEpisodeReader {
 			role = "assistant";
 			content = this.extractAssistantText(msg.content).trim();
 		} else if (msg.role === "toolResult") {
-			role = "user";
+			role = "tool";
 			const toolName = msg.toolName ?? "";
 			if (!toolName || !includeToolOutputs.includes(toolName)) return null;
 			const text = this.extractTextParts(msg.content).trim();
 			if (!text) return null;
 			content = `[tool: ${toolName}]\n${text}`;
 		} else if (msg.role === "bashExecution") {
-			role = "user";
+			role = "tool";
 			if (msg.excludeFromContext) return null; // `!!` — model never saw it
 			if (!includeToolOutputs.includes("bash")) return null;
 			const command = (msg.command ?? "").trim();
@@ -630,6 +631,9 @@ export class PiEpisodeReader implements IEpisodeReader {
 		}
 
 		if (!content) return null;
+
+		// Drop any message (any role) that carries our injected context, checked before truncation.
+		if (containsInjectedKnowledge(content)) return null;
 
 		if (content.length > MAX_MESSAGE_CHARS) {
 			content = `${content.slice(0, MAX_MESSAGE_CHARS)}\n[...truncated]`;

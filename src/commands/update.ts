@@ -1,37 +1,86 @@
-import { createHash } from "node:crypto";
-import { createWriteStream, existsSync } from "node:fs";
-import { chmod, readFile, rename, unlink } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { rename, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
-import { createGunzip } from "node:zlib";
+import {
+	REPO,
+	detectPlatform,
+	downloadVerified,
+	fetchChecksums,
+	releaseAssetUrl,
+	requireExpectedSha,
+} from "./release-download.js";
 
-const REPO = "MAnders333/knowledge-server";
 const GITHUB_API = "https://api.github.com";
-const GITHUB_RELEASES = `https://github.com/${REPO}/releases/download`;
+const SMOKE_TIMEOUT_MS = 20_000;
+const PREV_SUFFIX = ".prev";
 
-/**
- * Detect the platform suffix used in release asset names.
- * Matches the suffixes produced by the CI build matrix.
- */
-function detectPlatform(): string {
-	const os = process.platform;
-	const arch = process.arch;
+export type FetchFn = typeof fetch;
+export type SmokeFn = (path: string, args: string[]) => Promise<boolean>;
 
-	if (os === "linux" && arch === "x64") return "linux-x64";
-	if (os === "darwin" && arch === "arm64") return "darwin-arm64";
+export interface InstallDeps {
+	fetchFn?: FetchFn;
+	/** Runs a staged or installed binary; true when it exits 0. Injectable for tests. */
+	smoke?: SmokeFn;
+}
 
-	throw new Error(
-		`Unsupported platform: ${os}/${arch}. Supported: linux/x64, darwin/arm64. To update manually, download from https://github.com/${REPO}/releases`,
-	);
+/** One release asset to install. `dest` decides the staging directory. */
+export interface ReleaseAsset {
+	/** Name as listed in SHA256SUMS, also the installed file's basename. */
+	name: string;
+	/** URL of the release asset (gzipped for binaries, plain for text). */
+	url: string;
+	/** Final install path. Staged beside it so the rename is atomic. */
+	dest: string;
+	gzip: boolean;
+	/** Binaries only: arguments that must make the file exit 0 before and after the swap. */
+	smokeArgs?: string[];
 }
 
 /**
- * Fetch the latest release tag from the GitHub API.
- * Returns a version string like "v1.2.3".
+ * Run a binary with `args` and report whether it exits 0. Output is discarded.
+ * Never throws: a binary that cannot be executed counts as a failed smoke test.
  */
-async function fetchLatestVersion(): Promise<string> {
-	const res = await fetch(`${GITHUB_API}/repos/${REPO}/releases/latest`, {
+export async function smokeTest(
+	path: string,
+	args: string[],
+): Promise<boolean> {
+	try {
+		const proc = Bun.spawn([path, ...args], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		const timer = setTimeout(() => proc.kill(), SMOKE_TIMEOUT_MS);
+		try {
+			return (await proc.exited) === 0;
+		} finally {
+			clearTimeout(timer);
+		}
+	} catch {
+		return false;
+	}
+}
+
+/** Parse "vX.Y.Z" into numeric parts, or null if the format is not strict semver. */
+export function parseVersion(version: string): [number, number, number] | null {
+	const match = /^v(\d+)\.(\d+)\.(\d+)$/.exec(version);
+	if (!match) return null;
+	return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+/** True when `target` is an older release than `current`. */
+export function isDowngrade(current: string, target: string): boolean {
+	const cur = parseVersion(current);
+	const tgt = parseVersion(target);
+	if (!cur || !tgt) throw new Error(`Cannot compare ${current} and ${target}`);
+	for (let i = 0; i < 3; i++) {
+		if (tgt[i] !== cur[i]) return tgt[i] < cur[i];
+	}
+	return false;
+}
+
+/** Fetch the latest release tag from the GitHub API. Returns "vX.Y.Z". */
+async function fetchLatestVersion(fetchFn: FetchFn): Promise<string> {
+	const res = await fetchFn(`${GITHUB_API}/repos/${REPO}/releases/latest`, {
 		headers: {
 			Accept: "application/vnd.github+json",
 			"User-Agent": "knowledge-server-updater",
@@ -41,7 +90,7 @@ async function fetchLatestVersion(): Promise<string> {
 		throw new Error(`GitHub API error: ${res.status} ${res.statusText}`);
 	}
 	const data = (await res.json()) as { tag_name?: string };
-	if (!data.tag_name || !/^v\d+\.\d+\.\d+$/.test(data.tag_name)) {
+	if (!data.tag_name || !parseVersion(data.tag_name)) {
 		throw new Error(
 			`Unexpected tag_name from GitHub API: ${JSON.stringify(data.tag_name)}`,
 		);
@@ -49,159 +98,146 @@ async function fetchLatestVersion(): Promise<string> {
 	return data.tag_name;
 }
 
-/**
- * Fetch the SHA256SUMS file for a given platform from the release and return
- * a map of { assetFilename → expectedHex }.
- */
-async function fetchChecksums(
-	targetVersion: string,
-	platform: string,
-): Promise<Map<string, string>> {
-	const url = `${GITHUB_RELEASES}/${targetVersion}/SHA256SUMS-${platform}`;
-	const res = await fetch(url, {
-		headers: { "User-Agent": "knowledge-server-updater" },
-		redirect: "follow",
-	});
-	if (!res.ok) {
-		throw new Error(
-			`Failed to fetch checksums: ${res.status} ${res.statusText} (${url})`,
-		);
-	}
-	const text = await res.text();
-	const map = new Map<string, string>();
-	for (const line of text.split("\n")) {
-		const trimmed = line.trim();
-		if (!trimmed) continue;
-		// sha256sum format: "<hash>  <filename>" (two spaces) or "<hash> <filename>"
-		const spaceIdx = trimmed.indexOf(" ");
-		if (spaceIdx < 0) continue;
-		const hash = trimmed.slice(0, spaceIdx).trim();
-		const filename = trimmed.slice(spaceIdx).trim().replace(/^\*/, ""); // strip leading * (binary mode)
-		map.set(filename, hash);
-	}
-	return map;
+function prevPath(dest: string): string {
+	return dest + PREV_SUFFIX;
+}
+
+async function removeQuietly(path: string): Promise<void> {
+	await unlink(path).catch(() => {});
+}
+
+interface SwapRecord {
+	dest: string;
+	/** The previous file was renamed to `dest.prev`. */
+	movedAside: boolean;
+	/** The staged file was renamed into `dest`. */
+	installed: boolean;
 }
 
 /**
- * Verify the SHA256 checksum of a downloaded file against an expected hex string.
- * Throws if the checksum does not match.
+ * Restore the pre-swap state of every record, in reverse order. Returns
+ * human-readable failures; an empty array means the rollback fully succeeded.
  */
-async function verifyChecksum(
-	filePath: string,
-	expectedHex: string,
-	label: string,
-): Promise<void> {
-	const data = await readFile(filePath);
-	const actual = createHash("sha256").update(data).digest("hex");
-	if (actual !== expectedHex) {
-		throw new Error(
-			`Checksum mismatch for ${label}:\n  expected: ${expectedHex}\n  actual:   ${actual}\n  Aborting — the download may be corrupt or tampered.`,
-		);
-	}
-}
-
-/**
- * Download a gzip-compressed binary URL, decompress on the fly, and write to a
- * temp file beside the target path. Streams the response body directly to disk
- * so the full binary is never held in memory.
- *
- * Placing the temp file in the SAME DIRECTORY as the target guarantees the
- * subsequent rename is within the same filesystem — cross-device renames (e.g.
- * /tmp → /home) are not atomic and can corrupt the binary if the process dies
- * mid-copy. A same-directory rename is a single atomic syscall on POSIX.
- *
- * Prints a live progress indicator showing MB received.
- *
- * Returns the temp file path (caller is responsible for cleanup on error).
- */
-async function downloadBinary(
-	url: string,
-	targetPath: string,
-	label: string,
-	silent = false,
-): Promise<string> {
-	const tmpPath = join(
-		dirname(targetPath),
-		`.knowledge-server-update-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-	);
-
-	const res = await fetch(url, {
-		headers: { "User-Agent": "knowledge-server-updater" },
-		redirect: "follow",
-	});
-	if (!res.ok) {
-		throw new Error(
-			`Download failed: ${res.status} ${res.statusText} (${url})`,
-		);
-	}
-	if (!res.body) {
-		throw new Error(`No response body from ${url}`);
-	}
-
-	// Stream: HTTP response → gunzip → disk.
-	// Node's pipeline() handles backpressure and propagates errors.
-	// We wrap res.body (Web ReadableStream) in a Node Readable via Bun's
-	// compatibility layer so we can pipe through node:zlib.createGunzip().
-	const fileStream = createWriteStream(tmpPath);
-	let bytesWritten = 0;
-	if (!silent) process.stdout.write(`  Downloading ${label}... `);
-
-	try {
-		// Bun supports piping Web ReadableStream to Node streams directly.
-		// We interpose a transform to count decompressed bytes for the progress display.
-		const gunzip = createGunzip();
-		gunzip.on("data", (chunk: Buffer) => {
-			bytesWritten += chunk.length;
-			if (!silent) {
-				// Overwrite the same line: \r moves to start of line without newline.
-				const mb = (bytesWritten / 1_048_576).toFixed(1);
-				process.stdout.write(`\r  Downloading ${label}... ${mb} MB`);
+async function rollbackSwap(
+	records: SwapRecord[],
+	staged: string[],
+): Promise<string[]> {
+	const failures: string[] = [];
+	for (const rec of [...records].reverse()) {
+		if (rec.installed) await removeQuietly(rec.dest);
+		if (rec.movedAside) {
+			try {
+				await rename(prevPath(rec.dest), rec.dest);
+			} catch (err) {
+				failures.push(
+					`could not restore ${rec.dest} from ${prevPath(rec.dest)}: ${err instanceof Error ? err.message : err}`,
+				);
 			}
-		});
+		}
+	}
+	await Promise.all(staged.map(removeQuietly));
+	return failures;
+}
 
-		// Convert Web ReadableStream to Node Readable for pipeline()
-		// res.body null case is already guarded above. Double cast (through unknown) is required
-		// because tsc sees ReadableStream<Uint8Array<ArrayBuffer>> which doesn't structurally
-		// overlap with Node's ReadableStream<any> — the two ReadableStream types come from
-		// different @types packages (lib.dom vs @types/node).
-		const nodeReadable = Readable.fromWeb(
-			res.body as unknown as Parameters<typeof Readable.fromWeb>[0],
-		);
-		await pipeline(nodeReadable, gunzip, fileStream);
-
-		if (!silent) {
-			const mb = (bytesWritten / 1_048_576).toFixed(1);
-			process.stdout.write(`\r  Downloading ${label}... ${mb} MB — done\n`);
+/**
+ * Install staged files as one transaction. Each destination's current file is
+ * moved to `<dest>.prev`, then the staged file is renamed into place. After all
+ * renames, binaries with smoke arguments are run from their final paths. Any
+ * failure restores every destination to its pre-swap state, so binaries are
+ * never left as a mismatched pair.
+ */
+async function swapTransaction(
+	entries: Array<{ tmp: string; asset: ReleaseAsset }>,
+	smoke: SmokeFn,
+): Promise<void> {
+	const records: SwapRecord[] = [];
+	const stagedPaths = entries.map((e) => e.tmp);
+	try {
+		for (const { tmp, asset } of entries) {
+			const rec: SwapRecord = {
+				dest: asset.dest,
+				movedAside: false,
+				installed: false,
+			};
+			records.push(rec);
+			if (existsSync(asset.dest)) {
+				await rename(asset.dest, prevPath(asset.dest));
+				rec.movedAside = true;
+			}
+			await rename(tmp, asset.dest);
+			rec.installed = true;
+		}
+		for (const { asset } of entries) {
+			if (!asset.smokeArgs) continue;
+			if (!(await smoke(asset.dest, asset.smokeArgs))) {
+				throw new Error(
+					`post-install smoke test failed: ${asset.dest} ${asset.smokeArgs.join(" ")}`,
+				);
+			}
 		}
 	} catch (err) {
-		await unlink(tmpPath).catch(() => {});
-		throw err;
+		const failures = await rollbackSwap(records, stagedPaths);
+		const base = err instanceof Error ? err.message : String(err);
+		if (failures.length > 0) {
+			throw new Error(
+				`${base}. Rollback FAILED: ${failures.join("; ")}. Restore manually from the *.prev files.`,
+			);
+		}
+		throw new Error(`${base}. Previous files restored.`);
 	}
-
-	return tmpPath;
 }
 
 /**
- * Atomically install a downloaded binary temp file at the target path.
- * chmod 0o755 is applied before rename so the binary is never non-executable
- * during the swap (chmod is on the temp file, not the live binary).
+ * Download, verify, smoke-test and install a set of release assets.
+ *
+ * Nothing touches the install directory until every asset has passed checksum
+ * verification and every binary has passed its staged smoke test. Any missing
+ * SHA256SUMS entry, hash mismatch or failed smoke test aborts with no change.
  */
-async function installBinary(
-	tmpPath: string,
-	targetPath: string,
+export async function installVerifiedAssets(
+	assets: ReleaseAsset[],
+	checksums: Map<string, string>,
+	deps: InstallDeps = {},
 ): Promise<void> {
+	const fetchFn = deps.fetchFn ?? fetch;
+	const smoke = deps.smoke ?? smokeTest;
+
+	// Resolve every expected hash before any network I/O.
+	const expected = assets.map((a) => requireExpectedSha(checksums, a.name));
+
+	const staged: Array<{ tmp: string; asset: ReleaseAsset }> = [];
 	try {
-		await chmod(tmpPath, 0o755);
-		await rename(tmpPath, targetPath);
+		for (let i = 0; i < assets.length; i++) {
+			const asset = assets[i];
+			const tmp = await downloadVerified({
+				url: asset.url,
+				stageDir: dirname(asset.dest),
+				name: asset.name,
+				expectedSha: expected[i],
+				gzip: asset.gzip,
+				mode: asset.smokeArgs ? 0o755 : 0o644,
+				fetchFn,
+			});
+			staged.push({ tmp, asset });
+		}
+		for (const { tmp, asset } of staged) {
+			if (!asset.smokeArgs) continue;
+			if (!(await smoke(tmp, asset.smokeArgs))) {
+				throw new Error(
+					`staged ${asset.name} failed smoke test (${asset.smokeArgs.join(" ")}); nothing was installed`,
+				);
+			}
+		}
 	} catch (err) {
-		await unlink(tmpPath).catch(() => {});
+		await Promise.all(staged.map((s) => removeQuietly(s.tmp)));
 		throw err;
 	}
+
+	await swapTransaction(staged, smoke);
 }
 
 /**
- * Download and install the knowledge-daemon binary for the current platform
- * at the given destination path.
+ * Download and install the knowledge-daemon binary at `destPath`.
  *
  * Used by the server startup path to self-heal a missing daemon binary —
  * e.g. after upgrading from v2 where only knowledge-server was downloaded.
@@ -213,64 +249,65 @@ async function installBinary(
 export async function downloadAndInstallDaemon(
 	version: string | undefined,
 	destPath: string,
+	deps: InstallDeps = {},
 ): Promise<void> {
+	const fetchFn = deps.fetchFn ?? fetch;
 	const platform = detectPlatform();
-	const targetVersion = version ?? (await fetchLatestVersion());
-	const checksums = await fetchChecksums(targetVersion, platform);
-
+	const targetVersion = version ?? (await fetchLatestVersion(fetchFn));
+	const checksums = await fetchChecksums(targetVersion, platform, fetchFn);
 	const asset = `knowledge-daemon-${platform}`;
-	const url = `${GITHUB_RELEASES}/${targetVersion}/${asset}.gz`;
-
-	// silent=true: suppress the \r progress display — the server startup caller
-	// logs progress via its own structured logger before and after this call.
-	const tmpPath = await downloadBinary(url, destPath, asset, true);
-	// Note: downloadBinary and installBinary each clean up tmpPath on their own
-	// failure paths. The only gap is a checksum mismatch after a successful
-	// download — handle that explicitly here.
-	const expectedHash = checksums.get(asset);
-	if (expectedHash) {
-		try {
-			await verifyChecksum(tmpPath, expectedHash, asset);
-		} catch (err) {
-			await unlink(tmpPath).catch(() => {});
-			throw err;
-		}
-	} else {
-		console.warn(
-			`  ⚠ No checksum found for ${asset} in release ${targetVersion} — installing without verification.`,
-		);
-	}
-	await installBinary(tmpPath, destPath);
+	await installVerifiedAssets(
+		[
+			{
+				name: asset,
+				url: releaseAssetUrl(targetVersion, `${asset}.gz`),
+				dest: destPath,
+				gzip: true,
+				smokeArgs: ["--version"],
+			},
+		],
+		checksums,
+		{ fetchFn, smoke: deps.smoke },
+	);
 }
 
 /**
  * Main update routine.
  *
- * Usage: knowledge-server update [--version v1.2.3]
+ * Usage: knowledge-server update [--version v1.2.3] [--force]
  *
- * Checks for a newer release on GitHub, downloads the platform-appropriate
- * binary (gzip-compressed, streamed directly to disk), verifies SHA-256, and
- * atomically replaces the current executable in place.
- * The server must be restarted to pick up the new binary.
+ * Checks for a newer release on GitHub, verifies and smoke-tests the
+ * platform binaries and plugin files, then installs them as one transaction.
+ * The previous files are kept as `<name>.prev`. The server must be restarted
+ * to pick up the new binary.
  *
  * @param argv - process.argv slice after "update" (e.g. ["--version", "v1.2.3"])
  * @param currentVersion - the version string of the currently running binary (e.g. "v1.0.1")
+ * @param deps - injectable I/O for tests
  */
 export async function runUpdate(
 	argv: string[],
 	currentVersion: string,
+	deps: InstallDeps = {},
 ): Promise<void> {
-	// Parse optional --version flag
+	const fetchFn = deps.fetchFn ?? fetch;
+
 	let targetVersion = "";
 	const versionIdx = argv.indexOf("--version");
 	if (versionIdx !== -1) {
 		targetVersion = argv[versionIdx + 1] ?? "";
-		if (!targetVersion || !/^v\d+\.\d+\.\d+$/.test(targetVersion)) {
+		if (!targetVersion || !parseVersion(targetVersion)) {
 			console.error(
 				`Invalid version: ${targetVersion || "(missing)"}. Expected format: v1.2.3`,
 			);
 			process.exit(1);
 		}
+	}
+	const force = argv.includes("--force");
+
+	if (!parseVersion(currentVersion)) {
+		console.error(`  ✗ Unexpected current version: ${currentVersion}`);
+		process.exit(1);
 	}
 
 	const execPath = process.execPath;
@@ -291,7 +328,6 @@ export async function runUpdate(
 		process.exit(1);
 	}
 
-	// Detect platform
 	let platform: string;
 	try {
 		platform = detectPlatform();
@@ -304,11 +340,10 @@ export async function runUpdate(
 	console.log(`  Executable:       ${execPath}`);
 	console.log(`  Platform:         ${platform}`);
 
-	// Resolve target version
 	if (!targetVersion) {
 		process.stdout.write("  Fetching latest release... ");
 		try {
-			targetVersion = await fetchLatestVersion();
+			targetVersion = await fetchLatestVersion(fetchFn);
 			console.log(targetVersion);
 		} catch (err) {
 			console.error(`\n  ✗ ${err instanceof Error ? err.message : err}`);
@@ -320,67 +355,76 @@ export async function runUpdate(
 		console.log(`\n  Already at ${currentVersion} — nothing to do.`);
 		return;
 	}
+	if (isDowngrade(currentVersion, targetVersion) && !force) {
+		console.error(
+			`\n  ✗ Refusing to downgrade ${currentVersion} → ${targetVersion}. Pass --force to install an older release.`,
+		);
+		process.exit(1);
+	}
 
 	console.log(`\n  Updating ${currentVersion} → ${targetVersion}`);
 
-	// Fetch checksums before downloading — fail fast if the checksums file is unavailable.
-	// The checksum file contains hashes of the uncompressed binaries; we verify after gunzip.
 	process.stdout.write("  Fetching checksums... ");
 	let checksums: Map<string, string>;
 	try {
-		checksums = await fetchChecksums(targetVersion, platform);
+		checksums = await fetchChecksums(targetVersion, platform, fetchFn);
 		console.log("done");
 	} catch (err) {
 		console.error(`\n  ✗ ${err instanceof Error ? err.message : err}`);
 		process.exit(1);
 	}
 
-	// Download both binaries: knowledge-server (HTTP/MCP server) and knowledge-daemon
-	// (episode uploader, auto-spawned by the server in single-machine mode).
+	// knowledge-server (HTTP/MCP server) and knowledge-daemon (episode uploader,
+	// auto-spawned by the server in single-machine mode) live side by side.
 	const libexecDir = dirname(execPath);
 	const daemonPath = join(libexecDir, "knowledge-daemon");
 
-	const binariesToUpdate: Array<{ asset: string; destPath: string }> = [
-		{ asset: `knowledge-server-${platform}`, destPath: execPath },
-		{ asset: `knowledge-daemon-${platform}`, destPath: daemonPath },
+	// Plugin and command files live one level above libexec/ (install.sh layout).
+	const inferredInstallDir = dirname(libexecDir);
+	const pluginNames = [
+		"knowledge.ts",
+		"pi-knowledge.ts",
+		"consolidate.md",
+		"knowledge-review.md",
 	];
-
-	// Track temp paths so all can be cleaned up if any step fails.
-	// downloadBinary places temp files next to the target binary for atomic rename.
-	const tmpPaths: string[] = [];
-	try {
-		for (const { asset, destPath } of binariesToUpdate) {
-			const url = `${GITHUB_RELEASES}/${targetVersion}/${asset}.gz`;
-			// Push the path only after downloadBinary succeeds so the outer catch
-			// only tries to unlink files that actually exist.
-			const tmpPath = await downloadBinary(url, destPath, asset);
-			tmpPaths.push(tmpPath);
-			const expectedHash = checksums.get(asset);
-			if (expectedHash) {
-				process.stdout.write("  Verifying checksum... ");
-				await verifyChecksum(tmpPath, expectedHash, asset);
-				console.log("ok");
-			} else {
-				console.warn(
-					`  ⚠ No checksum found for ${asset} — proceeding without verification`,
-				);
-			}
+	const assets: ReleaseAsset[] = [
+		{
+			name: `knowledge-server-${platform}`,
+			url: releaseAssetUrl(targetVersion, `knowledge-server-${platform}.gz`),
+			dest: execPath,
+			gzip: true,
+			smokeArgs: ["--help"],
+		},
+		{
+			name: `knowledge-daemon-${platform}`,
+			url: releaseAssetUrl(targetVersion, `knowledge-daemon-${platform}.gz`),
+			dest: daemonPath,
+			gzip: true,
+			smokeArgs: ["--version"],
+		},
+	];
+	// Plugin/command files are refreshed only when a previous install placed
+	// them. pi-knowledge.ts and the *.md files are optional, knowledge.ts is not.
+	const pluginDest = join(inferredInstallDir, "knowledge.ts");
+	if (existsSync(pluginDest)) {
+		for (const name of pluginNames) {
+			const dest = join(inferredInstallDir, name);
+			if (name !== "knowledge.ts" && !existsSync(dest)) continue;
+			assets.push({
+				name,
+				url: releaseAssetUrl(targetVersion, name),
+				dest,
+				gzip: false,
+			});
 		}
-	} catch (err) {
-		// Clean up temp files; outer catch is the single cleanup point.
-		await Promise.all(tmpPaths.map((p) => unlink(p).catch(() => {})));
-		console.error(`\n  ✗ ${err instanceof Error ? err.message : err}`);
-		process.exit(1);
 	}
 
-	// Pair each temp path with its target and install sequentially.
-	// Sequential (not parallel) avoids two concurrent overwrites of files in the
-	// same directory, one of which is the running executable.
-	process.stdout.write("  Installing binaries... ");
+	process.stdout.write("  Verifying, staging and installing... ");
 	try {
-		for (let i = 0; i < binariesToUpdate.length; i++) {
-			await installBinary(tmpPaths[i], binariesToUpdate[i].destPath);
-		}
+		await installVerifiedAssets(assets, checksums, {
+			fetchFn,
+			smoke: deps.smoke,
+		});
 		console.log("done");
 	} catch (err) {
 		console.error(`\n  ✗ ${err instanceof Error ? err.message : err}`);
@@ -404,71 +448,21 @@ export async function runUpdate(
 		}
 	}
 
-	// Update plugin and command files if the install dir can be inferred.
-	// Convention from install.sh: binary lives at <install-dir>/libexec/knowledge-server,
-	// so the install dir is two levels up from process.execPath.
-	const inferredInstallDir = dirname(libexecDir);
-	const pluginDest = join(inferredInstallDir, "knowledge.ts");
-	const commandFiles: Array<[string, string]> = [
-		["consolidate.md", join(inferredInstallDir, "consolidate.md")],
-		["knowledge-review.md", join(inferredInstallDir, "knowledge-review.md")],
-	];
-
-	if (existsSync(pluginDest)) {
-		process.stdout.write("  Updating plugin and commands... ");
-		try {
-			const assets = [
-				["knowledge.ts", pluginDest],
-				// pi extension is optional — only refreshed when a previous
-				// install/update placed it in the install dir.
-				...([join(inferredInstallDir, "pi-knowledge.ts")]
-					.filter((p) => existsSync(p))
-					.map((p) => ["pi-knowledge.ts", p]) as Array<[string, string]>),
-				...commandFiles.filter(([, dest]) => existsSync(dest)),
-			] as Array<[string, string]>;
-
-			// Asset names are hardcoded constants in this function — not user-controlled.
-			await Promise.all(
-				assets.map(async ([name, dest]) => {
-					const url = `${GITHUB_RELEASES}/${targetVersion}/${name}`;
-					const res = await fetch(url, {
-						headers: { "User-Agent": "knowledge-server-updater" },
-						redirect: "follow",
-					});
-					if (!res.ok)
-						throw new Error(`${res.status} ${res.statusText} (${name})`);
-					const tmpDest = join(
-						dirname(dest),
-						`.knowledge-server-update-${name}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-					);
-					try {
-						await Bun.write(tmpDest, await res.text());
-						await rename(tmpDest, dest);
-					} catch (err) {
-						await unlink(tmpDest).catch(() => {});
-						throw err;
-					}
-				}),
-			);
-			console.log("done");
-		} catch (err) {
-			console.error(
-				`\n  ⚠ Plugin/command update failed: ${err instanceof Error ? err.message : err}`,
-			);
-			console.error(
-				"    Binary was updated. Re-run install.sh to refresh plugin files.",
-			);
-		}
-	}
-
 	console.log(`\n  Updated to ${targetVersion}.`);
+	console.log(
+		`  Previous binaries kept as ${basename(execPath)}${PREV_SUFFIX} and knowledge-daemon${PREV_SUFFIX} for rollback.`,
+	);
 	console.log("  Restart the server to pick up the new binary.");
 
-	const currentMatch = /^v(\d+)\.(\d+)/.exec(currentVersion);
-	if (!currentMatch)
-		throw new Error(`Unexpected currentVersion format: ${currentVersion}`);
-	const currentMajor = Number(currentMatch[1]);
-	const currentMinor = Number(currentMatch[2]);
+	const current = parseVersion(currentVersion);
+	const target = parseVersion(targetVersion);
+	if (!current || !target) {
+		throw new Error(
+			`Unexpected version format: ${currentVersion} → ${targetVersion}`,
+		);
+	}
+	const [currentMajor, currentMinor] = current;
+	const [targetMajor] = target;
 
 	// v1.x → v2.x: knowledge-server-mcp binary replaced by `knowledge-server mcp`.
 	if (currentMajor === 1 && currentMinor < 7) {
@@ -485,10 +479,6 @@ export async function runUpdate(
 	// v2.x → v3.x: consolidation now requires knowledge-daemon.
 	// The server auto-spawns it automatically, so no manual action is needed
 	// for single-machine setups. For remote setups, install the daemon separately.
-	const targetMatch = /^v(\d+)/.exec(targetVersion);
-	if (!targetMatch)
-		throw new Error(`Unexpected targetVersion format: ${targetVersion}`);
-	const targetMajor = Number(targetMatch[1]);
 	if (currentMajor < 3 && targetMajor >= 3) {
 		console.log(`
   ⚠ Breaking change (v3): consolidation now runs through knowledge-daemon.

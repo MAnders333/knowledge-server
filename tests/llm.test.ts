@@ -5,7 +5,8 @@
  * package — no real network calls are made. This validates:
  *   - JSON parsing strategies (clean JSON, code-fenced, bracket-match, partial-array)
  *   - Response filtering (bad types, missing fields, no_conflict elision)
- *   - Safe defaults on parse failure (decideMerge → "insert", extractKnowledge → [])
+ *   - Safe defaults on merge parse failure (decideMerge → "insert"); malformed
+ *     extraction output throws a SyntaxError (deterministic failure)
  *   - formatEpisodes output shape
  */
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
@@ -71,7 +72,7 @@ describe("formatEpisodes", () => {
 			projectName: "analytics",
 		});
 		const out = formatEpisodes([ep]);
-		expect(out).toContain('"Churn Analysis"');
+		expect(out).toContain("<episode-title>Churn Analysis</episode-title>");
 		expect(out).toContain("analytics");
 		expect(out).toContain("user: hello");
 	});
@@ -102,7 +103,9 @@ describe("formatEpisodes", () => {
 			content: "# My Knowledge Doc\n\nSome content here.",
 		});
 		const out = formatEpisodes([ep]);
-		expect(out).toContain('### Document: "My Knowledge Doc"');
+		expect(out).toContain(
+			'### Document: "<episode-title>My Knowledge Doc</episode-title>"',
+		);
 		expect(out).not.toContain("project:");
 		expect(out).not.toContain("(document)");
 		expect(out).toContain("Some content here.");
@@ -183,10 +186,18 @@ describe("ConsolidationLLM.extractKnowledge", () => {
 		expect(result[0].content).toBe("Entry one.");
 	});
 
-	it("returns [] when the response is unparseable", async () => {
+	it("throws a SyntaxError (deterministic failure) when the response is unparseable", async () => {
 		mockGenerateText("I'm sorry, I cannot help with that.");
-		const result = await llm.extractKnowledge("episodes");
-		expect(result).toEqual([]);
+		await expect(llm.extractKnowledge("episodes")).rejects.toBeInstanceOf(
+			SyntaxError,
+		);
+	});
+
+	it("throws when the response is valid JSON but not an array", async () => {
+		mockGenerateText(JSON.stringify({ entries: [] }));
+		await expect(llm.extractKnowledge("episodes")).rejects.toBeInstanceOf(
+			SyntaxError,
+		);
 	});
 
 	it("clamps entries with invalid types to 'fact' (the default fallback)", async () => {
@@ -376,13 +387,11 @@ describe("ConsolidationLLM.detectAndResolveContradiction", () => {
 		expect(result[0].resolution).toBe("supersede_old");
 	});
 
-	it("returns [] on unparseable response (no crash)", async () => {
+	it("throws a SyntaxError when the response is unparseable", async () => {
 		mockGenerateText("Sorry, cannot process this.");
-		const result = await llm.detectAndResolveContradiction(
-			newEntry,
-			candidates,
-		);
-		expect(result).toEqual([]);
+		await expect(
+			llm.detectAndResolveContradiction(newEntry, candidates),
+		).rejects.toBeInstanceOf(SyntaxError);
 	});
 
 	it("includes merge fields when resolution is 'merge'", async () => {

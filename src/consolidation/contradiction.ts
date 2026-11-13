@@ -128,17 +128,17 @@ export class ContradictionScanner {
 					`[contradiction] ${logPrefix}${result.resolution}: ${JSON.stringify(entry.content)} vs candidate ${result.candidateId} — ${JSON.stringify(result.reason)}`,
 				);
 
+				// The LLM layer has already validated merge fields (see llm-output.ts), so a
+				// merge reaching this point always carries usable content and type.
 				const mergedData =
 					result.resolution === "merge" &&
-					result.mergedContent &&
-					result.mergedType &&
-					result.mergedTopics &&
-					result.mergedConfidence !== undefined
+					result.mergedContent !== undefined &&
+					result.mergedType !== undefined
 						? {
 								content: result.mergedContent,
 								type: result.mergedType,
-								topics: result.mergedTopics,
-								confidence: result.mergedConfidence,
+								topics: result.mergedTopics ?? [],
+								confidence: result.mergedConfidence ?? 0.7,
 							}
 						: undefined;
 

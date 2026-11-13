@@ -13,6 +13,7 @@ import {
 	latestVersion,
 	pendingMigrations,
 } from "../migration-registry.js";
+import { resolvePostgresTls, warnNoTlsOnce } from "../postgres/tls.js";
 
 // biome-ignore lint: TS limitation with Omit stripping call signatures
 type TxSql = any;
@@ -185,7 +186,10 @@ export class PostgresServerStateDB implements IServerStateDB {
 	private initPromise: Promise<void> | null = null;
 
 	constructor(uri: string) {
-		this.sql = postgres(uri, {
+		const tls = resolvePostgresTls(uri);
+		warnNoTlsOnce(tls.warnNoTls);
+		this.sql = postgres(tls.uri, {
+			...(tls.ssl ? { ssl: tls.ssl } : {}),
 			max: 10,
 			idle_timeout: 30,
 			connect_timeout: 10,

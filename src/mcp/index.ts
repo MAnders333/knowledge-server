@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 // @ts-ignore — Bun supports JSON imports natively
 import pkg from "../../package.json" with { type: "json" };
-import { contradictionTagBlock, staleTag } from "../activation/format.js";
+import { formatActivatedKnowledge } from "../activation/format.js";
 import { resolveServerAddress } from "../config-file.js";
 import { config } from "../config.js";
 import type { ActivationResult } from "../types.js";
@@ -191,14 +191,7 @@ export async function main() {
 					};
 				}
 
-				const formatted = result.entries
-					.map(
-						(r, i) =>
-							`${i + 1}. [${r.entry.type}] ${r.entry.content}${staleTag(r.staleness)}${contradictionTagBlock(r.contradiction)}\n` +
-							`   Topics: ${r.entry.topics.join(", ")}\n` +
-							`   Confidence: ${r.entry.confidence} | Semantic match: ${r.rawSimilarity.toFixed(3)} | Score: ${r.similarity.toFixed(3)}`,
-					)
-					.join("\n\n");
+				const formatted = formatActivatedKnowledge(result.entries);
 
 				const conflictCount = result.entries.filter(
 					(r) => r.contradiction,

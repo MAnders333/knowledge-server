@@ -554,3 +554,95 @@ describe("EpisodeReader — tool output parts are ignored when not in allowlist"
 		expect(episodes[0].content).not.toContain("sensitive data");
 	});
 });
+
+// ── getNewEpisodes — injected knowledge guard ─────────────────────────────────
+
+const INJECTED_BLOCK = [
+	"<addrl-activated-knowledge>",
+	"## Recalled Knowledge (from prior sessions)",
+	"- [fact] Deploys go out on Thursdays",
+	"</addrl-activated-knowledge>",
+].join("\n");
+
+describe("EpisodeReader — injected knowledge guard", () => {
+	beforeEach(() => seedProject(openCodeDb));
+
+	/** Seed a session whose first message is `first`, then four plain messages; returns the episodes. */
+	function extractWithFirst(first: { role: string; text: string }) {
+		const now = Date.now();
+		const sid = seedSession(openCodeDb);
+		const turns = [
+			first,
+			{ role: "user", text: "question one" },
+			{ role: "assistant", text: "answer one" },
+			{ role: "user", text: "question two" },
+			{ role: "assistant", text: "answer two" },
+		];
+		turns.forEach((turn, i) => {
+			const mid = seedMessage(openCodeDb, {
+				sessionId: sid,
+				role: turn.role,
+				timeCreated: now + i,
+			});
+			seedTextPart(openCodeDb, {
+				messageId: mid,
+				text: turn.text,
+				timeCreated: now + i,
+			});
+		});
+		return reader.getNewEpisodes([sid], new Map());
+	}
+
+	it("drops a user message that carries the injected block", () => {
+		const episodes = extractWithFirst({
+			role: "user",
+			text: `Context follows.\n${INJECTED_BLOCK}`,
+		});
+		expect(episodes.length).toBe(1);
+		expect(episodes[0].content).not.toContain("addrl-activated-knowledge");
+		expect(episodes[0].content).not.toContain("Deploys go out on Thursdays");
+		expect(episodes[0].content).toContain("question one");
+	});
+
+	it("drops an assistant message that quotes the injected tag", () => {
+		const episodes = extractWithFirst({
+			role: "assistant",
+			text: "The block opens with <addrl-activated-knowledge> and closes with </addrl-activated-knowledge>.",
+		});
+		expect(episodes.length).toBe(1);
+		expect(episodes[0].content).not.toContain("addrl-activated-knowledge");
+		expect(episodes[0].content).toContain("question one");
+	});
+
+	it("drops a user message whose injected block sits past 60K characters", () => {
+		const episodes = extractWithFirst({
+			role: "user",
+			text: `${"x".repeat(60_000)}\n${INJECTED_BLOCK}`,
+		});
+		expect(episodes.length).toBe(1);
+		expect(episodes[0].content).not.toContain("[...truncated]");
+		expect(episodes[0].content).not.toContain("xxxx");
+		expect(episodes[0].content).toContain("question one");
+	});
+
+	it("drops an assistant message whose injected block sits past 60K characters", () => {
+		const episodes = extractWithFirst({
+			role: "assistant",
+			text: `${"x".repeat(60_000)}\n${INJECTED_BLOCK}`,
+		});
+		expect(episodes.length).toBe(1);
+		expect(episodes[0].content).not.toContain("[...truncated]");
+		expect(episodes[0].content).not.toContain("xxxx");
+		expect(episodes[0].content).toContain("question one");
+	});
+
+	it("keeps ordinary messages unchanged", () => {
+		const episodes = extractWithFirst({
+			role: "user",
+			text: "plain first message",
+		});
+		expect(episodes.length).toBe(1);
+		expect(episodes[0].content).toContain("  user: plain first message");
+		expect(episodes[0].content).toContain("  assistant: answer one");
+	});
+});

@@ -1052,3 +1052,116 @@ describe("CursorEpisodeReader — workspace root resolution", () => {
 		}
 	});
 });
+
+// ── Injected knowledge guard ──────────────────────────────────────────────────
+
+const INJECTED_BLOCK = [
+	"<addrl-activated-knowledge>",
+	"## Recalled Knowledge (from prior sessions)",
+	"- [fact] Deploys go out on Thursdays",
+	"</addrl-activated-knowledge>",
+].join("\n");
+
+type CursorTurn = { type: 1 | 2; text: string };
+
+const PLAIN_TURNS: CursorTurn[] = [
+	{ type: 1, text: "question one" },
+	{ type: 2, text: "answer one" },
+	{ type: 1, text: "question two" },
+	{ type: 2, text: "answer two" },
+];
+
+function withBubbleIds(turns: CursorTurn[]) {
+	return turns.map((t, i) => ({ ...t, bubbleId: `b${i}` }));
+}
+
+/** Run the reader over a single-session database and return its episodes. */
+function runCursor(db: Database) {
+	const { path, cleanup } = dbToFile(db);
+	try {
+		const reader = new CursorEpisodeReader(path);
+		const candidates = reader.getCandidateSessions(0);
+		const episodes = reader.getNewEpisodes([candidates[0].id], new Map());
+		reader.close();
+		return episodes;
+	} finally {
+		cleanup();
+	}
+}
+
+function extractInline(turns: CursorTurn[]) {
+	const db = createDb();
+	insertFormatA(db, COMPOSER_A, { turns: withBubbleIds(turns) });
+	return runCursor(db);
+}
+
+function extractBubbles(turns: CursorTurn[]) {
+	const db = createDb();
+	insertFormatB(db, COMPOSER_A, { turns: withBubbleIds(turns) });
+	return runCursor(db);
+}
+
+const CURSOR_FORMATS = [
+	["Format A (inline turns)", extractInline],
+	["Format B (bubble headers)", extractBubbles],
+] as const;
+
+for (const [format, extract] of CURSOR_FORMATS) {
+	describe(`CursorEpisodeReader — injected knowledge guard, ${format}`, () => {
+		it("drops a user turn that carries the injected block", () => {
+			const episodes = extract([
+				{ type: 1, text: `Context follows.\n${INJECTED_BLOCK}` },
+				...PLAIN_TURNS,
+			]);
+			expect(episodes).toHaveLength(1);
+			expect(episodes[0].content).not.toContain("addrl-activated-knowledge");
+			expect(episodes[0].content).not.toContain("Deploys go out on Thursdays");
+			expect(episodes[0].content).toContain("question one");
+		});
+
+		it("drops an assistant turn that quotes the injected tag", () => {
+			const episodes = extract([
+				{
+					type: 2,
+					text: "The block opens with <addrl-activated-knowledge> and closes with </addrl-activated-knowledge>.",
+				},
+				...PLAIN_TURNS,
+			]);
+			expect(episodes).toHaveLength(1);
+			expect(episodes[0].content).not.toContain("addrl-activated-knowledge");
+			expect(episodes[0].content).toContain("question one");
+		});
+
+		it("drops a user turn whose injected block sits past 60K characters", () => {
+			const episodes = extract([
+				{ type: 1, text: `${"x".repeat(60_000)}\n${INJECTED_BLOCK}` },
+				...PLAIN_TURNS,
+			]);
+			expect(episodes).toHaveLength(1);
+			expect(episodes[0].content).not.toContain("[...truncated]");
+			expect(episodes[0].content).not.toContain("xxxx");
+			expect(episodes[0].content).toContain("question one");
+		});
+
+		it("drops an assistant turn whose injected block sits past 60K characters", () => {
+			const episodes = extract([
+				{ type: 2, text: `${"x".repeat(60_000)}\n${INJECTED_BLOCK}` },
+				...PLAIN_TURNS,
+			]);
+			expect(episodes).toHaveLength(1);
+			expect(episodes[0].content).not.toContain("[...truncated]");
+			expect(episodes[0].content).not.toContain("xxxx");
+			expect(episodes[0].content).toContain("question one");
+		});
+
+		it("keeps ordinary turns unchanged", () => {
+			const episodes = extract([
+				{ type: 1, text: "plain first turn" },
+				...PLAIN_TURNS,
+			]);
+			expect(episodes).toHaveLength(1);
+			expect(episodes[0].content).toContain("user: plain first turn");
+			expect(episodes[0].content).toContain("assistant: answer one");
+		});
+	});
+}

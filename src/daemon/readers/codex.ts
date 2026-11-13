@@ -1,6 +1,7 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
+import { containsInjectedKnowledge } from "../../activation/format.js";
 import { config } from "../../config.js";
 import type {
 	Episode,
@@ -478,6 +479,9 @@ export class CodexEpisodeReader implements IEpisodeReader {
 			) {
 				continue;
 			}
+
+			// Drop messages carrying our injected context, checked before truncation.
+			if (containsInjectedKnowledge(text)) continue;
 
 			let truncated = text;
 			if (truncated.length > MAX_MESSAGE_CHARS) {

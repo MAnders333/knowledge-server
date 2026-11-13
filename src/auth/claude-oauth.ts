@@ -23,9 +23,11 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import {
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	readFileSync,
+	renameSync,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -106,8 +108,14 @@ export function loadOAuthTokens(): OAuthTokens | null {
 /** Persist OAuth tokens to disk. File is created with mode 0o600 (user-only). */
 export function saveOAuthTokens(tokens: OAuthTokens): void {
 	const filePath = getOAuthFilePath();
-	mkdirSync(dirname(filePath), { recursive: true });
-	writeFileSync(filePath, JSON.stringify(tokens, null, 2), { mode: 0o600 });
+	mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
+	// Write a sibling temp file, then rename it over the target so a crash or a
+	// full disk never leaves a truncated token file. chmod covers a temp file
+	// left behind by an earlier run (writeFileSync keeps an existing file's mode).
+	const tmpPath = `${filePath}.tmp`;
+	writeFileSync(tmpPath, JSON.stringify(tokens, null, 2), { mode: 0o600 });
+	chmodSync(tmpPath, 0o600);
+	renameSync(tmpPath, filePath);
 }
 
 /** Remove stored OAuth tokens. No-op if the file does not exist. */
@@ -133,6 +141,23 @@ function generateVerifier(): string {
 
 function generateChallenge(verifier: string): string {
 	return base64urlEncode(createHash("sha256").update(verifier).digest());
+}
+
+/**
+ * Access-token lifetime used when the token endpoint omits `expires_in`
+ * (optional in RFC 6749 §5.1). Storing NaN would serialise as null and make
+ * the saved file unloadable, losing the refresh token.
+ */
+const DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 3600;
+
+function expiresAtFrom(expiresIn: number | undefined): number {
+	const valid =
+		typeof expiresIn === "number" &&
+		Number.isFinite(expiresIn) &&
+		expiresIn > 0;
+	return (
+		Date.now() + (valid ? expiresIn : DEFAULT_ACCESS_TOKEN_TTL_SECONDS) * 1000
+	);
 }
 
 // ── Token refresh ─────────────────────────────────────────────────────────────
@@ -167,14 +192,19 @@ export async function refreshTokens(
 	const data = (await response.json()) as {
 		access_token: string;
 		refresh_token?: string;
-		expires_in: number;
+		expires_in?: number;
 	};
+	if (typeof data.access_token !== "string" || !data.access_token) {
+		throw new Error(
+			"Claude OAuth token refresh failed: response has no access_token",
+		);
+	}
 
 	return {
 		access_token: data.access_token,
 		// Some responses omit refresh_token (the existing one stays valid per RFC 6749 §6).
 		refresh_token: data.refresh_token ?? refreshToken,
-		expires_at: Date.now() + data.expires_in * 1000,
+		expires_at: expiresAtFrom(data.expires_in),
 	};
 }
 
@@ -353,12 +383,12 @@ export async function runOAuthFlow(): Promise<OAuthTokens> {
 	const data = (await response.json()) as {
 		access_token: string;
 		refresh_token: string;
-		expires_in: number;
+		expires_in?: number;
 	};
 
 	return {
 		access_token: data.access_token,
 		refresh_token: data.refresh_token,
-		expires_at: Date.now() + data.expires_in * 1000,
+		expires_at: expiresAtFrom(data.expires_in),
 	};
 }

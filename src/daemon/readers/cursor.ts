@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { containsInjectedKnowledge } from "../../activation/format.js";
 import { config } from "../../config.js";
 import type {
 	Episode,
@@ -415,6 +416,7 @@ export class CursorEpisodeReader implements IEpisodeReader {
 			if (turn.type !== 1 && turn.type !== 2) continue;
 			const text = (turn.text ?? "").trim();
 			if (!text) continue;
+			if (containsInjectedKnowledge(text)) continue;
 
 			const messageId = turn.bubbleId ?? `${sessionId}-turn-${i}`;
 			const timestamp =
@@ -516,6 +518,7 @@ export class CursorEpisodeReader implements IEpisodeReader {
 			// Text may live on the bubble or be absent (e.g. tool-only turns)
 			const text = (bubble?.text ?? "").trim();
 			if (!text) continue;
+			if (containsInjectedKnowledge(text)) continue;
 
 			const timestamp =
 				n <= 1

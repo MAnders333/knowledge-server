@@ -211,10 +211,11 @@ export class EmbeddingClient {
 		// Resolve endpoint and key using the priority chain.
 		if (config.embedding.baseURL) {
 			// Dedicated embedding endpoint — use as-is (user provides full base URL).
-			// Key: dedicated embedding key, or generic unified key. Do NOT fall back to
-			// OPENAI_API_KEY here — a custom endpoint (e.g. Ollama) won't accept it.
+			// The key is resolved in config.ts: EMBEDDING_API_KEY, or LLM_API_KEY only
+			// when the endpoint shares LLM_BASE_ENDPOINT's origin. Never OPENAI_API_KEY
+			// here — a custom endpoint (e.g. Ollama) won't accept it.
 			this.endpoint = config.embedding.baseURL;
-			this.apiKey = config.embedding.apiKey || config.llm.apiKey;
+			this.apiKey = config.embedding.apiKey;
 		} else if (config.llm.openai.baseURL) {
 			// Reuse OpenAI-compatible provider base URL + key.
 			this.endpoint = config.llm.openai.baseURL;
@@ -252,12 +253,14 @@ export class EmbeddingClient {
 		timeoutMs: number,
 		batchDims: number | undefined,
 	): Promise<number[][]> {
+		const headers: Record<string, string> = {
+			"Content-Type": "application/json",
+		};
+		// Local endpoints (Ollama, llama.cpp) run without a key: send none rather than "Bearer ".
+		if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
 		const response = await fetch(`${this.endpoint}/embeddings`, {
 			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: `Bearer ${this.apiKey}`,
-			},
+			headers,
 			body: JSON.stringify({
 				model: this.model,
 				input: chunk,

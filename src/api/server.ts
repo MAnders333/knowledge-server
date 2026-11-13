@@ -17,11 +17,7 @@ import {
 	ActivationEventRecorder,
 	hashSessionId,
 } from "../activation/events.js";
-import {
-	contradictionTagBlock,
-	contradictionTagInline,
-	staleTag,
-} from "../activation/format.js";
+import { formatActivatedKnowledge } from "../activation/format.js";
 import { DEFAULT_CONFIG } from "../config-file.js";
 import { REVIEW_STALE_STRENGTH_THRESHOLD, config } from "../config.js";
 import type { ConsolidationEngine } from "../consolidation/consolidate.js";
@@ -35,6 +31,8 @@ import type {
 	KnowledgeStatus,
 } from "../types.js";
 import { withTimeout } from "../utils.js";
+import { buildHostAllowlist } from "./host-allowlist.js";
+import { MAX_BODY_BYTES, boundCues, capText } from "./input-limits.js";
 
 /**
  * HTTP API for the knowledge server.
@@ -96,15 +94,41 @@ export function createApp(
 	activationEvents: ActivationEventRecorder = new ActivationEventRecorder(
 		serverStateDb,
 	),
+	/** Address the server is bound to; always accepted in the Host allow-list. */
+	bindHost = "127.0.0.1",
+	/** Extra Host values (KNOWLEDGE_ALLOWED_HOSTS), each `name` or `name:port`. */
+	extraAllowedHosts: readonly string[] = [],
 ): Hono {
 	const app = new Hono();
+	const allowlist = buildHostAllowlist(bindHost, extraAllowedHosts);
+
+	// Every route, /mcp included, refuses a Host or Origin that does not name this
+	// machine (or an allowed host). This blocks DNS rebinding and cross-origin
+	// browser pages. Browsers always send Host, so a missing Host is refused too.
+	// Non-browser clients that send no Origin are unaffected.
+	app.use("*", async (c, next) => {
+		if (!allowlist.matchesHost(c.req.header("host") ?? "")) {
+			return c.json({ error: "Forbidden: Host not allowed" }, 403);
+		}
+		const origin = c.req.header("origin");
+		if (origin !== undefined && !allowlist.matchesOrigin(origin)) {
+			return c.json({ error: "Forbidden: Origin not allowed" }, 403);
+		}
+		await next();
+	});
+
+	// Body cap for JSON routes. Oversized bodies are rejected before parsing.
+	const jsonBodyLimit = bodyLimit({
+		maxSize: MAX_BODY_BYTES,
+		onError: (c) => c.json({ error: "Payload too large" }, 413),
+	});
 	// Reuse ActivationEngine's EmbeddingClient to avoid a second model connection.
 	const service = new KnowledgeService(db, activation.embeddings);
 
 	// Pre-build a service instance for each readable store so PATCH /entries/:id
 	// can route writes to the correct store without per-request allocation.
 	const serviceByStore = new Map<IKnowledgeStore, KnowledgeService>(
-		readDbs.map((s) => [
+		[...new Set([...readDbs, ...writableDbs])].map((s) => [
 			s,
 			s === db ? service : new KnowledgeService(s, activation.embeddings),
 		]),
@@ -112,108 +136,111 @@ export function createApp(
 
 	// -- /mcp streamable-http transport --
 	//
-	// One stateless transport instance shared across all requests. Stateless mode
-	// is appropriate here because every `activate` call is independent — there is
-	// no conversation state to maintain between MCP requests.
+	// Stateless: every request gets a fresh McpServer and transport. The SDK
+	// refuses to reuse a stateless transport, and a shared server would let
+	// JSON-RPC ids from concurrent clients collide.
 	//
 	// For hosted deployments: set KNOWLEDGE_ADMIN_TOKEN and point MCP clients at
 	// https://your-server.com/mcp with `Authorization: Bearer <token>`.
 	// For local use: no token required (server binds to 127.0.0.1 only).
-	const mcpTransport = new WebStandardStreamableHTTPServerTransport({
-		sessionIdGenerator: undefined, // stateless
-	});
+	const createMcpServer = (): McpServer => {
+		const mcpServer = new McpServer({
+			name: "knowledge-server",
+			version: pkg.version,
+		});
 
-	const mcpServer = new McpServer({
-		name: "knowledge-server",
-		version: pkg.version,
-	});
+		mcpServer.tool(
+			"activate",
+			"Activate associated knowledge by providing cues. Returns knowledge entries that are semantically related to the provided cues. Use this when you need to recall what has been learned from prior sessions about a specific topic. Provide descriptive cues — topics, questions, or keywords — and receive relevant knowledge entries ranked by association strength.",
+			activateInputSchema,
+			async ({ cues, limit, threshold }) => {
+				try {
+					const started = performance.now();
+					const result = await activation.activate(capText(cues), {
+						limit,
+						threshold,
+					});
+					const latencyMs = Math.round(performance.now() - started);
+					const cueStr = Array.isArray(cues) ? cues.join(" | ") : cues;
+					const prompt = Array.isArray(cues)
+						? (cues[cues.length - 1] ?? "")
+						: cues;
+					logActivation("mcp", cueStr, result.entries);
+					recordActivationEvent({
+						client: "mcp",
+						promptChars: prompt.length,
+						result,
+						latencyMs,
+						sessionId: null,
+						clientGaveUp: false,
+					});
 
-	mcpServer.tool(
-		"activate",
-		"Activate associated knowledge by providing cues. Returns knowledge entries that are semantically related to the provided cues. Use this when you need to recall what has been learned from prior sessions about a specific topic. Provide descriptive cues — topics, questions, or keywords — and receive relevant knowledge entries ranked by association strength.",
-		activateInputSchema,
-		async ({ cues, limit, threshold }) => {
-			try {
-				const started = performance.now();
-				const result = await activation.activate(cues, { limit, threshold });
-				const latencyMs = Math.round(performance.now() - started);
-				const cueStr = Array.isArray(cues) ? cues.join(" | ") : cues;
-				const prompt = Array.isArray(cues)
-					? (cues[cues.length - 1] ?? "")
-					: cues;
-				logActivation("mcp", cueStr, result.entries);
-				recordActivationEvent({
-					client: "mcp",
-					promptChars: prompt.length,
-					result,
-					latencyMs,
-					sessionId: null,
-					clientGaveUp: false,
-				});
+					if (result.entries.length === 0) {
+						return {
+							content: [
+								{
+									type: "text" as const,
+									text: "No relevant knowledge found for these cues.",
+								},
+							],
+						};
+					}
 
-				if (result.entries.length === 0) {
+					const formatted = formatActivatedKnowledge(result.entries);
+
+					const conflictCount = result.entries.filter(
+						(r) => r.contradiction,
+					).length;
+					const conflictNote =
+						conflictCount > 0
+							? ` — ${conflictCount} conflicted, do not act on those without clarifying which version is correct`
+							: "";
+
 					return {
 						content: [
 							{
 								type: "text" as const,
-								text: "No relevant knowledge found for these cues.",
+								text: `## Activated Knowledge (${result.entries.length} entries, ${result.totalActive} total active${conflictNote})\n\n${formatted}`,
 							},
 						],
 					};
+				} catch (e) {
+					logger.error("[mcp/activate] Error:", e);
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: `Error activating knowledge: ${e}`,
+							},
+						],
+						isError: true,
+					};
 				}
+			},
+		);
+		return mcpServer;
+	};
 
-				const formatted = result.entries
-					.map(
-						(r, i) =>
-							`${i + 1}. [${r.entry.type}] ${r.entry.content}${staleTag(r.staleness)}${contradictionTagBlock(r.contradiction)}\n` +
-							`   Topics: ${r.entry.topics.join(", ")}\n` +
-							`   Confidence: ${r.entry.confidence} | Semantic match: ${r.rawSimilarity.toFixed(3)} | Score: ${r.similarity.toFixed(3)}`,
-					)
-					.join("\n\n");
-
-				const conflictCount = result.entries.filter(
-					(r) => r.contradiction,
-				).length;
-				const conflictNote =
-					conflictCount > 0
-						? ` — ${conflictCount} conflicted, do not act on those without clarifying which version is correct`
-						: "";
-
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: `## Activated Knowledge (${result.entries.length} entries, ${result.totalActive} total active${conflictNote})\n\n${formatted}`,
-						},
-					],
-				};
-			} catch (e) {
-				logger.error("[mcp/activate] Error:", e);
-				return {
-					content: [
-						{ type: "text" as const, text: `Error activating knowledge: ${e}` },
-					],
-					isError: true,
-				};
-			}
-		},
-	);
-
-	// Connect McpServer to transport (async; safe to fire-and-forget here since
-	// connect() only sets up event listeners and does not block).
-	mcpServer.connect(mcpTransport).catch((e) => {
-		logger.error("[mcp] Failed to connect MCP server to transport:", e);
-	});
-
-	// Route all methods on /mcp to the transport.
 	// Auth: required only when a stable admin token is configured (hosted mode).
-	// In local mode (random per-process token) /mcp is open — the server already
-	// binds to 127.0.0.1 so network access is not a concern.
-	app.all("/mcp", async (c) => {
+	// In local mode (random per-process token) /mcp is open; the server already
+	// binds to loopback and the Host/Origin checks above apply.
+	const mcpHostHeaders = allowlist.sdkHostHeaders(serverPort);
+	app.all("/mcp", jsonBodyLimit, async (c) => {
 		if (adminTokenIsStable && !requireAdminToken(c)) {
 			return c.json({ error: "Unauthorized" }, 401);
 		}
-		return mcpTransport.handleRequest(c.req.raw);
+		const transport = new WebStandardStreamableHTTPServerTransport({
+			sessionIdGenerator: undefined, // stateless
+			enableDnsRebindingProtection: true,
+			allowedHosts: mcpHostHeaders,
+		});
+		const mcpServer = createMcpServer();
+		await mcpServer.connect(transport);
+		const response = await transport.handleRequest(c.req.raw);
+		// The SDK streams JSON-RPC responses; release the server once they are sent.
+		return releaseWhenDone(response, () => {
+			void mcpServer.close();
+		});
 	});
 
 	// -- Auth helper --
@@ -228,6 +255,22 @@ export function createApp(
 		const provided = Buffer.from(auth);
 		if (provided.length !== expectedToken.length) return false;
 		return timingSafeEqual(provided, expectedToken);
+	}
+
+	/**
+	 * Find an entry for a mutating admin route. Only writable stores are searched.
+	 * An entry that exists only in a read-only store yields "read-only" (403)
+	 * instead of being changed.
+	 */
+	async function findWritableEntry(
+		id: string,
+	): Promise<
+		{ entry: KnowledgeEntry; store: IKnowledgeStore } | "read-only" | null
+	> {
+		const found = await findEntryAcrossStores(writableDbs, id);
+		if (found) return found;
+		const inReadOnly = await findEntryAcrossStores(readDbs, id);
+		return inReadOnly ? "read-only" : null;
 	}
 
 	// -- Helpers --
@@ -317,13 +360,16 @@ export function createApp(
 
 	// -- Activation --
 
+	// Access records are written for every returned entry, including for
+	// unauthenticated callers. Gating that is deliberately out of scope here.
 	app.get("/activate", async (c) => {
 		// Accept one or more `q` params (repeated: ?q=seg1&q=seg2&q=full).
 		// Single ?q=... still works — queries() returns a one-element array.
-		const queries = c.req.queries("q");
-		if (!queries || queries.length === 0) {
+		const rawQueries = c.req.queries("q");
+		if (!rawQueries || rawQueries.length === 0) {
 			return c.json({ error: "Missing query parameter 'q'" }, 400);
 		}
+		const queries = boundCues(rawQueries);
 
 		// Optional overrides — callers (plugin, MCP) can tune per their needs.
 		// Defaults come from config so the server admin controls the baseline.
@@ -367,7 +413,12 @@ export function createApp(
 			});
 			// telemetry is internal (content-free measurement); not part of the response.
 			const { telemetry: _telemetry, ...body } = result;
-			return c.json(body);
+			// `context` is the ready-to-inject block. Plugins prefer it over their own
+			// formatting, so the escaping and labelling live in one place (format.ts).
+			return c.json({
+				...body,
+				context: formatActivatedKnowledge(result.entries),
+			});
 		} catch (e) {
 			logger.error("[activate] Error:", e);
 			return c.json({ error: "Internal server error" }, 500);
@@ -591,17 +642,20 @@ export function createApp(
 	// Accepts any subset of: content, topics, confidence, status.
 	// If content or topics change, re-compute the embedding immediately so activation
 	// and reconsolidation continue using a semantically correct vector.
-	app.patch("/entries/:id", async (c) => {
+	app.patch("/entries/:id", jsonBodyLimit, async (c) => {
 		if (!requireAdminToken(c)) {
 			return c.json({ error: "Unauthorized" }, 401);
 		}
 
 		const id = c.req.param("id");
-		const found = await findEntryAcrossStores(readDbs, id);
-		if (!found) {
+		const located = await findWritableEntry(id);
+		if (located === "read-only") {
+			return c.json({ error: "Entry is in a read-only store" }, 403);
+		}
+		if (!located) {
 			return c.json({ error: "Entry not found" }, 404);
 		}
-		const { entry, store: entryStore } = found;
+		const { entry, store: entryStore } = located;
 
 		let body: Record<string, unknown>;
 		try {
@@ -694,17 +748,20 @@ export function createApp(
 	//
 	// The entry must have status='conflicted'. Its counterpart is looked up automatically
 	// via the contradicts relation.
-	app.post("/entries/:id/resolve", async (c) => {
+	app.post("/entries/:id/resolve", jsonBodyLimit, async (c) => {
 		if (!requireAdminToken(c)) {
 			return c.json({ error: "Unauthorized" }, 401);
 		}
 
 		const resolveId = c.req.param("id");
-		const found = await findEntryAcrossStores(readDbs, resolveId);
-		if (!found) {
+		const located = await findWritableEntry(resolveId);
+		if (located === "read-only") {
+			return c.json({ error: "Entry is in a read-only store" }, 403);
+		}
+		if (!located) {
 			return c.json({ error: "Entry not found" }, 404);
 		}
-		const { entry, store: entryStore } = found;
+		const { entry, store: entryStore } = located;
 		if (entry.status !== "conflicted") {
 			return c.json(
 				{ error: `Entry is not conflicted (status: ${entry.status})` },
@@ -875,7 +932,7 @@ export function createApp(
 	//           or  {} on error (Claude Code ignores empty hookSpecificOutput gracefully)
 	app.post(
 		"/hooks/claude-code/user-prompt",
-		bodyLimit({ maxSize: 1 * 1024 * 1024, onError: (c) => c.json({}) }),
+		bodyLimit({ maxSize: MAX_BODY_BYTES, onError: (c) => c.json({}) }),
 		async (c) => {
 			let prompt: string;
 			let sessionIdBody: unknown;
@@ -893,7 +950,7 @@ export function createApp(
 			try {
 				// Split prompt into per-line cues + full prompt holistic cue,
 				// matching the same multi-cue strategy used by the OpenCode plugin.
-				const cues = splitIntoCues(prompt);
+				const cues = boundCues(splitIntoCues(capText(prompt)));
 				const started = performance.now();
 				const result = await activation.activate(cues, { limit: 8 });
 				const latencyMs = Math.round(performance.now() - started);
@@ -914,19 +971,7 @@ export function createApp(
 					return c.json({});
 				}
 
-				// Format activated entries using the same inline style as the passive plugin.
-				const lines = result.entries.map((r) => {
-					const stale = staleTag(r.staleness);
-					const contradiction = contradictionTagInline(r.contradiction);
-					return `- [${r.entry.type}] ${r.entry.content}${stale}${contradiction}`;
-				});
-
-				const additionalContext = [
-					"<addrl-activated-knowledge>",
-					"Relevant knowledge from your knowledge base:",
-					...lines,
-					"</addrl-activated-knowledge>",
-				].join("\n");
+				const additionalContext = formatActivatedKnowledge(result.entries);
 
 				return c.json({
 					hookSpecificOutput: {
@@ -951,11 +996,14 @@ export function createApp(
 		}
 
 		const deleteId = c.req.param("id");
-		const found = await findEntryAcrossStores(readDbs, deleteId);
-		if (!found) {
+		const located = await findWritableEntry(deleteId);
+		if (located === "read-only") {
+			return c.json({ error: "Entry is in a read-only store" }, 403);
+		}
+		if (!located) {
 			return c.json({ error: "Entry not found" }, 404);
 		}
-		const { entry, store: entryStore } = found;
+		const { entry, store: entryStore } = located;
 
 		// If the entry is conflicted, restore its counterpart to active before deleting.
 		// deleteEntry cascades and removes the contradicts relation, which would otherwise
@@ -1082,4 +1130,41 @@ function stripEmbedding(
 ): Omit<KnowledgeEntry, "embedding"> {
 	const { embedding: _embedding, ...rest } = entry;
 	return rest;
+}
+
+/**
+ * Run `onDone` once the response body has been fully streamed or cancelled.
+ * The per-request MCP server must stay alive until its responses are written.
+ */
+function releaseWhenDone(response: Response, onDone: () => void): Response {
+	if (!response.body) {
+		onDone();
+		return response;
+	}
+	const reader = response.body.getReader();
+	const body = new ReadableStream<Uint8Array>({
+		async pull(controller) {
+			try {
+				const { done, value } = await reader.read();
+				if (done) {
+					controller.close();
+					onDone();
+				} else {
+					controller.enqueue(value);
+				}
+			} catch (e) {
+				controller.error(e);
+				onDone();
+			}
+		},
+		cancel(reason) {
+			void reader.cancel(reason);
+			onDone();
+		},
+	});
+	return new Response(body, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: response.headers,
+	});
 }

@@ -5,6 +5,11 @@ import { config } from "../config.js";
 import { approxTokens } from "../daemon/readers/shared.js";
 import type { IKnowledgeStore, IServerStateDB } from "../db/index.js";
 import { logger } from "../logger.js";
+import {
+	formatRedactionCounts,
+	redactSecrets,
+	totalRedactions,
+} from "../redact.js";
 import type {
 	ConsolidationResult,
 	Episode,
@@ -133,6 +138,9 @@ export class ConsolidationEngine {
 	 * next run so partial state does not persist across runs.
 	 */
 	private _lastTouchedStores = new Set<IKnowledgeStore>();
+
+	/** Secret redactions applied during the current run, by kind (counts only). */
+	private _runRedactions: Record<string, number> = {};
 
 	/**
 	 * Concurrency guard — only one consolidation run at a time, regardless of
@@ -270,6 +278,7 @@ export class ConsolidationEngine {
 		// Reset touched stores for this run — accumulates across all source batches.
 		this._lastTouchedStores = new Set();
 		const entryCache = new StoreEntryCache();
+		this._runRedactions = {};
 
 		let totalSessionsProcessed = 0;
 		let totalSegmentsProcessed = 0;
@@ -293,6 +302,13 @@ export class ConsolidationEngine {
 			totalConflictsResolved += sourceTotals.conflictsResolved;
 			for (const s of sourceTotals.touchedStores)
 				this._lastTouchedStores.add(s);
+		}
+
+		const redactedTotal = totalRedactions(this._runRedactions);
+		if (redactedTotal > 0) {
+			logger.log(
+				`[redact] consolidation: redacted ${redactedTotal} value(s) (${formatRedactionCounts(this._runRedactions)})`,
+			);
 		}
 
 		if (totalSessionsProcessed === 0) {
@@ -575,6 +591,18 @@ export class ConsolidationEngine {
 	}
 
 	/**
+	 * Scrub secrets from LLM-produced entry text before it is embedded or stored.
+	 * Counts accumulate in `_runRedactions` and are logged once per run.
+	 */
+	private redactRunText(text: string): string {
+		const result = redactSecrets(text);
+		for (const [kind, n] of Object.entries(result.counts)) {
+			this._runRedactions[kind] = (this._runRedactions[kind] ?? 0) + n;
+		}
+		return result.text;
+	}
+
+	/**
 	 * Process a single chunk of episodes through the two-pass pipeline:
 	 *
 	 * Pass 1 — Extract: call the LLM to extract knowledge entries from the episodes.
@@ -654,11 +682,25 @@ export class ConsolidationEngine {
 			};
 		}
 
+		extracted = extracted.map((entry) => ({
+			...entry,
+			content: this.redactRunText(entry.content),
+		}));
+
 		// ── Pass 2: Dispatch per store ───────────────────────────────────────────
 		// Group extracted entries by their resolved target store. Each entry may have
 		// been assigned a different domain by the LLM — group them now so we load
 		// entriesMap once per store rather than once per entry (or per recursive leaf).
-		const storeGroups = this.groupExtractedByStore(extracted, domainResolution);
+		const { groups: storeGroups, unavailableDomain } =
+			this.groupExtractedByStore(extracted, domainResolution);
+		if (unavailableDomain !== undefined) {
+			// Writing these entries to another store would move them across a domain
+			// boundary, so nothing is written and the chunk waits for a later run.
+			logger.warn(
+				`[consolidation/${source}] Deferring chunk — store for domain "${unavailableDomain}" is unavailable; nothing written, episodes kept for retry.`,
+			);
+			return { outcome: "deferred", ...none };
+		}
 
 		// Use the max message time of the chunk as the session timestamp for new entries.
 		const reduced = chunk.reduce(
@@ -831,27 +873,36 @@ export class ConsolidationEngine {
 	/**
 	 * Group extracted entries by their resolved target store.
 	 *
-	 * Each entry may carry an LLM-assigned domain that overrides the chunk default.
-	 * Returns a Map<store, entries[]> preserving the order entries were assigned to
-	 * each store. The chunk's default store (from domainResolution) is used for
-	 * entries with no domain assignment.
+	 * An entry's LLM-chosen domain is honoured only when it names a configured domain.
+	 * Entries without one use the chunk's path-based default store. An entry whose
+	 * chosen domain is configured but whose store is unavailable is never written to
+	 * another store: the function reports that domain as `unavailableDomain`, and the
+	 * caller defers the whole chunk so it is retried later.
 	 */
 	private groupExtractedByStore(
 		extracted: ExtractedKnowledge[],
 		domainResolution: DomainResolution | null,
-	): Map<IKnowledgeStore, ExtractedKnowledge[]> {
+	): {
+		groups: Map<IKnowledgeStore, ExtractedKnowledge[]>;
+		unavailableDomain?: string;
+	} {
 		const groups = new Map<IKnowledgeStore, ExtractedKnowledge[]>();
 		const domainRouter = this.domainRouter;
+		let unavailableDomain: string | undefined;
 
 		for (const entry of extracted) {
-			// Resolve the target store for this entry (same logic as before,
-			// now centralised here instead of inside the reconsolidate callback).
-			const targetStore =
-				domainResolution && domainRouter
-					? (domainRouter.resolveStore(
-							entry.domain ?? domainResolution.domainId,
-						) ?? domainResolution.store)
-					: this.db;
+			let targetStore: IKnowledgeStore;
+			if (domainResolution && domainRouter) {
+				const choice = domainRouter.resolveEntryDomain(entry.domain);
+				if (choice.status === "unavailable") {
+					unavailableDomain ??= choice.domainId;
+					continue;
+				}
+				targetStore =
+					choice.status === "ok" ? choice.store : domainResolution.store;
+			} else {
+				targetStore = this.db;
+			}
 
 			let group = groups.get(targetStore);
 			if (!group) {
@@ -861,7 +912,7 @@ export class ConsolidationEngine {
 			group.push(entry);
 		}
 
-		return groups;
+		return { groups, unavailableDomain };
 	}
 
 	/**
@@ -1086,23 +1137,20 @@ export class ConsolidationEngine {
 						case "update":
 						case "replace": {
 							const safeType = clampKnowledgeType(decision.type);
+							const content = this.redactRunText(decision.content);
 							const mergeUpdates = {
-								content: decision.content,
+								content,
 								type: safeType,
 								topics: decision.topics,
 								confidence: Math.max(0, Math.min(1, decision.confidence)),
 								additionalSources: sessionIds,
 							};
 							const freshEmbedding = await this.activation.embeddings.embed(
-								formatEmbeddingText(
-									safeType,
-									decision.content,
-									decision.topics ?? [],
-								),
+								formatEmbeddingText(safeType, content, decision.topics ?? []),
 							);
 							await store.mergeEntry(nearest.id, mergeUpdates, freshEmbedding);
 							logger.log(
-								`[consolidation/${source}] ${decision.action === "update" ? "Updated" : "Replaced"}: ${JSON.stringify(nearest.content)} → ${JSON.stringify(decision.content)}`,
+								`[consolidation/${source}] ${decision.action === "update" ? "Updated" : "Replaced"}: ${JSON.stringify(nearest.content)} → ${JSON.stringify(content)}`,
 							);
 							updated++;
 							contradictionCandidates.add(nearest.id);
@@ -1110,7 +1158,7 @@ export class ConsolidationEngine {
 							if (existingCached) {
 								entriesMap.set(nearest.id, {
 									...existingCached,
-									content: decision.content,
+									content,
 									type: safeType as KnowledgeEntry["type"],
 									topics: decision.topics,
 									confidence: mergeUpdates.confidence,

@@ -35,6 +35,71 @@ function parseFloatEnv(
 	return min !== undefined ? Math.max(min, value) : value;
 }
 
+// ── Host allow-list and embedding credentials ────────────────────────────────
+
+/**
+ * Parse KNOWLEDGE_ALLOWED_HOSTS: comma-separated Host header values
+ * (`name` or `name:port`). Entries are trimmed and lower-cased; empty entries
+ * are dropped. Format is validated where the allow-list is built (api/host-allowlist).
+ */
+export function parseAllowedHosts(raw: string | undefined): string[] {
+	return (raw ?? "")
+		.split(",")
+		.map((h) => h.trim().toLowerCase())
+		.filter((h) => h.length > 0);
+}
+
+function originOf(url: string | undefined): string | null {
+	if (!url) return null;
+	try {
+		return new URL(url).origin;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Choose the API key for a dedicated EMBEDDING_BASE_URL.
+ *
+ * EMBEDDING_API_KEY is used when set. LLM_API_KEY is forwarded only when the
+ * embedding endpoint has the same origin as LLM_BASE_ENDPOINT (the same trust
+ * domain). Any other endpoint gets no key, so the generic LLM credential never
+ * leaves its configured provider.
+ */
+export function resolveEmbeddingApiKey(env: {
+	embeddingBaseURL?: string;
+	embeddingApiKey?: string;
+	llmBaseEndpoint?: string;
+	llmApiKey?: string;
+}): string {
+	const dedicated = env.embeddingApiKey?.trim();
+	if (dedicated) return dedicated;
+	const llmKey = env.llmApiKey?.trim();
+	if (!env.embeddingBaseURL || !llmKey) return "";
+	const embeddingOrigin = originOf(env.embeddingBaseURL);
+	return embeddingOrigin !== null &&
+		embeddingOrigin === originOf(env.llmBaseEndpoint)
+		? llmKey
+		: "";
+}
+
+/** True for an http:// URL whose host is not loopback (localhost, 127.0.0.0/8, ::1). */
+function isPlainHttpRemote(url: string): boolean {
+	try {
+		const u = new URL(url);
+		if (u.protocol !== "http:") return false;
+		const h = u.hostname.replace(/^\[|\]$/g, "");
+		return !(
+			h === "localhost" ||
+			h.endsWith(".localhost") ||
+			h === "::1" ||
+			/^127\./.test(h)
+		);
+	} catch {
+		return false;
+	}
+}
+
 // ── Threshold defaults ───────────────────────────────────────────────────────
 // Single source of truth for all similarity-threshold defaults. Calibrated for
 // text-embedding-3-large. Run `knowledge-server calibrate` to find the right
@@ -80,6 +145,13 @@ export const config = {
 	// instead of a random one generated at startup. Useful for scripted/automated use.
 	// Leave unset in production for better security (random token per process lifetime).
 	adminToken: process.env.KNOWLEDGE_ADMIN_TOKEN || null,
+	// Extra Host names accepted by the HTTP API (comma-separated, optional :port).
+	// localhost, 127.0.0.1, [::1] and KNOWLEDGE_HOST are always accepted.
+	allowedHosts: parseAllowedHosts(process.env.KNOWLEDGE_ALLOWED_HOSTS),
+	// Scrub credentials (API keys, tokens, private keys, DB passwords) from
+	// transcript text before it is staged, sent to an LLM/embedding API, or stored.
+	// Set REDACT_SECRETS=false to disable.
+	redactSecrets: process.env.REDACT_SECRETS !== "false",
 
 	// Log file — all operational output is tee'd here in addition to stdout.
 	// Set KNOWLEDGE_LOG_PATH to override; set to "" to disable file logging.
@@ -289,7 +361,12 @@ export const config = {
 	// Example for Ollama: EMBEDDING_BASE_URL=http://localhost:11434/v1
 	embedding: {
 		baseURL: process.env.EMBEDDING_BASE_URL || "",
-		apiKey: process.env.EMBEDDING_API_KEY || "",
+		apiKey: resolveEmbeddingApiKey({
+			embeddingBaseURL: process.env.EMBEDDING_BASE_URL,
+			embeddingApiKey: process.env.EMBEDDING_API_KEY,
+			llmBaseEndpoint: process.env.LLM_BASE_ENDPOINT,
+			llmApiKey: process.env.LLM_API_KEY,
+		}),
 		model: process.env.EMBEDDING_MODEL || "text-embedding-3-large",
 		// Only defined when EMBEDDING_DIMENSIONS is explicitly set.
 		// Forwarded to the API only when present — the `dimensions` parameter is
@@ -540,6 +617,7 @@ export function resolveEnvFilePath(): string {
 // Update these if the template values in install.sh change.
 const PLACEHOLDER_API_KEY = "your-api-key-here";
 const PLACEHOLDER_ENDPOINT = "https://your-llm-endpoint.example.com";
+const PLACEHOLDER_ADMIN_TOKEN = "your-stable-token-here";
 
 export function validateConfig(): string[] {
 	const errors: string[] = [];
@@ -623,11 +701,7 @@ export function validateConfig(): string[] {
 	// Affected setup: Ollama embeddings + cloud LLM where OPENAI_API_KEY is not set
 	// and LLM_API_KEY is the cloud provider key (not an OpenAI-compatible key).
 	if (config.embedding.baseURL) {
-		const embeddingApiKey =
-			config.embedding.apiKey?.trim() ||
-			config.llm.openai.apiKey?.trim() ||
-			config.llm.apiKey?.trim() ||
-			"";
+		const embeddingApiKey = config.embedding.apiKey?.trim() || "";
 		if (!embeddingApiKey || embeddingApiKey === PLACEHOLDER_API_KEY) {
 			// Warn rather than error — local endpoints (Ollama, llama.cpp) don't
 			// require authentication and will work without a key. Cloud-hosted
@@ -638,6 +712,11 @@ export function validateConfig(): string[] {
 					"Local endpoints (Ollama, llama.cpp) work without a key — this warning can be ignored.",
 			);
 		}
+		if (isPlainHttpRemote(config.embedding.baseURL)) {
+			console.warn(
+				"[config] EMBEDDING_BASE_URL uses plain http on a non-loopback host; embedding text and API keys cross the network unencrypted. Use https.",
+			);
+		}
 	}
 
 	// Enforce a minimum token length when a fixed admin token is configured.
@@ -645,10 +724,16 @@ export function validateConfig(): string[] {
 	// of a random hex string gives ~64 bits of entropy, a reasonable lower bound.
 	// Random startup-generated tokens (24 bytes → 48 hex chars, ~192 bits) always pass.
 	// Prefer at least 24 hex chars (openssl rand -hex 24) for a stronger guarantee.
-	if (config.adminToken !== null && config.adminToken.length < 16) {
-		errors.push(
-			"KNOWLEDGE_ADMIN_TOKEN must be at least 16 characters. Use a long random value (e.g. openssl rand -hex 24).",
-		);
+	if (config.adminToken !== null) {
+		if (config.adminToken.length < 16) {
+			errors.push(
+				"KNOWLEDGE_ADMIN_TOKEN must be at least 16 characters. Use a long random value (e.g. openssl rand -hex 24).",
+			);
+		} else if (config.adminToken === PLACEHOLDER_ADMIN_TOKEN) {
+			errors.push(
+				"KNOWLEDGE_ADMIN_TOKEN is still the template placeholder. Replace it with a long random value (e.g. openssl rand -hex 24).",
+			);
+		}
 	}
 
 	// Note: loopback-host validation is done post-registry in index.ts because

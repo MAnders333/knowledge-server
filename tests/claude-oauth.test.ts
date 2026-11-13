@@ -16,7 +16,15 @@
  * Originally implemented by Dennis Paul (PR #66).
  */
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -289,6 +297,82 @@ describe("refreshTokens", () => {
 			const result = await refreshTokens("original-rt");
 			expect(result.refresh_token).toBe("original-rt");
 			expect(result.access_token).toBe("new-at");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+});
+
+// ── saveOAuthTokens: atomic write and file mode ───────────────────────────────
+
+describe("saveOAuthTokens file handling", () => {
+	it("writes 0600 with no temp file left behind", async () => {
+		const { saveOAuthTokens } = await getOAuth();
+		saveOAuthTokens({
+			access_token: "at",
+			refresh_token: "rt",
+			expires_at: Date.now() + 120_000,
+		});
+		const filePath = join(tempDir, "knowledge-server", "claude-oauth.json");
+		expect(statSync(filePath).mode & 0o777).toBe(0o600);
+		expect(existsSync(`${filePath}.tmp`)).toBe(false);
+	});
+
+	it("tightens the mode of an existing world-readable token file", async () => {
+		const { saveOAuthTokens } = await getOAuth();
+		const dir = join(tempDir, "knowledge-server");
+		mkdirSync(dir, { recursive: true });
+		const filePath = join(dir, "claude-oauth.json");
+		writeFileSync(filePath, "{}", { mode: 0o644 });
+		chmodSync(filePath, 0o644);
+
+		saveOAuthTokens({
+			access_token: "at",
+			refresh_token: "rt",
+			expires_at: Date.now() + 120_000,
+		});
+		expect(statSync(filePath).mode & 0o777).toBe(0o600);
+	});
+});
+
+// ── refreshTokens: optional expires_in and response validation ────────────────
+
+describe("refreshTokens response handling", () => {
+	it("stores a finite expiry and keeps the refresh token when expires_in is absent", async () => {
+		const { refreshTokens, saveOAuthTokens, loadOAuthTokens } =
+			await getOAuth();
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = async () =>
+			new Response(JSON.stringify({ access_token: "new-at" }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		try {
+			const before = Date.now();
+			const refreshed = await refreshTokens("kept-rt");
+			expect(Number.isFinite(refreshed.expires_at)).toBe(true);
+			expect(refreshed.expires_at).toBeGreaterThan(before);
+			expect(refreshed.refresh_token).toBe("kept-rt");
+
+			saveOAuthTokens(refreshed);
+			const reloaded = loadOAuthTokens();
+			expect(reloaded?.refresh_token).toBe("kept-rt");
+			expect(reloaded?.access_token).toBe("new-at");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it("rejects a response without an access token", async () => {
+		const { refreshTokens } = await getOAuth();
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = async () =>
+			new Response(JSON.stringify({ expires_in: 3600 }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		try {
+			await expect(refreshTokens("rt")).rejects.toThrow(/no access_token/);
 		} finally {
 			globalThis.fetch = originalFetch;
 		}

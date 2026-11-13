@@ -262,7 +262,8 @@ export interface IEpisodeReader {
  */
 export interface EpisodeMessage {
 	messageId: string; // stable UUID from OpenCode DB — used to key episode ranges
-	role: "user" | "assistant";
+	/** "tool" marks tool output: third-party text, never a user turn. */
+	role: "user" | "assistant" | "tool";
 	content: string;
 	timestamp: number;
 }

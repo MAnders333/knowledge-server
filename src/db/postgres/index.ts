@@ -21,6 +21,8 @@ import {
 } from "./embedding-codec.js";
 import { PG_MIGRATIONS } from "./migrations.js";
 import { PG_CREATE_TABLES, SCHEMA_VERSION } from "./schema.js";
+import type { PostgresTlsConfig } from "./tls.js";
+import { resolvePostgresTls, warnNoTlsOnce } from "./tls.js";
 
 /**
  * TypeScript's `Omit` on interfaces strips call signatures.
@@ -189,8 +191,8 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	 */
 	private efSearchUnsupported = false;
 
-	/** Connection string, reused for the dedicated schema-lock connection. */
-	private readonly connectionUri: string;
+	/** TLS-resolved connection settings, reused for the dedicated schema-lock connection. */
+	private readonly tls: PostgresTlsConfig;
 
 	/**
 	 * @param connectionUri  Full postgres:// connection string.
@@ -205,8 +207,11 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			return Number.isNaN(v) || v < 1 ? 10 : v;
 		})(),
 	) {
-		this.connectionUri = connectionUri;
-		this.sql = postgres(connectionUri, {
+		const tls = resolvePostgresTls(connectionUri);
+		warnNoTlsOnce(tls.warnNoTls);
+		this.tls = tls;
+		this.sql = postgres(tls.uri, {
+			...(tls.ssl ? { ssl: tls.ssl } : {}),
 			max: poolMax,
 			// idle_timeout is intentionally disabled (0 = no timeout).
 			// The advisory lock acquired by tryAcquireConsolidationLock() is
@@ -352,7 +357,8 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	 * if the process dies mid-migration.
 	 */
 	private async withSchemaLock(fn: () => Promise<void>): Promise<void> {
-		const lockSql = postgres(this.connectionUri, {
+		const lockSql = postgres(this.tls.uri, {
+			...(this.tls.ssl ? { ssl: this.tls.ssl } : {}),
 			max: 1,
 			idle_timeout: 0,
 			connect_timeout: 10,

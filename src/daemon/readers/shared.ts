@@ -77,10 +77,19 @@ export function chunkByTokenBudget(
 	return chunks;
 }
 
+/** Label per role. Tool output is marked as third-party so it is never read as a user turn. */
+const ROLE_LABELS: Record<EpisodeMessage["role"], string> = {
+	user: "user",
+	assistant: "assistant",
+	tool: "tool output (third-party text)",
+};
+
 /**
  * Format messages into a plain-text block for LLM extraction.
  * Per-message size is bounded by MAX_MESSAGE_CHARS applied by the callers.
  */
 export function formatMessages(messages: EpisodeMessage[]): string {
-	return messages.map((m) => `  ${m.role}: ${m.content}`).join("\n");
+	return messages
+		.map((m) => `  ${ROLE_LABELS[m.role]}: ${m.content}`)
+		.join("\n");
 }

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Hono } from "hono";
 // @ts-ignore — Bun supports JSON imports natively
 import pkg from "../package.json" with { type: "json" };
 import { ActivationEngine } from "../src/activation/activate";
@@ -37,6 +38,34 @@ describe("HTTP API", () => {
 	let embedSpy: ReturnType<typeof spyOn>;
 
 	let serverStateDb: ServerStateDB;
+
+	/** Requests carry a loopback Host, as a real client would send. */
+	function withHostHeader(target: Hono) {
+		return {
+			request: (path: string, init: RequestInit = {}) =>
+				target.request(path, {
+					...init,
+					headers: {
+						Host: "127.0.0.1:3179",
+						...(init.headers as Record<string, string>),
+					},
+				}),
+		};
+	}
+
+	/** Requests carry a loopback Host, as a real client would send. */
+	function request(
+		path: string,
+		init: RequestInit = {},
+	): Response | Promise<Response> {
+		return app.request(path, {
+			...init,
+			headers: {
+				Host: "127.0.0.1:3179",
+				...(init.headers as Record<string, string>),
+			},
+		});
+	}
 
 	beforeEach(() => {
 		tempDir = mkdtempSync(join(tmpdir(), "knowledge-api-test-"));
@@ -83,7 +112,7 @@ describe("HTTP API", () => {
 	});
 
 	it("GET /status should return server info without config when unauthenticated", async () => {
-		const res = await app.request("/status");
+		const res = await request("/status");
 		expect(res.status).toBe(200);
 
 		const data = await res.json();
@@ -96,7 +125,7 @@ describe("HTTP API", () => {
 	});
 
 	it("GET /status should include config block when authenticated", async () => {
-		const res = await app.request("/status", {
+		const res = await request("/status", {
 			headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
 		});
 		expect(res.status).toBe(200);
@@ -109,7 +138,7 @@ describe("HTTP API", () => {
 	});
 
 	it("GET /entries should return empty list initially", async () => {
-		const res = await app.request("/entries");
+		const res = await request("/entries");
 		expect(res.status).toBe(200);
 
 		const data = await res.json();
@@ -138,7 +167,7 @@ describe("HTTP API", () => {
 			embedding: [0.1, 0.2, 0.3],
 		});
 
-		const res = await app.request("/entries");
+		const res = await request("/entries");
 		const data = await res.json();
 		expect(data.count).toBe(1);
 		expect(data.entries[0].content).toBe("Test fact");
@@ -169,7 +198,7 @@ describe("HTTP API", () => {
 		await db.insertEntry(makeEntry("f1", "active"));
 		await db.insertEntry(makeEntry("f2", "archived"));
 
-		const activeRes = await app.request("/entries?status=active");
+		const activeRes = await request("/entries?status=active");
 		const activeData = await activeRes.json();
 		expect(activeData.count).toBe(1);
 		expect(activeData.entries[0].id).toBe("f1");
@@ -195,7 +224,7 @@ describe("HTTP API", () => {
 			derivedFrom: [],
 		});
 
-		const res = await app.request("/entries/specific-1");
+		const res = await request("/entries/specific-1");
 		expect(res.status).toBe(200);
 
 		const data = await res.json();
@@ -204,17 +233,17 @@ describe("HTTP API", () => {
 	});
 
 	it("GET /entries/:id should return 404 for unknown", async () => {
-		const res = await app.request("/entries/nonexistent");
+		const res = await request("/entries/nonexistent");
 		expect(res.status).toBe(404);
 	});
 
 	it("GET /activate should require query parameter", async () => {
-		const res = await app.request("/activate");
+		const res = await request("/activate");
 		expect(res.status).toBe(400);
 	});
 
 	it("GET /activate with single q param returns 200", async () => {
-		const res = await app.request("/activate?q=test+query");
+		const res = await request("/activate?q=test+query");
 		// No entries in DB and no real embedding client — engine returns empty list
 		// but should not error (empty knowledge base is a valid state).
 		// The real embedding call will fail without a live server, so we just check
@@ -226,7 +255,7 @@ describe("HTTP API", () => {
 
 	it("GET /activate with repeated q params passes all to engine", async () => {
 		// Verify the endpoint accepts multiple q values without a 400/404.
-		const res = await app.request(
+		const res = await request(
 			"/activate?q=first+topic&q=second+topic&q=full+message",
 		);
 		expect(res.status).not.toBe(404);
@@ -234,7 +263,7 @@ describe("HTTP API", () => {
 	});
 
 	it("GET /review should return review data", async () => {
-		const res = await app.request("/review");
+		const res = await request("/review");
 		expect(res.status).toBe(200);
 
 		const data = await res.json();
@@ -244,12 +273,12 @@ describe("HTTP API", () => {
 	});
 
 	it("POST /consolidate should return 401 without token", async () => {
-		const res = await app.request("/consolidate", { method: "POST" });
+		const res = await request("/consolidate", { method: "POST" });
 		expect(res.status).toBe(401);
 	});
 
 	it("POST /consolidate should return 401 with wrong token", async () => {
-		const res = await app.request("/consolidate", {
+		const res = await request("/consolidate", {
 			method: "POST",
 			headers: { Authorization: "Bearer wrong-token" },
 		});
@@ -257,7 +286,7 @@ describe("HTTP API", () => {
 	});
 
 	it("POST /consolidate should succeed with correct token", async () => {
-		const res = await app.request("/consolidate", {
+		const res = await request("/consolidate", {
 			method: "POST",
 			headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
 		});
@@ -288,7 +317,7 @@ describe("HTTP API", () => {
 				busyConsolidation,
 				TEST_ADMIN_TOKEN,
 			);
-			const res = await busyApp.request("/consolidate", {
+			const res = await withHostHeader(busyApp).request("/consolidate", {
 				method: "POST",
 				headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
 			});
@@ -300,14 +329,14 @@ describe("HTTP API", () => {
 	});
 
 	it("POST /reinitialize should return 401 without token", async () => {
-		const res = await app.request("/reinitialize?confirm=yes", {
+		const res = await request("/reinitialize?confirm=yes", {
 			method: "POST",
 		});
 		expect(res.status).toBe(401);
 	});
 
 	it("POST /reinitialize should require confirm=yes even with token", async () => {
-		const res = await app.request("/reinitialize", {
+		const res = await request("/reinitialize", {
 			method: "POST",
 			headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
 		});
@@ -315,7 +344,7 @@ describe("HTTP API", () => {
 	});
 
 	it("POST /reinitialize should succeed with token and confirm=yes", async () => {
-		const res = await app.request("/reinitialize?confirm=yes", {
+		const res = await request("/reinitialize?confirm=yes", {
 			method: "POST",
 			headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
 		});
@@ -327,7 +356,7 @@ describe("HTTP API", () => {
 	// -- PATCH /entries/:id --
 
 	it("PATCH /entries/:id should return 401 without token", async () => {
-		const res = await app.request("/entries/nonexistent", {
+		const res = await request("/entries/nonexistent", {
 			method: "PATCH",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ content: "new" }),
@@ -336,7 +365,7 @@ describe("HTTP API", () => {
 	});
 
 	it("PATCH /entries/:id should return 404 for unknown entry", async () => {
-		const res = await app.request("/entries/nonexistent", {
+		const res = await request("/entries/nonexistent", {
 			method: "PATCH",
 			headers: {
 				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
@@ -366,7 +395,7 @@ describe("HTTP API", () => {
 			derivedFrom: [],
 		});
 
-		const res = await app.request("/entries/patch-test", {
+		const res = await request("/entries/patch-test", {
 			method: "PATCH",
 			headers: {
 				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
@@ -411,7 +440,7 @@ describe("HTTP API", () => {
 
 		embedSpy.mockResolvedValue([0.44, 0.55, 0.66]);
 
-		const res = await app.request("/entries/patch-topics", {
+		const res = await request("/entries/patch-topics", {
 			method: "PATCH",
 			headers: {
 				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
@@ -445,7 +474,7 @@ describe("HTTP API", () => {
 			derivedFrom: [],
 		});
 
-		const res = await app.request("/entries/patch-noop", {
+		const res = await request("/entries/patch-noop", {
 			method: "PATCH",
 			headers: {
 				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
@@ -459,12 +488,12 @@ describe("HTTP API", () => {
 	// -- DELETE /entries/:id --
 
 	it("DELETE /entries/:id should return 401 without token", async () => {
-		const res = await app.request("/entries/nonexistent", { method: "DELETE" });
+		const res = await request("/entries/nonexistent", { method: "DELETE" });
 		expect(res.status).toBe(401);
 	});
 
 	it("DELETE /entries/:id should return 404 for unknown entry", async () => {
-		const res = await app.request("/entries/nonexistent", {
+		const res = await request("/entries/nonexistent", {
 			method: "DELETE",
 			headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
 		});
@@ -490,7 +519,7 @@ describe("HTTP API", () => {
 			derivedFrom: [],
 		});
 
-		const res = await app.request("/entries/delete-test", {
+		const res = await request("/entries/delete-test", {
 			method: "DELETE",
 			headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
 		});
@@ -500,14 +529,14 @@ describe("HTTP API", () => {
 		expect(data.deleted).toBe("delete-test");
 
 		// Verify it's gone
-		const check = await app.request("/entries/delete-test");
+		const check = await request("/entries/delete-test");
 		expect(check.status).toBe(404);
 	});
 
 	// -- POST /entries/:id/resolve --
 
 	it("POST /entries/:id/resolve should return 401 without token", async () => {
-		const res = await app.request("/entries/nonexistent/resolve", {
+		const res = await request("/entries/nonexistent/resolve", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ resolution: "supersede_other" }),
@@ -516,7 +545,7 @@ describe("HTTP API", () => {
 	});
 
 	it("POST /entries/:id/resolve should return 404 for unknown entry", async () => {
-		const res = await app.request("/entries/nonexistent/resolve", {
+		const res = await request("/entries/nonexistent/resolve", {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
@@ -546,7 +575,7 @@ describe("HTTP API", () => {
 			derivedFrom: [],
 		});
 
-		const res = await app.request("/entries/not-conflicted/resolve", {
+		const res = await request("/entries/not-conflicted/resolve", {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
@@ -576,7 +605,7 @@ describe("HTTP API", () => {
 			derivedFrom: [],
 		});
 
-		const res = await app.request("/entries/conflicted-del/resolve", {
+		const res = await request("/entries/conflicted-del/resolve", {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
@@ -609,7 +638,7 @@ describe("HTTP API", () => {
 			derivedFrom: [],
 		});
 
-		const res = await app.request("/entries/conflicted-bad/resolve", {
+		const res = await request("/entries/conflicted-bad/resolve", {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
@@ -737,7 +766,7 @@ describe("HTTP API", () => {
 				const body: Record<string, string> = { resolution };
 				if (resolution === "merge") body.mergedContent = "merged text";
 
-				const res = await crossStoreApp.request(
+				const res = await withHostHeader(crossStoreApp).request(
 					"/entries/cross-store-entry/resolve",
 					{
 						method: "POST",
@@ -754,9 +783,12 @@ describe("HTTP API", () => {
 			}
 
 			// The entry should remain untouched — not deleted, still conflicted
-			const check = await crossStoreApp.request("/entries/cross-store-entry", {
-				headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
-			});
+			const check = await withHostHeader(crossStoreApp).request(
+				"/entries/cross-store-entry",
+				{
+					headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
+				},
+			);
 			expect(check.status).toBe(200);
 			const checkData = await check.json();
 			expect(checkData.entry.status).toBe("conflicted");
@@ -804,7 +836,7 @@ describe("HTTP API", () => {
 			contradicts("res-rel-1", "res-conflicted-a", "res-archived-b"),
 		);
 
-		const res = await app.request("/entries/res-conflicted-a/resolve", {
+		const res = await request("/entries/res-conflicted-a/resolve", {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
@@ -825,7 +857,7 @@ describe("HTTP API", () => {
 			contradicts("res-rel-2", "res-conflicted-c", "res-conflicted-b"),
 		);
 
-		const res = await app.request("/entries/res-conflicted-c/resolve", {
+		const res = await request("/entries/res-conflicted-c/resolve", {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
@@ -846,7 +878,7 @@ describe("HTTP API", () => {
 			contradicts("del-rel-1", "del-conflicted-a", "del-archived-b"),
 		);
 
-		const res = await app.request("/entries/del-conflicted-a", {
+		const res = await request("/entries/del-conflicted-a", {
 			method: "DELETE",
 			headers: { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` },
 		});
@@ -861,7 +893,7 @@ describe("HTTP API", () => {
 		await db.insertEntry(revivalEntry("patch-stale", "archived", [9, 9, 9]));
 		embedSpy.mockClear();
 
-		const res = await app.request("/entries/patch-stale", {
+		const res = await request("/entries/patch-stale", {
 			method: "PATCH",
 			headers: {
 				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
@@ -882,7 +914,7 @@ describe("HTTP API", () => {
 		await db.insertEntry(revivalEntry("patch-null", "tombstoned"));
 		embedSpy.mockClear();
 
-		const res = await app.request("/entries/patch-null", {
+		const res = await request("/entries/patch-null", {
 			method: "PATCH",
 			headers: {
 				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,
@@ -904,7 +936,7 @@ describe("HTTP API", () => {
 		);
 		embedSpy.mockClear();
 
-		const res = await app.request("/entries/patch-fresh", {
+		const res = await request("/entries/patch-fresh", {
 			method: "PATCH",
 			headers: {
 				Authorization: `Bearer ${TEST_ADMIN_TOKEN}`,

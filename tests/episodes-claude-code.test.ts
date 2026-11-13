@@ -958,3 +958,179 @@ describe("ClaudeCodeEpisodeReader — edge cases", () => {
 		expect(candidates[0].id).toBe(SESSION_UUID);
 	});
 });
+
+// ── Injected knowledge guard ──────────────────────────────────────────────────
+
+const INJECTED_BLOCK = [
+	"<addrl-activated-knowledge>",
+	"## Recalled Knowledge (from prior sessions)",
+	"- [fact] Deploys go out on Thursdays",
+	"</addrl-activated-knowledge>",
+].join("\n");
+
+/** Write a session whose first record is `first`, then four plain messages. */
+function sessionStartingWith(first: {
+	role: "user" | "assistant";
+	content: string | object[];
+}): void {
+	writeSession([
+		msgRecord({
+			uuid: "m1",
+			role: first.role,
+			timestamp: ts(BASE, 0),
+			content: first.content,
+		}),
+		msgRecord({
+			uuid: "m2",
+			role: "user",
+			timestamp: ts(BASE, 1000),
+			content: "question one",
+		}),
+		msgRecord({
+			uuid: "m3",
+			role: "assistant",
+			timestamp: ts(BASE, 2000),
+			content: "answer one",
+		}),
+		msgRecord({
+			uuid: "m4",
+			role: "user",
+			timestamp: ts(BASE, 3000),
+			content: "question two",
+		}),
+		msgRecord({
+			uuid: "m5",
+			role: "assistant",
+			timestamp: ts(BASE, 4000),
+			content: "answer two",
+		}),
+	]);
+}
+
+describe("ClaudeCodeEpisodeReader — injected knowledge guard", () => {
+	it("drops a user message that carries the injected block", () => {
+		sessionStartingWith({
+			role: "user",
+			content: [{ type: "text", text: `Context follows.\n${INJECTED_BLOCK}` }],
+		});
+
+		const episodes = reader.getNewEpisodes([SESSION_UUID], new Map());
+		expect(episodes).toHaveLength(1);
+		expect(episodes[0].content).not.toContain("addrl-activated-knowledge");
+		expect(episodes[0].content).not.toContain("Deploys go out on Thursdays");
+		expect(episodes[0].content).toContain("question one");
+	});
+
+	it("drops an assistant message that quotes the injected tag", () => {
+		sessionStartingWith({
+			role: "assistant",
+			content:
+				"The block opens with <addrl-activated-knowledge> and closes with </addrl-activated-knowledge>.",
+		});
+
+		const episodes = reader.getNewEpisodes([SESSION_UUID], new Map());
+		expect(episodes).toHaveLength(1);
+		expect(episodes[0].content).not.toContain("addrl-activated-knowledge");
+		expect(episodes[0].content).toContain("answer two");
+	});
+
+	it("drops a user message whose injected block sits past 60K characters", () => {
+		sessionStartingWith({
+			role: "user",
+			content: `${"x".repeat(60_000)}\n${INJECTED_BLOCK}`,
+		});
+
+		const episodes = reader.getNewEpisodes([SESSION_UUID], new Map());
+		expect(episodes).toHaveLength(1);
+		expect(episodes[0].content).not.toContain("[...truncated]");
+		expect(episodes[0].content).not.toContain("xxxx");
+		expect(episodes[0].content).toContain("question one");
+	});
+
+	it("drops an assistant message whose injected block sits past 60K characters", () => {
+		sessionStartingWith({
+			role: "assistant",
+			content: `${"x".repeat(60_000)}\n${INJECTED_BLOCK}`,
+		});
+
+		const episodes = reader.getNewEpisodes([SESSION_UUID], new Map());
+		expect(episodes).toHaveLength(1);
+		expect(episodes[0].content).not.toContain("[...truncated]");
+		expect(episodes[0].content).not.toContain("xxxx");
+		expect(episodes[0].content).toContain("question one");
+	});
+
+	it("keeps ordinary messages unchanged", () => {
+		sessionStartingWith({ role: "user", content: "plain first message" });
+
+		const episodes = reader.getNewEpisodes([SESSION_UUID], new Map());
+		expect(episodes).toHaveLength(1);
+		expect(episodes[0].content).toContain("  user: plain first message");
+		expect(episodes[0].content).toContain("  assistant: answer one");
+	});
+});
+
+describe("ClaudeCodeEpisodeReader — tool-only user records", () => {
+	it("labels a user record that carries only tool output as tool output", () => {
+		const originalAllowlist = config.consolidation.includeToolOutputs;
+		config.consolidation.includeToolOutputs = ["allowlisted_tool"];
+		try {
+			writeSession([
+				msgRecord({
+					uuid: "m1",
+					role: "assistant",
+					timestamp: ts(BASE, 0),
+					content: [
+						{
+							type: "tool_use",
+							id: "tu-1",
+							name: "allowlisted_tool",
+							input: {},
+						},
+					],
+				}),
+				msgRecord({
+					uuid: "m2",
+					role: "user",
+					timestamp: ts(BASE, 1000),
+					content: [
+						{
+							type: "tool_result",
+							tool_use_id: "tu-1",
+							content: "TOOL ONLY OUTPUT",
+						},
+					],
+				}),
+				msgRecord({
+					uuid: "m3",
+					role: "assistant",
+					timestamp: ts(BASE, 2000),
+					content: "Done.",
+				}),
+				msgRecord({
+					uuid: "m4",
+					role: "user",
+					timestamp: ts(BASE, 3000),
+					content: "Thanks.",
+				}),
+				msgRecord({
+					uuid: "m5",
+					role: "assistant",
+					timestamp: ts(BASE, 4000),
+					content: "ok",
+				}),
+			]);
+
+			const episodes = reader.getNewEpisodes([SESSION_UUID], new Map());
+			expect(episodes).toHaveLength(1);
+			expect(episodes[0].content).toContain(
+				"tool output (third-party text): [tool: allowlisted_tool]\nTOOL ONLY OUTPUT",
+			);
+			expect(episodes[0].content).not.toContain(
+				"user: [tool: allowlisted_tool]",
+			);
+		} finally {
+			config.consolidation.includeToolOutputs = originalAllowlist;
+		}
+	});
+});
