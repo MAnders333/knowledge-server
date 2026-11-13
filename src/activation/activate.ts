@@ -423,8 +423,8 @@ export class ActivationEngine {
 	 * deduplicated, filtered by threshold, and ranked — so a multi-topic message
 	 * retrieves relevant knowledge for every topic, not just the dominant one.
 	 *
-	 * The stages run in this order. stages.ts holds the ones that read no store:
-	 * retrieval, rerank, precision gate, sort and drop what cannot be injected,
+	 * The stages run in this order. Retrieval reads the stores and stays here;
+	 * stages.ts holds the ones that read no store: rerank, precision gate, sort and drop what cannot be injected,
 	 * session dedupe and rank cap, support sources, contradiction annotations,
 	 * render budget.
 	 *
