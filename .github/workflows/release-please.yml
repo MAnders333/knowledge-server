@@ -24,6 +24,7 @@ jobs:
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
       pull-requests: write
@@ -75,7 +76,20 @@ jobs:
           - os: macos-latest
             suffix: darwin-arm64
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
+      - name: Refuse to build a commit that CI did not validate
+        # release-please tags the commit it released (outputs.sha). Only the commit CI
+        # validated (workflow_run.head_sha) may be built and published. Otherwise the
+        # build fails, and the release stays a draft.
+        env:
+          VALIDATED_SHA: ${{ github.event.workflow_run.head_sha }}
+          RELEASE_SHA: ${{ needs.release-please.outputs.sha }}
+        run: |
+          if [ "$RELEASE_SHA" != "$VALIDATED_SHA" ]; then
+            echo "::error::release commit $RELEASE_SHA is not the CI-validated commit $VALIDATED_SHA; not building."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Build the commit release-please tagged, not whatever main points at now.
@@ -204,6 +218,7 @@ jobs:
     needs: [release-please, build-binaries]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     env:

@@ -12,6 +12,7 @@ interface Step {
 	id?: string;
 	uses?: string;
 	run?: string;
+	env?: Record<string, string>;
 	with?: Record<string, string>;
 }
 interface Job {
@@ -220,5 +221,65 @@ describe("release workflow concurrency", () => {
 		expect(releaseJob).toContain(
 			"concurrency:\n      group: release-please\n      cancel-in-progress: false",
 		);
+	});
+});
+
+describe("workflow job timeouts", () => {
+	// Expected limits per job. Every job in every workflow must set one.
+	const expected: Record<string, Record<string, number>> = {
+		"ci.yml": { check: 30 },
+		"bun-advisories.yml": { check: 10 },
+		"release-please.yml": {
+			"release-please": 15,
+			"build-binaries": 30,
+			publish: 15,
+		},
+	};
+
+	for (const [file, jobs] of Object.entries(expected)) {
+		it(`${file}: every job sets timeout-minutes to its limit`, () => {
+			const wf = Bun.YAML.parse(read(`.github/workflows/${file}`)) as Record<
+				string,
+				Record<string, { "timeout-minutes"?: number }>
+			>;
+			const found = Object.fromEntries(
+				Object.entries(wf.jobs).map(([name, job]) => [
+					name,
+					job["timeout-minutes"],
+				]),
+			);
+			expect(found).toEqual(jobs);
+		});
+	}
+});
+
+describe("release build validates the commit it builds", () => {
+	const wf = workflow(".github/workflows/release-please.yml");
+	const build = wf.jobs["build-binaries"] as Job;
+	const guardIndex = build.steps.findIndex(
+		(s) => s.name === "Refuse to build a commit that CI did not validate",
+	);
+	const checkoutIndex = build.steps.findIndex((s) =>
+		s.uses?.startsWith("actions/checkout@"),
+	);
+	const guard = build.steps[guardIndex];
+
+	it("runs the guard before the checkout of the release commit", () => {
+		expect(guardIndex).toBeGreaterThanOrEqual(0);
+		expect(guardIndex).toBeLessThan(checkoutIndex);
+	});
+
+	it("compares the release commit to the CI-validated head SHA and fails on mismatch", () => {
+		expect(guard?.env).toEqual({
+			VALIDATED_SHA: "${{ github.event.workflow_run.head_sha }}",
+			RELEASE_SHA: "${{ needs.release-please.outputs.sha }}",
+		});
+		expect(guard?.run).toContain('[ "$RELEASE_SHA" != "$VALIDATED_SHA" ]');
+		expect(guard?.run).toContain("exit 1");
+	});
+
+	it("checks out the release commit the guard validated", () => {
+		const checkout = build.steps[checkoutIndex];
+		expect(checkout?.with?.ref).toBe("${{ needs.release-please.outputs.sha }}");
 	});
 });
