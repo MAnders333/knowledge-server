@@ -62,6 +62,12 @@ Every downloaded file is checked against the release's `SHA256SUMS` before anyth
 
 Releases published before plugin and command files were checksummed (their `SHA256SUMS` has no `knowledge.ts` entry) cannot be installed with `update --version` or `install.sh --version`; both stop with a message. To roll back an update, use the `*.prev` binaries it kept.
 
+### Upgrade notes
+
+- **Upgrade the server and the daemon together.** The state DB schema is now v6, and older builds refuse a v6 state DB. Upgrade the server and the daemon on every machine, and every machine that shares a Postgres state DB, at the same time. Rolling back with the `*.prev` binaries works only until a v6 state DB is written; after that, roll forward.
+- **Stricter settings.** A value that used to be clamped or ignored now stops startup and names the variable, for example `LOG_MAX_BYTES=-1`, `LLM_MAX_RETRIES=-1`, `LLM_TIMEOUT_*_MS=0`, `RERANK_TIMEOUT_MS=50`, `POSTGRES_POOL_MAX=0` or `DAEMON_UPLOAD_INTERVAL_SECONDS=0`. Empty values count as unset. `ACTIVATION_PRECISION_GATE`, `ACTIVATION_STRENGTH_DAMPENING` and `CONTRADICTION_CONFLICTS_ONLY` accept true/false, on/off, yes/no or 1/0; any other spelling stops startup. Before this change, any value other than `off` enabled the precision gate.
+- **Codex hooks need trust again.** After `knowledge-server setup-tool codex` is re-run, open Codex, run `/hooks` and trust the knowledge-server hook again.
+
 ### From source
 
 **Prerequisites:** [Bun](https://bun.sh) 1.4.4, the version in `.bun-version` that the release binaries are built with. Other Bun versions are not tested.
@@ -246,7 +252,7 @@ Two connection modes:
 - `readers/pending.ts` — drains `pending_episodes` uploaded by the daemon
 - `consolidate.ts` — full cycle: read → extract → reconsolidate → contradiction scan → embed → synthesis → delete processed rows. Decay runs on its own timer (`DECAY_INTERVAL_MS`).
 - `llm.ts` — four LLM calls: `extractKnowledge` (extraction model), `decideMerge` (merge model), `detectAndResolveContradiction` (contradiction model), `synthesizePrinciple` (synthesis model, fires rarely on ripe clusters)
-- `decay.ts` — forgetting curve with type-specific half-lives
+- `src/domain/strength.ts` — forgetting curve with type-specific half-lives
 
 ## Configuration
 
@@ -449,7 +455,7 @@ Credentials and paths stay in `.env`:
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. `info` logs lengths, ids, counts and similarity scores; entry and episode text is logged only at `debug`. `warn` suppresses info lines. |
 | `LOG_MAX_BYTES` | `20971520` (20 MB) | Size at which the active log rotates. Rotation keeps `server.log.1` to `server.log.3` and drops the oldest, so the files total about four times this value. `0` disables rotation. Rotated copies can hold text written by earlier versions, including an old admin token; delete them once you no longer need them. |
 
-**Upgrading with a custom `stateDb.path`.** The PID file and server log now sit in the directory of `stateDb.path`, not in `~/.local/share/knowledge-server`. A server started before the upgrade keeps writing its PID file to the old location, so stop it before upgrading (`knowledge-server stop`, with the old binary). If it is still running after the upgrade, stop it with `kill "$(cat ~/.local/share/knowledge-server/server.pid)"`.
+**Upgrading with a custom `stateDb.path`.** The PID file and server log now sit in the directory of `stateDb.path`, not in `~/.local/share/knowledge-server`. `knowledge-server stop` and `status` find a PID file left in the old location, so stop a server that was started before the upgrade with `knowledge-server stop`.
 
 ### Session sources
 
@@ -558,7 +564,7 @@ The default name `jev-1.14.0` exists on the maintainer's gateway and on TypeSafe
 | `RERANK_REMOTE_URL` | `${LLM_BASE_ENDPOINT}/decisions/v1/systemone` | Full System One URL. Direct TypeSafe: `https://api.typesafe.ai/v1/systemone`. A URL on another origin than `LLM_BASE_ENDPOINT` needs `RERANK_REMOTE_API_KEY`; without it remote reranking stays off and the local reranker runs. Plain http to a non-loopback host logs a startup warning, since the key is then sent unencrypted; requests are not refused |
 | `RERANK_REMOTE_API_KEY` | `LLM_API_KEY`, only on the `LLM_BASE_ENDPOINT` origin | Key for `RERANK_REMOTE_URL`. The gateway key is never sent to another origin |
 | `RERANK_REMOTE_MODEL` | `jev-1.14.0` | Decision model for `RERANK_PROVIDER=remote`, named as your endpoint names it. Use a versioned name. The gateway does not resolve an alias to a version (`jev-latest` comes back as `typesafe/jev-latest`), and calibrated floors are keyed by the configured name. `activation_event.rerank_model` stores `remote/<configured model>`, the floor key; the name the endpoint reports resolving to is logged as `resolved_model` |
-| `RERANK_REMOTE_TIMEOUT_MS` | `2500` | Budget for one call, including one retry after a 429 whose `Retry-After` fits in what is left. It starts after the query embedding and store reads, so an activation takes this plus those. The Codex hook's curl limit is 4 s, so a slow embedding can push the call past it; on expiry dense ordering is used |
+| `RERANK_REMOTE_TIMEOUT_MS` | `2500` | Budget for one call, including one retry after a 429 whose `Retry-After` fits in what is left. The call gets no more than the request's remaining budget less 500 ms reserved for later work (the request budget is 4.5 s per activation, 3.5 s for the Codex hook). Rerank is skipped when under 300 ms is left, and dense ordering is used. The request clock starts at request entry, so the query embedding and store reads count against it. On expiry dense ordering is used |
 
 Remote mode needs an endpoint (`RERANK_REMOTE_URL`, or `LLM_BASE_ENDPOINT`) and a key (`RERANK_REMOTE_API_KEY`, or `LLM_API_KEY` for the gateway's own origin). If either is missing (or still a template placeholder), the server logs a warning at startup and uses the local reranker. When remote reranking is active, startup also rejects `RERANK_CANDIDATES` above 40, and any configuration whose request could exceed about 100,000 characters: `RERANK_CANDIDATES × (RERANK_MAX_DOC_TOKENS × 4 + 512) + RERANK_MAX_QUERY_TOKENS × 4`. The defaults give about 25,000.
 
