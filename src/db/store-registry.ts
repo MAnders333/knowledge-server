@@ -10,6 +10,7 @@ import type { KnowledgeServerConfig, StoreConfig } from "../config-file.js";
 import { parseIntEnv } from "../config.js";
 import { DomainRouter } from "../consolidation/domain-router.js";
 import { logger } from "../logger.js";
+import { redactUriCredentials } from "../redact-uri.js";
 import type { IKnowledgeStore, IServerStateDB } from "./interface.js";
 import { PostgresKnowledgeDB } from "./postgres/index.js";
 import { isNonLocalPostgresUri } from "./postgres/tls.js";
@@ -180,7 +181,7 @@ export class StoreRegistry {
 				await pgStateDb.initialize();
 				serverStateDb = pgStateDb;
 				logger.log(
-					`[db] Server state DB: Postgres at ${uri.replace(/:\/\/[^@]*@/, "://<redacted>@")}`,
+					`[db] Server state DB: Postgres at ${redactUriCredentials(uri)}`,
 				);
 			} else {
 				serverStateDb = new ServerStateDB(
@@ -317,7 +318,7 @@ async function initStore(storeConfig: StoreConfig): Promise<IKnowledgeStore> {
 		}
 
 		logger.log(
-			`[db] Store "${storeConfig.id}": PostgreSQL at ${redactUri(uri)}`,
+			`[db] Store "${storeConfig.id}": PostgreSQL at ${redactUriCredentials(uri)}`,
 		);
 		const db = new PostgresKnowledgeDB(uri);
 		db.id = storeConfig.id;
@@ -375,16 +376,5 @@ function warnIfMixedTopology(config: KnowledgeServerConfig): void {
 				"and will fall back to the default store. " +
 				"Consider using Postgres for all writable stores in remote deployments.",
 		);
-	}
-}
-
-/** Redact password from a postgres URI for safe logging. */
-function redactUri(uri: string): string {
-	try {
-		const url = new URL(uri);
-		if (url.password) url.password = "***";
-		return url.toString();
-	} catch {
-		return uri.replace(/(\/\/[^:/@]*):[^@]*@/, "$1:***@");
 	}
 }

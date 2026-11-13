@@ -13,6 +13,7 @@ import {
 	resolveLegacyKnowledgeDbPath,
 } from "../../config-file.js";
 import { logger } from "../../logger.js";
+import { redactUriCredentials } from "../../redact-uri.js";
 import { errCode } from "../../utils.js";
 import type { IServerStateDB } from "../interface.js";
 import { ServerStateDB } from "./index.js";
@@ -49,7 +50,7 @@ export async function createServerStateDB(
 			);
 		}
 		logger.log(
-			`[db] Server state DB: Postgres at ${stateDbUri.replace(/:\/\/[^@]*@/, "://<redacted>@")}`,
+			`[db] Server state DB: Postgres at ${redactUriCredentials(stateDbUri)}`,
 		);
 		const db = new PostgresServerStateDB(stateDbUri);
 		await db.initialize();
