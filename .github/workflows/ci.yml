@@ -36,8 +36,9 @@ jobs:
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          # Keep in sync with the Bun version in release-please.yml (binaries are built with it).
-          bun-version: 1.3.9
+          # Single source of truth for the Bun version (also used by release-please.yml
+          # and scripts/check-bun-advisories.ts).
+          bun-version-file: .bun-version
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -57,19 +58,24 @@ jobs:
         continue-on-error: true
         run: bun audit
 
+      - name: Pinned Bun has no published security advisories
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun scripts/check-bun-advisories.ts
+
       - name: Compile smoke test
         if: ${{ github.event_name == 'pull_request' }}
         env:
-          # Binary size budgets (bytes) for linux-x64 built with Bun 1.3.9 and the
+          # Binary size budgets (bytes) for linux-x64 built with the Bun version in .bun-version and the
           # same flags as below. Measured 2026-11-12 with
-          #   bunx bun@1.3.9 build --compile --minify --no-compile-autoload-dotenv \
+          #   bunx bun@1.4.4 build --compile --minify --no-compile-autoload-dotenv \
           #     --no-compile-autoload-bunfig --target=bun-linux-x64 <entry> --outfile <out>
-          # server 117174970 bytes, daemon 102529350 bytes. Budget = measured + 10%.
+          # server 123754672 bytes, daemon 109287600 bytes. Budget = measured + 10%.
           # To re-baseline: re-measure with that command, set each budget to the new
           # size * 1.1 and update the numbers in this comment. Raise a budget only
           # when a dependency change legitimately grows the binary.
-          SERVER_SIZE_BUDGET: 128892467
-          DAEMON_SIZE_BUDGET: 112782285
+          SERVER_SIZE_BUDGET: 136130139
+          DAEMON_SIZE_BUDGET: 120216360
         run: |
           bun build --compile --minify --no-compile-autoload-dotenv --no-compile-autoload-bunfig src/index.ts --outfile dist/knowledge-server-linux-x64
           bun build --compile --minify --no-compile-autoload-dotenv --no-compile-autoload-bunfig src/daemon/index.ts --outfile dist/knowledge-daemon-linux-x64

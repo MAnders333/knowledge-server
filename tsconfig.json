@@ -12,6 +12,6 @@
     "resolveJsonModule": true,
     "types": ["bun"]
   },
-  "include": ["src/**/*", "plugin/**/*", "bench/**/*"],
+  "include": ["src/**/*", "plugin/**/*", "bench/**/*", "scripts/**/*.ts"],
   "exclude": ["node_modules", "dist", "tests"]
 }

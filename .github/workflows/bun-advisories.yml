@@ -1,0 +1,33 @@
+name: Bun advisories
+
+# The release binaries embed the Bun runtime. Check weekly (and when the pin or
+# this check changes) that the pinned version has no published advisory.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .bun-version
+      - scripts/check-bun-advisories.ts
+
+permissions: {}
+
+jobs:
+  check:
+    name: Pinned Bun has no published advisory
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+      - name: Check advisories
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun scripts/check-bun-advisories.ts
