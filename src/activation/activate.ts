@@ -10,6 +10,7 @@ import type {
 	InjectionPlan,
 	KnowledgeEntry,
 } from "../types.js";
+import { DEFAULT_ACTIVATION_BUDGET_MS } from "./client.js";
 import {
 	EmbeddingClient,
 	bulkEmbedOptions,
@@ -37,6 +38,30 @@ const MAX_SESSIONS = 1000;
 const SESSION_RESCORE_MARGIN = 0.1;
 /** Relation-expanded sources are gated and ranked at this fraction of their parent. */
 const SOURCE_GATE_DISCOUNT = 0.9;
+
+/**
+ * Rerank gets what is left of the request budget after the embedding and store
+ * reads, less RERANK_RESERVE_MS for the work after it. The budget itself is per
+ * client (see client.ts).
+ */
+const RERANK_RESERVE_MS = 500;
+/** Below this much time left, rerank is not started and dense order is used. */
+const RERANK_MIN_BUDGET_MS = 300;
+
+/**
+ * Milliseconds the rerank call may use at `now`: the budget less the reserve and the
+ * time already spent. Undefined when the request has no start time (no deadline).
+ */
+function rerankBudgetMs(
+	requestStartedAt: number | undefined,
+	budgetMs: number,
+	now: number,
+): number | undefined {
+	return requestStartedAt === undefined
+		? undefined
+		: requestStartedAt + budgetMs - RERANK_RESERVE_MS - now;
+}
+
 /**
  * Token cap of the injected block: the formatter's character cap in the same
  * estimate the token budget uses. The budget never exceeds it, so every entry the
@@ -169,14 +194,16 @@ export class StoreBreaker {
 
 	/**
 	 * Max calls in flight for this operation before it has answered in an
-	 * activation. Only a closed circuit lets callers queue; otherwise admit()
-	 * decides at once.
+	 * activation. A healthy store is not capped, so its cues fan out at once. After
+	 * failures, a closed circuit allows threshold - failures calls at a time. An open
+	 * or half-open circuit admits through admit() alone: one probe per window.
 	 */
 	budget(store: string, op: string): number {
 		const s = this.stateOf(store, op);
-		return s.status === "closed"
-			? Math.max(1, this.threshold - s.failures)
-			: Number.POSITIVE_INFINITY;
+		if (s.status !== "closed" || s.failures === 0) {
+			return Number.POSITIVE_INFINITY;
+		}
+		return Math.max(1, this.threshold - s.failures);
 	}
 
 	/** Admit one call. After the window, the first caller becomes the probe. */
@@ -361,10 +388,10 @@ export class ActivationEngine {
 	/**
 	 * One store call under the circuit breaker, within one activation.
 	 *
-	 * Until the store answers in this activation, at most breaker.budget() of its
-	 * calls are in flight, so a dead store receives at most STORE_FAILURE_THRESHOLD
-	 * calls however many cues fan out. Calls the breaker refuses return at once:
-	 * no timeout wait, no warning.
+	 * A store that has not failed is not capped: its cues fan out at once. After
+	 * failures, a closed circuit admits at most threshold - failures calls at a time.
+	 * An open or half-open circuit admits one probe per window through admit(). Calls
+	 * the breaker refuses return at once: no timeout wait, no warning.
 	 */
 	private async callStore<T>(
 		db: IKnowledgeStore,
@@ -449,6 +476,17 @@ export class ActivationEngine {
 			 * once the plan is committed. Requests without a key are not deduplicated.
 			 */
 			session?: string;
+			/**
+			 * performance.now() when the request entered the server. Rerank starts only
+			 * with enough of the budget left, and its timeout is clamped to what remains.
+			 * Omitted: no deadline.
+			 */
+			requestStartedAt?: number;
+			/**
+			 * Time budget of the request, in ms, counted from requestStartedAt. Defaults
+			 * to DEFAULT_ACTIVATION_BUDGET_MS; the server passes the client's own budget.
+			 */
+			budgetMs?: number;
 		},
 	): Promise<ActivationResult> {
 		const queryList = normalizeCues(
@@ -759,48 +797,77 @@ export class ActivationEngine {
 		// warning and leaves the dense-only ordering intact.
 		const nCandidates = scored.length;
 		let gateDropped = 0;
+		let deduped = 0;
 		let gateMode: GateMode = this.reranker ? "dense" : "off";
 		let rerankModel: string | null = null;
-		if (this.reranker && scored.length > 0) {
-			// Bound the rerank input: across multiple cues and stores the pool can exceed
-			// `candidates`, so keep the dense-best slice. The order is always dense
-			// similarity, best first: listwise scorers show position bias, and a fixed
-			// order (D00 is the dense best) keeps their output reproducible.
-			const maxCandidates = config.activation.rerank.candidates;
-			scored.sort((a, b) => b.rawSimilarity - a.rawSimilarity);
-			if (scored.length > maxCandidates) scored.length = maxCandidates;
 
-			try {
-				const documents = scored.map((s) =>
-					formatEmbeddingText(s.entry.type, s.entry.content, s.entry.topics),
-				);
-				const scores = await this.reranker.scoreBatch(primaryQuery, documents);
-				for (let i = 0; i < scored.length; i++) {
-					scored[i].rerankScore = scores[i];
-					scored[i].gateScore = scores[i];
-					scored[i].similarity =
-						scores[i] *
-						(config.activation.gate.strengthDampening
-							? 0.5 + 0.5 * scored[i].staleness.strength
-							: scored[i].staleness.strength);
+		// Rerank only when the request has time left for it. Without a start time
+		// there is no deadline, and the scorer's own timeout applies.
+		const budgetMs = options?.budgetMs ?? DEFAULT_ACTIVATION_BUDGET_MS;
+		const rerankBudget = rerankBudgetMs(
+			options?.requestStartedAt,
+			budgetMs,
+			performance.now(),
+		);
+		const rerankInTime =
+			rerankBudget === undefined || rerankBudget >= RERANK_MIN_BUDGET_MS;
+		if (this.reranker && scored.length > 0) {
+			if (rerankInTime) {
+				// Bound the rerank input: across multiple cues and stores the pool can exceed
+				// `candidates`, so keep the dense-best slice. The order is always dense
+				// similarity, best first: listwise scorers show position bias, and a fixed
+				// order (D00 is the dense best) keeps their output reproducible.
+				const maxCandidates = config.activation.rerank.candidates;
+				scored.sort((a, b) => b.rawSimilarity - a.rawSimilarity);
+				if (scored.length > maxCandidates) scored.length = maxCandidates;
+
+				try {
+					const documents = scored.map((s) =>
+						formatEmbeddingText(s.entry.type, s.entry.content, s.entry.topics),
+					);
+					const scores = await this.reranker.scoreBatch(
+						primaryQuery,
+						documents,
+						{ budgetMs: rerankBudget },
+					);
+					for (let i = 0; i < scored.length; i++) {
+						scored[i].rerankScore = scores[i];
+						scored[i].gateScore = scores[i];
+						scored[i].similarity =
+							scores[i] *
+							(config.activation.gate.strengthDampening
+								? 0.5 + 0.5 * scored[i].staleness.strength
+								: scored[i].staleness.strength);
+					}
+					gateMode = "rerank";
+					rerankModel = scorerKey(this.reranker.identity);
+					componentHealth.recordSuccess("rerank");
+				} catch (err) {
+					// A refusal (full local queue, open remote breaker, or a call the request
+					// budget cut short) is back-pressure, not a provider failure, so it does
+					// not count toward health.
+					if (!(err instanceof RerankSkippedError)) {
+						componentHealth.recordFailure("rerank", err);
+					}
+					const reason = err instanceof Error ? err.message : String(err);
+					const { provider, model } = this.reranker.identity;
+					if (err instanceof RerankSkippedError) {
+						// Skipped calls are logged at info; the remote breaker warns once when
+						// it opens.
+						logger.log(
+							`[activation] rerank skipped: ${reason}. Dense-only ordering: provider=${provider} model=${model} gate_mode=dense.`,
+						);
+					} else {
+						logger.warn(
+							`[activation] Rerank failed — using dense-only ordering. provider=${provider} model=${model} gate_mode=dense. Reason: ${reason}`,
+						);
+					}
 				}
-				gateMode = "rerank";
-				rerankModel = scorerKey(this.reranker.identity);
-				componentHealth.recordSuccess("rerank");
-			} catch (err) {
-				componentHealth.recordFailure("rerank", err);
-				const reason = err instanceof Error ? err.message : String(err);
+			} else {
 				const { provider, model } = this.reranker.identity;
-				if (err instanceof RerankSkippedError) {
-					// The remote breaker warns once when it opens; skipped calls stay quiet.
-					logger.log(
-						`[activation] Rerank skipped — dense-only ordering. provider=${provider} model=${model} gate_mode=dense. Reason: ${reason}`,
-					);
-				} else {
-					logger.warn(
-						`[activation] Rerank failed — using dense-only ordering. provider=${provider} model=${model} gate_mode=dense. Reason: ${reason}`,
-					);
-				}
+				logger.log(
+					`[activation] rerank skipped: request budget. Dense-only ordering: provider=${provider} model=${model} gate_mode=dense.`,
+				);
 			}
 		}
 
@@ -816,6 +883,15 @@ export class ActivationEngine {
 			gateDropped += scored.length - passing.length;
 			scored.splice(0, scored.length, ...passing);
 		}
+		// Support sources are gated only when a reranker scored the candidates or the
+		// dense margin is set. Without either, the floor is the bare threshold, which
+		// the candidates already meet; gating a source at 0.9× its parent against it
+		// would drop sources that were always injected.
+		const sourceFloor =
+			floor !== null &&
+			(gateMode === "rerank" || config.activation.gate.denseMargin > 0)
+				? floor
+				: null;
 
 		// Sort, then drop what cannot be injected before the cap, so the cap is spent
 		// on entries that can be shown: flagged conflicted entries with no contradicts
@@ -841,7 +917,6 @@ export class ActivationEngine {
 		scored.splice(0, scored.length, ...unflagged);
 
 		const sessionKey = options?.session;
-		let deduped = 0;
 		if (sessionKey !== undefined) {
 			const fresh = scored.filter((s) => {
 				const suppressed = this.sessions.isSuppressed(
@@ -867,8 +942,10 @@ export class ActivationEngine {
 		// - For each source entry not already in the scored set, compute its score
 		//   as the synthesized entry's similarity × 0.9 (slightly lower to rank it
 		//   below the principle itself, but still nearby)
-		// - Gate: a source inherits no rerank score, so it is gated at 0.9× its
-		//   parent's gate score (the same discount as its rank), against the same floor
+		// - Gate: when a reranker scored the candidates, or ACTIVATION_DENSE_MARGIN is
+		//   set, a source inherits no rerank score and is gated at 0.9× its parent's
+		//   gate score (the same discount as its rank) against the floor. Otherwise
+		//   sources are not gated.
 		// - Add sources to the result (but do NOT exceed maxResults)
 		const synthesizedIds = scored
 			.filter(
@@ -939,7 +1016,7 @@ export class ActivationEngine {
 					if (scored.length >= maxResults) break;
 
 					const sourceGate = parent.gateScore * SOURCE_GATE_DISCOUNT;
-					if (floor !== null && sourceGate < floor) {
+					if (sourceFloor !== null && sourceGate < sourceFloor) {
 						gateDropped++;
 						continue;
 					}
@@ -1140,14 +1217,15 @@ export class ActivationEngine {
 	}
 
 	/**
-	 * Floor of the precision gate for this ordering mode, or null when no gate
-	 * applies (no reranker configured).
+	 * Floor of the precision gate. A rerank score is gated by the rerank floor. Any
+	 * other ordering (rerank disabled, failed, skipped or out of time) is gated by the
+	 * dense floor, so ACTIVATION_DENSE_MARGIN applies whenever the gate is on.
 	 */
 	private gateFloor(
 		gateMode: GateMode,
 		scored: ReadonlyArray<{ gateScore: number }>,
 		similarityThreshold: number,
-	): number | null {
+	): number {
 		const gate = config.activation.gate;
 		if (gateMode === "rerank" && this.reranker) {
 			let top = 0;
@@ -1159,10 +1237,7 @@ export class ActivationEngine {
 				topScore: top,
 			});
 		}
-		if (gateMode === "dense") {
-			return denseFloor(similarityThreshold, gate.denseMargin);
-		}
-		return null;
+		return denseFloor(similarityThreshold, gate.denseMargin);
 	}
 
 	/**

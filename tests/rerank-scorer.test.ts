@@ -189,6 +189,17 @@ describe("LocalReranker (stub session)", () => {
 		expect(session.runs.length).toBeLessThan(docs.length);
 	});
 
+	it("a call the request budget cut short is refused as skipped, not failed", async () => {
+		installSyntheticModel();
+		await useFakeSession(30);
+		const docs = Array.from({ length: 40 }, (_, i) => words(20, i * 20));
+		const error = await synthReranker(2_000)
+			.scoreBatch(words(4), docs, { budgetMs: 200 })
+			.catch((e: unknown) => e);
+		expect(error).toBeInstanceOf(RerankSkippedError);
+		expect(String(error)).toContain("request budget");
+	});
+
 	it("C3: a query longer than the model window still lets documents change the score", async () => {
 		installSyntheticModel();
 		await useFakeSession();

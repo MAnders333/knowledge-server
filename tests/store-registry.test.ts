@@ -525,7 +525,7 @@ describe("StoreBreaker and activation fan-out", () => {
 		expect(warn).toHaveBeenCalledTimes(2);
 	});
 
-	it("a dead store: at most 3 ANN calls per circuit, none during its window; the count gets one call per activation until its own circuit opens", async () => {
+	it("a dead store: the first activation sends every cue to it, then none while its ANN circuit is open; the count gets one call per activation until its own circuit opens", async () => {
 		const warn = spyOn(loggerModule.logger, "warn").mockImplementation(
 			() => {},
 		);
@@ -552,25 +552,26 @@ describe("StoreBreaker and activation fan-out", () => {
 		const started = Date.now();
 		await engine.activate(cues);
 		expect(Date.now() - started).toBeLessThan(1_000);
-		// Activation 1: the ANN circuit opens on its third failure; the count is
-		// one fan-out call, so it has failed once.
-		expect(findSimilarEntries.mock.calls.length).toBe(3);
+		// Activation 1: a store that has not failed is not capped, so every cue reaches
+		// it. The ANN circuit opens on its third failure; the count is one fan-out call.
+		expect(findSimilarEntries.mock.calls.length).toBe(8);
 		expect(getActiveEntryCount.mock.calls.length).toBe(1);
 		expect(warn).toHaveBeenCalledTimes(1);
 
+		// The ANN circuit is open: no more ANN calls, and the count is still asked once.
 		await engine.activate(cues);
-		expect(findSimilarEntries.mock.calls.length).toBe(3);
+		expect(findSimilarEntries.mock.calls.length).toBe(8);
 		expect(getActiveEntryCount.mock.calls.length).toBe(2);
 		expect(warn).toHaveBeenCalledTimes(1);
 
 		// The count's third failure opens its own circuit.
 		await engine.activate(cues);
-		expect(findSimilarEntries.mock.calls.length).toBe(3);
+		expect(findSimilarEntries.mock.calls.length).toBe(8);
 		expect(getActiveEntryCount.mock.calls.length).toBe(3);
 		expect(warn).toHaveBeenCalledTimes(2);
 
 		await engine.activate(cues);
-		expect(findSimilarEntries.mock.calls.length).toBe(3);
+		expect(findSimilarEntries.mock.calls.length).toBe(8);
 		expect(getActiveEntryCount.mock.calls.length).toBe(3);
 		expect(warn).toHaveBeenCalledTimes(2);
 	});

@@ -734,3 +734,57 @@ describe("default candidate pool", () => {
 		expect(candidatesWith({})).toBe(16);
 	});
 });
+
+describe("RemoteReranker transport and privacy", () => {
+	it("clamps the call to the budget the caller passes", async () => {
+		// Real clock on purpose: the abort comes from AbortSignal.timeout, which fake
+		// timers cannot drive. The stub answers after the budget has run out.
+		respond = async () => {
+			await Bun.sleep(500);
+			return systemOne({ D00: 0.5 });
+		};
+		await expect(
+			makeReranker({ timeoutMs: 2_000 }).scoreBatch("q", ["a"], {
+				budgetMs: 100,
+			}),
+		).rejects.toThrow("request budget");
+	});
+
+	it("a call the request budget cut short is skipped, and the breaker does not count it", async () => {
+		respond = async () => {
+			await Bun.sleep(500);
+			return systemOne({ D00: 0.5 });
+		};
+		const reranker = makeReranker({ timeoutMs: 2_000 });
+		for (let i = 0; i < 3; i++) {
+			await expect(
+				reranker.scoreBatch("q", ["a"], { budgetMs: 100 }),
+			).rejects.toBeInstanceOf(RerankSkippedError);
+		}
+		respond = () => systemOne({ D00: 0.5 });
+		// The breaker is still closed: a call with no budget reaches the endpoint.
+		expect(await reranker.scoreBatch("q", ["a"])).toEqual([0.5]);
+	});
+
+	it("scrubs secrets from the query and the documents before the call", async () => {
+		const secret = "a".repeat(40);
+		respond = () => systemOne({ D00: 0.5 });
+		await makeReranker().scoreBatch(`check api_key = ${secret} please`, [
+			`doc with api_key=${secret}`,
+		]);
+		const sent = JSON.stringify(requests[0].body);
+		expect(sent).not.toContain(secret);
+		expect(sent).toContain("[REDACTED:keyed_entropy]");
+	});
+
+	it("does not follow a redirect, so the key is not sent to the redirect target", async () => {
+		respond = () =>
+			new Response(null, {
+				status: 307,
+				headers: { Location: `http://127.0.0.1:${server.port}/elsewhere` },
+			});
+		await expect(makeReranker().scoreBatch("q", ["a"])).rejects.toThrow();
+		expect(requests).toHaveLength(1);
+		expect(requests[0].path).toBe(ROUTE);
+	});
+});

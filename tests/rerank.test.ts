@@ -29,6 +29,7 @@ import { ActivationEngine } from "../src/activation/activate";
 import { cosineSimilarity } from "../src/activation/embeddings";
 import type { RerankScorer } from "../src/activation/rerank";
 import { config } from "../src/config";
+import { logger } from "../src/logger";
 import type { IKnowledgeStore } from "../src/types";
 import type { KnowledgeEntry } from "../src/types";
 import { makeEntry } from "./fixtures";
@@ -324,5 +325,88 @@ describe("ActivationEngine rerank stage", () => {
 			"low",
 		]);
 		expect(result.entries[0].rerankScore).toBeUndefined();
+	});
+});
+
+describe("rerank time budget", () => {
+	const gate = config.activation.gate as { enabled: boolean };
+	let gateWasOn = true;
+	beforeEach(() => {
+		gateWasOn = gate.enabled;
+		gate.enabled = false;
+	});
+	afterEach(() => {
+		gate.enabled = gateWasOn;
+	});
+
+	type Call = { docs: string[]; budgetMs?: number };
+	/** Scorer that records each call and scores every document 0.9. */
+	function recordingScorer(): RerankScorer & { calls: Call[] } {
+		const calls: Call[] = [];
+		return {
+			identity: { provider: "local", model: "test/recording" },
+			calls,
+			scoreBatch: mock(
+				async (_q: string, docs: string[], options?: { budgetMs?: number }) => {
+					calls.push({ docs, budgetMs: options?.budgetMs });
+					return docs.map(() => 0.9);
+				},
+			),
+		};
+	}
+
+	function engineWith(
+		entries: Array<KnowledgeEntry & { embedding: number[] }>,
+		scorer: RerankScorer,
+	): ActivationEngine {
+		const engine = new ActivationEngine(
+			makeStoreStub(entries, { supportAnn: true }),
+			undefined,
+			undefined,
+			scorer,
+		);
+		spyOn(engine.embeddings, "embedBatch").mockResolvedValue([QUERY_EMB]);
+		return engine;
+	}
+
+	it("skips rerank and keeps dense order when the request has too little time left", async () => {
+		const scorer = recordingScorer();
+		// 4.4 s of the 4.5 s budget are gone: less than the reserve plus the minimum remains.
+		const result = await engineWith(makeEntries(), scorer).activate(
+			"test query",
+			{ requestStartedAt: performance.now() - 4_400 },
+		);
+		expect(scorer.calls).toHaveLength(0);
+		expect(result.telemetry?.gateMode).toBe("dense");
+		expect(result.entries[0].entry.id).toBe("high");
+	});
+
+	it("gives the call the request budget less the reserve", async () => {
+		const scorer = recordingScorer();
+		await engineWith(makeEntries(), scorer).activate("test query", {
+			requestStartedAt: performance.now(),
+		});
+		// 4.5 s less the 0.5 s reserve, less the little time already spent.
+		const budget = scorer.calls[0]?.budgetMs ?? 0;
+		expect(budget).toBeGreaterThan(3_000);
+		expect(budget).toBeLessThanOrEqual(4_000);
+	});
+
+	it("passes no budget when the request has no start time", async () => {
+		const scorer = recordingScorer();
+		await engineWith(makeEntries(), scorer).activate("test query");
+		expect(scorer.calls[0]?.budgetMs).toBeUndefined();
+	});
+
+	it("logs one info line when the request budget leaves no time for rerank", async () => {
+		const info = spyOn(logger, "log").mockImplementation(() => {});
+		const scorer = recordingScorer();
+		await engineWith(makeEntries(), scorer).activate("test query", {
+			requestStartedAt: performance.now() - 4_400,
+		});
+		expect(scorer.calls).toHaveLength(0);
+		expect(info).toHaveBeenCalledWith(
+			expect.stringContaining("rerank skipped: request budget"),
+		);
 	});
 });

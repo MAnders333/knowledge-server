@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { basename, join } from "node:path";
+import { isPlainHttpRemote } from "./activation/key-transport.js";
 import { hasOAuthTokens } from "./auth/claude-oauth.js";
 import { DEFAULT_CONFIG_PATH, resolveDataDir } from "./config-file.js";
 import { envFileCandidates, preferredEnvFile } from "./env-file.js";
@@ -328,21 +329,19 @@ function isHttpUrl(url: string): boolean {
 	}
 }
 
-/** True for an http:// URL whose host is not loopback (localhost, 127.0.0.0/8, ::1). */
-function isPlainHttpRemote(url: string): boolean {
-	try {
-		const u = new URL(url);
-		if (u.protocol !== "http:") return false;
-		const h = u.hostname.replace(/^\[|\]$/g, "");
-		return !(
-			h === "localhost" ||
-			h.endsWith(".localhost") ||
-			h === "::1" ||
-			/^127\./.test(h)
-		);
-	} catch {
-		return false;
-	}
+/**
+ * Startup warning for an endpoint that receives an API key over plain http to a
+ * non-loopback host. It is a warning, not an error: LAN gateways often run plain http.
+ */
+function warnKeyOverPlainHttp(
+	setting: string,
+	url: string,
+	apiKey: string,
+): void {
+	if (!apiKey.trim() || !isPlainHttpRemote(url)) return;
+	console.warn(
+		`[config] ${setting} uses plain http on a non-loopback host, so its API key is sent unencrypted. Use https.`,
+	);
 }
 
 // ── Parsing ──────────────────────────────────────────────────────────────────
@@ -1087,12 +1086,23 @@ export function validateConfig(): string[] {
 					"Local endpoints (Ollama, llama.cpp) work without a key — this warning can be ignored.",
 			);
 		}
-		if (isPlainHttpRemote(config.embedding.baseURL)) {
-			console.warn(
-				"[config] EMBEDDING_BASE_URL uses plain http on a non-loopback host; embedding text and API keys cross the network unencrypted. Use https.",
-			);
-		}
 	}
+	// A key sent over plain http to a non-loopback host crosses the network unencrypted.
+	warnKeyOverPlainHttp(
+		"LLM_BASE_ENDPOINT",
+		config.llm.baseEndpoint,
+		config.llm.apiKey,
+	);
+	warnKeyOverPlainHttp(
+		"OPENAI_BASE_URL",
+		config.llm.openai.baseURL,
+		config.llm.openai.apiKey || config.llm.apiKey,
+	);
+	warnKeyOverPlainHttp(
+		"EMBEDDING_BASE_URL",
+		config.embedding.baseURL,
+		config.embedding.apiKey,
+	);
 
 	// Enforce a minimum token length when a fixed admin token is configured.
 	// A short token is trivial to brute-force over a loopback connection — 16 chars
@@ -1125,10 +1135,8 @@ export function validateConfig(): string[] {
 				"The remote reranker URL (RERANK_REMOTE_URL, or LLM_BASE_ENDPOINT + /decisions/v1/systemone) must be an absolute http or https URL.",
 			);
 		}
-		if (remote.url && isPlainHttpRemote(remote.url)) {
-			console.warn(
-				"[config] The remote reranker URL uses plain http on a non-loopback host; the query, candidate text and API key cross the network unencrypted. Use https.",
-			);
+		if (remote.url) {
+			warnKeyOverPlainHttp("RERANK_REMOTE_URL", remote.url, remote.apiKey);
 		}
 		if (candidates > REMOTE_RERANK_MAX_CANDIDATES) {
 			errors.push(

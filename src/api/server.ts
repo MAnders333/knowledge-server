@@ -11,6 +11,7 @@ import { splitIntoCues } from "../activation/activate.js";
 import {
 	CLIENT_HEADER,
 	type ClientTag,
+	activationBudgetMs,
 	parseClientTag,
 } from "../activation/client.js";
 import {
@@ -529,6 +530,7 @@ export function createApp(
 	// Access records are written for every returned entry, including for
 	// unauthenticated callers. Gating that is deliberately out of scope here.
 	app.get("/activate", async (c) => {
+		const started = performance.now();
 		// Accept one or more `q` params (repeated: ?q=seg1&q=seg2&q=full).
 		// Single ?q=... still works — queries() returns a one-element array.
 		const rawQueries = c.req.queries("q");
@@ -562,10 +564,15 @@ export function createApp(
 		const sessionId = c.req.header("x-knowledge-session");
 		const prompt = queries[queries.length - 1] ?? "";
 		try {
-			const started = performance.now();
 			const result = await activation.activate(
 				queries.length === 1 ? queries[0] : queries,
-				{ limit, threshold, session: sessionDedupeKey(client, sessionId) },
+				{
+					limit,
+					threshold,
+					session: sessionDedupeKey(client, sessionId),
+					requestStartedAt: started,
+					budgetMs: activationBudgetMs(client),
+				},
 			);
 			const latencyMs = Math.round(performance.now() - started);
 			logActivation(client, queries.join(" | "), result.entries);
@@ -1237,6 +1244,7 @@ export function createApp(
 		"/hooks/claude-code/user-prompt",
 		bodyLimit({ maxSize: MAX_BODY_BYTES, onError: (c) => c.json({}) }),
 		async (c) => {
+			const started = performance.now();
 			let prompt: string;
 			let sessionIdBody: unknown;
 			try {
@@ -1254,7 +1262,6 @@ export function createApp(
 				// Split prompt into per-line cues + full prompt holistic cue,
 				// matching the same multi-cue strategy used by the OpenCode plugin.
 				const cues = boundCues(splitIntoCues(capText(prompt)));
-				const started = performance.now();
 				const client = parseClientTag(
 					c.req.query("client") ?? c.req.header(CLIENT_HEADER) ?? "claude-code",
 				);
@@ -1263,6 +1270,8 @@ export function createApp(
 				const result = await activation.activate(cues, {
 					limit: 8,
 					session: sessionDedupeKey(client, sessionId),
+					requestStartedAt: started,
+					budgetMs: activationBudgetMs(client),
 				});
 				const latencyMs = Math.round(performance.now() - started);
 				logActivation(client, prompt, result.entries);

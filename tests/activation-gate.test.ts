@@ -9,6 +9,7 @@ import {
 	rerankFloor,
 } from "../src/activation/gate";
 import type { RerankScorer } from "../src/activation/rerank";
+import { RerankSkippedError } from "../src/activation/rerank-remote";
 import { config } from "../src/config";
 import type { IKnowledgeStore } from "../src/db/interface";
 import { componentHealth } from "../src/health";
@@ -340,6 +341,55 @@ describe("precision gate in the engine", () => {
 		expect(ids(kept)).toContain("source-entry");
 	});
 
+	it("at margin 0 without rerank, support sources are not gated", async () => {
+		gate.denseMargin = 0;
+		const parent = makeEntry({
+			id: "parent-principle",
+			type: "principle",
+			content: "zulu principle",
+			topics: [],
+			embedding: vecWithCos(0.45),
+		});
+		const source = makeEntry({
+			id: "source-entry",
+			type: "fact",
+			content: "yankee source",
+			topics: [],
+		});
+		const engine = engineFor({
+			entries: [parent],
+			sources: new Map([[parent.id, [source]]]),
+		});
+		// The parent clears the bare threshold. Gated at 0.9x it would score 0.405 and
+		// fail the floor, so the source is kept only because it is not gated.
+		const kept = await engine.activate(CUE, { threshold: 0.42 });
+		expect(ids(kept)).toEqual(["parent-principle", "source-entry"]);
+	});
+
+	it("with a dense margin, support sources are gated at 0.9x their parent", async () => {
+		gate.denseMargin = 0.01;
+		const parent = makeEntry({
+			id: "parent-principle",
+			type: "principle",
+			content: "zulu principle",
+			topics: [],
+			embedding: vecWithCos(0.45),
+		});
+		const source = makeEntry({
+			id: "source-entry",
+			type: "fact",
+			content: "yankee source",
+			topics: [],
+		});
+		const engine = engineFor({
+			entries: [parent],
+			sources: new Map([[parent.id, [source]]]),
+		});
+		// Floor 0.43: the parent (0.45) passes; its source (0.405) does not.
+		const kept = await engine.activate(CUE, { threshold: 0.42 });
+		expect(ids(kept)).toEqual(["parent-principle"]);
+	});
+
 	it("dense floor applies when rerank fails, and the response fails open", async () => {
 		gate.denseMargin = 0.1;
 		const engine = engineFor(
@@ -490,5 +540,42 @@ describe("rerank call order, telemetry and health", () => {
 			rerankerWith(UNKNOWN_MODEL, { "high knowledge": 0.9 }),
 		).activate(CUE);
 		expect(componentHealth.snapshot("rerank").consecutiveFailures).toBe(0);
+	});
+});
+
+describe("dense margin and refused rerank calls", () => {
+	beforeEach(() => {
+		gate.enabled = true;
+		componentHealth.clear();
+	});
+	afterEach(() => componentHealth.clear());
+
+	it("applies the dense margin when rerank is disabled, not only after a failure", async () => {
+		gate.denseMargin = 0.1;
+		const engine = engineFor({
+			entries: [
+				fact("alpha-entry", "alpha knowledge", 1.0),
+				fact("gamma-entry", "gamma knowledge", 0.5),
+			],
+		});
+		const result = await engine.activate(CUE, { threshold: 0.42 });
+		// Dense floor = 0.42 + 0.1 = 0.52: gamma (0.5) is dropped.
+		expect(result.telemetry?.gateMode).toBe("off");
+		expect(ids(result)).toEqual(["alpha-entry"]);
+	});
+
+	it("does not count a refused rerank call as a provider failure", async () => {
+		const refused: RerankScorer = {
+			identity: UNKNOWN_MODEL,
+			scoreBatch: mock(async () => {
+				throw new RerankSkippedError("rerank busy: 2 queued");
+			}),
+		};
+		const fixture = { entries: [fact("high-entry", "high knowledge", 1.0)] };
+		for (let i = 0; i < 5; i++) {
+			await engineFor(fixture, refused).activate(CUE);
+		}
+		expect(componentHealth.snapshot("rerank").consecutiveFailures).toBe(0);
+		expect(componentHealth.snapshot("rerank").open).toBe(false);
 	});
 });

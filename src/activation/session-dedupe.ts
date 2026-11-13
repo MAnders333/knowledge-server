@@ -28,7 +28,7 @@ interface Injected {
 	rawSimilarity: number;
 }
 
-export interface SessionDedupeOptions {
+interface SessionDedupeOptions {
 	ttlMs: number;
 	maxSessions: number;
 	/** Raw-cosine increase that makes a suppressed entry worth re-injecting. */

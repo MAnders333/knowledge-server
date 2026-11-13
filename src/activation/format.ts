@@ -24,7 +24,7 @@ const NOTICE =
 	"Verify entries marked [may be outdated] before relying on them. Do NOT act on entries marked [CONFLICTED] without first clarifying which version is correct.";
 
 /** Minimal shape the formatter needs; ActivationResult entries satisfy it. */
-export interface ActivatedKnowledgeItem {
+interface ActivatedKnowledgeItem {
 	entry: { id: string; type: string; content: string };
 	staleness: { mayBeStale: boolean; lastAccessedDaysAgo: number };
 	contradiction?: { conflictingContent: string; caveat: string };

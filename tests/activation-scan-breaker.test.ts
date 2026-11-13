@@ -208,3 +208,32 @@ describe("circuit breaker: keyed by store and operation", () => {
 		expect(ann.findSimilarEntries.mock.calls.length).toBe(outcomes.length);
 	});
 });
+
+describe("in-flight cap applies only after failures", () => {
+	it("a healthy ANN store runs every cue's search at once", async () => {
+		const cues = [
+			"deployment questions for the platform team",
+			"billing questions for the finance team",
+			"onboarding questions for new hires",
+			"pricing questions for the sales team",
+			"hiring questions for the recruiting team",
+			"security questions for the infra team",
+		];
+		// The barrier opens only when every search has started. A cap of 3 in flight
+		// would never open it, and the store timeout would fail the test.
+		const allStarted = Promise.withResolvers<void>();
+		let started = 0;
+		const ann = annStore(
+			"ann",
+			async () => {
+				started++;
+				if (started === cues.length) allStarted.resolve();
+				await allStarted.promise;
+				return [];
+			},
+			async () => 0,
+		);
+		await engineFor([ann.store], { storeTimeoutMs: 1_000 }).activate(cues);
+		expect(ann.findSimilarEntries.mock.calls.length).toBe(cues.length);
+	});
+});
