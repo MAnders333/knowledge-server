@@ -639,6 +639,12 @@ export class ConsolidationEngine {
 		const completedSessionIds = new Set<string>();
 
 		for (let ci = 0; ci < chunks.length; ci++) {
+			// Another process took over consolidate.lock: stop before writing anything more.
+			if (this.processLock?.lost) {
+				throw new Error(
+					"consolidate.lock was taken over by another process; this run stopped",
+				);
+			}
 			const chunk = chunks[ci];
 			const chunkLabel = `${ci + 1}/${chunks.length}`;
 			const episodeTitles = [...new Set(chunk.map((ep) => ep.sessionTitle))]

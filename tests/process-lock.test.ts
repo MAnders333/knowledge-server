@@ -82,17 +82,34 @@ describe("tryAcquireProcessLock", () => {
 		handle?.release();
 	});
 
-	it("takes over a lock whose heartbeat expired even if the pid is alive", () => {
+	it("keeps a live holder's lock while its heartbeat is merely old", () => {
 		mkdirSync(dirname(lockPath), { recursive: true });
-		const old = Date.now() - 60 * 60_000;
+		const now = Date.now();
 		writeFileSync(
 			lockPath,
-			JSON.stringify({ pid: process.pid, acquiredAt: old, heartbeatAt: old }),
+			JSON.stringify({
+				pid: process.pid,
+				acquiredAt: now,
+				heartbeatAt: now - 60 * 60_000,
+			}),
 		);
-		expect(lockHolder(lockPath)).toBeNull();
-		const handle = tryAcquireProcessLock(lockPath);
-		expect(handle).not.toBeNull();
-		handle?.release();
+		// An hour without a heartbeat (a sleeping machine, a lagging timer) does not
+		// free a holder that is still running.
+		expect(lockHolder(lockPath, {}, now)?.pid).toBe(process.pid);
+		expect(tryAcquireProcessLock(lockPath)).toBeNull();
+		// Only a heartbeat older than the long bound marks a reused PID as stale.
+		expect(lockHolder(lockPath, {}, now + 25 * 60 * 60_000)).toBeNull();
+	});
+
+	it("treats a holder whose pid is not alive as gone, even with a fresh heartbeat", () => {
+		mkdirSync(dirname(lockPath), { recursive: true });
+		const now = Date.now();
+		writeFileSync(
+			lockPath,
+			JSON.stringify({ pid: 4242, acquiredAt: now, heartbeatAt: now }),
+		);
+		expect(lockHolder(lockPath, { isAlive: () => true }, now)?.pid).toBe(4242);
+		expect(lockHolder(lockPath, { isAlive: () => false }, now)).toBeNull();
 	});
 
 	it("treats a live holder with a fresh heartbeat as held", () => {
@@ -184,6 +201,29 @@ describe("tryAcquireProcessLock", () => {
 		const after = readLockRecord(lockPath)?.heartbeatAt ?? 0;
 		expect(after).toBeGreaterThan(before);
 		handle?.release();
+	});
+
+	it("reports the lock as lost, once, when another process replaces the lockfile", async () => {
+		let lostCalls = 0;
+		const handle = tryAcquireProcessLock(lockPath, {
+			heartbeatMs: 20,
+			onLost: () => {
+				lostCalls++;
+			},
+		});
+		expect(handle).not.toBeNull();
+		writeFileSync(
+			lockPath,
+			JSON.stringify({ pid: 1, acquiredAt: 0, heartbeatAt: Date.now() }),
+		);
+		// Real timer on purpose: the heartbeat is a setInterval that only the platform
+		// clock fires. The interval is 20 ms, so the poll below ends quickly.
+		for (let i = 0; i < 100 && !handle?.lost; i++) await Bun.sleep(20);
+		expect(handle?.lost).toBe(true);
+		expect(lostCalls).toBe(1);
+		// The lost holder never writes the lockfile back, and releasing leaves it alone.
+		handle?.release();
+		expect(readLockRecord(lockPath)?.pid).toBe(1);
 	});
 });
 

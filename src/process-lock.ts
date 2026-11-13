@@ -5,11 +5,18 @@
  * exclusive create (`wx`), so at most one process wins. The holder refreshes
  * `heartbeatAt` on a timer. A lock is stale, and may be taken over, when either:
  *   - its PID is no longer alive (crash, reboot, kill -9), or
- *   - its heartbeat is older than `staleAfterMs` (backstop for PID reuse).
+ *   - its PID is alive but the heartbeat has not moved for LOCK_STALE_AFTER_MS.
+ *     That bound only guards against a PID reused by an unrelated process after a
+ *     crash. It is long on purpose: a live holder whose machine slept, or whose
+ *     timers lagged, keeps its lock. A waiter must not take over a running holder.
+ *
+ * A holder whose lockfile was replaced by another process has lost the lock. It
+ * logs an error, sets `lost` on its handle, calls `onLost`, and never writes the
+ * lockfile again. Callers stop their work when they see `lost`.
  *
  * Used for: the single knowledge-daemon per data dir (`daemon.lock`), the
  * consolidation run lock shared by the server and the CLI (`consolidate.lock`),
- * and the per-SQLite-database consolidation lock.
+ * the per-SQLite-database consolidation lock and the state-maintenance lock.
  *
  * Takeover of a stale lock is best-effort: two processes that discover the same
  * stale lock in the same instant can both remove it. Crashed holders are the only
@@ -29,6 +36,7 @@ import {
 	writeSync,
 } from "node:fs";
 import { dirname } from "node:path";
+import { logger } from "./logger.js";
 import { errCode } from "./utils.js";
 
 export interface LockRecord {
@@ -39,19 +47,24 @@ export interface LockRecord {
 
 export interface LockHandle {
 	readonly path: string;
+	/** True once another process has replaced or removed the lockfile. */
+	readonly lost: boolean;
 	/** Remove the lockfile if this process still owns it. Idempotent. */
 	release(): void;
 }
 
 export interface LockOptions {
-	/** Heartbeat holder with no refresh for this long is treated as gone. */
-	staleAfterMs?: number;
 	/** How often the holder refreshes its heartbeat. */
 	heartbeatMs?: number;
+	/** Called once when the holder finds the lock taken by another process. */
+	onLost?: () => void;
+	/** PID liveness check. Defaults to isProcessAlive; tests inject one. */
+	isAlive?: (pid: number) => boolean;
 }
 
-export const LOCK_STALE_AFTER_MS = 10 * 60_000;
-export const LOCK_HEARTBEAT_MS = 30_000;
+/** Heartbeat age after which a live holder is presumed to be a reused PID (24 h). */
+const LOCK_STALE_AFTER_MS = 24 * 60 * 60_000;
+const LOCK_HEARTBEAT_MS = 30_000;
 /** An unreadable lockfile (created but not yet written, or torn) is held this long. */
 const UNREADABLE_STALE_MS = 60_000;
 
@@ -94,7 +107,7 @@ export function lockHolder(
 	options: LockOptions = {},
 	now = Date.now(),
 ): LockRecord | null {
-	const staleAfterMs = options.staleAfterMs ?? LOCK_STALE_AFTER_MS;
+	const isAlive = options.isAlive ?? isProcessAlive;
 	const record = readLockRecord(path);
 	if (record === null) {
 		try {
@@ -106,8 +119,8 @@ export function lockHolder(
 			return null;
 		}
 	}
-	if (!isProcessAlive(record.pid)) return null;
-	if (now - record.heartbeatAt > staleAfterMs) return null;
+	if (!isAlive(record.pid)) return null;
+	if (now - record.heartbeatAt > LOCK_STALE_AFTER_MS) return null;
 	return record;
 }
 
@@ -120,23 +133,36 @@ function writeRecord(path: string, record: LockRecord): void {
 function makeHandle(
 	path: string,
 	record: LockRecord,
-	heartbeatMs: number,
+	options: { heartbeatMs: number; onLost?: () => void },
 ): LockHandle {
 	let released = false;
+	let lost = false;
 	const timer = setInterval(() => {
-		// Another process may have taken over after a stall; never overwrite it.
-		if (readLockRecord(path)?.pid !== process.pid) return;
+		if (readLockRecord(path)?.pid !== process.pid) {
+			// Another process replaced or removed the lockfile. Never write it back:
+			// the lock now belongs to someone else, and this holder must stop.
+			lost = true;
+			clearInterval(timer);
+			logger.error(
+				`[lock] ${path} was taken over by another process; this process no longer holds the lock.`,
+			);
+			options.onLost?.();
+			return;
+		}
 		record.heartbeatAt = Date.now();
 		writeRecord(path, record);
-	}, heartbeatMs);
+	}, options.heartbeatMs);
 	timer.unref?.();
 	return {
 		path,
+		get lost() {
+			return lost;
+		},
 		release() {
 			if (released) return;
 			released = true;
 			clearInterval(timer);
-			if (readLockRecord(path)?.pid === process.pid) {
+			if (!lost && readLockRecord(path)?.pid === process.pid) {
 				try {
 					unlinkSync(path);
 				} catch (e) {
@@ -155,7 +181,6 @@ export function tryAcquireProcessLock(
 	path: string,
 	options: LockOptions = {},
 ): LockHandle | null {
-	const staleAfterMs = options.staleAfterMs ?? LOCK_STALE_AFTER_MS;
 	const heartbeatMs = options.heartbeatMs ?? LOCK_HEARTBEAT_MS;
 	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 	// Two attempts: the second runs only after a stale lockfile was removed.
@@ -173,12 +198,15 @@ export function tryAcquireProcessLock(
 			} finally {
 				closeSync(fd);
 			}
-			return makeHandle(path, record, heartbeatMs);
+			return makeHandle(path, record, {
+				heartbeatMs,
+				onLost: options.onLost,
+			});
 		} catch (e) {
 			if (errCode(e) !== "EEXIST") throw e;
 		}
-		if (lockHolder(path, { staleAfterMs }) !== null) return null;
-		if (!removeStaleLock(path, staleAfterMs)) return null;
+		if (lockHolder(path, options) !== null) return null;
+		if (!removeStaleLock(path, options)) return null;
 	}
 	return null;
 }
@@ -196,7 +224,7 @@ export function tryAcquireProcessLock(
  * and is removed so the lock is not stuck. A release that races with a takeover
  * can still lose one window; the lock file is short-lived and this is narrow.
  */
-function removeStaleLock(path: string, staleAfterMs: number): boolean {
+function removeStaleLock(path: string, options: LockOptions): boolean {
 	const takeover = `${path}.takeover`;
 	let fd: number;
 	try {
@@ -214,7 +242,7 @@ function removeStaleLock(path: string, staleAfterMs: number): boolean {
 	}
 	closeSync(fd);
 	try {
-		if (lockHolder(path, { staleAfterMs }) !== null) return false;
+		if (lockHolder(path, options) !== null) return false;
 		try {
 			unlinkSync(path);
 		} catch (e) {
