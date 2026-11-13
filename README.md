@@ -436,6 +436,8 @@ Credentials and paths stay in `.env`:
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. `info` logs lengths, ids and similarity scores; consolidation and contradiction decisions at `info` include entry text. `warn` suppresses those lines. |
 | `LOG_MAX_BYTES` | `20971520` (20 MB) | Size at which the active log rotates. Rotation keeps `server.log.1` to `server.log.3` and drops the oldest, so the files total about four times this value. `0` disables rotation. Rotated copies can hold text written by earlier versions, including an old admin token; delete them once you no longer need them. |
 
+**Upgrading with a custom `stateDb.path`.** The PID file and server log now sit in the directory of `stateDb.path`, not in `~/.local/share/knowledge-server`. A server started before the upgrade keeps writing its PID file to the old location, so stop it before upgrading (`knowledge-server stop`, with the old binary). If it is still running after the upgrade, stop it with `kill "$(cat ~/.local/share/knowledge-server/server.pid)"`.
+
 ### Session sources
 
 All sources are auto-detected. Override paths or disable sources via environment variables:

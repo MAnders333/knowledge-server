@@ -365,6 +365,15 @@ const EXPLICIT_PATH_VARS = [
 export function parseEnv(env: Env, configPath = DEFAULT_CONFIG_PATH) {
 	const r = new EnvReader(env);
 	const dataDir = resolveDataDir(configPath);
+	const explicitPidPath = env.KNOWLEDGE_PID_PATH;
+	const pidPath = explicitPidPath ?? join(dataDir, "server.pid");
+	const legacyPidDefault = join(
+		homeDir(),
+		".local",
+		"share",
+		"knowledge-server",
+		"server.pid",
+	);
 
 	const rerankEnabled = env.RERANK_ENABLED !== "false";
 	const rerankProvider = rerankProviderFromEnv(env);
@@ -413,7 +422,15 @@ export function parseEnv(env: Env, configPath = DEFAULT_CONFIG_PATH) {
 		// PID file — written on startup, deleted on clean shutdown.
 		// Used by `knowledge-server stop` to signal the running server.
 		// Override with KNOWLEDGE_PID_PATH; set to "" to disable PID file management.
-		pidPath: env.KNOWLEDGE_PID_PATH ?? join(dataDir, "server.pid"),
+		pidPath,
+		// Where earlier versions wrote the PID file: the default before the data
+		// directory followed stateDb.path. Set only when that differs from pidPath and
+		// KNOWLEDGE_PID_PATH is unset, so a server started by an earlier version can
+		// still be found after an upgrade. Null otherwise.
+		legacyPidPath:
+			explicitPidPath === undefined && legacyPidDefault !== pidPath
+				? legacyPidDefault
+				: null,
 
 		// Upper bound on each knowledge store's connect at startup (store-registry.ts).
 		storeInitTimeoutMs: r.int("STORE_INIT_TIMEOUT_MS", 10_000, 1),

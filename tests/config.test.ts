@@ -337,3 +337,47 @@ describe("parseEnv — per-type LLM timeouts", () => {
 		expect(parsed.config.llm.timeoutsMs.extraction).toBe(45_000);
 	});
 });
+
+describe("parseEnv — PID file after the data-dir move", () => {
+	let dir: string;
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "ks-config-pid-"));
+	});
+
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	function customStateDbConfig(): string {
+		const dataDir = join(dir, "data");
+		mkdirSync(dataDir);
+		const configPath = join(dir, "config.jsonc");
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				stores: [{ id: "main", kind: "sqlite", writable: true }],
+				stateDb: { kind: "sqlite", path: join(dataDir, "state.db") },
+			}),
+		);
+		return configPath;
+	}
+
+	it("names the PID file an earlier version wrote, when the data directory moved", () => {
+		const { config } = parseEnv({}, customStateDbConfig());
+		expect(config.pidPath).toBe(join(dir, "data", "server.pid"));
+		expect(config.legacyPidPath).toBe(
+			join(homeDir(), ".local", "share", "knowledge-server", "server.pid"),
+		);
+	});
+
+	it("names no legacy PID file on the default layout or with KNOWLEDGE_PID_PATH set", () => {
+		expect(parse({}).config.legacyPidPath).toBeNull();
+		expect(
+			parseEnv(
+				{ KNOWLEDGE_PID_PATH: join(dir, "explicit.pid") },
+				customStateDbConfig(),
+			).config.legacyPidPath,
+		).toBeNull();
+	});
+});
