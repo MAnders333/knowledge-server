@@ -177,7 +177,7 @@ jobs:
         with:
           name: release-${{ matrix.suffix }}
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
           path: |
             dist/knowledge-server-${{ matrix.suffix }}
             dist/knowledge-server-${{ matrix.suffix }}.gz
@@ -194,9 +194,12 @@ jobs:
   publish:
     # Runs only when every build leg succeeded. Until this job promotes the
     # draft, /releases/latest (used by install.sh and update) does not see it.
-    # If a build leg fails, re-run only the failed jobs. A full re-run does not
+    # If a build leg fails, re-run only the failed jobs within 7 days, while the
+    # staged artifacts still exist (retention-days below). A full re-run does not
     # recover the draft: release-please has already tagged the release, so the
-    # release-please job reports no new release and this job is skipped.
+    # release-please job reports no new release and this job is skipped. Once the
+    # artifacts expire, upload the missing assets with `gh release upload` and
+    # promote the draft with `gh release edit --draft=false` by hand.
     name: Publish release
     needs: [release-please, build-binaries]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
