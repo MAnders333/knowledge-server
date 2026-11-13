@@ -86,7 +86,15 @@ describe("admin token gate", () => {
 	});
 
 	describe("stable token", () => {
-		beforeEach(() => build(true));
+		beforeEach(() => {
+			// The routes under test call the activation engine: stub it, no embedder.
+			spyOn(activation, "activate").mockResolvedValue({
+				entries: [],
+				query: "",
+				totalActive: 0,
+			});
+			build(true);
+		});
 
 		it("answers /health without a token", async () => {
 			const res = await call("/health");
@@ -145,6 +153,64 @@ describe("admin token gate", () => {
 			expect(bare.status).toBe(401);
 		});
 
+		it.each([
+			["GET", "/status", undefined, 200],
+			["GET", "/activate?q=churn", undefined, 200],
+			["GET", "/review", undefined, 200],
+			["GET", "/entries", undefined, 200],
+			["GET", "/entries/c0ffee00", undefined, 404],
+			["POST", "/entries/c0ffee00/flag", { reason: "wrong" }, 404],
+			[
+				"POST",
+				"/hooks/claude-code/user-prompt",
+				{ prompt: "how do we rotate the admin token" },
+				200,
+			],
+		])("accepts the token on %s %s", async (method, path, body, status) => {
+			const res = await call(path, {
+				method,
+				token: STABLE_TOKEN,
+				headers: { "Content-Type": "application/json" },
+				body: body === undefined ? null : JSON.stringify(body),
+			});
+			expect(res.status).toBe(status);
+		});
+
+		it("accepts the token on /mcp", async () => {
+			const res = await call("/mcp", {
+				method: "POST",
+				token: STABLE_TOKEN,
+				headers: {
+					"Content-Type": "application/json",
+					Accept: "application/json, text/event-stream",
+				},
+				body: JSON.stringify({
+					jsonrpc: "2.0",
+					id: 1,
+					method: "initialize",
+					params: {
+						protocolVersion: "2025-03-26",
+						capabilities: {},
+						clientInfo: { name: "auth-test", version: "1.0.0" },
+					},
+				}),
+			});
+			expect(res.status).toBe(200);
+		});
+
+		it("treats an empty bearer as no token, and reads the scheme case-insensitively", async () => {
+			for (const authorization of ["Bearer", "Bearer    "]) {
+				const res = await call("/entries", {
+					headers: { Authorization: authorization },
+				});
+				expect(res.status).toBe(401);
+			}
+			const lower = await call("/entries", {
+				headers: { Authorization: `bearer ${STABLE_TOKEN}` },
+			});
+			expect(lower.status).toBe(200);
+		});
+
 		it("throttles failed attempts per client address with 429 and Retry-After", async () => {
 			for (let i = 0; i < 10; i++) {
 				expect(
@@ -162,10 +228,15 @@ describe("admin token gate", () => {
 			expect(retryAfter).toBeGreaterThan(0);
 			expect(retryAfter).toBeLessThanOrEqual(60);
 
-			// The valid holder on the same address is refused until the window ends,
-			// while another address is unaffected.
+			// A correct token is never refused by the throttle. The valid holder on the
+			// same address gets through, wrong tokens there stay refused, and another
+			// address is unaffected.
 			expect(
 				(await call("/entries", { token: STABLE_TOKEN }, "10.0.0.1")).status,
+			).toBe(200);
+			expect(
+				(await call("/entries", { token: "wrong-token-0000" }, "10.0.0.1"))
+					.status,
 			).toBe(429);
 			expect(
 				(await call("/entries", { token: STABLE_TOKEN }, "10.0.0.2")).status,
@@ -233,5 +304,16 @@ describe("AuthFailureThrottle", () => {
 		expect(throttle.blockedForMs("a", 1)).toBe(0);
 		expect(throttle.blockedForMs("b", 1)).toBeGreaterThan(0);
 		expect(throttle.blockedForMs("c", 1)).toBeGreaterThan(0);
+	});
+
+	it("keeps a renewed window at the back of the eviction order", () => {
+		const throttle = new AuthFailureThrottle(1, 1000, 2);
+		throttle.recordFailure("a", 0);
+		throttle.recordFailure("b", 0);
+		// a's window has ended, so this failure opens a new one and a moves to the back.
+		throttle.recordFailure("a", 1000);
+		throttle.recordFailure("c", 1000);
+		expect(throttle.blockedForMs("a", 1001)).toBeGreaterThan(0);
+		expect(throttle.blockedForMs("b", 1001)).toBe(0);
 	});
 });

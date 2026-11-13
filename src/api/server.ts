@@ -192,27 +192,34 @@ export function createApp(
 
 	// -- Admin token --
 
+	// The Bearer token the request presents, or null when there is none. The scheme is
+	// case-insensitive. An empty or whitespace-only bearer is no token at all.
+	function presentedToken(c: Context): string | null {
+		const parts = (c.req.header("Authorization") ?? "").trim().split(/\s+/);
+		if (parts.length !== 2 || parts[0].toLowerCase() !== "bearer") return null;
+		return parts[1];
+	}
+
 	// Compare SHA-256 digests, not the raw strings: both digests are 32 bytes, so the
 	// comparison does not reveal the length of the token that was sent.
-	const expectedAuthDigest = createHash("sha256")
-		.update(`Bearer ${adminToken}`)
-		.digest();
+	const expectedTokenDigest = createHash("sha256").update(adminToken).digest();
 
 	function requireAdminToken(c: Context): boolean {
-		const provided = createHash("sha256")
-			.update(c.req.header("Authorization") ?? "")
-			.digest();
-		return timingSafeEqual(provided, expectedAuthDigest);
+		const token = presentedToken(c);
+		if (token === null) return false;
+		const provided = createHash("sha256").update(token).digest();
+		return timingSafeEqual(provided, expectedTokenDigest);
 	}
 
 	// Stable admin token: every route except /health needs its Bearer token, reads
-	// included. Failed attempts are throttled per client address. In random-token
-	// mode reads stay open to loopback clients, and only the mutation routes check
-	// the token.
+	// included. A correct token always passes; the throttle never refuses it. Only
+	// failed attempts are counted, and a client with too many in the current window
+	// gets 429 until the window ends. In random-token mode reads stay open to loopback
+	// clients, and only the mutation routes check the token.
 	const authFailures = new AuthFailureThrottle();
 	if (adminTokenIsStable) {
 		app.use("*", async (c, next) => {
-			if (c.req.path === "/health") return next();
+			if (c.req.path === "/health" || requireAdminToken(c)) return next();
 			const client = clientAddressOf(c);
 			const blockedMs = authFailures.blockedForMs(client);
 			if (blockedMs > 0) {
@@ -222,11 +229,8 @@ export function createApp(
 					429,
 				);
 			}
-			if (!requireAdminToken(c)) {
-				authFailures.recordFailure(client);
-				return c.json({ error: "Unauthorized" }, 401);
-			}
-			await next();
+			authFailures.recordFailure(client);
+			return c.json({ error: "Unauthorized" }, 401);
 		});
 	}
 
@@ -409,15 +413,15 @@ export function createApp(
 	// -- Helpers --
 
 	/**
-	 * Log one activation to the server log. Content-light by default:
+	 * Log one activation to the server log. Ids and scores only at info level:
 	 *
 	 *   [activation/opencode] chars=129 → 3 entries
 	 *   [activation/opencode]   0.72 fact  <id>
 	 *
-	 * At LOG_LEVEL=debug the query and entry text are added:
+	 * Query and entry text are logged only at debug level, on separate lines:
 	 *
-	 *   [activation/opencode] q="<full query>" → 3 entries
-	 *   [activation/opencode]   0.72 fact  <id>  "full entry content"
+	 *   [activation/opencode] q="<full query>"
+	 *   [activation/opencode]     content "<entry content>"
 	 *
 	 * caller is the client tag (opencode, pi, claude-code, mcp, unknown, …).
 	 * Measurement lives in activation_event (see recordActivationEvent).
@@ -429,19 +433,21 @@ export function createApp(
 	): void {
 		const prefix = `[activation/${caller}]`;
 		const debug = logger.isEnabled("debug");
-		const head = debug ? `q=${JSON.stringify(query)}` : `chars=${query.length}`;
-		if (entries.length === 0) {
-			logger.log(`${prefix} ${head} → 0 entries`);
-			return;
-		}
-		logger.log(
-			`${prefix} ${head} → ${entries.length} entr${entries.length === 1 ? "y" : "ies"}`,
-		);
+		const count =
+			entries.length === 0
+				? "0 entries"
+				: `${entries.length} entr${entries.length === 1 ? "y" : "ies"}`;
+		logger.log(`${prefix} chars=${query.length} → ${count}`);
+		if (debug) logger.debug(`${prefix} q=${JSON.stringify(query)}`);
 		for (const r of entries) {
-			const content = debug ? `  ${JSON.stringify(r.entry.content)}` : "";
 			logger.log(
-				`${prefix}   ${r.rawSimilarity.toFixed(3)} ${r.entry.type.padEnd(10)} ${r.entry.id}${content}`,
+				`${prefix}   ${r.rawSimilarity.toFixed(3)} ${r.entry.type.padEnd(10)} ${r.entry.id}`,
 			);
+			if (debug) {
+				logger.debug(
+					`${prefix}     content ${JSON.stringify(r.entry.content)}`,
+				);
+			}
 		}
 	}
 

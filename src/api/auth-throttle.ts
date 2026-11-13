@@ -3,8 +3,8 @@
  *
  * Fixed windows, one per client address. Once a client has failed `maxFailures`
  * times in a window it is refused (429) until the window ends. Other clients are
- * unaffected. The map is bounded: when it is full, the least recently created
- * window is dropped, so a flood of addresses cannot grow it without limit.
+ * unaffected. The map is bounded: when it is full, the window opened longest ago
+ * is dropped, so a flood of addresses cannot grow it without limit.
  */
 export class AuthFailureThrottle {
 	private readonly windows = new Map<
@@ -29,7 +29,10 @@ export class AuthFailureThrottle {
 	recordFailure(client: string, now = Date.now()): void {
 		let window = this.windows.get(client);
 		if (!window || now - window.startedAt >= this.windowMs) {
-			if (!window && this.windows.size >= this.maxClients) {
+			// Delete first: a renewed window moves to the back, so eviction (oldest
+			// first) follows the order in which the windows were opened.
+			this.windows.delete(client);
+			if (this.windows.size >= this.maxClients) {
 				const oldest = this.windows.keys().next().value;
 				if (oldest !== undefined) this.windows.delete(oldest);
 			}
