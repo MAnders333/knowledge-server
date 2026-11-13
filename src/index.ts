@@ -462,9 +462,16 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	if (serverStateDb instanceof ServerStateDB) {
 		const stateDb = serverStateDb;
 		setTimeout(() => {
-			stateDb.compactIfNeeded({
-				lockPath: stateMaintenanceLockPath(dataDir),
-			});
+			try {
+				stateDb.compactIfNeeded({
+					lockPath: stateMaintenanceLockPath(dataDir),
+				});
+			} catch (err) {
+				// The server is already bound: housekeeping must never take it down.
+				logger.warn(
+					`[db] state.db housekeeping failed: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
 		}, 0);
 	}
 

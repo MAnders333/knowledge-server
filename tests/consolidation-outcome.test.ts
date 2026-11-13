@@ -7,6 +7,7 @@
  * attempt, and are dead-lettered after PENDING_EPISODE_MAX_ATTEMPTS. The drain
  * loops stop when a batch settles nothing.
  */
+import { Database } from "bun:sqlite";
 import {
 	afterEach,
 	beforeEach,
@@ -19,6 +20,7 @@ import {
 import { mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import * as aiModule from "ai";
 import { ActivationEngine } from "../src/activation/activate";
 import { drainConsolidation } from "../src/commands/consolidation-drain";
 import { config } from "../src/config";
@@ -938,5 +940,86 @@ describe("secrets are scrubbed before extraction", () => {
 		const prompt = String(extract.mock.calls[0]?.[0]);
 		expect(prompt).not.toContain(token);
 		expect(prompt).toContain("[REDACTED:github_token]");
+	});
+});
+
+describe("provider failures from a real model call", () => {
+	// Provider text is assembled as data, the way a gateway returns it.
+	const ECHO = "EPISODE-TEXT-THAT-MUST-NOT-LEAK";
+	let savedRetries: number;
+
+	beforeEach(() => {
+		savedRetries = config.llm.maxRetries;
+		config.llm.maxRetries = 0;
+	});
+	afterEach(() => {
+		config.llm.maxRetries = savedRetries;
+	});
+
+	function providerError(message: string, statusCode: number, body: unknown) {
+		return Object.assign(new Error(message), {
+			name: "AI_APICallError",
+			statusCode,
+			responseBody: JSON.stringify(body),
+		});
+	}
+
+	/** The last_error recorded for a pending row, read from the state DB file. */
+	function storedLastError(id: string): string | null {
+		const reader = new Database(join(tempDir, "state.db"), { readonly: true });
+		try {
+			const row = reader
+				.query<{ last_error: string | null }, [string]>(
+					"SELECT last_error FROM pending_episode_attempts WHERE id = ?",
+				)
+				.get(id);
+			return row?.last_error ?? null;
+		} finally {
+			reader.close();
+		}
+	}
+
+	it("stores the status and error code of a rejected request, not the provider's text", async () => {
+		await state.insertPendingEpisode(
+			pendingRow({
+				id: "row-422",
+				sessionId: "session-422",
+				maxMessageTime: Date.now() - 1000,
+			}),
+		);
+		spyOn(aiModule, "generateText").mockRejectedValue(
+			providerError(`Invalid input: ${ECHO}`, 422, {
+				detail: [{ loc: ["body", "input"], msg: ECHO, type: "string_type" }],
+			}),
+		);
+
+		await engine.consolidate();
+
+		const stored = storedLastError("row-422");
+		expect(stored).toContain("AI_APICallError HTTP 422 (error: string_type)");
+		expect(stored).not.toContain(ECHO);
+	});
+
+	it("a billing rejection stays pending and is never dead-lettered", async () => {
+		await state.insertPendingEpisode(
+			pendingRow({
+				id: "row-billing",
+				sessionId: "session-billing",
+				maxMessageTime: Date.now() - 1000,
+			}),
+		);
+		spyOn(aiModule, "generateText").mockRejectedValue(
+			providerError("Your credit balance is too low", 400, {
+				error: { message: "Your credit balance is too low" },
+			}),
+		);
+
+		for (let i = 0; i <= PENDING_EPISODE_MAX_ATTEMPTS; i++) {
+			await engine.consolidate();
+		}
+
+		const rows = await state.getPendingEpisodes(0);
+		expect(rows.map((r) => r.id)).toContain("row-billing");
+		expect(storedLastError("row-billing")).toBeNull();
 	});
 });

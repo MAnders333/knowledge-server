@@ -8,15 +8,19 @@
  * rate limits, timeouts, dropped connections, expired credentials and provider
  * outages. Transient failures never dead-letter an episode; the chunk is retried
  * on a later run.
+ *
+ * A failed model call arrives as LlmCallError, whose message is sanitized. The
+ * provider's own error is on its cause chain, and these functions read it there.
+ * That text is only matched, never stored or shown.
  */
 export function isDeterministicFailure(err: unknown): boolean {
-	if (err instanceof SyntaxError) return true;
+	const chain = errorChain(err);
+	if (chain.some((e) => e instanceof SyntaxError)) return true;
 	if (
-		typeof err === "object" &&
-		err !== null &&
-		"code" in err &&
-		typeof err.code === "string" &&
-		err.code.startsWith("22")
+		chain.some(
+			(e) =>
+				"code" in e && typeof e.code === "string" && e.code.startsWith("22"),
+		)
 	) {
 		return true;
 	}
@@ -43,25 +47,26 @@ export function providerFailureClass(err: unknown): string {
 	if (status !== undefined && status >= 500) {
 		return `provider error (HTTP ${status})`;
 	}
-	if (
-		err instanceof Error &&
-		(err.name === "AbortError" ||
-			err.name === "TimeoutError" ||
-			/timed? ?out|aborted/i.test(err.message))
-	) {
-		return "request timed out";
-	}
+	const timedOut = errorChain(err).some(
+		(e) =>
+			e instanceof Error &&
+			(e.name === "AbortError" ||
+				e.name === "TimeoutError" ||
+				/timed? ?out|aborted/i.test(e.message)),
+	);
+	if (timedOut) return "request timed out";
 	return "provider unreachable";
 }
 
-/** Find the HTTP status on the error or on the provider error it wraps (Vercel AI SDK). */
-function httpStatusOf(err: unknown): number | undefined {
+/**
+ * The error and the errors it wraps, outermost first: the AI SDK's lastError, then
+ * cause. Depth-limited.
+ */
+function errorChain(err: unknown): object[] {
+	const chain: object[] = [];
 	let current: unknown = err;
-	for (let depth = 0; depth < 4; depth++) {
-		if (typeof current !== "object" || current === null) return undefined;
-		if ("statusCode" in current && typeof current.statusCode === "number") {
-			return current.statusCode;
-		}
+	while (typeof current === "object" && current !== null && chain.length < 4) {
+		chain.push(current);
 		current =
 			"lastError" in current
 				? current.lastError
@@ -69,14 +74,25 @@ function httpStatusOf(err: unknown): number | undefined {
 					? current.cause
 					: undefined;
 	}
+	return chain;
+}
+
+/** The HTTP status on the error or on the provider error it wraps. */
+function httpStatusOf(err: unknown): number | undefined {
+	for (const e of errorChain(err)) {
+		if ("statusCode" in e && typeof e.statusCode === "number") {
+			return e.statusCode;
+		}
+	}
 	return undefined;
 }
 
+/** The messages down the chain, for matching only. */
 function messageOf(err: unknown): string {
-	if (!(err instanceof Error)) return String(err);
-	const inner =
-		"lastError" in err && err.lastError instanceof Error
-			? err.lastError.message
-			: "";
-	return `${err.message} ${inner}`;
+	const chain = errorChain(err);
+	if (chain.length === 0) return String(err);
+	return chain
+		.filter((e): e is Error => e instanceof Error)
+		.map((e) => e.message)
+		.join(" ");
 }

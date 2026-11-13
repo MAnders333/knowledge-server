@@ -68,6 +68,8 @@ jobs:
       # Required by actions/attest-build-provenance (Sigstore OIDC identity).
       id-token: write
       attestations: write
+      # Required by the guard step below, which reads CI runs for the release commit.
+      actions: read
     strategy:
       matrix:
         include:
@@ -78,16 +80,18 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - name: Refuse to build a commit that CI did not validate
-        # release-please tags the commit it released (outputs.sha). Only the commit CI
-        # validated (workflow_run.head_sha) may be built and published. Otherwise the
-        # build fails, and the release stays a draft.
+      - name: Build only a commit whose CI run succeeded
+        # release-please tags the commit it released (outputs.sha). It is built only
+        # when CI concluded successfully for that commit on a push. CI for the release
+        # merge commit may still be running, or may have failed; then this job fails
+        # and the release stays a draft.
         env:
-          VALIDATED_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_SHA: ${{ needs.release-please.outputs.sha }}
         run: |
-          if [ "$RELEASE_SHA" != "$VALIDATED_SHA" ]; then
-            echo "::error::release commit $RELEASE_SHA is not the CI-validated commit $VALIDATED_SHA; not building."
+          green="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$RELEASE_SHA" --event push --status success --json databaseId --jq 'length')"
+          if [ "$green" -lt 1 ]; then
+            echo "::error::no successful CI push run for release commit $RELEASE_SHA; not building. Re-run this job once CI is green for that commit."
             exit 1
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -209,11 +213,13 @@ jobs:
     # Runs only when every build leg succeeded. Until this job promotes the
     # draft, /releases/latest (used by install.sh and update) does not see it.
     # If a build leg fails, re-run only the failed jobs within 7 days, while the
-    # staged artifacts still exist (retention-days below). A full re-run does not
-    # recover the draft: release-please has already tagged the release, so the
-    # release-please job reports no new release and this job is skipped. Once the
-    # artifacts expire, upload the missing assets with `gh release upload` and
-    # promote the draft with `gh release edit --draft=false` by hand.
+    # staged artifacts still exist (retention-days below). A build leg fails while CI
+    # has no successful push run for the release commit. Once CI is green for that
+    # commit, re-running the failed jobs builds it. A full re-run does not recover
+    # the draft: release-please has already tagged the release, so the release-please
+    # job reports no new release and this job is skipped. Once the artifacts expire,
+    # upload the missing assets with `gh release upload` and promote the draft with
+    # `gh release edit --draft=false` by hand.
     name: Publish release
     needs: [release-please, build-binaries]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}

@@ -15,6 +15,7 @@ import * as aiModule from "ai";
 import { config } from "../src/config";
 import {
 	ConsolidationLLM,
+	LlmCallError,
 	formatEpisodes,
 	omitRequestParams,
 	renameMaxTokensParam,
@@ -922,9 +923,14 @@ describe("ConsolidationLLM timeout and retry policy", () => {
 		const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
 		const started = Date.now();
 		try {
-			await expect(
-				llm.detectAndResolveContradiction(newEntry, candidates),
-			).rejects.toThrow("aborted");
+			const failure = await llm
+				.detectAndResolveContradiction(newEntry, candidates)
+				.catch((e: unknown) => e);
+			// The message names the class only; the abort itself stays on the cause.
+			expect(failure).toBeInstanceOf(LlmCallError);
+			expect((failure as Error).cause).toMatchObject({
+				message: "This operation was aborted",
+			});
 			expect(Date.now() - started).toBeLessThan(5_000);
 			expect(spy).toHaveBeenCalledTimes(1);
 			const logged = errorSpy.mock.calls.map((c) => String(c[0])).join("\n");
@@ -944,9 +950,13 @@ describe("ConsolidationLLM timeout and retry policy", () => {
 		);
 		const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
 		try {
-			await expect(llm.decideMerge(existing, extracted)).rejects.toThrow(
-				"aborted",
-			);
+			const failure = await llm
+				.decideMerge(existing, extracted)
+				.catch((e: unknown) => e);
+			expect(failure).toBeInstanceOf(LlmCallError);
+			expect((failure as Error).cause).toMatchObject({
+				message: "This operation was aborted",
+			});
 			expect(spy).toHaveBeenCalledTimes(1);
 			expect(String(errorSpy.mock.calls[0]?.[0])).toContain(
 				"merge call to anthropic/claude-haiku-4-5 exceeded 50ms timeout",
@@ -971,9 +981,14 @@ describe("ConsolidationLLM timeout and retry policy", () => {
 
 	it("gives up after 1 + maxRetries attempts when a non-timeout error persists", async () => {
 		const spy = generateTextMock();
-		spy.mockRejectedValue(new Error("HTTP 503 upstream unavailable"));
+		const apiError = Object.assign(new Error("upstream unavailable"), {
+			name: "AI_APICallError",
+			statusCode: 503,
+		});
+		spy.mockRejectedValue(apiError);
+		// The thrown error names the class and status, not the provider's message.
 		await expect(llm.decideMerge(existing, extracted)).rejects.toThrow(
-			"HTTP 503",
+			"AI_APICallError HTTP 503",
 		);
 		expect(spy).toHaveBeenCalledTimes(3);
 	});
