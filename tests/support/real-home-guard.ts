@@ -42,6 +42,15 @@ const WATCHED_DIRS = [
 ];
 
 /**
+ * Names a running server creates and rewrites on its own: locks, pid and log files,
+ * SQLite journals, daemon state and the model cache. Directory listings skip them,
+ * so a server running beside the tests does not fail the run. Database and config
+ * files are still reported when they appear.
+ */
+const SERVER_RUNTIME_NAME =
+	/^(?:server\.pid|server\.log.*|daemon\..*|models|.*\.lock|.*\.tmp|.*-(?:wal|shm|journal))$/;
+
+/**
  * The real home from the passwd entry (independent of `HOME`, which the isolated
  * test runs override). `KS_REAL_HOME_GUARD_ROOT` points the guard at another
  * directory; only the guard's own tests use it, to prove the guard fires.
@@ -80,7 +89,10 @@ export function snapshotHome(home: string = REAL_HOME): Map<string, string> {
 	for (const rel of WATCHED_DIRS) {
 		const abs = join(home, rel);
 		if (!existsSync(abs)) continue;
-		const names = readdirSync(abs).sort().join("\n");
+		const names = readdirSync(abs)
+			.filter((name) => !SERVER_RUNTIME_NAME.test(name))
+			.sort()
+			.join("\n");
 		out.set(rel, `dir entries:\n${names}`);
 	}
 	return out;

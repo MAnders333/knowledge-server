@@ -85,4 +85,31 @@ describe("real home guard", () => {
 			rmSync(home, { recursive: true, force: true });
 		}
 	});
+
+	it("ignores runtime files a running server writes in its data directory", () => {
+		const home = mkdtempSync(join(tmpdir(), "home-guard-"));
+		try {
+			const dataDir = join(home, ".local", "share", "knowledge-server");
+			mkdirSync(dataDir, { recursive: true });
+			const before = snapshotHome(home);
+
+			for (const name of [
+				"consolidate.lock",
+				"server.log.1",
+				"server.pid",
+				"knowledge.db-wal",
+				"knowledge.db-shm",
+				"state.db-journal",
+				"daemon.status",
+				"scratch.tmp",
+			]) {
+				writeFileSync(join(dataDir, name), "");
+			}
+			mkdirSync(join(dataDir, "models"));
+
+			expect(diffSnapshots(before, snapshotHome(home))).toEqual([]);
+		} finally {
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
 });
