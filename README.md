@@ -191,7 +191,7 @@ Codex: after `setup-tool codex`, open Codex, run `/hooks`, and trust the knowled
 
 Each injected entry starts with a short id, for example `(id 1a2b3c4d)`. When an entry is wrong or outdated, the agent can call the `knowledge_flag` MCP tool with that id. The entry is queued for review (status `conflicted`), is no longer injected into sessions, and is not deleted. The flag reason is written to the server log (`[entries/flag]`), not stored on the entry. The MCP process needs `KNOWLEDGE_ADMIN_TOKEN` in its environment for this.
 
-`knowledge-server status` shows the server's health (`ok`, `degraded` or `down`, with reasons) when the server answers, and, per source, the episodes captured in the last 7 days next to the activations received. It warns when a source is captured but nothing was injected.
+`knowledge-server status` shows the server's health (`ok`, `degraded` or `down`, with reasons) when the server answers, and, per source, the episodes captured in the last 7 days next to the activations that injected entries. It warns when a source is captured but nothing was injected.
 
 ## Components
 

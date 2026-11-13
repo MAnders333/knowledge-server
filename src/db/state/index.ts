@@ -20,15 +20,23 @@ import {
 	pendingMigrations,
 } from "../migration-registry.js";
 import { SQLITE_BUSY_TIMEOUT_MS } from "../sqlite-busy.js";
+import {
+	ACTIVATION_EVENT_COLUMNS,
+	type ActivationEventValue,
+} from "./activation-columns.js";
 import { runStateMigrations } from "./migrations.js";
 import {
-	ACTIVATION_EVENT_V4_COLUMNS,
 	SERVER_LOCAL_MIGRATIONS,
-} from "./schema.js";
-import {
-	SERVER_LOCAL_CREATE_TABLES,
 	SERVER_LOCAL_SCHEMA_VERSION,
 } from "./schema.js";
+
+const INSERT_ACTIVATION_EVENT_SQL = `INSERT INTO activation_event (${ACTIVATION_EVENT_COLUMNS.map((c) => c.name).join(", ")})
+	VALUES (${ACTIVATION_EVENT_COLUMNS.map(() => "?").join(", ")})`;
+
+/** SQLite has no boolean type: booleans are bound as 1 or 0. */
+function sqliteBinding(value: ActivationEventValue): string | number | null {
+	return typeof value === "boolean" ? Number(value) : value;
+}
 
 /**
  * Default path for state.db — the server-local staging/bookkeeping database.
@@ -94,91 +102,72 @@ export class ServerStateDB implements IServerStateDB {
 	}
 
 	private initialize(legacyKnowledgeDbPath: string | undefined): void {
-		this.db.exec(`
-      CREATE TABLE IF NOT EXISTS schema_version (
-        version INTEGER NOT NULL,
-        applied_at INTEGER NOT NULL
-      );
-    `);
-
-		const currentVersion =
-			(
-				this.db
-					.prepare(
-						"SELECT version FROM schema_version ORDER BY version DESC LIMIT 1",
-					)
-					.get() as { version: number } | null
-			)?.version ?? 0;
-
-		assertNotNewerThanCode(
-			currentVersion,
-			SERVER_LOCAL_SCHEMA_VERSION,
-			"state.db",
-		);
-		if (currentVersion > 0) {
-			// Every version after the stored one must be registered. The state tables
-			// themselves are created idempotently below.
-			pendingMigrations(
-				SERVER_LOCAL_MIGRATIONS,
-				currentVersion,
-				SERVER_LOCAL_SCHEMA_VERSION,
-				"state.db",
+		const storedVersion = this.migrateSchema();
+		if (storedVersion === 0) {
+			logger.log(
+				`[db] Server state DB: created at v${SERVER_LOCAL_SCHEMA_VERSION}`,
 			);
 		}
-
-		// Always ensure applied_migrations exists — it was added in v1 but may be
-		// absent from existing v1 DBs created before this table was introduced.
+		// Bookkeeping for the one-time data migrations below. Kept out of the registry
+		// so a file stamped before this table existed still gets it.
 		this.db.exec(`
       CREATE TABLE IF NOT EXISTS applied_migrations (
         name       TEXT    PRIMARY KEY,
         applied_at INTEGER NOT NULL
       );
     `);
-
-		// v4: activation_event gate and budget counts. CREATE TABLE IF NOT EXISTS does
-		// not add columns to a table that already exists, so add any that are missing.
-		const eventColumns = new Set(
-			(
-				this.db.prepare("PRAGMA table_info(activation_event)").all() as Array<{
-					name: string;
-				}>
-			).map((c) => c.name),
-		);
-		if (eventColumns.size > 0) {
-			for (const column of ACTIVATION_EVENT_V4_COLUMNS) {
-				if (!eventColumns.has(column)) {
-					this.db.exec(
-						`ALTER TABLE activation_event ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`,
-					);
-				}
-			}
-		}
-		// v5: the scorer that produced rerank_scores. Nullable: earlier rows have none.
-		if (eventColumns.size > 0 && !eventColumns.has("rerank_model")) {
-			this.db.exec("ALTER TABLE activation_event ADD COLUMN rerank_model TEXT");
-		}
-		// Fresh DB or already at current version — create/verify tables.
-		// Always run CREATE TABLE IF NOT EXISTS for all tables — additive and
-		// idempotent. Schema migrations for state.db are always additive; tables
-		// are never dropped (pending_episodes may have unsent daemon uploads).
-		this.db.exec(SERVER_LOCAL_CREATE_TABLES);
-
-		// Stamp the current version idempotently. INSERT OR IGNORE avoids a
-		// duplicate-row error if the table already has a row for this version.
-		if (currentVersion < SERVER_LOCAL_SCHEMA_VERSION) {
-			this.db
-				.prepare(
-					"INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
-				)
-				.run(SERVER_LOCAL_SCHEMA_VERSION, Date.now());
-			if (currentVersion === 0) {
-				logger.log(
-					`[db] Server state DB: created at v${SERVER_LOCAL_SCHEMA_VERSION}`,
-				);
-			}
-		}
 		// Run one-time data migrations (idempotent — each guards itself via applied_migrations).
 		runStateMigrations(this.db, legacyKnowledgeDbPath);
+	}
+
+	/**
+	 * Apply each registered schema migration above the stored version, in order.
+	 * Runs under one write lock and re-reads the version under it, so a daemon and a
+	 * server starting together cannot both run the same ALTER. Returns the version
+	 * found before migrating (0 for a new file).
+	 */
+	private migrateSchema(): number {
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			this.db.exec(`
+      CREATE TABLE IF NOT EXISTS schema_version (
+        version INTEGER NOT NULL,
+        applied_at INTEGER NOT NULL
+      );
+    `);
+			const storedVersion =
+				(
+					this.db
+						.prepare(
+							"SELECT version FROM schema_version ORDER BY version DESC LIMIT 1",
+						)
+						.get() as { version: number } | null
+				)?.version ?? 0;
+			assertNotNewerThanCode(
+				storedVersion,
+				SERVER_LOCAL_SCHEMA_VERSION,
+				"state.db",
+			);
+			for (const migration of pendingMigrations(
+				SERVER_LOCAL_MIGRATIONS,
+				storedVersion,
+				SERVER_LOCAL_SCHEMA_VERSION,
+				"state.db",
+			)) {
+				migration.up(this.db);
+				this.db
+					.prepare(
+						"INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+					)
+					.run(migration.version, Date.now());
+			}
+			this.db.exec("COMMIT");
+			return storedVersion;
+		} catch (err) {
+			// A failed statement can already have rolled the transaction back.
+			if (this.db.inTransaction) this.db.exec("ROLLBACK");
+			throw err;
+		}
 	}
 
 	// ── Pending Episodes ──────────────────────────────────────────────────────
@@ -506,34 +495,11 @@ export class ServerStateDB implements IServerStateDB {
 
 	async insertActivationEvents(rows: ActivationEventRow[]): Promise<void> {
 		if (rows.length === 0) return;
-		const stmt = this.db.prepare(
-			`INSERT INTO activation_event
-			   (ts, client, session_hash, prompt_chars, cue_count, n_candidates, n_returned,
-			    entry_ids, raw_sims, rerank_scores, rerank_model, gate_mode, latency_ms, client_deadline_exceeded,
-			    gate_dropped, budget_dropped, deduped, injected_tokens)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		);
+		const stmt = this.db.prepare(INSERT_ACTIVATION_EVENT_SQL);
 		this.db.transaction(() => {
 			for (const r of rows) {
 				stmt.run(
-					r.ts,
-					r.client,
-					r.sessionHash,
-					r.promptChars,
-					r.cueCount,
-					r.nCandidates,
-					r.nReturned,
-					JSON.stringify(r.entryIds),
-					JSON.stringify(r.rawSims),
-					r.rerankScores === null ? null : JSON.stringify(r.rerankScores),
-					r.rerankModel,
-					r.gateMode,
-					r.latencyMs,
-					r.clientDeadlineExceeded ? 1 : 0,
-					r.gateDropped,
-					r.budgetDropped,
-					r.deduped,
-					r.injectedTokens,
+					...ACTIVATION_EVENT_COLUMNS.map((c) => sqliteBinding(c.value(r))),
 				);
 			}
 		})();
@@ -546,12 +512,13 @@ export class ServerStateDB implements IServerStateDB {
 		return Number(res.changes);
 	}
 
+	/** Injected activations per client since sinceMs: only those that returned entries and were not cut off by the client deadline. */
 	async countActivationsByClient(
 		sinceMs: number,
 	): Promise<Record<string, number>> {
 		const rows = this.db
 			.prepare(
-				"SELECT client, COUNT(*) AS n FROM activation_event WHERE ts >= ? GROUP BY client",
+				"SELECT client, COUNT(*) AS n FROM activation_event WHERE ts >= ? AND n_returned > 0 AND client_deadline_exceeded = 0 GROUP BY client",
 			)
 			.all(sinceMs) as Array<{ client: string; n: number }>;
 		return Object.fromEntries(rows.map((r) => [r.client, Number(r.n)]));
