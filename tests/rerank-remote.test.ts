@@ -680,10 +680,17 @@ describe("validateConfig: remote reranker", () => {
 describe("default candidate pool", () => {
 	/** Candidate count read in a child process, so the config singleton loads fresh. */
 	function candidatesWith(env: Record<string, string>): number {
+		const reranking: Record<string, true> = {
+			RERANK_CANDIDATES: true,
+			RERANK_PROVIDER: true,
+			RERANK_ENABLED: true,
+			RERANK_REMOTE_URL: true,
+			RERANK_REMOTE_API_KEY: true,
+			LLM_BASE_ENDPOINT: true,
+			LLM_API_KEY: true,
+		};
 		const childEnv = Object.fromEntries(
-			Object.entries(process.env).filter(
-				([name]) => name !== "RERANK_CANDIDATES" && name !== "RERANK_PROVIDER",
-			),
+			Object.entries(process.env).filter(([name]) => !reranking[name]),
 		);
 		const configPath = new URL("../src/config.ts", import.meta.url).pathname;
 		const child = Bun.spawnSync({
@@ -700,13 +707,26 @@ describe("default candidate pool", () => {
 		return Number(child.stdout.toString().trim().split("\n").pop());
 	}
 
-	it("is 30 for the remote reranker when RERANK_CANDIDATES is unset", () => {
-		expect(candidatesWith({ RERANK_PROVIDER: "remote" })).toBe(30);
+	const gateway = {
+		LLM_BASE_ENDPOINT: "https://gateway.example.org",
+		LLM_API_KEY: API_KEY,
+	};
+
+	it("is 30 for a usable remote reranker when RERANK_CANDIDATES is unset", () => {
+		expect(candidatesWith({ RERANK_PROVIDER: "remote", ...gateway })).toBe(30);
+	});
+
+	it("is 16 when the remote reranker cannot run, so the local fallback keeps its pool", () => {
+		expect(candidatesWith({ RERANK_PROVIDER: "remote" })).toBe(16);
 	});
 
 	it("keeps an explicit RERANK_CANDIDATES for the remote reranker", () => {
 		expect(
-			candidatesWith({ RERANK_PROVIDER: "remote", RERANK_CANDIDATES: "16" }),
+			candidatesWith({
+				RERANK_PROVIDER: "remote",
+				RERANK_CANDIDATES: "16",
+				...gateway,
+			}),
 		).toBe(16);
 	});
 

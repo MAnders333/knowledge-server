@@ -64,7 +64,7 @@ Releases published before plugin and command files were checksummed (their `SHA2
 
 ### From source
 
-**Prerequisites:** [Bun](https://bun.sh) ≥ 1.2
+**Prerequisites:** [Bun](https://bun.sh) 1.4.4, the version in `.bun-version` that the release binaries are built with. Other Bun versions are not tested.
 
 ```bash
 git clone https://github.com/MAnders333/knowledge-server
@@ -259,6 +259,8 @@ Configuration is split across two files:
 
 **`~/.config/knowledge-server/config.jsonc`** — store topology (which databases to use and where). Created automatically on first run (default: local SQLite). Edit this for Postgres or multi-store setups.
 
+**Invalid values fail at startup.** The server refuses to start when a value is not a number, is outside its range, or is not a recognised flag spelling; the message names the variable. An empty value means the default. The daemon and the MCP proxy skip this check. `ACTIVATION_PRECISION_GATE`, `ACTIVATION_STRENGTH_DAMPENING` and `CONTRADICTION_CONFLICTS_ONLY` accept `true`/`false`, `on`/`off`, `yes`/`no` and `1`/`0`. The `*_ENABLED` switches and `RERANK_ENABLED` are off only for `false`.
+
 ### Editor validation (`$schema`)
 
 Add a `$schema` line to `config.jsonc` for IDE autocomplete and validation:
@@ -414,7 +416,7 @@ Provider-specific credentials take precedence over the unified endpoint.
 | `EMBEDDING_MODEL` | `text-embedding-3-large` | Embedding model. **Changing this re-embeds all entries on next startup.** |
 | `EMBEDDING_DIMENSIONS` | *(model default)* | Truncated output dimensions (only valid for `text-embedding-3-*`) |
 | `EMBEDDING_BASE_URL` | *(see below)* | Dedicated embedding endpoint. Priority: `EMBEDDING_BASE_URL` → `OPENAI_BASE_URL` → `LLM_BASE_ENDPOINT/openai/v1` |
-| `EMBEDDING_API_KEY` | *(see below)* | Key for a dedicated `EMBEDDING_BASE_URL`. `LLM_API_KEY` is used there only when that URL shares `LLM_BASE_ENDPOINT`'s origin. Otherwise falls back to `OPENAI_API_KEY`, then `LLM_API_KEY`. |
+| `EMBEDDING_API_KEY` | *(see below)* | Key for a dedicated `EMBEDDING_BASE_URL`. `LLM_API_KEY` is used there only when that URL shares `LLM_BASE_ENDPOINT`'s origin. Otherwise no key is sent. |
 | `EMBEDDING_TIMEOUT_MS` | `20000` | Per-request embedding timeout in ms. Background re-embed and backfill use at least `60000` |
 | `EMBEDDING_MAX_RETRIES` | `2` | Retries per 100-text chunk on transient errors (timeouts, network errors, HTTP 408/429/5xx, truncated or malformed responses) during background re-embed and backfill. Interactive activation does not retry |
 
@@ -441,9 +443,11 @@ Credentials and paths stay in `.env`:
 | `KNOWLEDGE_ADMIN_TOKEN` | *(random per process)* | Fixed admin token for scripted use (≥16 chars; the template placeholder `your-stable-token-here` is rejected) |
 | `KNOWLEDGE_ALLOWED_HOSTS` | *(empty)* | Extra `Host` names the API accepts, comma-separated (`name` or `name:port`). `localhost`, `127.0.0.1`, `[::1]` and the bind host are always accepted. Needed when a reverse proxy forwards a different hostname. |
 | `REDACT_SECRETS` | `true` | Scrub credentials (private keys, cloud/SaaS/LLM API tokens, JWTs, `Authorization` headers, `*_SECRET`/`*_TOKEN`/`*_PASSWORD`/`*_API_KEY` values, URL passwords, long keyed secrets) from transcript text before it is staged, sent to an LLM or embedding API, or stored. Set `false` to disable. Counts are logged per run; values are never logged. |
-| `KNOWLEDGE_LOG_PATH` | `~/.local/share/knowledge-server/server.log` | Log file. Set to `""` to disable. When stdout or stderr already points at this file (the launchd plist does this), each line is written once. |
+| `KNOWLEDGE_LOG_PATH` | `server.log` in the data directory: the directory of `stateDb.path` (default `~/.local/share/knowledge-server`) | Log file. Set to `""` to disable. When stdout or stderr already points at this file (the launchd plist does this), each line is written once. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. `info` logs lengths, ids, counts and similarity scores; entry and episode text is logged only at `debug`. `warn` suppresses info lines. |
 | `LOG_MAX_BYTES` | `20971520` (20 MB) | Size at which the active log rotates. Rotation keeps `server.log.1` to `server.log.3` and drops the oldest, so the files total about four times this value. `0` disables rotation. Rotated copies can hold text written by earlier versions, including an old admin token; delete them once you no longer need them. |
+
+**Upgrading with a custom `stateDb.path`.** The PID file and server log now sit in the directory of `stateDb.path`, not in `~/.local/share/knowledge-server`. A server started before the upgrade keeps writing its PID file to the old location, so stop it before upgrading (`knowledge-server stop`, with the old binary). If it is still running after the upgrade, stop it with `kill "$(cat ~/.local/share/knowledge-server/server.pid)"`.
 
 ### Session sources
 
@@ -507,7 +511,7 @@ All sources are auto-detected. Override paths or disable sources via environment
 |---|---|---|
 | `ACTIVATION_MAX_RESULTS` | `10` | Max entries returned per activation |
 | `ACTIVATION_SIMILARITY_THRESHOLD` | `0.42` | Minimum cosine similarity to activate |
-| `ACTIVATION_PRECISION_GATE` | `on` | `off` disables the floors and the token budget below (dedupe is separate). The render cap still applies, so the block never exceeds the formatter's 6,000-character limit |
+| `ACTIVATION_PRECISION_GATE` | `on` | `off`, `false`, `0` or `no` disables the floors and the token budget below (dedupe is separate). The render cap still applies, so the block never exceeds the formatter's 6,000-character limit |
 | `RERANK_FLOOR` | unset | Absolute rerank-score floor for the configured scorer. Unset: relative rule only; no absolute floor is enabled by default. The benchmark's suggested value for `jev-1.14.0` is `0.2`, with a precision trade-off (see the note under Reranking). Applies to the top entry too |
 | `RERANK_REL_FRAC` | `0.35` | With rerank, a candidate must reach this fraction of the best rerank score (floor = max of this and `RERANK_FLOOR`) |
 | `ACTIVATION_DENSE_MARGIN` | `0` | Used when rerank did not run (disabled, failed, or timed out): raw cosine must clear the similarity threshold by this margin. At `0` the dense fallback adds no filtering beyond the threshold |
@@ -544,15 +548,15 @@ The default name `jev-1.14.0` exists on the maintainer's gateway and on TypeSafe
 | `RERANK_ENABLED` | `true` | `false` restores dense-only ordering |
 | `RERANK_PROVIDER` | `local` | `local` or `remote`. Any other value fails validation. `remote` sends content off this machine (see the privacy note) |
 | `RERANK_MODEL` | `Xenova/ms-marco-MiniLM-L-6-v2` | Local Hugging Face ONNX cross-encoder. **The default is English-only.** For other languages use a multilingual ONNX export with a WordPiece `tokenizer.json`. Other models are fetched from `main` without a checksum |
-| `RERANK_MODELS_DIR` | `~/.local/share/knowledge-server/models` | Local model cache |
-| `RERANK_CANDIDATES` | `16` (local); `30` with `RERANK_PROVIDER=remote` | Dense candidates scored per activation. Remote scores at most 40 in one call. 30 was the benchmark's choice: 16 to 40 gave +0.030 nDCG on NFCorpus (CI +0.014 to +0.047) and +0.011 on SciFact (not significant) |
+| `RERANK_MODELS_DIR` | `models` in the data directory (see `KNOWLEDGE_LOG_PATH`) | Local model cache |
+| `RERANK_CANDIDATES` | `30` when the remote reranker is usable (`RERANK_PROVIDER=remote` with an endpoint and key); otherwise `16` | Dense candidates scored per activation. Remote scores at most 40 in one call. 30 was the benchmark's choice: 16 to 40 gave +0.030 nDCG on NFCorpus (CI +0.014 to +0.047) and +0.011 on SciFact (not significant) |
 | `RERANK_TIMEOUT_MS` | `3000` | Budget for one local rerank call. On expiry the whole batch falls back to dense ordering (no partial scores) |
 | `RERANK_MAX_QUERY_TOKENS` | `128` | Last N tokens of the prompt used as the rerank query (remote: N × 4 characters) |
 | `RERANK_MAX_DOC_TOKENS` | `256` | First N tokens of each candidate that is scored (remote: N × 4 characters). Shorter caps lowered quality on long documents |
 | `RERANK_REMOTE_URL` | `${LLM_BASE_ENDPOINT}/decisions/v1/systemone` | Full System One URL. Direct TypeSafe: `https://api.typesafe.ai/v1/systemone`. A URL on another origin than `LLM_BASE_ENDPOINT` needs `RERANK_REMOTE_API_KEY`; without it remote reranking stays off and the local reranker runs. Plain http to a non-loopback host logs a warning |
 | `RERANK_REMOTE_API_KEY` | `LLM_API_KEY`, only on the `LLM_BASE_ENDPOINT` origin | Key for `RERANK_REMOTE_URL`. The gateway key is never sent to another origin |
 | `RERANK_REMOTE_MODEL` | `jev-1.14.0` | Decision model for `RERANK_PROVIDER=remote`, named as your endpoint names it. Use a versioned name. The gateway does not resolve an alias to a version (`jev-latest` comes back as `typesafe/jev-latest`), and calibrated floors are keyed by the configured name. `activation_event.rerank_model` stores `remote/<configured model>`, the floor key; the name the endpoint reports resolving to is logged as `resolved_model` |
-| `RERANK_REMOTE_TIMEOUT_MS` | `4000` | Budget for one call, including one retry after a 429 whose `Retry-After` fits in what is left. It sits inside the 5 s plugin budget; on expiry dense ordering is used |
+| `RERANK_REMOTE_TIMEOUT_MS` | `2500` | Budget for one call, including one retry after a 429 whose `Retry-After` fits in what is left. It starts after the query embedding and store reads, so an activation takes this plus those. The Codex hook's curl limit is 4 s, so a slow embedding can push the call past it; on expiry dense ordering is used |
 
 Remote mode needs an endpoint (`RERANK_REMOTE_URL`, or `LLM_BASE_ENDPOINT`) and a key (`RERANK_REMOTE_API_KEY`, or `LLM_API_KEY` for the gateway's own origin). If either is missing (or still a template placeholder), the server logs a warning at startup and uses the local reranker. When remote reranking is active, startup also rejects `RERANK_CANDIDATES` above 40, and any configuration whose request could exceed about 100,000 characters: `RERANK_CANDIDATES × (RERANK_MAX_DOC_TOKENS × 4 + 512) + RERANK_MAX_QUERY_TOKENS × 4`. The defaults give about 25,000.
 

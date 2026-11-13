@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import postgres from "postgres";
+import { config } from "../../config.js";
 import { computeStrength } from "../../consolidation/decay.js";
 import { logger } from "../../logger.js";
 import { clampKnowledgeType } from "../../types.js";
@@ -201,17 +202,11 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 
 	/**
 	 * @param connectionUri  Full postgres:// connection string.
-	 * @param poolMax        Maximum pool connections. Defaults to POSTGRES_POOL_MAX
-	 *                       env var if set, otherwise 10. Useful for hosted services
+	 * @param poolMax        Maximum pool connections. Defaults to config.postgres.poolMax
+	 *                       (POSTGRES_POOL_MAX, otherwise 10). Useful for hosted services
 	 *                       with tight connection limits (Supabase free, Railway, Neon).
 	 */
-	constructor(
-		connectionUri: string,
-		poolMax = (() => {
-			const v = Number.parseInt(process.env.POSTGRES_POOL_MAX ?? "", 10);
-			return Number.isNaN(v) || v < 1 ? 10 : v;
-		})(),
-	) {
+	constructor(connectionUri: string, poolMax = config.postgres.poolMax) {
 		const tls = resolvePostgresTls(connectionUri);
 		warnNoTlsOnce(tls.warnNoTls);
 		this.tls = tls;

@@ -833,7 +833,7 @@ describe("per-call-type LLM timeout defaults and env resolution", () => {
 		});
 	});
 
-	it("ignores non-numeric per-type values and clamps to a minimum of 1 ms", async () => {
+	it("ignores non-numeric and zero per-type values, falling back to LLM_TIMEOUT_MS (validateConfig reports them)", async () => {
 		expect(
 			await timeoutsFromEnv({
 				LLM_TIMEOUT_MERGE_MS: "soon",
@@ -843,7 +843,7 @@ describe("per-call-type LLM timeout defaults and env resolution", () => {
 		).toEqual({
 			contradiction: 45_000,
 			merge: 45_000,
-			extraction: 1,
+			extraction: 45_000,
 			synthesis: 45_000,
 		});
 	});

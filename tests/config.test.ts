@@ -1,354 +1,434 @@
 /**
- * Tests for validateConfig().
- *
- * validateConfig() reads from two sources:
- *   1. The module-level `config` singleton (frozen at import time) — for
- *      llm.apiKey, llm.baseEndpoint, host, opencodeDbPath.
- *   2. process.env directly — for the float-range validators
- *      (DECAY_ARCHIVE_THRESHOLD, CONTRADICTION_MIN_SIMILARITY,
- *       ACTIVATION_SIMILARITY_THRESHOLD) and EMBEDDING_DIMENSIONS.
- *
- * Only source (2) is testable with env-var manipulation in a single process,
- * because module caching freezes the singleton at import time. All tests here
- * target source (2). We filter results by error-message keyword so singleton-
- * sourced errors (LLM_API_KEY, etc.) don't cause false failures on clean CI.
+ * Tests for the environment parse (parseEnv). parseEnv(env) is pure: each test
+ * passes the exact environment it needs, so nothing depends on the process
+ * environment. Parsed values are in `config`; invalid input is in `issues`,
+ * which validateConfig() reports at startup.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { validateConfig } from "../src/config";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { parseEnv, spawnedDaemonIntervalArgs } from "../src/config";
+import { homeDir } from "../src/home";
 
-// ── env var helpers ───────────────────────────────────────────────────────────
+/** A config file path that does not exist, so no data-dir override applies. */
+const NO_CONFIG_FILE = join(tmpdir(), "ks-config-test-absent", "config.jsonc");
 
-const ENV_VARS = [
-	"DECAY_ARCHIVE_THRESHOLD",
-	"RECONSOLIDATION_SIMILARITY_THRESHOLD",
-	"CONTRADICTION_MIN_SIMILARITY",
-	"CONTRADICTION_CONFLICTS_ONLY",
-	"ACTIVATION_SIMILARITY_THRESHOLD",
-	"EMBEDDING_DIMENSIONS",
-	"OPENAI_MAX_TOKENS_PARAM",
-	"RERANK_PROVIDER",
-] as const;
-
-type EnvVar = (typeof ENV_VARS)[number];
-const snapshot: Partial<Record<EnvVar, string>> = {};
-
-beforeEach(() => {
-	for (const v of ENV_VARS) {
-		snapshot[v] = process.env[v];
-		// Unset each optional validator so the baseline is clean for each test
-		Reflect.deleteProperty(process.env, v);
-	}
-});
-
-afterEach(() => {
-	for (const v of ENV_VARS) {
-		if (snapshot[v] === undefined) {
-			Reflect.deleteProperty(process.env, v);
-		} else {
-			process.env[v] = snapshot[v];
-		}
-	}
-});
-
-/** Only the errors for the env vars under test — filters out the
- *  singleton-sourced errors (LLM_API_KEY, LLM_BASE_ENDPOINT, host, opencodeDbPath)
- *  that depend on how the test process was launched. */
-function envErrors(): string[] {
-	return validateConfig().filter((e) => ENV_VARS.some((v) => e.includes(v)));
+function parse(env: Record<string, string>) {
+	return parseEnv(env, NO_CONFIG_FILE);
 }
 
-// ── baseline ──────────────────────────────────────────────────────────────────
+function issuesFor(env: Record<string, string>): string[] {
+	return parse(env).issues;
+}
 
-describe("validateConfig — CONTRADICTION_CONFLICTS_ONLY", () => {
-	it("accepts true and false", () => {
-		for (const value of ["true", "false"]) {
-			process.env.CONTRADICTION_CONFLICTS_ONLY = value;
-			expect(envErrors()).toEqual([]);
-		}
+// ── defaults and empty values ─────────────────────────────────────────────────
+
+describe("parseEnv — defaults", () => {
+	it("parses an empty environment without issues", () => {
+		const { config, issues } = parse({});
+		expect(issues).toEqual([]);
+		expect(config.activation.rerank.remote.timeoutMs).toBe(2500);
+		expect(config.activation.rerank.timeoutMs).toBe(3000);
+		expect(config.activation.gate.rerankFloor).toBeNull();
+		expect(config.storeInitTimeoutMs).toBe(10_000);
+		expect(config.postgres.poolMax).toBe(10);
+	});
+
+	it("treats an empty value as unset", () => {
+		expect(
+			issuesFor({ EMBEDDING_DIMENSIONS: "", OPENAI_MAX_TOKENS_PARAM: "" }),
+		).toEqual([]);
+		expect(
+			parse({ EMBEDDING_DIMENSIONS: "" }).config.embedding.dimensions,
+		).toBe(undefined);
+	});
+});
+
+// ── numeric ranges ────────────────────────────────────────────────────────────
+
+describe("parseEnv — (0, 1] float ranges", () => {
+	it("accepts 1 (inclusive upper bound) and parses it", () => {
+		const { config, issues } = parse({ DECAY_ARCHIVE_THRESHOLD: "1" });
+		expect(issues).toEqual([]);
+		expect(config.decay.archiveThreshold).toBe(1);
+	});
+
+	it.each(["0", "1.5", "-0.2", "abc"])(
+		"rejects DECAY_ARCHIVE_THRESHOLD=%s with a message naming the variable",
+		(value) => {
+			const issues = issuesFor({ DECAY_ARCHIVE_THRESHOLD: value });
+			expect(issues).toHaveLength(1);
+			expect(issues[0]).toContain(
+				"DECAY_ARCHIVE_THRESHOLD must be a number in (0, 1]",
+			);
+		},
+	);
+
+	it("rejects ACTIVATION_SIMILARITY_THRESHOLD=0", () => {
+		expect(issuesFor({ ACTIVATION_SIMILARITY_THRESHOLD: "0" })).toHaveLength(1);
+	});
+});
+
+describe("parseEnv — [0, 1] float ranges (zero allowed)", () => {
+	it("accepts RERANK_REL_FRAC at both ends", () => {
+		expect(issuesFor({ RERANK_REL_FRAC: "0" })).toEqual([]);
+		expect(issuesFor({ RERANK_REL_FRAC: "1" })).toEqual([]);
+	});
+
+	it("rejects RERANK_REL_FRAC above 1, which would empty every result", () => {
+		const issues = issuesFor({ RERANK_REL_FRAC: "1.5" });
+		expect(issues).toHaveLength(1);
+		expect(issues[0]).toContain("RERANK_REL_FRAC must be a number in [0, 1]");
+	});
+
+	it("keeps RERANK_FLOOR=0 as a floor of 0, not as unset", () => {
+		const { config, issues } = parse({ RERANK_FLOOR: "0" });
+		expect(issues).toEqual([]);
+		expect(config.activation.gate.rerankFloor).toBe(0);
+	});
+
+	it("rejects RERANK_FLOOR above 1 (scores are sigmoids)", () => {
+		expect(issuesFor({ RERANK_FLOOR: "2" })).toHaveLength(1);
+	});
+
+	it("rejects ACTIVATION_DENSE_MARGIN above 1", () => {
+		expect(issuesFor({ ACTIVATION_DENSE_MARGIN: "2" })).toHaveLength(1);
+	});
+
+	it("accepts CONTRADICTION_MIN_TOP_SIMILARITY=0 (the documented 'no floor')", () => {
+		expect(issuesFor({ CONTRADICTION_MIN_TOP_SIMILARITY: "0" })).toEqual([]);
+	});
+});
+
+describe("parseEnv — integer minimums", () => {
+	it("rejects a rerank timeout below its 100 ms minimum instead of clamping it", () => {
+		const issues = issuesFor({ RERANK_TIMEOUT_MS: "50" });
+		expect(issues).toHaveLength(1);
+		expect(issues[0]).toContain("RERANK_TIMEOUT_MS must be an integer ≥ 100");
+	});
+
+	it("rejects a non-numeric remote rerank timeout", () => {
+		expect(issuesFor({ RERANK_REMOTE_TIMEOUT_MS: "soon" })).toHaveLength(1);
+	});
+
+	it("rejects ACTIVATION_TOKEN_BUDGET of 0", () => {
+		expect(issuesFor({ ACTIVATION_TOKEN_BUDGET: "0" })).toHaveLength(1);
+	});
+
+	it("rejects STORE_INIT_TIMEOUT_MS of 0 and parses a valid value", () => {
+		expect(issuesFor({ STORE_INIT_TIMEOUT_MS: "0" })).toHaveLength(1);
+		expect(
+			parse({ STORE_INIT_TIMEOUT_MS: "500" }).config.storeInitTimeoutMs,
+		).toBe(500);
+	});
+
+	it("rejects POSTGRES_POOL_MAX of 0 and parses a valid value", () => {
+		expect(issuesFor({ POSTGRES_POOL_MAX: "0" })).toHaveLength(1);
+		expect(parse({ POSTGRES_POOL_MAX: "4" }).config.postgres.poolMax).toBe(4);
+	});
+
+	it("reports an invalid value once, even when a fallback chain reads it twice", () => {
+		const issues = issuesFor({ LLM_TIMEOUT_MS: "abc" });
+		expect(issues).toHaveLength(1);
+		expect(issues[0]).toContain("LLM_TIMEOUT_MS");
+	});
+});
+
+// ── cross-field: contradiction band ───────────────────────────────────────────
+
+describe("parseEnv — contradiction scan band", () => {
+	it("rejects an explicit CONTRADICTION_MIN_SIMILARITY at the default reconsolidation threshold", () => {
+		const issues = issuesFor({ CONTRADICTION_MIN_SIMILARITY: "0.82" });
+		expect(issues).toHaveLength(1);
+		expect(issues[0]).toContain(
+			"strictly below RECONSOLIDATION_SIMILARITY_THRESHOLD (0.78)",
+		);
+	});
+
+	it("rejects an explicit band that a custom reconsolidation threshold empties", () => {
+		const issues = issuesFor({
+			RECONSOLIDATION_SIMILARITY_THRESHOLD: "0.5",
+			CONTRADICTION_MIN_SIMILARITY: "0.6",
+		});
+		expect(issues).toHaveLength(1);
+	});
+
+	it("does not reject an unset band when the reconsolidation threshold is lowered", () => {
+		expect(issuesFor({ RECONSOLIDATION_SIMILARITY_THRESHOLD: "0.3" })).toEqual(
+			[],
+		);
+	});
+});
+
+// ── enumerations and booleans ─────────────────────────────────────────────────
+
+describe("parseEnv — CONTRADICTION_CONFLICTS_ONLY", () => {
+	it("accepts true and false, and parses them", () => {
+		expect(
+			parse({ CONTRADICTION_CONFLICTS_ONLY: "true" }).config.consolidation
+				.contradictionConflictsOnly,
+		).toBe(true);
+		expect(
+			parse({ CONTRADICTION_CONFLICTS_ONLY: "false" }).config.consolidation
+				.contradictionConflictsOnly,
+		).toBe(false);
 	});
 
 	it("rejects any other value", () => {
-		process.env.CONTRADICTION_CONFLICTS_ONLY = "yes";
-		expect(
-			envErrors().some((e) => e.includes("CONTRADICTION_CONFLICTS_ONLY")),
-		).toBe(true);
+		const issues = issuesFor({ CONTRADICTION_CONFLICTS_ONLY: "maybe" });
+		expect(issues).toHaveLength(1);
+		expect(issues[0]).toContain("CONTRADICTION_CONFLICTS_ONLY");
 	});
 });
 
-describe("validateConfig — float-range baseline (all optional vars unset)", () => {
-	it("produces no float-range errors when optional vars are unset", () => {
-		// All ENV_VARS are deleted in beforeEach — validateConfig should skip them.
-		expect(envErrors()).toEqual([]);
+describe("parseEnv — OPENAI_MAX_TOKENS_PARAM", () => {
+	it("accepts both names and parses them", () => {
+		expect(
+			parse({ OPENAI_MAX_TOKENS_PARAM: "max_tokens" }).config.llm.openai
+				.maxTokensParam,
+		).toBe("max_tokens");
+		expect(
+			parse({ OPENAI_MAX_TOKENS_PARAM: "max_completion_tokens" }).config.llm
+				.openai.maxTokensParam,
+		).toBe("max_completion_tokens");
+	});
+
+	it("rejects an unknown name and keeps the legacy default", () => {
+		const parsed = parse({ OPENAI_MAX_TOKENS_PARAM: "max_output_tokens" });
+		expect(parsed.issues).toHaveLength(1);
+		expect(parsed.config.llm.openai.maxTokensParam).toBe("max_tokens");
 	});
 });
 
-// ── DECAY_ARCHIVE_THRESHOLD ───────────────────────────────────────────────────
+describe("parseEnv — ACTIVATION_PRECISION_GATE and ACTIVATION_STRENGTH_DAMPENING", () => {
+	it.each(["off", "false", "0", "no", "OFF", " No "])(
+		"%s disables the precision gate",
+		(value) => {
+			const parsed = parse({ ACTIVATION_PRECISION_GATE: value });
+			expect(parsed.issues).toEqual([]);
+			expect(parsed.config.activation.gate.enabled).toBe(false);
+		},
+	);
 
-describe("validateConfig — DECAY_ARCHIVE_THRESHOLD", () => {
-	it("accepts a valid value in (0, 1]", () => {
-		process.env.DECAY_ARCHIVE_THRESHOLD = "0.15";
+	it.each(["on", "true", "1", "yes"])(
+		"%s enables the precision gate",
+		(value) => {
+			expect(
+				parse({ ACTIVATION_PRECISION_GATE: value }).config.activation.gate
+					.enabled,
+			).toBe(true);
+		},
+	);
+
+	it("is on by default", () => {
+		expect(parse({}).config.activation.gate.enabled).toBe(true);
+	});
+
+	it("reports an unrecognised spelling and keeps the default", () => {
+		const parsed = parse({ ACTIVATION_PRECISION_GATE: "maybe" });
+		expect(parsed.issues).toHaveLength(1);
+		expect(parsed.config.activation.gate.enabled).toBe(true);
+	});
+
+	it("reads ACTIVATION_STRENGTH_DAMPENING with the same spellings", () => {
 		expect(
-			envErrors().filter((e) => e.includes("DECAY_ARCHIVE_THRESHOLD")),
-		).toHaveLength(0);
-	});
-
-	it("accepts 1 (upper bound is inclusive)", () => {
-		process.env.DECAY_ARCHIVE_THRESHOLD = "1";
-		expect(
-			envErrors().filter((e) => e.includes("DECAY_ARCHIVE_THRESHOLD")),
-		).toHaveLength(0);
-	});
-
-	it("rejects 0 (lower bound is exclusive)", () => {
-		process.env.DECAY_ARCHIVE_THRESHOLD = "0";
-		expect(envErrors().some((e) => e.includes("DECAY_ARCHIVE_THRESHOLD"))).toBe(
-			true,
-		);
-	});
-
-	it("rejects a value > 1", () => {
-		process.env.DECAY_ARCHIVE_THRESHOLD = "1.5";
-		expect(envErrors().some((e) => e.includes("DECAY_ARCHIVE_THRESHOLD"))).toBe(
-			true,
-		);
-	});
-
-	it("rejects a non-numeric string", () => {
-		process.env.DECAY_ARCHIVE_THRESHOLD = "high";
-		expect(envErrors().some((e) => e.includes("DECAY_ARCHIVE_THRESHOLD"))).toBe(
-			true,
-		);
+			parse({ ACTIVATION_STRENGTH_DAMPENING: "yes" }).config.activation.gate
+				.strengthDampening,
+		).toBe(true);
+		expect(parse({}).config.activation.gate.strengthDampening).toBe(false);
 	});
 });
 
-// ── RECONSOLIDATION_SIMILARITY_THRESHOLD ─────────────────────────────────────
-
-describe("validateConfig — RECONSOLIDATION_SIMILARITY_THRESHOLD", () => {
-	it("accepts a valid value in (0, 1)", () => {
-		process.env.RECONSOLIDATION_SIMILARITY_THRESHOLD = "0.75";
-		expect(
-			envErrors().filter((e) =>
-				e.includes("RECONSOLIDATION_SIMILARITY_THRESHOLD"),
-			),
-		).toHaveLength(0);
-	});
-
-	it("rejects 0 (lower bound is exclusive)", () => {
-		process.env.RECONSOLIDATION_SIMILARITY_THRESHOLD = "0";
-		expect(
-			envErrors().some((e) =>
-				e.includes("RECONSOLIDATION_SIMILARITY_THRESHOLD"),
-			),
-		).toBe(true);
-	});
-
-	it("rejects a value above 1", () => {
-		process.env.RECONSOLIDATION_SIMILARITY_THRESHOLD = "1.5";
-		expect(
-			envErrors().some((e) =>
-				e.includes("RECONSOLIDATION_SIMILARITY_THRESHOLD"),
-			),
-		).toBe(true);
-	});
-
-	it("rejects a non-numeric string", () => {
-		process.env.RECONSOLIDATION_SIMILARITY_THRESHOLD = "high";
-		expect(
-			envErrors().some((e) =>
-				e.includes("RECONSOLIDATION_SIMILARITY_THRESHOLD"),
-			),
-		).toBe(true);
-	});
-});
-
-// ── CONTRADICTION_MIN_SIMILARITY ──────────────────────────────────────────────
-
-describe("validateConfig — CONTRADICTION_MIN_SIMILARITY", () => {
-	it("accepts a value strictly below 0.82 (default reconsolidation threshold)", () => {
-		process.env.CONTRADICTION_MIN_SIMILARITY = "0.4";
-		expect(
-			envErrors().filter((e) => e.includes("CONTRADICTION_MIN_SIMILARITY")),
-		).toHaveLength(0);
-	});
-
-	it("rejects 0 (lower bound is exclusive)", () => {
-		process.env.CONTRADICTION_MIN_SIMILARITY = "0";
-		expect(
-			envErrors().some((e) => e.includes("CONTRADICTION_MIN_SIMILARITY")),
-		).toBe(true);
-	});
-
-	it("rejects exactly 0.82 (upper bound is exclusive)", () => {
-		process.env.CONTRADICTION_MIN_SIMILARITY = "0.82";
-		expect(
-			envErrors().some((e) => e.includes("CONTRADICTION_MIN_SIMILARITY")),
-		).toBe(true);
-	});
-
-	it("rejects a value above 0.82", () => {
-		process.env.CONTRADICTION_MIN_SIMILARITY = "0.9";
-		expect(
-			envErrors().some((e) => e.includes("CONTRADICTION_MIN_SIMILARITY")),
-		).toBe(true);
-	});
-
-	it("rejects a non-numeric string", () => {
-		process.env.CONTRADICTION_MIN_SIMILARITY = "medium";
-		expect(
-			envErrors().some((e) => e.includes("CONTRADICTION_MIN_SIMILARITY")),
-		).toBe(true);
-	});
-
-	it("rejects CONTRADICTION_MIN_SIMILARITY >= custom RECONSOLIDATION_SIMILARITY_THRESHOLD", () => {
-		// When the reconsolidation threshold is lowered (e.g. for a different embedding
-		// model), CONTRADICTION_MIN_SIMILARITY must still be strictly below it.
-		process.env.RECONSOLIDATION_SIMILARITY_THRESHOLD = "0.7";
-		process.env.CONTRADICTION_MIN_SIMILARITY = "0.7"; // equal → must be rejected
-		expect(
-			envErrors().some((e) => e.includes("CONTRADICTION_MIN_SIMILARITY")),
-		).toBe(true);
-	});
-});
-
-// ── ACTIVATION_SIMILARITY_THRESHOLD ──────────────────────────────────────────
-
-describe("validateConfig — ACTIVATION_SIMILARITY_THRESHOLD", () => {
-	it("accepts a valid value in (0, 1]", () => {
-		process.env.ACTIVATION_SIMILARITY_THRESHOLD = "0.35";
-		expect(
-			envErrors().filter((e) => e.includes("ACTIVATION_SIMILARITY_THRESHOLD")),
-		).toHaveLength(0);
-	});
-
-	it("rejects 0 (lower bound is exclusive)", () => {
-		process.env.ACTIVATION_SIMILARITY_THRESHOLD = "0";
-		expect(
-			envErrors().some((e) => e.includes("ACTIVATION_SIMILARITY_THRESHOLD")),
-		).toBe(true);
-	});
-
-	it("rejects a value above 1", () => {
-		process.env.ACTIVATION_SIMILARITY_THRESHOLD = "1.1";
-		expect(
-			envErrors().some((e) => e.includes("ACTIVATION_SIMILARITY_THRESHOLD")),
-		).toBe(true);
-	});
-});
-
-// ── EMBEDDING_DIMENSIONS ──────────────────────────────────────────────────────
-
-describe("validateConfig — EMBEDDING_DIMENSIONS", () => {
+describe("parseEnv — EMBEDDING_DIMENSIONS", () => {
 	it("accepts a positive integer", () => {
-		process.env.EMBEDDING_DIMENSIONS = "512";
-		expect(
-			envErrors().filter((e) => e.includes("EMBEDDING_DIMENSIONS")),
-		).toHaveLength(0);
+		const parsed = parse({ EMBEDDING_DIMENSIONS: "512" });
+		expect(parsed.issues).toEqual([]);
+		expect(parsed.config.embedding.dimensions).toBe(512);
 	});
 
-	it("accepts a float string (parseInt truncates to valid integer)", () => {
-		// parseInt("1.5") = 1, which is >= 1 — validateConfig accepts this.
-		// TODO: consider tightening to reject non-integer strings in future.
-		process.env.EMBEDDING_DIMENSIONS = "1.5";
-		expect(
-			envErrors().filter((e) => e.includes("EMBEDDING_DIMENSIONS")),
-		).toHaveLength(0);
-	});
+	it.each(["0", "-1", "large"])(
+		"rejects %s and leaves dimensions unset",
+		(value) => {
+			const parsed = parse({ EMBEDDING_DIMENSIONS: value });
+			expect(parsed.issues).toHaveLength(1);
+			expect(parsed.issues[0]).toContain(
+				"EMBEDDING_DIMENSIONS must be an integer ≥ 1",
+			);
+			expect(parsed.config.embedding.dimensions).toBeUndefined();
+		},
+	);
 
-	it("rejects 0", () => {
-		process.env.EMBEDDING_DIMENSIONS = "0";
-		expect(envErrors().some((e) => e.includes("EMBEDDING_DIMENSIONS"))).toBe(
-			true,
-		);
-	});
-
-	it("rejects a negative integer", () => {
-		process.env.EMBEDDING_DIMENSIONS = "-1";
-		expect(envErrors().some((e) => e.includes("EMBEDDING_DIMENSIONS"))).toBe(
-			true,
-		);
-	});
-
-	it("rejects a non-numeric string", () => {
-		process.env.EMBEDDING_DIMENSIONS = "large";
-		expect(envErrors().some((e) => e.includes("EMBEDDING_DIMENSIONS"))).toBe(
-			true,
-		);
-	});
-
-	it("produces no error when EMBEDDING_DIMENSIONS is unset", () => {
-		// Already deleted in beforeEach
-		expect(
-			envErrors().filter((e) => e.includes("EMBEDDING_DIMENSIONS")),
-		).toHaveLength(0);
+	it("accumulates one issue per violated constraint", () => {
+		const issues = issuesFor({
+			DECAY_ARCHIVE_THRESHOLD: "0",
+			EMBEDDING_DIMENSIONS: "-5",
+		});
+		expect(issues).toHaveLength(2);
 	});
 });
 
-// ── OPENAI_MAX_TOKENS_PARAM ───────────────────────────────────────────────────
+// ── rerank provider ───────────────────────────────────────────────────────────
 
-describe("validateConfig — OPENAI_MAX_TOKENS_PARAM", () => {
-	it("accepts max_tokens", () => {
-		process.env.OPENAI_MAX_TOKENS_PARAM = "max_tokens";
-		expect(
-			envErrors().filter((e) => e.includes("OPENAI_MAX_TOKENS_PARAM")),
-		).toHaveLength(0);
-	});
-
-	it("accepts max_completion_tokens", () => {
-		process.env.OPENAI_MAX_TOKENS_PARAM = "max_completion_tokens";
-		expect(
-			envErrors().filter((e) => e.includes("OPENAI_MAX_TOKENS_PARAM")),
-		).toHaveLength(0);
-	});
-
-	it("rejects an unknown parameter name", () => {
-		process.env.OPENAI_MAX_TOKENS_PARAM = "max_output_tokens";
-		expect(envErrors().some((e) => e.includes("OPENAI_MAX_TOKENS_PARAM"))).toBe(
-			true,
-		);
-	});
-
-	it("produces no error when OPENAI_MAX_TOKENS_PARAM is unset", () => {
-		// Already deleted in beforeEach
-		expect(
-			envErrors().filter((e) => e.includes("OPENAI_MAX_TOKENS_PARAM")),
-		).toHaveLength(0);
-	});
-});
-
-// ── multiple errors accumulated ───────────────────────────────────────────────
-
-describe("validateConfig — multiple errors accumulated", () => {
-	it("returns one error per violated constraint", () => {
-		process.env.DECAY_ARCHIVE_THRESHOLD = "0";
-		process.env.CONTRADICTION_MIN_SIMILARITY = "0.82";
-		process.env.EMBEDDING_DIMENSIONS = "-5";
-		const errors = envErrors();
-		expect(
-			errors.filter((e) => e.includes("DECAY_ARCHIVE_THRESHOLD")),
-		).toHaveLength(1);
-		expect(
-			errors.filter((e) => e.includes("CONTRADICTION_MIN_SIMILARITY")),
-		).toHaveLength(1);
-		expect(
-			errors.filter((e) => e.includes("EMBEDDING_DIMENSIONS")),
-		).toHaveLength(1);
-	});
-});
-
-// ── RERANK_PROVIDER ───────────────────────────────────────────────────────────
-
-describe("validateConfig — RERANK_PROVIDER", () => {
+describe("parseEnv — RERANK_PROVIDER", () => {
 	it("accepts local and remote, in any case", () => {
 		for (const value of ["local", "remote", " Remote "]) {
-			process.env.RERANK_PROVIDER = value;
-			expect(envErrors()).toEqual([]);
+			expect(issuesFor({ RERANK_PROVIDER: value })).toEqual([]);
 		}
 	});
 
-	it("reports an unknown provider instead of running a silent fallback", () => {
-		process.env.RERANK_PROVIDER = "remtoe";
-		const errors = envErrors();
-		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain('RERANK_PROVIDER must be "local" or "remote"');
+	it("reports an unknown provider and runs as local", () => {
+		const parsed = parse({ RERANK_PROVIDER: "remtoe" });
+		expect(parsed.issues).toEqual([
+			'RERANK_PROVIDER must be "local" or "remote" (got "remtoe").',
+		]);
+		expect(parsed.config.activation.rerank.provider).toBe("local");
+	});
+});
+
+// ── data directory ────────────────────────────────────────────────────────────
+
+describe("parseEnv — data directory", () => {
+	let dir: string;
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "ks-config-data-"));
+	});
+
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	it("puts server.log, server.pid and the model cache beside the configured state DB", () => {
+		const configPath = join(dir, "config.jsonc");
+		const dataDir = join(dir, "data");
+		mkdirSync(dataDir);
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				stores: [{ id: "main", kind: "sqlite", writable: true }],
+				stateDb: { kind: "sqlite", path: join(dataDir, "state.db") },
+			}),
+		);
+
+		const { config } = parseEnv({}, configPath);
+		expect(config.logPath).toBe(join(dataDir, "server.log"));
+		expect(config.pidPath).toBe(join(dataDir, "server.pid"));
+		expect(config.activation.rerank.modelsDir).toBe(join(dataDir, "models"));
+	});
+
+	it("keeps the default location when no config file sets a state DB", () => {
+		expect(parse({}).config.logPath).toBe(
+			join(homeDir(), ".local", "share", "knowledge-server", "server.log"),
+		);
+	});
+});
+
+describe("parseEnv — per-type LLM timeouts", () => {
+	it("reports a zero per-type timeout and falls back to LLM_TIMEOUT_MS", () => {
+		const parsed = parse({
+			LLM_TIMEOUT_EXTRACTION_MS: "0",
+			LLM_TIMEOUT_MS: "45000",
+		});
+		expect(parsed.issues).toHaveLength(1);
+		expect(parsed.issues[0]).toContain(
+			"LLM_TIMEOUT_EXTRACTION_MS must be an integer ≥ 1",
+		);
+		expect(parsed.config.llm.timeoutsMs.extraction).toBe(45_000);
+	});
+});
+
+describe("parseEnv — PID file after the data-dir move", () => {
+	let dir: string;
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "ks-config-pid-"));
+	});
+
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	function customStateDbConfig(): string {
+		const dataDir = join(dir, "data");
+		mkdirSync(dataDir);
+		const configPath = join(dir, "config.jsonc");
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				stores: [{ id: "main", kind: "sqlite", writable: true }],
+				stateDb: { kind: "sqlite", path: join(dataDir, "state.db") },
+			}),
+		);
+		return configPath;
+	}
+
+	it("names the PID file an earlier version wrote, when the data directory moved", () => {
+		const { config } = parseEnv({}, customStateDbConfig());
+		expect(config.pidPath).toBe(join(dir, "data", "server.pid"));
+		expect(config.legacyPidPath).toBe(
+			join(homeDir(), ".local", "share", "knowledge-server", "server.pid"),
+		);
+	});
+
+	it("names no legacy PID file on the default layout or with KNOWLEDGE_PID_PATH set", () => {
+		expect(parse({}).config.legacyPidPath).toBeNull();
+		expect(
+			parseEnv(
+				{ KNOWLEDGE_PID_PATH: join(dir, "explicit.pid") },
+				customStateDbConfig(),
+			).config.legacyPidPath,
+		).toBeNull();
+	});
+});
+
+describe("daemon upload interval", () => {
+	it("reads DAEMON_UPLOAD_INTERVAL_SECONDS as a positive integer", () => {
+		expect(
+			parse({ DAEMON_UPLOAD_INTERVAL_SECONDS: "600" }).config.daemon
+				.uploadIntervalSeconds,
+		).toBe(600);
+		expect(parse({}).config.daemon.uploadIntervalSeconds).toBeNull();
+	});
+
+	it.each(["0", "-5", "soon"])("reports %s and treats it as unset", (value) => {
+		const parsed = parse({ DAEMON_UPLOAD_INTERVAL_SECONDS: value });
+		expect(parsed.issues).toHaveLength(1);
+		expect(parsed.issues[0]).toContain(
+			"DAEMON_UPLOAD_INTERVAL_SECONDS must be an integer ≥ 1",
+		);
+		expect(parsed.config.daemon.uploadIntervalSeconds).toBeNull();
+	});
+
+	it("passes --interval=300 to the spawned daemon only when the variable is unset", () => {
+		expect(spawnedDaemonIntervalArgs(null)).toEqual(["--interval=300"]);
+		expect(spawnedDaemonIntervalArgs(600)).toEqual([]);
+	});
+});
+
+describe("validateConfig — an invalid value fails startup", () => {
+	it("returns the issue from the process environment, as serve does", () => {
+		const configPath = new URL("../src/config.ts", import.meta.url).pathname;
+		const child = Bun.spawnSync({
+			cmd: [
+				process.execPath,
+				"-e",
+				`import { validateConfig } from ${JSON.stringify(configPath)}; console.log(JSON.stringify(validateConfig()));`,
+			],
+			env: {
+				PATH: process.env.PATH ?? "",
+				HOME: process.env.HOME ?? "",
+				RERANK_TIMEOUT_MS: "50",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(child.exitCode).toBe(0);
+		const errors: string[] = JSON.parse(
+			child.stdout.toString().trim().split("\n").pop() ?? "[]",
+		);
+		expect(errors).toContain(
+			'RERANK_TIMEOUT_MS must be an integer ≥ 100 (got "50").',
+		);
 	});
 });

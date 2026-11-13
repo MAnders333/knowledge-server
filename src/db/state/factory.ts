@@ -41,13 +41,11 @@ export async function createServerStateDB(
 		// Config file absent — use defaults (local SQLite)
 	}
 
-	const stateDbUri = process.env.STATE_DB_URI ?? config.stateDb?.uri;
-
-	if (config.stateDb?.kind === "postgres" || stateDbUri) {
+	// STATE_DB_URI is already applied to config.stateDb by config-file.ts.
+	if (config.stateDb?.kind === "postgres") {
+		const stateDbUri = config.stateDb.uri;
 		if (!stateDbUri) {
-			throw new Error(
-				'stateDb.kind is "postgres" but no uri configured and STATE_DB_URI env var is not set',
-			);
+			throw new Error('stateDb.kind is "postgres" but no uri configured');
 		}
 		logger.log(
 			`[db] Server state DB: Postgres at ${redactUriCredentials(stateDbUri)}`,
