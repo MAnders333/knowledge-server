@@ -58,6 +58,39 @@ interface ChunkResult {
 /** Thrown when another process holds a store's consolidation lock. The chunk is deferred, not failed. */
 class StoreLockHeldError extends Error {}
 
+type EmbeddedEntry = KnowledgeEntry & { embedding: number[] };
+
+/**
+ * Embedded entries of each store, loaded once per consolidate() batch.
+ *
+ * Every chunk used to reload the whole store (≈10–14 full loads per batch). Each
+ * map is mutated in place as chunks insert, merge and supersede, which mirrors the
+ * writes made through this batch. A store is dropped from the cache (and reloaded
+ * by the next chunk) when a write is not mirrored exactly, e.g. a contradiction
+ * merge clears the stored embedding, or when a chunk fails part-way.
+ */
+class StoreEntryCache {
+	private readonly maps = new Map<
+		IKnowledgeStore,
+		Map<string, EmbeddedEntry>
+	>();
+
+	async get(store: IKnowledgeStore): Promise<Map<string, EmbeddedEntry>> {
+		let entries = this.maps.get(store);
+		if (!entries) {
+			entries = new Map(
+				(await store.getActiveEntriesWithEmbeddings()).map((e) => [e.id, e]),
+			);
+			this.maps.set(store, entries);
+		}
+		return entries;
+	}
+
+	invalidate(store: IKnowledgeStore): void {
+		this.maps.delete(store);
+	}
+}
+
 /**
  * The consolidation engine — the heart of the knowledge system.
  *
@@ -236,6 +269,7 @@ export class ConsolidationEngine {
 
 		// Reset touched stores for this run — accumulates across all source batches.
 		this._lastTouchedStores = new Set();
+		const entryCache = new StoreEntryCache();
 
 		let totalSessionsProcessed = 0;
 		let totalSegmentsProcessed = 0;
@@ -246,7 +280,11 @@ export class ConsolidationEngine {
 
 		// Process each reader source independently with its own cursor.
 		for (const reader of this.readers) {
-			const sourceTotals = await this.consolidateSource(reader, attempted);
+			const sourceTotals = await this.consolidateSource(
+				reader,
+				attempted,
+				entryCache,
+			);
 			totalSessionsProcessed += sourceTotals.sessionsProcessed;
 			totalSegmentsProcessed += sourceTotals.segmentsProcessed;
 			totalCreated += sourceTotals.entriesCreated;
@@ -261,21 +299,6 @@ export class ConsolidationEngine {
 			logger.log("[consolidation] No new sessions to process.");
 		}
 
-		// Apply decay to ALL active entries across all configured stores.
-		// Fan out to domain stores via the router; always include this.db as primary.
-		// NOTE: decayStores is derived from domainRouter.allStores() (available stores
-		// registered with the router), while activation.writableDbs is derived from
-		// registry.writableStores() (all writable stores). Both exclude unavailable
-		// stores and should be equivalent in practice — but they are two independent
-		// derivation paths. If filtering logic changes in either, keep them in sync.
-		const decayStores = this.domainRouter
-			? new Set([this.db, ...this.domainRouter.allStores()])
-			: new Set([this.db]);
-		let archived = 0;
-		for (const store of decayStores) {
-			archived += await this.applyDecay(store);
-		}
-
 		// Generate embeddings for new entries across all writable stores.
 		// ensureEmbeddings() fans out internally to this.activation.writableDbs.
 		const embeddedCount = await this.activation.ensureEmbeddings();
@@ -284,12 +307,12 @@ export class ConsolidationEngine {
 		);
 
 		// Seed embedding metadata for any store that has no metadata record yet
-		// (e.g. first consolidation after a pre-v8 upgrade). Use decayStores as the
-		// scope — all writable stores — to cover stores that may have received writes
-		// in prior runs but never had metadata recorded.
+		// (e.g. first consolidation after a pre-v8 upgrade). Use every knowledge
+		// store — to cover stores that may have received writes in prior runs but
+		// never had metadata recorded.
 		// Only seeds when metadata is absent — the model-change path is handled
 		// exclusively by checkAndReEmbed() at startup.
-		for (const store of decayStores) {
+		for (const store of this.knowledgeStores()) {
 			if (!(await store.getEmbeddingMetadata())) {
 				const sample = await store.getOneEntryWithEmbedding();
 				if (sample) {
@@ -317,14 +340,13 @@ export class ConsolidationEngine {
 			segmentsProcessed: totalSegmentsProcessed,
 			entriesCreated: totalCreated,
 			entriesUpdated: totalUpdated,
-			entriesArchived: archived,
 			conflictsDetected: totalConflictsDetected,
 			conflictsResolved: totalConflictsResolved,
 			duration: Date.now() - startTime,
 		};
 
 		logger.log(
-			`[consolidation] Complete. ${result.sessionsProcessed} sessions (${result.segmentsProcessed} segments) -> ${result.entriesCreated} entries (${result.entriesArchived} archived, ${result.conflictsDetected} conflicts, ${result.conflictsResolved} resolved) in ${result.duration}ms`,
+			`[consolidation] Complete. ${result.sessionsProcessed} sessions (${result.segmentsProcessed} segments) -> ${result.entriesCreated} entries (${result.conflictsDetected} conflicts, ${result.conflictsResolved} resolved) in ${result.duration}ms`,
 		);
 
 		return result;
@@ -337,6 +359,7 @@ export class ConsolidationEngine {
 	private async consolidateSource(
 		reader: IEpisodeReader,
 		attempted: Set<string>,
+		entryCache: StoreEntryCache,
 	): Promise<{
 		sessionsProcessed: number;
 		segmentsProcessed: number;
@@ -494,6 +517,7 @@ export class ConsolidationEngine {
 			const result = await this.processChunk(
 				chunk[0]?.source ?? reader.source,
 				chunk,
+				entryCache,
 			);
 			totalCreated += result.created;
 			totalUpdated += result.updated;
@@ -578,6 +602,7 @@ export class ConsolidationEngine {
 	private async processChunk(
 		source: string,
 		chunk: ReturnType<IEpisodeReader["getNewEpisodes"]>,
+		entryCache: StoreEntryCache,
 	): Promise<ChunkResult> {
 		const none = {
 			created: 0,
@@ -662,6 +687,7 @@ export class ConsolidationEngine {
 					entriesForStore,
 					sessionIds,
 					chunkSessionTimestamp,
+					entryCache,
 				).then((counts) => ({ store, counts })),
 			),
 		);
@@ -857,6 +883,7 @@ export class ConsolidationEngine {
 		entries: ExtractedKnowledge[],
 		sessionIds: string[],
 		chunkSessionTimestamp: number,
+		entryCache: StoreEntryCache,
 	): Promise<{
 		created: number;
 		updated: number;
@@ -891,12 +918,14 @@ export class ConsolidationEngine {
 			);
 		}
 
+		// True once the cached map provably matches the store; otherwise the cache
+		// entry is dropped so the next chunk reloads it.
+		let mapMirrorsStore = false;
 		try {
-			// Load all active entries from this store once.
-			// entriesMap is mutated in place as inserts/updates happen so that
-			// subsequent entries in this batch can deduplicate against earlier ones.
-			const allEntries = await store.getActiveEntriesWithEmbeddings();
-			const entriesMap = new Map(allEntries.map((e) => [e.id, e]));
+			// entriesMap is shared across the batch (see StoreEntryCache) and mutated
+			// in place as inserts/updates happen so that later entries deduplicate
+			// against earlier ones.
+			const entriesMap = await entryCache.get(store);
 
 			let created = 0;
 			let updated = 0;
@@ -1110,6 +1139,9 @@ export class ConsolidationEngine {
 				entriesMap,
 				contradictionCandidates,
 			);
+			// A resolved contradiction can rewrite a stored entry in a way the map does
+			// not mirror (a merge clears the winner's embedding), so reload next time.
+			mapMirrorsStore = contradictions.detected === 0;
 
 			return {
 				created,
@@ -1118,15 +1150,46 @@ export class ConsolidationEngine {
 				conflictsResolved: contradictions.resolved,
 			};
 		} finally {
+			if (!mapMirrorsStore) entryCache.invalidate(store);
 			await store.releaseConsolidationLock();
 		}
 	}
 
 	/**
-	 * Apply decay to all active entries.
+	 * Every knowledge store consolidation writes to: the primary store plus the
+	 * domain stores known to the router.
+	 *
+	 * NOTE: derived from domainRouter.allStores() (available stores registered with
+	 * the router), while activation.writableDbs is derived from registry.writableStores()
+	 * (all writable stores). Both exclude unavailable stores and should be equivalent in
+	 * practice — but they are two independent derivation paths. If filtering logic
+	 * changes in either, keep them in sync.
+	 */
+	private knowledgeStores(): Set<IKnowledgeStore> {
+		return this.domainRouter
+			? new Set([this.db, ...this.domainRouter.allStores()])
+			: new Set([this.db]);
+	}
+
+	/**
+	 * Apply strength decay to every knowledge store: archive entries whose strength
+	 * fell below the threshold, and tombstone long-archived ones. Run on its own
+	 * schedule (daily, see runDecay callers in index.ts), not per consolidation batch.
 	 * Returns the number of entries that were archived.
 	 */
-	private async applyDecay(db: IKnowledgeStore = this.db): Promise<number> {
+	async runDecay(): Promise<number> {
+		let archived = 0;
+		for (const store of this.knowledgeStores()) {
+			archived += await this.applyDecay(store);
+		}
+		return archived;
+	}
+
+	/**
+	 * Apply decay to all active entries of one store.
+	 * Returns the number of entries that were archived.
+	 */
+	private async applyDecay(db: IKnowledgeStore): Promise<number> {
 		// Include conflicted entries — their strength must continue aging.
 		// A conflicted entry whose strength falls to zero is effectively forgotten
 		// regardless of the conflict, and should still be archived.
@@ -1137,6 +1200,8 @@ export class ConsolidationEngine {
 		for (const entry of entries) {
 			const newStrength = computeStrength(entry);
 
+			// Strength is computed on read, so only archival writes it back. Entries that
+			// stay above the threshold cost no write.
 			if (newStrength < config.decay.archiveThreshold) {
 				await db.updateEntry(entry.id, {
 					status: "archived",
@@ -1146,9 +1211,6 @@ export class ConsolidationEngine {
 				logger.log(
 					`[decay] Archived: ${JSON.stringify(entry.content)} (strength: ${newStrength.toFixed(3)})`,
 				);
-			} else if (Math.abs(newStrength - entry.strength) > 0.01) {
-				// Only update if strength changed meaningfully
-				await db.updateStrength(entry.id, newStrength);
 			}
 		}
 

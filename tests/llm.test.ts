@@ -9,13 +9,16 @@
  *   - formatEpisodes output shape
  */
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { fileURLToPath } from "node:url";
 import * as aiModule from "ai";
+import { config } from "../src/config";
 import {
 	ConsolidationLLM,
 	formatEpisodes,
 	omitRequestParams,
 	renameMaxTokensParam,
 } from "../src/consolidation/llm";
+import { logger } from "../src/logger";
 import type { Episode } from "../src/types";
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -636,5 +639,234 @@ describe("omitRequestParams", () => {
 	it("returns the body unchanged when the list is empty", () => {
 		const body = { model: "m", temperature: 0.2 };
 		expect(omitRequestParams(body, [])).toEqual(body);
+	});
+});
+
+// ── per-call-type timeouts and retry policy ───────────────────────────────────
+
+const CONFIG_MODULE = fileURLToPath(
+	new URL("../src/config.ts", import.meta.url),
+);
+
+/** Read config.llm.timeoutsMs in a fresh process, so env is read at import time. */
+async function timeoutsFromEnv(env: Record<string, string>) {
+	const inherited = Object.fromEntries(
+		Object.entries(process.env).filter(
+			(entry): entry is [string, string] =>
+				entry[1] !== undefined && !entry[0].startsWith("LLM_TIMEOUT_"),
+		),
+	);
+	const script = `import(${JSON.stringify(CONFIG_MODULE)}).then(({ config }) => console.log(JSON.stringify(config.llm.timeoutsMs)));`;
+	const proc = Bun.spawn([process.execPath, "-e", script], {
+		env: { ...inherited, ...env },
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [stdout, exitCode] = await Promise.all([
+		new Response(proc.stdout).text(),
+		proc.exited,
+	]);
+	expect(exitCode).toBe(0);
+	return JSON.parse(stdout.trim().split("\n").at(-1) ?? "");
+}
+
+describe("per-call-type LLM timeout defaults and env resolution", () => {
+	it("defaults to 60s contradiction, 90s merge, 300s extraction and synthesis", async () => {
+		expect(await timeoutsFromEnv({})).toEqual({
+			contradiction: 60_000,
+			merge: 90_000,
+			extraction: 300_000,
+			synthesis: 300_000,
+		});
+	});
+
+	it("applies each LLM_TIMEOUT_<TYPE>_MS override to its own call type only", async () => {
+		expect(
+			await timeoutsFromEnv({
+				LLM_TIMEOUT_CONTRADICTION_MS: "20000",
+				LLM_TIMEOUT_MERGE_MS: "30000",
+				LLM_TIMEOUT_EXTRACTION_MS: "400000",
+				LLM_TIMEOUT_SYNTHESIS_MS: "500000",
+			}),
+		).toEqual({
+			contradiction: 20_000,
+			merge: 30_000,
+			extraction: 400_000,
+			synthesis: 500_000,
+		});
+	});
+
+	it("uses LLM_TIMEOUT_MS as the fallback for every type without its own override", async () => {
+		expect(await timeoutsFromEnv({ LLM_TIMEOUT_MS: "45000" })).toEqual({
+			contradiction: 45_000,
+			merge: 45_000,
+			extraction: 45_000,
+			synthesis: 45_000,
+		});
+	});
+
+	it("gives a per-type override precedence over LLM_TIMEOUT_MS", async () => {
+		expect(
+			await timeoutsFromEnv({
+				LLM_TIMEOUT_MS: "45000",
+				LLM_TIMEOUT_SYNTHESIS_MS: "7000",
+			}),
+		).toEqual({
+			contradiction: 45_000,
+			merge: 45_000,
+			extraction: 45_000,
+			synthesis: 7_000,
+		});
+	});
+
+	it("ignores non-numeric per-type values and clamps to a minimum of 1 ms", async () => {
+		expect(
+			await timeoutsFromEnv({
+				LLM_TIMEOUT_MERGE_MS: "soon",
+				LLM_TIMEOUT_EXTRACTION_MS: "0",
+				LLM_TIMEOUT_MS: "45000",
+			}),
+		).toEqual({
+			contradiction: 45_000,
+			merge: 45_000,
+			extraction: 1,
+			synthesis: 45_000,
+		});
+	});
+});
+
+describe("ConsolidationLLM timeout and retry policy", () => {
+	let llm: ConsolidationLLM;
+	const savedTimeouts = { ...config.llm.timeoutsMs };
+	const savedRetry = {
+		maxRetries: config.llm.maxRetries,
+		retryBaseDelayMs: config.llm.retryBaseDelayMs,
+	};
+	const existing = {
+		content: "Port is 8080.",
+		type: "fact",
+		topics: ["server"],
+		confidence: 0.9,
+	};
+	const extracted = {
+		content: "Port is 9090.",
+		type: "fact",
+		topics: ["server"],
+		confidence: 0.85,
+	};
+	const newEntry = {
+		id: "new-1",
+		content: "Port is 9090.",
+		type: "fact",
+		topics: ["server"],
+		confidence: 0.9,
+		createdAt: Date.now(),
+	};
+	const candidates = [
+		{
+			id: "old-1",
+			content: "Port is 8080.",
+			type: "fact",
+			topics: ["server"],
+			confidence: 0.85,
+			createdAt: Date.now() - 1000,
+		},
+	];
+
+	beforeEach(() => {
+		llm = new ConsolidationLLM();
+		config.llm.maxRetries = 2;
+		config.llm.retryBaseDelayMs = 0;
+	});
+
+	afterEach(() => {
+		Object.assign(config.llm.timeoutsMs, savedTimeouts);
+		Object.assign(config.llm, savedRetry);
+	});
+
+	/** Spy on generateText, creating the spy if this test has not yet. */
+	function generateTextMock() {
+		generateTextSpy ??= spyOn(aiModule, "generateText");
+		return generateTextSpy;
+	}
+
+	/** Stand-in model call that never answers and rejects only when aborted. */
+	function hangUntilAborted(opts: { abortSignal?: AbortSignal }) {
+		const { promise, reject } = Promise.withResolvers<never>();
+		opts.abortSignal?.addEventListener("abort", () =>
+			reject(new Error("This operation was aborted")),
+		);
+		return promise;
+	}
+
+	it("aborts a hung contradiction call at its budget, logs the type, and does not retry", async () => {
+		config.llm.timeoutsMs.contradiction = 50;
+		const spy = generateTextMock();
+		spy.mockImplementation(
+			hangUntilAborted as unknown as typeof aiModule.generateText,
+		);
+		const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+		const started = Date.now();
+		try {
+			await expect(
+				llm.detectAndResolveContradiction(newEntry, candidates),
+			).rejects.toThrow("aborted");
+			expect(Date.now() - started).toBeLessThan(5_000);
+			expect(spy).toHaveBeenCalledTimes(1);
+			const logged = errorSpy.mock.calls.map((c) => String(c[0])).join("\n");
+			expect(logged).toContain(
+				"contradiction call to anthropic/claude-haiku-4-5 exceeded 50ms timeout (attempt 1/3) — not retrying",
+			);
+		} finally {
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("uses the merge budget for merge decisions", async () => {
+		config.llm.timeoutsMs.merge = 50;
+		const spy = generateTextMock();
+		spy.mockImplementation(
+			hangUntilAborted as unknown as typeof aiModule.generateText,
+		);
+		const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+		try {
+			await expect(llm.decideMerge(existing, extracted)).rejects.toThrow(
+				"aborted",
+			);
+			expect(spy).toHaveBeenCalledTimes(1);
+			expect(String(errorSpy.mock.calls[0]?.[0])).toContain(
+				"merge call to anthropic/claude-haiku-4-5 exceeded 50ms timeout",
+			);
+		} finally {
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("retries a transient non-timeout error up to maxRetries, then succeeds", async () => {
+		const spy = generateTextMock();
+		spy
+			.mockRejectedValueOnce(new Error("HTTP 503 upstream unavailable"))
+			.mockRejectedValueOnce(new Error("HTTP 503 upstream unavailable"))
+			.mockResolvedValueOnce({
+				text: JSON.stringify({ action: "keep" }),
+			} as Awaited<ReturnType<typeof aiModule.generateText>>);
+		const d = await llm.decideMerge(existing, extracted);
+		expect(d.action).toBe("keep");
+		expect(spy).toHaveBeenCalledTimes(3);
+	});
+
+	it("gives up after 1 + maxRetries attempts when a non-timeout error persists", async () => {
+		const spy = generateTextMock();
+		spy.mockRejectedValue(new Error("HTTP 503 upstream unavailable"));
+		await expect(llm.decideMerge(existing, extracted)).rejects.toThrow(
+			"HTTP 503",
+		);
+		expect(spy).toHaveBeenCalledTimes(3);
+	});
+
+	it("passes maxRetries: 0 to generateText so the SDK never retries inside an attempt", async () => {
+		const spy = mockGenerateText(JSON.stringify({ action: "keep" }));
+		await llm.decideMerge(existing, extracted);
+		expect(spy.mock.calls[0]?.[0]).toMatchObject({ maxRetries: 0 });
 	});
 });

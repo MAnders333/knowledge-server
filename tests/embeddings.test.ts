@@ -16,8 +16,11 @@ import {
 	EmbeddingClient,
 	type EmbeddingError,
 	cosineSimilarity,
+	cosineToPrepared,
 	isRetryableEmbeddingError,
+	prepareQuery,
 	retryDelayMs,
+	storedNorm,
 } from "../src/activation/embeddings";
 import { config } from "../src/config";
 import { KnowledgeDB } from "../src/db/sqlite/index";
@@ -602,5 +605,40 @@ describe("retryDelayMs", () => {
 
 	it("stays capped for large attempt numbers", () => {
 		expect(retryDelayMs(1_000, 1_000)).toBe(30_000);
+	});
+});
+
+describe("scan scoring: prepared queries against stored float32 vectors", () => {
+	function randomVector(n: number, seed: number): Float32Array {
+		const out = new Float32Array(n);
+		let x = seed;
+		for (let i = 0; i < n; i++) {
+			x = (x * 1103515245 + 12345) & 0x7fffffff;
+			out[i] = x / 0x7fffffff - 0.5;
+		}
+		return out;
+	}
+
+	it("cosineToPrepared equals cosineSimilarity for stored float32 vectors", () => {
+		for (const n of [1, 3, 4, 5, 1023, 3072]) {
+			const q = Array.from(randomVector(n, n + 7));
+			const prepared = prepareQuery(q);
+			for (let seed = 1; seed <= 10; seed++) {
+				const stored = randomVector(n, seed * 97 + n);
+				const expected = cosineSimilarity(q, Array.from(stored));
+				const got = cosineToPrepared(prepared, stored, storedNorm(stored));
+				expect(Math.abs(got - expected)).toBeLessThan(1e-9);
+			}
+		}
+	});
+
+	it("zero vectors score 0 instead of NaN", () => {
+		const zero = new Float32Array(8);
+		const q = prepareQuery([1, 2, 3, 4, 5, 6, 7, 8]);
+		expect(cosineToPrepared(q, zero, storedNorm(zero))).toBe(0);
+		const stored = Float32Array.from([1, 2, 3]);
+		expect(
+			cosineToPrepared(prepareQuery([0, 0, 0]), stored, storedNorm(stored)),
+		).toBe(0);
 	});
 });

@@ -9,6 +9,15 @@ import pkg from "../../package.json" with { type: "json" };
 import type { ActivationEngine } from "../activation/activate.js";
 import { splitIntoCues } from "../activation/activate.js";
 import {
+	CLIENT_HEADER,
+	type ClientTag,
+	parseClientTag,
+} from "../activation/client.js";
+import {
+	ActivationEventRecorder,
+	hashSessionId,
+} from "../activation/events.js";
+import {
 	contradictionTagBlock,
 	contradictionTagInline,
 	staleTag,
@@ -80,6 +89,13 @@ export function createApp(
 	writableDbs: IKnowledgeStore[] = [db],
 	/** Port the server is bound to; reported by the admin /status. */
 	serverPort: number = DEFAULT_CONFIG.port,
+	/**
+	 * Content-free activation telemetry sink. The caller owns its lifecycle
+	 * (start/stop). Defaults to a recorder on serverStateDb with no timers.
+	 */
+	activationEvents: ActivationEventRecorder = new ActivationEventRecorder(
+		serverStateDb,
+	),
 ): Hono {
 	const app = new Hono();
 	// Reuse ActivationEngine's EmbeddingClient to avoid a second model connection.
@@ -118,9 +134,22 @@ export function createApp(
 		activateInputSchema,
 		async ({ cues, limit, threshold }) => {
 			try {
+				const started = performance.now();
 				const result = await activation.activate(cues, { limit, threshold });
+				const latencyMs = Math.round(performance.now() - started);
 				const cueStr = Array.isArray(cues) ? cues.join(" | ") : cues;
+				const prompt = Array.isArray(cues)
+					? (cues[cues.length - 1] ?? "")
+					: cues;
 				logActivation("mcp", cueStr, result.entries);
+				recordActivationEvent({
+					client: "mcp",
+					promptChars: prompt.length,
+					result,
+					latencyMs,
+					sessionId: null,
+					clientGaveUp: false,
+				});
 
 				if (result.entries.length === 0) {
 					return {
@@ -204,44 +233,85 @@ export function createApp(
 	// -- Helpers --
 
 	/**
-	 * Log a single activation event to the server log.
+	 * Log one activation to the server log. Content-light by default:
 	 *
-	 * Two-line format when entries fire:
+	 *   [activation/opencode] chars=129 → 3 entries
+	 *   [activation/opencode]   0.72 fact  <id>
 	 *
-	 *   [activation/http] q="<full query>" → 3 entries
-	 *   [activation/http]   0.72 fact  <id>  "full entry content"
-	 *   [activation/http]   0.61 decision  <id>  "full entry content"
-	 *   ...
+	 * At LOG_LEVEL=debug the query and entry text are added:
 	 *
-	 * Zero-result queries get a single line:
-	 *   [activation/http] q="<full query>" → 0 entries
+	 *   [activation/opencode] q="<full query>" → 3 entries
+	 *   [activation/opencode]   0.72 fact  <id>  "full entry content"
 	 *
-	 * caller:
-	 *   "http"             — GET /activate (plugin, direct curl)
-	 *   "mcp"              — MCP activate tool (agent deliberate recall)
-	 *   "claude-code-hook" — POST /hooks/claude-code/user-prompt (passive injection)
-	 *
-	 * The full query and full entry content are logged without truncation so the
-	 * log is usable for threshold analysis. JSON.stringify escapes control chars
-	 * and ANSI codes from LLM-sourced content.
+	 * caller is the client tag (opencode, pi, claude-code, mcp, unknown, …).
+	 * Measurement lives in activation_event (see recordActivationEvent).
 	 */
 	function logActivation(
-		caller: "http" | "mcp" | "claude-code-hook",
+		caller: string,
 		query: string,
 		entries: ActivationResult["entries"],
 	): void {
 		const prefix = `[activation/${caller}]`;
+		const debug = logger.isEnabled("debug");
+		const head = debug ? `q=${JSON.stringify(query)}` : `chars=${query.length}`;
 		if (entries.length === 0) {
-			logger.log(`${prefix} q=${JSON.stringify(query)} → 0 entries`);
+			logger.log(`${prefix} ${head} → 0 entries`);
 			return;
 		}
 		logger.log(
-			`${prefix} q=${JSON.stringify(query)} → ${entries.length} entr${entries.length === 1 ? "y" : "ies"}`,
+			`${prefix} ${head} → ${entries.length} entr${entries.length === 1 ? "y" : "ies"}`,
 		);
 		for (const r of entries) {
+			const content = debug ? `  ${JSON.stringify(r.entry.content)}` : "";
 			logger.log(
-				`${prefix}   ${r.rawSimilarity.toFixed(3)} ${r.entry.type.padEnd(10)} ${r.entry.id}  ${JSON.stringify(r.entry.content)}`,
+				`${prefix}   ${r.rawSimilarity.toFixed(3)} ${r.entry.type.padEnd(10)} ${r.entry.id}${content}`,
 			);
+		}
+	}
+
+	/**
+	 * Queue one content-free activation_event row. Never throws, never waits on the
+	 * database: the recorder batches writes off the request path.
+	 */
+	function recordActivationEvent(args: {
+		client: ClientTag;
+		promptChars: number;
+		result: ActivationResult;
+		latencyMs: number;
+		sessionId: string | null | undefined;
+		/** True when the client disconnected before the result was ready. */
+		clientGaveUp: boolean;
+	}): void {
+		const { client, promptChars, result, latencyMs, sessionId, clientGaveUp } =
+			args;
+		try {
+			const gateMode = result.telemetry?.gateMode ?? "off";
+			activationEvents.record({
+				ts: Date.now(),
+				client,
+				sessionHash: hashSessionId(sessionId),
+				promptChars,
+				cueCount: result.telemetry?.cueCount ?? 0,
+				nCandidates: result.telemetry?.nCandidates ?? 0,
+				nReturned: result.entries.length,
+				entryIds: result.entries.map((r) => r.entry.id),
+				rawSims: result.entries.map(
+					(r) => Math.round(r.rawSimilarity * 1e4) / 1e4,
+				),
+				rerankScores:
+					gateMode === "rerank"
+						? result.entries.map((r) =>
+								r.rerankScore === undefined
+									? null
+									: Math.round(r.rerankScore * 1e4) / 1e4,
+							)
+						: null,
+				gateMode,
+				latencyMs,
+				clientDeadlineExceeded: clientGaveUp,
+			});
+		} catch {
+			// Measurement must never fail a request.
 		}
 	}
 
@@ -274,13 +344,30 @@ export function createApp(
 			? Math.max(0, Math.min(1, parsedThreshold))
 			: undefined;
 
+		const client = parseClientTag(
+			c.req.query("client") ?? c.req.header(CLIENT_HEADER),
+		);
+		const sessionId = c.req.header("x-knowledge-session");
+		const prompt = queries[queries.length - 1] ?? "";
 		try {
+			const started = performance.now();
 			const result = await activation.activate(
 				queries.length === 1 ? queries[0] : queries,
 				{ limit, threshold },
 			);
-			logActivation("http", queries.join(" | "), result.entries);
-			return c.json(result);
+			const latencyMs = Math.round(performance.now() - started);
+			logActivation(client, queries.join(" | "), result.entries);
+			recordActivationEvent({
+				client,
+				promptChars: prompt.length,
+				result,
+				latencyMs,
+				sessionId,
+				clientGaveUp: c.req.raw.signal.aborted,
+			});
+			// telemetry is internal (content-free measurement); not part of the response.
+			const { telemetry: _telemetry, ...body } = result;
+			return c.json(body);
 		} catch (e) {
 			logger.error("[activate] Error:", e);
 			return c.json({ error: "Internal server error" }, 500);
@@ -786,12 +873,14 @@ export function createApp(
 		bodyLimit({ maxSize: 1 * 1024 * 1024, onError: (c) => c.json({}) }),
 		async (c) => {
 			let prompt: string;
+			let sessionIdBody: unknown;
 			try {
 				const body = (await c.req.json()) as Record<string, unknown>;
 				if (typeof body.prompt !== "string" || !body.prompt.trim()) {
 					return c.json({});
 				}
 				prompt = body.prompt;
+				sessionIdBody = body.session_id;
 			} catch {
 				return c.json({});
 			}
@@ -800,8 +889,21 @@ export function createApp(
 				// Split prompt into per-line cues + full prompt holistic cue,
 				// matching the same multi-cue strategy used by the OpenCode plugin.
 				const cues = splitIntoCues(prompt);
+				const started = performance.now();
 				const result = await activation.activate(cues, { limit: 8 });
-				logActivation("claude-code-hook", prompt, result.entries);
+				const latencyMs = Math.round(performance.now() - started);
+				const client = parseClientTag(
+					c.req.query("client") ?? c.req.header(CLIENT_HEADER) ?? "claude-code",
+				);
+				logActivation(client, prompt, result.entries);
+				recordActivationEvent({
+					client,
+					promptChars: prompt.length,
+					result,
+					latencyMs,
+					sessionId: typeof sessionIdBody === "string" ? sessionIdBody : null,
+					clientGaveUp: c.req.raw.signal.aborted,
+				});
 
 				if (result.entries.length === 0) {
 					return c.json({});

@@ -241,14 +241,36 @@ export const config = {
 			process.env.LLM_SYNTHESIS_MODEL ||
 			process.env.LLM_EXTRACTION_MODEL ||
 			"anthropic/claude-sonnet-4-6",
-		// Per-call timeout in milliseconds. Applied per attempt (not across all retries).
-		// Default: 5 minutes. Large contradiction batches (50+ candidates) can take
-		// 2–3 minutes for a complex Sonnet response; 5 minutes gives headroom while
-		// still bounding a true hang (network stall, rate-limit loop, etc.).
-		// Minimum 1 ms enforced — set a high value rather than 0 to effectively disable.
-		timeoutMs: parseIntEnv(process.env.LLM_TIMEOUT_MS, 5 * 60 * 1000, 1),
-		// Per-call retry budget. On timeout or transient error, complete() retries up
-		// to this many additional times before throwing to the caller.
+		// Per-call-type timeouts in ms: total wall-clock budget for one attempt
+		// (not across retries). A timed-out attempt is not retried. Defaults suit
+		// hosted models; slow local models (Ollama) should raise the value for the
+		// affected call types. Precedence per type: LLM_TIMEOUT_<TYPE>_MS >
+		// LLM_TIMEOUT_MS > default. Minimum 1 ms enforced.
+		timeoutsMs: {
+			contradiction: parseIntEnv(
+				process.env.LLM_TIMEOUT_CONTRADICTION_MS,
+				parseIntEnv(process.env.LLM_TIMEOUT_MS, 60_000, 1),
+				1,
+			),
+			merge: parseIntEnv(
+				process.env.LLM_TIMEOUT_MERGE_MS,
+				parseIntEnv(process.env.LLM_TIMEOUT_MS, 90_000, 1),
+				1,
+			),
+			extraction: parseIntEnv(
+				process.env.LLM_TIMEOUT_EXTRACTION_MS,
+				parseIntEnv(process.env.LLM_TIMEOUT_MS, 300_000, 1),
+				1,
+			),
+			synthesis: parseIntEnv(
+				process.env.LLM_TIMEOUT_SYNTHESIS_MS,
+				parseIntEnv(process.env.LLM_TIMEOUT_MS, 300_000, 1),
+				1,
+			),
+		},
+		// Per-call retry budget. On transient error, complete() retries up to this many
+		// additional times before throwing to the caller. A timed-out attempt is never
+		// retried (its budget is treated as a hang).
 		// Retries use exponential backoff starting at retryBaseDelayMs (capped at 60s).
 		// Set to 0 to disable retries entirely.
 		maxRetries: parseIntEnv(process.env.LLM_MAX_RETRIES, 2, 0),
@@ -303,6 +325,10 @@ export const config = {
 	decay: {
 		archiveThreshold: parseFloatEnv(process.env.DECAY_ARCHIVE_THRESHOLD, 0.15),
 		tombstoneAfterDays: parseIntEnv(process.env.DECAY_TOMBSTONE_DAYS, 180, 1),
+		// Decay runs on its own schedule, independent of pending work, so an idle
+		// install still archives stale entries. Not run per consolidation batch.
+		// Set to 0 to disable.
+		intervalMs: parseIntEnv(process.env.DECAY_INTERVAL_MS, 86_400_000, 0),
 		// Type-specific decay rates (higher = slower decay)
 		typeHalfLife: {
 			fact: 30, // facts go stale in ~30 days
@@ -372,6 +398,30 @@ export const config = {
 			DEFAULT_CLUSTER_MIN_MEMBERS,
 			2,
 		),
+		// Maximum cluster members sent to synthesizePrinciple per call. Members are
+		// chosen closest-to-centroid first. Override via SYNTHESIS_MAX_PEERS env var.
+		synthesisMaxPeers: parseIntEnv(process.env.SYNTHESIS_MAX_PEERS, 50, 1),
+		// Approximate token budget for the members sent per synthesis prompt; members
+		// are dropped furthest-first until the estimate fits. Override via
+		// SYNTHESIS_MAX_PROMPT_TOKENS env var.
+		synthesisMaxPromptTokens: parseIntEnv(
+			process.env.SYNTHESIS_MAX_PROMPT_TOKENS,
+			30_000,
+			1000,
+		),
+		// Re-synthesizing an already-synthesized cluster requires a material change: at
+		// least SYNTHESIS_MIN_NEW_MEMBERS members joined since its last synthesis, or at
+		// least SYNTHESIS_MIN_NEW_FRACTION (0..1) of its current members did. Counting is
+		// cumulative across clustering passes until the cluster synthesizes.
+		synthesisMinNewMembers: parseIntEnv(
+			process.env.SYNTHESIS_MIN_NEW_MEMBERS,
+			3,
+			1,
+		),
+		synthesisMinNewFraction: Math.min(
+			1,
+			parseFloatEnv(process.env.SYNTHESIS_MIN_NEW_FRACTION, 0.2, 0),
+		),
 		// Polling interval for background auto-consolidation while the server is running.
 		// Default: 8 hours (28_800_000 ms). Only triggers when pending sessions exist,
 		// so a quiet period costs nothing. Matches the sleep-consolidation metaphor —
@@ -410,7 +460,7 @@ export const config = {
 			// Default on. RERANK_ENABLED=false restores pure dense ordering.
 			enabled: process.env.RERANK_ENABLED !== "false",
 			// Hugging Face model ID. Default is the classic English MS MARCO
-			// cross-encoder (int8 ONNX, ~23MB, ~2ms/pair on Apple Silicon).
+			// cross-encoder (int8 ONNX, ~23MB, ~40ms/pair on Apple Silicon WASM).
 			// For multilingual knowledge bases use a multilingual ONNX
 			// cross-encoder instead (e.g. a jina/bge multilingual reranker export).
 			model: process.env.RERANK_MODEL || "Xenova/ms-marco-MiniLM-L-6-v2",
@@ -424,6 +474,13 @@ export const config = {
 			// Hard timeout per rerank call; on expiry the result is abandoned
 			// and dense-only ordering is used.
 			timeoutMs: parseIntEnv(process.env.RERANK_TIMEOUT_MS, 2_000, 100),
+			// Query side of each pair: the last N tokens of the prompt. The
+			// rerank query is capped so a long prompt cannot squeeze documents
+			// out of the model window.
+			maxQueryTokens: parseIntEnv(process.env.RERANK_MAX_QUERY_TOKENS, 64, 1),
+			// Document side of each pair: the first N tokens of the candidate.
+			// 128 keeps a 40-pair batch near 1.5 s on one WASM thread.
+			maxDocTokens: parseIntEnv(process.env.RERANK_MAX_DOC_TOKENS, 128, 1),
 		},
 	},
 } as const;

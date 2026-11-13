@@ -1,10 +1,19 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { type AddressInfo, type Socket, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ActivationEngine } from "../src/activation/activate";
+import { ActivationEngine, StoreBreaker } from "../src/activation/activate";
 import { DEFAULT_CONFIG } from "../src/config-file";
+import type { IKnowledgeStore } from "../src/db/interface";
 import { KnowledgeDB } from "../src/db/sqlite/index";
 import { StoreRegistry } from "../src/db/store-registry";
 import * as loggerModule from "../src/logger";
@@ -367,7 +376,7 @@ describe("ActivationEngine multi-store fan-out", () => {
 			fakeEmbedding("entry from healthy store"),
 		]);
 		// Make db2 throw on full-scan load (Path B — neither store has ANN)
-		spyOn(db2, "getActiveEntriesWithEmbeddings").mockRejectedValue(
+		spyOn(db2, "scanEmbeddings").mockRejectedValue(
 			new Error("connection refused"),
 		);
 
@@ -378,7 +387,7 @@ describe("ActivationEngine multi-store fan-out", () => {
 		expect(ids).not.toContain("e2");
 	});
 
-	it("skips a previously-failed store on subsequent calls (health tracking)", async () => {
+	it("skips a store once its circuit opens (three consecutive failures)", async () => {
 		await db1.insertEntry(
 			makeEntry({
 				id: "e1",
@@ -401,21 +410,148 @@ describe("ActivationEngine multi-store fan-out", () => {
 		spyOn(engine.embeddings, "embedBatch").mockResolvedValue([
 			fakeEmbedding("healthy entry"),
 		]);
-		// db2 always fails
-		const failSpy = spyOn(
-			db2,
-			"getActiveEntriesWithEmbeddings",
-		).mockRejectedValue(new Error("connection refused"));
+		// db2 is dead: every call fails, so its consecutive-failure count only grows.
+		const failSpy = spyOn(db2, "scanEmbeddings").mockRejectedValue(
+			new Error("connection refused"),
+		);
+		spyOn(db2, "getContradictPairsForIds").mockRejectedValue(
+			new Error("connection refused"),
+		);
 
-		// First call — db2 is tried and fails
-		const result1 = await engine.activate("healthy entry");
-		expect(result1.entries.map((e) => e.entry.id)).toContain("e1");
-		expect(failSpy).toHaveBeenCalledTimes(1);
+		// Failing calls accumulate until three in a row open the circuit; then the store
+		// is no longer called at all, however many activations follow.
+		for (let call = 1; call <= 3; call++) {
+			const result = await engine.activate("healthy entry");
+			expect(result.entries.map((e) => e.entry.id)).toContain("e1");
+		}
+		const callsWhileOpening = failSpy.mock.calls.length;
+		expect(callsWhileOpening).toBeLessThanOrEqual(3);
 
-		// Second call — db2 should be skipped (health tracking), not retried
-		const result2 = await engine.activate("healthy entry");
-		expect(result2.entries.map((e) => e.entry.id)).toContain("e1");
-		// failSpy still at 1 — db2 was not called again
-		expect(failSpy).toHaveBeenCalledTimes(1);
+		const result = await engine.activate("healthy entry");
+		expect(result.entries.map((e) => e.entry.id)).toContain("e1");
+		expect(failSpy).toHaveBeenCalledTimes(callsWhileOpening);
+	});
+});
+
+describe("StoreBreaker and activation fan-out", () => {
+	const WINDOW_MS = 60_000;
+	let clock = 0;
+	const newBreaker = () =>
+		new StoreBreaker({ threshold: 3, windowMs: WINDOW_MS, now: () => clock });
+
+	afterEach(() => {
+		mock.restore();
+	});
+
+	it("opens after 3 consecutive failures and warns once", () => {
+		const warn = spyOn(loggerModule.logger, "warn").mockImplementation(
+			() => {},
+		);
+		const breaker = newBreaker();
+		breaker.record("s", false, "boom");
+		breaker.record("s", false, "boom");
+		expect(breaker.isBlocked("s")).toBe(false);
+		breaker.record("s", false, "boom");
+		expect(breaker.isBlocked("s")).toBe(true);
+		expect(breaker.admit("s")).toBe(false);
+		expect(warn).toHaveBeenCalledTimes(1);
+	});
+
+	it("counts consecutive failures only: a success resets the count", () => {
+		const warn = spyOn(loggerModule.logger, "warn").mockImplementation(
+			() => {},
+		);
+		const breaker = newBreaker();
+		breaker.record("s", false, "boom");
+		breaker.record("s", false, "boom");
+		breaker.record("s", true, "ok");
+		breaker.record("s", false, "boom");
+		breaker.record("s", false, "boom");
+		expect(breaker.isBlocked("s")).toBe(false);
+		expect(warn).not.toHaveBeenCalled();
+	});
+
+	it("skips calls while open, allows one probe after the window, closes on success", () => {
+		const warn = spyOn(loggerModule.logger, "warn").mockImplementation(
+			() => {},
+		);
+		clock = 1_000;
+		const breaker = newBreaker();
+		for (let i = 0; i < 3; i++) breaker.record("s", false, "boom");
+
+		clock += WINDOW_MS - 1;
+		expect(breaker.admit("s")).toBe(false);
+
+		clock += 1;
+		expect(breaker.isBlocked("s")).toBe(false);
+		expect(breaker.admit("s")).toBe(true); // the probe
+		expect(breaker.isBlocked("s")).toBe(true);
+		expect(breaker.admit("s")).toBe(false); // no second call while probing
+
+		breaker.record("s", true, "ok");
+		expect(breaker.isBlocked("s")).toBe(false);
+		expect(breaker.admit("s")).toBe(true);
+		// one warning for open, one for closed; nothing per refused call
+		expect(warn).toHaveBeenCalledTimes(2);
+	});
+
+	it("re-opens for another window when the probe fails", () => {
+		const warn = spyOn(loggerModule.logger, "warn").mockImplementation(
+			() => {},
+		);
+		clock = 5_000;
+		const breaker = newBreaker();
+		for (let i = 0; i < 3; i++) breaker.record("s", false, "boom");
+
+		clock += WINDOW_MS;
+		expect(breaker.admit("s")).toBe(true); // probe
+		breaker.record("s", false, "still down");
+		expect(breaker.admit("s")).toBe(false);
+
+		clock += WINDOW_MS - 1;
+		expect(breaker.admit("s")).toBe(false);
+		clock += 1;
+		expect(breaker.admit("s")).toBe(true); // next probe
+		// open, probe failed, next probe: exactly one warning per state change
+		expect(warn).toHaveBeenCalledTimes(2);
+	});
+
+	it("a dead store with 8 cues gets at most 3 calls, then none during the window", async () => {
+		const warn = spyOn(loggerModule.logger, "warn").mockImplementation(
+			() => {},
+		);
+		const findSimilarEntries = mock(() =>
+			Promise.reject(new Error("ECONNREFUSED")),
+		);
+		const getActiveEntryCount = mock(() =>
+			Promise.reject(new Error("ECONNREFUSED")),
+		);
+		const dead = {
+			id: "dead",
+			findSimilarEntries,
+			getActiveEntryCount,
+		} as unknown as IKnowledgeStore;
+		const engine = new ActivationEngine(dead);
+		spyOn(engine.embeddings, "embedBatch").mockImplementation(
+			async (texts: string[]) => texts.map(() => [1, 0, 0, 0, 0, 0, 0, 0]),
+		);
+		const cues = Array.from(
+			{ length: 8 },
+			(_, i) => `distinct cue number ${i}`,
+		);
+		const calls = () =>
+			findSimilarEntries.mock.calls.length +
+			getActiveEntryCount.mock.calls.length;
+
+		const started = Date.now();
+		await engine.activate(cues);
+		expect(Date.now() - started).toBeLessThan(1_000);
+		expect(calls()).toBeLessThanOrEqual(3);
+		expect(warn).toHaveBeenCalledTimes(1);
+
+		const afterFirst = calls();
+		await engine.activate(cues);
+		expect(calls()).toBe(afterFirst);
+		expect(warn).toHaveBeenCalledTimes(1);
 	});
 });

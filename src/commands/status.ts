@@ -3,6 +3,41 @@ import pkg from "../../package.json" with { type: "json" };
 import { StoreRegistry } from "../db/store-registry.js";
 import { errCode } from "../utils.js";
 
+/** Window for the per-source capture vs injection check. */
+export const COVERAGE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+export interface CoverageRow {
+	source: string;
+	captured: number;
+	injected: number;
+}
+
+/**
+ * Per-source captured (consolidated_episode) vs injected (activation_event)
+ * counts, plus a warning for each source that was captured but never injected.
+ * Pure: the caller supplies both maps.
+ */
+export function summarizeCoverage(
+	captured: Record<string, number>,
+	injected: Record<string, number>,
+): { rows: CoverageRow[]; warnings: string[] } {
+	const sources = [
+		...new Set([...Object.keys(captured), ...Object.keys(injected)]),
+	].sort();
+	const rows = sources.map((source) => ({
+		source,
+		captured: captured[source] ?? 0,
+		injected: injected[source] ?? 0,
+	}));
+	const warnings = rows
+		.filter((r) => r.captured > 0 && r.injected === 0)
+		.map(
+			(r) =>
+				`${r.source}: ${r.captured} episodes captured in the last 7 days but nothing injected. Check that the client calls /activate with its client tag.`,
+		);
+	return { rows, warnings };
+}
+
 /**
  * `knowledge-server status`
  *
@@ -89,6 +124,22 @@ export async function runStatus(pidPath: string): Promise<void> {
 		console.log(
 			`  Total processed:    ${state.totalSessionsProcessed} sessions, ${state.totalEntriesCreated} created, ${state.totalEntriesUpdated} updated`,
 		);
+
+		const since = Date.now() - COVERAGE_WINDOW_MS;
+		const { rows, warnings } = summarizeCoverage(
+			await serverStateDb.countEpisodesBySource(since),
+			await serverStateDb.countActivationsByClient(since),
+		);
+		if (rows.length > 0) {
+			console.log("");
+			console.log("  Last 7 days (captured → injected):");
+			for (const r of rows) {
+				console.log(
+					`    ${r.source.padEnd(14)} ${String(r.captured).padStart(6)} → ${r.injected}`,
+				);
+			}
+		}
+		for (const w of warnings) console.log(`  ⚠ ${w}`);
 	} finally {
 		await registry.close();
 	}

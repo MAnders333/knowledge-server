@@ -35,3 +35,22 @@ export function bufferToFloats(buf: Buffer | Uint8Array): number[] {
 	);
 	return Array.from(float32);
 }
+
+/**
+ * View a BYTEA value as a Float32Array (little-endian float32). Copies only when
+ * the buffer is not 4-byte aligned.
+ */
+export function byteaToFloat32(buf: Buffer | Uint8Array): Float32Array {
+	const uint8 =
+		buf instanceof Buffer
+			? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
+			: buf;
+	if (uint8.byteOffset % 4 === 0) {
+		return new Float32Array(
+			uint8.buffer,
+			uint8.byteOffset,
+			uint8.byteLength / 4,
+		);
+	}
+	return new Float32Array(uint8.slice().buffer);
+}

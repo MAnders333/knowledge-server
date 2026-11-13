@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 /**
  * Integration tests for the consolidation engine.
  *
@@ -83,30 +84,61 @@ afterEach(async () => {
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
-describe("ConsolidationEngine.applyDecay (via consolidate early-return path)", () => {
-	it("archives entries below threshold even when no new sessions exist", async () => {
-		// Insert a very weak entry that should be archived
-		const weakEntry = makeEntry({
-			id: "weak-1",
+describe("ConsolidationEngine decay", () => {
+	function weakEntry(id: string) {
+		return makeEntry({
+			id,
 			content: "Weak entry",
 			strength: 0.05, // below default archiveThreshold of 0.15
 			lastAccessedAt: Date.now() - 365 * 24 * 60 * 60 * 1000, // 1 year ago
 			createdAt: Date.now() - 365 * 24 * 60 * 60 * 1000,
 			updatedAt: Date.now() - 365 * 24 * 60 * 60 * 1000,
 		});
-		await db.insertEntry(weakEntry);
+	}
 
+	it("consolidate() does not decay: decay runs on its own schedule", async () => {
+		await db.insertEntry(weakEntry("weak-batch"));
 		// Mock getCandidateSessions so consolidate() hits the early-return path
 		// without opening the real OpenCode DB (which may have sessions in CI).
 		mockReader._sessions = [];
-		// Mock ensureEmbeddings to avoid real embedding network calls
 		spyOn(activation, "ensureEmbeddings").mockResolvedValue(0);
 
-		const result = await engine.consolidate();
+		await engine.consolidate();
 
-		expect(result.sessionsProcessed).toBe(0);
-		// The key invariant: early-return still calls applyDecay
-		expect(result.entriesArchived).toBe(1);
+		expect((await db.getEntry("weak-batch"))?.status).toBe("active");
+	});
+
+	it("runDecay archives entries below threshold even when no sessions are pending", async () => {
+		await db.insertEntry(weakEntry("weak-1"));
+		expect(await engine.runDecay()).toBe(1);
+		expect((await db.getEntry("weak-1"))?.status).toBe("archived");
+	});
+
+	it("runDecay writes nothing for entries that stay above the threshold", async () => {
+		const now = Date.now();
+		// Decayed live (about 0.5) but still above the 0.15 archive threshold.
+		await db.insertEntry(
+			makeEntry({
+				id: "aging-1",
+				confidence: 0.9,
+				strength: 1.0, // stored value, never rewritten by decay
+				lastAccessedAt: now - 60 * 24 * 60 * 60 * 1000,
+				createdAt: now - 60 * 24 * 60 * 60 * 1000,
+				updatedAt: now - 60 * 24 * 60 * 60 * 1000,
+			}),
+		);
+		expect(await engine.runDecay()).toBe(0);
+		const raw = new Database(join(tempDir, "test.db"), { readonly: true });
+		try {
+			const row = raw
+				.prepare("SELECT strength, status FROM knowledge_entry WHERE id = ?")
+				.get("aging-1") as { strength: number; status: string };
+			expect(row).toEqual({ strength: 1.0, status: "active" });
+		} finally {
+			raw.close();
+		}
+		// The live value is still what reads report.
+		expect((await db.getEntry("aging-1"))?.strength).toBeLessThan(0.9);
 	});
 });
 
@@ -582,6 +614,76 @@ function makeEpisode(overrides: Partial<Episode> = {}): Episode {
 }
 
 // ── ConsolidationEngine.reconsolidate() paths ─────────────────────────────────
+
+describe("ConsolidationEngine entry cache", () => {
+	it("loads each store's embedded entries once per batch, across chunks", async () => {
+		// 25 episodes with the default chunk size of 10 → 3 chunks in one batch.
+		mockReader._sessions = [{ id: "session-1", maxMessageTime: Date.now() }];
+		mockReader._episodes = Array.from({ length: 25 }, (_, i) =>
+			makeEpisode({ startMessageId: `msg-${i}`, endMessageId: `msg-${i}-end` }),
+		);
+		spyOn(activation, "ensureEmbeddings").mockResolvedValue(0);
+		spyOn(activation.embeddings, "embed").mockImplementation(
+			async (text: string) => fakeEmbedding(text),
+		);
+
+		let extractCall = 0;
+		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockImplementation(
+			async () => [
+				{
+					type: "fact",
+					content: `Distinct fact ${extractCall++}`,
+					topics: [`topic-${extractCall}`],
+					confidence: 0.9,
+					source: "test",
+				},
+			],
+		);
+		// Near-duplicate candidates (if any) are kept as distinct entries.
+		spyOn(ConsolidationLLM.prototype, "batchDecideMerge").mockImplementation(
+			async (pairs: unknown[]) =>
+				pairs.map(() => ({ action: "insert" }) as never),
+		);
+		const loads = spyOn(db, "getActiveEntriesWithEmbeddings");
+
+		const result = await engine.consolidate();
+
+		expect(result.entriesCreated).toBe(3);
+		expect(loads).toHaveBeenCalledTimes(1);
+	});
+
+	it("a later chunk deduplicates against an entry inserted by an earlier chunk", async () => {
+		mockReader._sessions = [{ id: "session-1", maxMessageTime: Date.now() }];
+		mockReader._episodes = Array.from({ length: 11 }, (_, i) =>
+			makeEpisode({ startMessageId: `msg-${i}`, endMessageId: `msg-${i}-end` }),
+		);
+		spyOn(activation, "ensureEmbeddings").mockResolvedValue(0);
+		spyOn(activation.embeddings, "embed").mockResolvedValue([
+			1, 0, 0, 0, 0, 0, 0, 0,
+		]);
+		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockResolvedValue([
+			{
+				type: "fact",
+				content: "Same fact in every chunk.",
+				topics: ["shared"],
+				confidence: 0.9,
+				source: "test",
+			},
+		]);
+		const decide = spyOn(
+			ConsolidationLLM.prototype,
+			"batchDecideMerge",
+		).mockImplementation(async (pairs: unknown[]) =>
+			pairs.map(() => ({ action: "keep" }) as never),
+		);
+
+		const result = await engine.consolidate();
+
+		// Chunk 1 inserts; chunk 2 sees that entry through the cache and asks decideMerge.
+		expect(result.entriesCreated).toBe(1);
+		expect(decide).toHaveBeenCalledTimes(1);
+	});
+});
 
 describe("ConsolidationEngine.reconsolidate() — novel entry (below threshold)", () => {
 	it("inserts a new entry when the knowledge base is empty", async () => {

@@ -227,16 +227,20 @@ function createModel(modelString: string) {
 	}
 }
 
+/** Consolidation call types; each has its own timeout in config.llm.timeoutsMs. */
+type LlmCallType = keyof typeof config.llm.timeoutsMs;
+
 /**
  * Send a prompt to a specific model. All LLM calls go through here.
  *
  * Resilience:
- * - Hard per-attempt timeout via AbortSignal (config.llm.timeoutMs, default 5 min).
- *   A warning is logged the moment the timeout fires, making hung calls immediately
- *   visible in the log rather than leaving a silent gap.
- * - Automatic retry with exponential backoff (config.llm.maxRetries, default 2).
- *   Retries on any error (timeout, network error, 5xx) so a transient upstream
- *   stall doesn't fail the whole consolidation chunk.
+ * - Hard total wall-clock timeout per attempt via AbortSignal, chosen by call type
+ *   (config.llm.timeoutsMs). The timeout is logged with the call type and budget.
+ * - A timed-out attempt is NOT retried: a call that exhausted its budget is treated
+ *   as hung, so one hang costs one timeout.
+ * - Other errors are retried with exponential backoff (config.llm.maxRetries, default 2),
+ *   so a transient upstream stall doesn't fail the whole consolidation chunk.
+ *   The AI SDK's own retries are disabled (maxRetries: 0) so attempts never multiply.
  * - On final failure after all retries, throws so the chunk-level error handler
  *   in consolidate.ts can decide whether to skip or abort the run.
  */
@@ -267,21 +271,24 @@ function formatLlmError(err: unknown): string {
 }
 
 async function complete(
+	callType: LlmCallType,
 	modelString: string,
 	systemPrompt: string,
 	userPrompt: string,
 	maxTokens = 8192,
 ): Promise<string> {
-	const { timeoutMs, maxRetries, retryBaseDelayMs } = config.llm;
+	const { retryBaseDelayMs, maxRetries } = config.llm;
+	const timeoutMs = config.llm.timeoutsMs[callType];
+	const budget =
+		timeoutMs % 1000 === 0 ? `${timeoutMs / 1000}s` : `${timeoutMs}ms`;
 	const maxAttempts = 1 + maxRetries;
 
 	let lastError: unknown;
 	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 		const controller = new AbortController();
+		let timedOut = false;
 		const timer = setTimeout(() => {
-			logger.warn(
-				`[llm] Call to ${modelString} exceeded ${timeoutMs / 1000}s timeout on attempt ${attempt}/${maxAttempts} — aborting.`,
-			);
+			timedOut = true;
 			controller.abort();
 		}, timeoutMs);
 
@@ -292,15 +299,24 @@ async function complete(
 				prompt: userPrompt,
 				temperature: 0.2,
 				maxOutputTokens: maxTokens,
+				// The SDK's own retry loop would re-run a hung call inside this attempt.
+				maxRetries: 0,
 				abortSignal: controller.signal,
 			});
 			return text;
 		} catch (err) {
 			lastError = err;
+			if (timedOut) {
+				// A call that exhausted its budget is treated as hung: no retry.
+				logger.error(
+					`[llm] ${callType} call to ${modelString} exceeded ${budget} timeout (attempt ${attempt}/${maxAttempts}) — not retrying`,
+				);
+				throw err;
+			}
 			if (attempt < maxAttempts) {
 				const delay = Math.min(retryBaseDelayMs * 2 ** (attempt - 1), 60_000);
 				logger.warn(
-					`[llm] Call to ${modelString} failed on attempt ${attempt}/${maxAttempts} — retrying in ${delay / 1000}s. Error: ${formatLlmError(err)}`,
+					`[llm] ${callType} call to ${modelString} failed on attempt ${attempt}/${maxAttempts} — retrying in ${delay / 1000}s. Error: ${formatLlmError(err)}`,
 				);
 				await new Promise((resolve) => setTimeout(resolve, delay));
 			}
@@ -310,7 +326,7 @@ async function complete(
 	}
 
 	logger.error(
-		`[llm] Call to ${modelString} failed after ${maxAttempts} attempt(s) — giving up. Last error: ${formatLlmError(lastError)}`,
+		`[llm] ${callType} call to ${modelString} failed after ${maxAttempts} attempt(s) — giving up. Last error: ${formatLlmError(lastError)}`,
 	);
 	throw lastError;
 }
@@ -488,6 +504,7 @@ Extract knowledge entries as a JSON array:
 If there is nothing new worth extracting, return an empty array: []`;
 
 		const response = await complete(
+			"extraction",
 			config.llm.extractionModel,
 			systemPrompt,
 			userPrompt,
@@ -627,6 +644,7 @@ Rules for the response array:
 - No extra fields, no markdown, no explanation outside the JSON array.`;
 
 		const response = await complete(
+			"merge",
 			config.llm.mergeModel,
 			systemPrompt,
 			userPrompt,
@@ -735,6 +753,7 @@ Respond with one of:
 {"action": "insert"}`;
 
 		const response = await complete(
+			"merge",
 			config.llm.mergeModel,
 			systemPrompt,
 			userPrompt,
@@ -838,6 +857,7 @@ If yes, return an array of synthesized principles. Return at most 2–3 entries 
 If no meaningful synthesis is possible, return: []`;
 
 		const response = await complete(
+			"synthesis",
 			config.llm.synthesisModel,
 			systemPrompt,
 			userPrompt,
@@ -978,6 +998,7 @@ Respond with a JSON array (one result per candidate, same order):
 ]`;
 
 		const response = await complete(
+			"contradiction",
 			config.llm.contradictionModel,
 			systemPrompt,
 			userPrompt,

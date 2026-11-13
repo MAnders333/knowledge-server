@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { logger } from "../../logger.js";
 import type {
+	ActivationEventRow,
 	ConsolidationState,
 	PendingEpisode,
 	ProcessedRange,
@@ -457,6 +458,66 @@ export class ServerStateDB implements IServerStateDB {
          WHERE id = 1`,
 			);
 		})();
+	}
+
+	// ── Activation events (measurement, content-free) ─────────────────────────
+
+	async insertActivationEvents(rows: ActivationEventRow[]): Promise<void> {
+		if (rows.length === 0) return;
+		const stmt = this.db.prepare(
+			`INSERT INTO activation_event
+			   (ts, client, session_hash, prompt_chars, cue_count, n_candidates, n_returned,
+			    entry_ids, raw_sims, rerank_scores, gate_mode, latency_ms, client_deadline_exceeded)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		);
+		this.db.transaction(() => {
+			for (const r of rows) {
+				stmt.run(
+					r.ts,
+					r.client,
+					r.sessionHash,
+					r.promptChars,
+					r.cueCount,
+					r.nCandidates,
+					r.nReturned,
+					JSON.stringify(r.entryIds),
+					JSON.stringify(r.rawSims),
+					r.rerankScores === null ? null : JSON.stringify(r.rerankScores),
+					r.gateMode,
+					r.latencyMs,
+					r.clientDeadlineExceeded ? 1 : 0,
+				);
+			}
+		})();
+	}
+
+	async pruneActivationEvents(cutoffMs: number): Promise<number> {
+		const res = this.db
+			.prepare("DELETE FROM activation_event WHERE ts < ?")
+			.run(cutoffMs);
+		return Number(res.changes);
+	}
+
+	async countActivationsByClient(
+		sinceMs: number,
+	): Promise<Record<string, number>> {
+		const rows = this.db
+			.prepare(
+				"SELECT client, COUNT(*) AS n FROM activation_event WHERE ts >= ? GROUP BY client",
+			)
+			.all(sinceMs) as Array<{ client: string; n: number }>;
+		return Object.fromEntries(rows.map((r) => [r.client, Number(r.n)]));
+	}
+
+	async countEpisodesBySource(
+		sinceMs: number,
+	): Promise<Record<string, number>> {
+		const rows = this.db
+			.prepare(
+				"SELECT source, COUNT(*) AS n FROM consolidated_episode WHERE processed_at >= ? GROUP BY source",
+			)
+			.all(sinceMs) as Array<{ source: string; n: number }>;
+		return Object.fromEntries(rows.map((r) => [r.source, Number(r.n)]));
 	}
 
 	async close(): Promise<void> {

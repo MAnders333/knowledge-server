@@ -55,6 +55,21 @@ function makeStoreStub(
 		getEntry: mock(() => Promise.resolve(null)),
 		getActiveEntries: mock(() => Promise.resolve([])),
 		getActiveEntriesWithEmbeddings: mock(() => Promise.resolve(entries)),
+		scanEmbeddings: mock(() =>
+			Promise.resolve(
+				entries.map((e) => ({
+					id: e.id,
+					embedding: Float32Array.from(e.embedding),
+				})),
+			),
+		),
+		getEntriesByIds: mock((ids: string[]) =>
+			Promise.resolve(
+				entries
+					.filter((e) => ids.includes(e.id))
+					.map(({ embedding: _embedding, ...rest }) => rest),
+			),
+		),
 		getOneEntryWithEmbedding: mock(() => Promise.resolve(null)),
 		getActiveAndConflictedEntries: mock(() => Promise.resolve([])),
 		getEntriesMissingEmbeddings: mock(() => Promise.resolve([])),
@@ -62,7 +77,6 @@ function makeStoreStub(
 		getEntries: mock(() => Promise.resolve([])),
 		recordAccess: mock(() => Promise.resolve()),
 		reinforceObservation: mock(() => Promise.resolve()),
-		updateStrength: mock(() => Promise.resolve()),
 		getStats: mock(() => Promise.resolve({})),
 		getEntriesWithOverlappingTopics: mock(() => Promise.resolve([])),
 		applyContradictionResolution: mock(() => Promise.resolve()),
@@ -147,11 +161,11 @@ describe("ActivationEngine.activate — ANN path (Path A)", () => {
 		mock.restore();
 	});
 
-	it("uses findSimilarEntries (not getActiveEntriesWithEmbeddings) when available", async () => {
+	it("uses findSimilarEntries (not scanEmbeddings) when available", async () => {
 		const result = await activation.activate(queryContent);
 
-		// ANN path must NOT call getActiveEntriesWithEmbeddings
-		expect(annStore.getActiveEntriesWithEmbeddings).not.toHaveBeenCalled();
+		// ANN path must NOT call scanEmbeddings
+		expect(annStore.scanEmbeddings).not.toHaveBeenCalled();
 		// ANN path MUST call findSimilarEntries
 		expect(annStore.findSimilarEntries).toHaveBeenCalled();
 
@@ -214,9 +228,41 @@ describe("ActivationEngine.activate — full-scan path (Path B)", () => {
 		mock.restore();
 	});
 
-	it("calls getActiveEntriesWithEmbeddings when findSimilarEntries is absent", async () => {
+	it("scans id + embedding rows when findSimilarEntries is absent", async () => {
 		await activation.activate(queryContent);
-		expect(fullScanStore.getActiveEntriesWithEmbeddings).toHaveBeenCalled();
+		expect(fullScanStore.scanEmbeddings).toHaveBeenCalled();
+		expect(fullScanStore.getActiveEntriesWithEmbeddings).not.toHaveBeenCalled();
+	});
+
+	it("scores scan entries with the same cosine as the reference implementation", async () => {
+		const others = Array.from({ length: 30 }, (_, i) =>
+			makeEntry({
+				id: `other-${i}`,
+				content: `other ${i}`,
+				embedding: fakeEmbedding(`other ${i}`),
+				status: "active",
+			}),
+		);
+		const store = makeStoreStub(
+			[highEntry, ...others] as Array<KnowledgeEntry & { embedding: number[] }>,
+			{ supportAnn: false },
+		);
+		const engine = new ActivationEngine(store);
+		spyOn(engine.embeddings, "embedBatch").mockResolvedValue([queryEmb]);
+
+		const result = await engine.activate(queryContent, { threshold: 0 });
+
+		expect(result.entries.length).toBeGreaterThan(0);
+		for (const { entry, rawSimilarity } of result.entries) {
+			const source = [highEntry, ...others].find((e) => e.id === entry.id);
+			expect(source).toBeDefined();
+			const expected = cosineSimilarity(queryEmb, source?.embedding ?? []);
+			// Stored vectors are float32 (as in both backends), so the reference is computed
+			// on float32-rounded values; the difference is float rounding only.
+			expect(Math.abs((rawSimilarity ?? Number.NaN) - expected)).toBeLessThan(
+				1e-6,
+			);
+		}
 	});
 
 	it("still returns the correct entry on Path B", async () => {
@@ -258,8 +304,8 @@ describe("ActivationEngine.activate - mixed stores (per-store path selection)", 
 		});
 
 		expect(annStore.findSimilarEntries).toHaveBeenCalled();
-		expect(annStore.getActiveEntriesWithEmbeddings).not.toHaveBeenCalled();
-		expect(scanStore.getActiveEntriesWithEmbeddings).toHaveBeenCalled();
+		expect(annStore.scanEmbeddings).not.toHaveBeenCalled();
+		expect(scanStore.scanEmbeddings).toHaveBeenCalled();
 		const ids = result.entries.map((e) => e.entry.id);
 		expect(ids).toContain("a1");
 		expect(ids).toContain("s1");
@@ -287,8 +333,8 @@ describe("ActivationEngine.activate - mixed stores (per-store path selection)", 
 		});
 
 		expect(notReady.findSimilarEntries).not.toHaveBeenCalled();
-		expect(notReady.getActiveEntriesWithEmbeddings).toHaveBeenCalled();
-		expect(ready.getActiveEntriesWithEmbeddings).not.toHaveBeenCalled();
+		expect(notReady.scanEmbeddings).toHaveBeenCalled();
+		expect(ready.scanEmbeddings).not.toHaveBeenCalled();
 		const ids = result.entries.map((e) => e.entry.id);
 		expect(ids).toContain("r1");
 		expect(ids).toContain("n1");
@@ -441,7 +487,7 @@ describe("ActivationEngine.activate - mixed stores (per-store path selection)", 
 		] as E[]);
 		annStore.id = "ann";
 		scanStore.id = "scan";
-		scanStore.getActiveEntriesWithEmbeddings = mock(() =>
+		scanStore.scanEmbeddings = mock(() =>
 			Promise.reject(new Error("connection refused")),
 		);
 
@@ -453,7 +499,7 @@ describe("ActivationEngine.activate - mixed stores (per-store path selection)", 
 		});
 
 		expect(annStore.findSimilarEntries).toHaveBeenCalled();
-		expect(annStore.getActiveEntriesWithEmbeddings).not.toHaveBeenCalled();
+		expect(annStore.scanEmbeddings).not.toHaveBeenCalled();
 		const ids = result.entries.map((e) => e.entry.id);
 		expect(ids).toContain("a1");
 		expect(ids).not.toContain("s1");
@@ -517,7 +563,7 @@ describe("ActivationEngine.activate - mixed stores (per-store path selection)", 
 		);
 
 		expect(annStore.findSimilarEntries).toHaveBeenCalledTimes(2);
-		expect(scanStore.getActiveEntriesWithEmbeddings).toHaveBeenCalledTimes(1);
+		expect(scanStore.scanEmbeddings).toHaveBeenCalledTimes(1);
 		const byId = new Map(result.entries.map((e) => [e.entry.id, e]));
 		expect(byId.get("a1")?.rawSimilarity).toBeCloseTo(1, 5);
 		expect(byId.get("s1")?.rawSimilarity).toBeCloseTo(1, 5);

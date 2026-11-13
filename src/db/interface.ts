@@ -1,4 +1,5 @@
 import type {
+	ActivationEventRow,
 	ConsolidationState,
 	KnowledgeEntry,
 	KnowledgeRelation,
@@ -132,6 +133,20 @@ export interface IServerStateDB {
 	 */
 	reinitialize(userId?: string): Promise<void>;
 
+	// ── Activation events (measurement, content-free) ─────────────────────────
+
+	/** Append content-free activation_event rows. Batched by the caller. */
+	insertActivationEvents(rows: ActivationEventRow[]): Promise<void>;
+
+	/** Delete activation_event rows with ts < cutoffMs. Returns the number deleted. */
+	pruneActivationEvents(cutoffMs: number): Promise<number>;
+
+	/** Injected activations per client since sinceMs (ts >= sinceMs). */
+	countActivationsByClient(sinceMs: number): Promise<Record<string, number>>;
+
+	/** Captured episodes per source since sinceMs (consolidated_episode.processed_at >= sinceMs). */
+	countEpisodesBySource(sinceMs: number): Promise<Record<string, number>>;
+
 	close(): Promise<void>;
 }
 
@@ -182,6 +197,19 @@ export interface IKnowledgeStore {
 		(KnowledgeEntry & { embedding: number[] }) | null
 	>;
 
+	/**
+	 * id + embedding of every active or conflicted entry, for the in-process
+	 * full-scan retrieval path. Loads no other columns, so scoring does not
+	 * materialise whole entries.
+	 */
+	scanEmbeddings(): Promise<Array<{ id: string; embedding: Float32Array }>>;
+
+	/**
+	 * Full entries (no embedding) for the given ids that are active or conflicted.
+	 * Hydrates the few scan hits that clear the similarity threshold.
+	 */
+	getEntriesByIds(ids: string[]): Promise<KnowledgeEntry[]>;
+
 	getActiveAndConflictedEntries(): Promise<KnowledgeEntry[]>;
 
 	getEntriesMissingEmbeddings(): Promise<KnowledgeEntry[]>;
@@ -196,8 +224,6 @@ export interface IKnowledgeStore {
 	recordAccess(id: string): Promise<void>;
 
 	reinforceObservation(id: string): Promise<void>;
-
-	updateStrength(id: string, strength: number): Promise<void>;
 
 	getStats(): Promise<Record<string, number>>;
 
@@ -295,6 +321,8 @@ export interface IKnowledgeStore {
 			lastMembershipChangedAt: number;
 			createdAt: number;
 			memberIds: string[];
+			/** entry id → ms when the entry first joined this cluster (kept across passes). */
+			memberJoinedAt: Map<string, number>;
 		}>
 	>;
 
@@ -366,7 +394,7 @@ export interface IKnowledgeStore {
 		statuses?: KnowledgeStatus[],
 	): Promise<
 		Array<{
-			entry: KnowledgeEntry & { embedding: number[] };
+			entry: KnowledgeEntry;
 			similarity: number;
 		}>
 	>;

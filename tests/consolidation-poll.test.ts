@@ -4,7 +4,7 @@
  * server and orphans the auto-spawned daemon).
  */
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
-import { runPollTick } from "../src/consolidation/poll";
+import { runDecayTick, runPollTick } from "../src/consolidation/poll";
 import { logger } from "../src/logger";
 
 afterEach(() => {
@@ -64,5 +64,56 @@ describe("runPollTick", () => {
 		await runPollTick(consolidation, drain);
 
 		expect(drain).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("runDecayTick", () => {
+	function stub(opts: { locked?: boolean; fail?: boolean } = {}) {
+		let locked = opts.locked ?? false;
+		const calls = { decay: 0, unlock: 0 };
+		return {
+			calls,
+			engine: {
+				tryLock: () => {
+					if (locked) return false;
+					locked = true;
+					return true;
+				},
+				unlock: () => {
+					calls.unlock++;
+					locked = false;
+				},
+				runDecay: async () => {
+					calls.decay++;
+					if (opts.fail) throw new Error("state db unreachable");
+					return 2;
+				},
+			},
+		};
+	}
+
+	it("runs decay with nothing pending and releases the lock", async () => {
+		const { engine, calls } = stub();
+		const result = await runDecayTick(engine);
+		expect(result).toEqual({ status: "done", archived: 2 });
+		expect(calls.decay).toBe(1);
+		expect(calls.unlock).toBe(1);
+	});
+
+	it("reports busy without decaying when another run holds the lock", async () => {
+		const { engine, calls } = stub({ locked: true });
+		expect(await runDecayTick(engine)).toEqual({ status: "busy" });
+		expect(calls.decay).toBe(0);
+	});
+
+	it("reports failure instead of rejecting, and still releases the lock", async () => {
+		const { engine, calls } = stub({ fail: true });
+		const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+		try {
+			expect(await runDecayTick(engine)).toEqual({ status: "failed" });
+			expect(calls.unlock).toBe(1);
+		} finally {
+			errorSpy.mockRestore();
+		}
 	});
 });

@@ -46,7 +46,13 @@ const SEP = "[SEP]";
 const MAX_WORD_CHARS = 100;
 
 /** Default sequence budget (MiniLM max_position_embeddings = 512). */
-const MAX_SEQUENCE_LENGTH = 512;
+export const MAX_SEQUENCE_LENGTH = 512;
+
+/**
+ * Text is clipped to this many characters before encoding (tail or head,
+ * depending on the caller), so a 1 MB prompt costs the same as an 8 kB one.
+ */
+const MAX_CLIP_CHARS = 8192;
 
 export class BertWordPieceTokenizer {
 	private readonly vocab: Map<string, number>;
@@ -55,10 +61,15 @@ export class BertWordPieceTokenizer {
 	private readonly sepId: number;
 	private readonly padId: number;
 	private readonly cfg: BertTokenizerConfig;
+	/** Vocab ids of "##" continuation pieces (a cut must not start on one). */
+	private readonly continuationIds = new Set<number>();
 
 	private constructor(vocab: Map<string, number>, cfg: BertTokenizerConfig) {
 		this.vocab = vocab;
 		this.cfg = cfg;
+		for (const [token, tokenId] of vocab) {
+			if (token.startsWith("##")) this.continuationIds.add(tokenId);
+		}
 		const id = (t: string) => {
 			const v = vocab.get(t);
 			if (v === undefined)
@@ -214,40 +225,46 @@ export class BertWordPieceTokenizer {
 	}
 
 	/**
+	 * Encode the last `maxTokens` word-piece ids of `text` (no special tokens).
+	 * Only the last MAX_CLIP_CHARS characters are encoded. A leading "##"
+	 * continuation piece is dropped so the kept text starts on a word.
+	 */
+	encodeTail(text: string, maxTokens: number): number[] {
+		const clipped =
+			text.length > MAX_CLIP_CHARS ? text.slice(-MAX_CLIP_CHARS) : text;
+		const ids = this.encode(clipped);
+		if (ids.length <= maxTokens) return ids;
+		let start = ids.length - maxTokens;
+		while (start < ids.length && this.continuationIds.has(ids[start])) start++;
+		return ids.slice(start);
+	}
+
+	/** Encode the first `maxTokens` word-piece ids of `text` (no special tokens). */
+	encodeHead(text: string, maxTokens: number): number[] {
+		const clipped =
+			text.length > MAX_CLIP_CHARS ? text.slice(0, MAX_CLIP_CHARS) : text;
+		const ids = this.encode(clipped);
+		return ids.length > maxTokens ? ids.slice(0, maxTokens) : ids;
+	}
+
+	/**
 	 * Encode a (query, document) pair: [CLS] q [SEP] d [SEP].
 	 * token_type_ids mark the two segments (0 for query+first SEP, 1 after).
-	 * Overlong pairs are truncated (document side first, matching the
-	 * longest_first strategy used for pair truncation in HF tokenizers).
+	 * Overlong pairs are trimmed longest-first, as HF's longest_first does:
+	 * the longer side loses one token at a time, so a long query can no longer
+	 * squeeze the document out entirely.
 	 */
 	encodePair(
 		query: string,
 		document: string,
 		maxLength: number = MAX_SEQUENCE_LENGTH,
 	): { ids: number[]; tokenTypeIds: number[] } {
-		const qIds = this.encode(query);
-		const dIds = this.encode(document);
-
-		// Budget: 3 special tokens ([CLS], [SEP], [SEP]).
-		const budget = maxLength - 3;
-		if (qIds.length + dIds.length > budget) {
-			// Truncate the document first; if the query alone overflows, truncate it.
-			const qKeep = Math.min(qIds.length, budget);
-			const dKeep = Math.max(0, budget - qKeep);
-			qIds.length = qKeep;
-			dIds.length = dKeep;
-		}
-
-		const ids = [this.clsId, ...qIds, this.sepId, ...dIds, this.sepId];
-		const tokenTypeIds = [
-			...new Array(qIds.length + 2).fill(0),
-			...new Array(dIds.length + 1).fill(1),
-		];
-		return { ids, tokenTypeIds };
+		return this.joinPair(this.encode(query), this.encode(document), maxLength);
 	}
 
 	/**
 	 * Batch-encode pairs with right padding to the longest sequence.
-	 * Returns flat BigInt64Array buffers + dims, ready for ort.Tensor.
+	 * Each distinct string is encoded once (a reranker repeats one query).
 	 */
 	batchEncodePairs(
 		queries: string[],
@@ -257,8 +274,36 @@ export class BertWordPieceTokenizer {
 		if (queries.length !== documents.length) {
 			throw new Error("queries and documents must have the same length");
 		}
-		const encoded = queries.map((q, i) =>
-			this.encodePair(q, documents[i], maxLength),
+		const memo = new Map<string, number[]>();
+		const encodeOnce = (text: string): number[] => {
+			let ids = memo.get(text);
+			if (!ids) {
+				ids = this.encode(text);
+				memo.set(text, ids);
+			}
+			return ids;
+		};
+		return this.batchFromIds(
+			queries.map(encodeOnce),
+			documents.map(encodeOnce),
+			maxLength,
+		);
+	}
+
+	/**
+	 * Batch already-encoded (query ids, document ids) pairs with right padding.
+	 * Returns flat BigInt64Array buffers + dims, ready for ort.Tensor.
+	 */
+	batchFromIds(
+		queryIds: number[][],
+		documentIds: number[][],
+		maxLength: number = MAX_SEQUENCE_LENGTH,
+	): BatchEncoding {
+		if (queryIds.length !== documentIds.length) {
+			throw new Error("queries and documents must have the same length");
+		}
+		const encoded = queryIds.map((q, i) =>
+			this.joinPair(q, documentIds[i], maxLength),
 		);
 		const batch = encoded.length;
 		const seqLen = Math.max(1, ...encoded.map((e) => e.ids.length));
@@ -286,6 +331,31 @@ export class BertWordPieceTokenizer {
 			tokenTypeIds,
 			dims: [batch, seqLen],
 		};
+	}
+
+	/** [CLS] q [SEP] d [SEP] with longest-first trimming to `maxLength`. */
+	private joinPair(
+		queryIds: number[],
+		documentIds: number[],
+		maxLength: number,
+	): { ids: number[]; tokenTypeIds: number[] } {
+		const qIds = [...queryIds];
+		const dIds = [...documentIds];
+		// Budget: 3 special tokens ([CLS], [SEP], [SEP]).
+		const budget = Math.max(0, maxLength - 3);
+		let excess = qIds.length + dIds.length - budget;
+		while (excess > 0) {
+			if (qIds.length > dIds.length) qIds.length -= 1;
+			else dIds.length -= 1; // ties trim the document, as HF does
+			excess -= 1;
+		}
+
+		const ids = [this.clsId, ...qIds, this.sepId, ...dIds, this.sepId];
+		const tokenTypeIds = [
+			...new Array(qIds.length + 2).fill(0),
+			...new Array(dIds.length + 1).fill(1),
+		];
+		return { ids, tokenTypeIds };
 	}
 }
 

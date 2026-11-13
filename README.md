@@ -172,7 +172,7 @@ Hono-based HTTP server. Binds to `127.0.0.1:3179` by default.
 
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
-| `/activate?q=...` | GET | — | Activate knowledge entries by query |
+| `/activate?q=...` | GET | — | Activate knowledge entries by query. Optional `client` query param or `x-knowledge-client` header (`opencode`, `claude-code`, `pi`, `omp`, `codex`, `mcp`, `cli`); missing or unknown values are recorded as `unknown`. |
 | `/consolidate` | POST | admin | Run a consolidation batch |
 | `/reinitialize?confirm=yes` | POST | admin | Wipe all entries and reset consolidation state |
 | `/status` | GET | — (config requires admin) | Health check and stats |
@@ -349,8 +349,12 @@ Provider-specific credentials take precedence over the unified endpoint.
 | `LLM_MERGE_MODEL` | `anthropic/claude-haiku-4-5` | Near-duplicate merge decisions (cheaper) |
 | `LLM_CONTRADICTION_MODEL` | `anthropic/claude-haiku-4-5` | Contradiction detection and resolution |
 | `LLM_SYNTHESIS_MODEL` | *(inherits `LLM_EXTRACTION_MODEL`)* | Cross-session principle synthesis |
-| `LLM_TIMEOUT_MS` | `300000` | Per-call LLM timeout in ms |
-| `LLM_MAX_RETRIES` | `2` | Retry attempts on timeout/error |
+| `LLM_TIMEOUT_CONTRADICTION_MS` | `60000` | Per-attempt timeout for contradiction detection. Raise for slow local models |
+| `LLM_TIMEOUT_MERGE_MS` | `90000` | Per-attempt timeout for merge decisions |
+| `LLM_TIMEOUT_EXTRACTION_MS` | `300000` | Per-attempt timeout for knowledge extraction |
+| `LLM_TIMEOUT_SYNTHESIS_MS` | `300000` | Per-attempt timeout for principle synthesis |
+| `LLM_TIMEOUT_MS` | *(per-type defaults)* | Fallback per-attempt timeout in ms for any call type without its own `LLM_TIMEOUT_<TYPE>_MS` |
+| `LLM_MAX_RETRIES` | `2` | Retry attempts on transient errors (a timed-out call is not retried) |
 | `OPENAI_MAX_TOKENS_PARAM` | `max_tokens` | Token-limit parameter sent on OpenAI-compatible calls. Set to `max_completion_tokens` for newer OpenAI models (gpt-5.x, o-series) that reject `max_tokens` |
 | `OPENAI_DROP_PARAMS` | *(none)* | Comma-separated request parameters to omit from OpenAI-compatible calls (e.g. `temperature` for gpt-5.x/o-series models that only accept the default value) |
 
@@ -386,7 +390,8 @@ Credentials and paths stay in `.env`:
 | Variable | Default | Description |
 |---|---|---|
 | `KNOWLEDGE_ADMIN_TOKEN` | *(random per process)* | Fixed admin token for scripted use (≥16 chars) |
-| `KNOWLEDGE_LOG_PATH` | `~/.local/share/knowledge-server/server.log` | Log file. Set to `""` to disable. |
+| `KNOWLEDGE_LOG_PATH` | `~/.local/share/knowledge-server/server.log` | Log file. Set to `""` to disable. When stdout or stderr already points at this file (the launchd plist does this), each line is written once. |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. Only `debug` logs query and entry text; `info` logs lengths, ids and similarity scores. |
 
 ### Session sources
 
@@ -428,6 +433,7 @@ All sources are auto-detected. Override paths or disable sources via environment
 |---|---|---|
 | `DECAY_ARCHIVE_THRESHOLD` | `0.15` | Strength below which an entry is archived |
 | `DECAY_TOMBSTONE_DAYS` | `180` | Days after archiving before permanent deletion |
+| `DECAY_INTERVAL_MS` | `86400000` (24h) | How often decay runs, independent of pending sessions. Set to `0` to disable. |
 
 ### Activation
 
@@ -435,6 +441,22 @@ All sources are auto-detected. Override paths or disable sources via environment
 |---|---|---|
 | `ACTIVATION_MAX_RESULTS` | `10` | Max entries returned per activation |
 | `ACTIVATION_SIMILARITY_THRESHOLD` | `0.42` | Minimum cosine similarity to activate |
+
+### Reranking (local cross-encoder)
+
+Dense retrieval overfetches `RERANK_CANDIDATES` entries and a local cross-encoder re-scores them. It runs offline after a one-time model download (~23MB). The default model is pinned to a Hugging Face revision and checksum. If reranking fails or times out, activation uses dense ordering.
+
+| Variable | Default | Description |
+|---|---|---|
+| `RERANK_ENABLED` | `true` | `false` restores dense-only ordering |
+| `RERANK_MODEL` | `Xenova/ms-marco-MiniLM-L-6-v2` | Hugging Face ONNX cross-encoder. **The default is English-only.** For other languages use a multilingual ONNX export with a WordPiece `tokenizer.json`. Other models are fetched from `main` without a checksum |
+| `RERANK_MODELS_DIR` | `~/.local/share/knowledge-server/models` | Model cache |
+| `RERANK_CANDIDATES` | `40` | Dense candidates scored per activation |
+| `RERANK_TIMEOUT_MS` | `2000` | Budget for one rerank call. On expiry the whole batch falls back to dense ordering (no partial scores) |
+| `RERANK_MAX_QUERY_TOKENS` | `64` | Last N tokens of the prompt used as the rerank query |
+| `RERANK_MAX_DOC_TOKENS` | `128` | First N tokens of each candidate that is scored |
+
+Pairs are scored one at a time and the event loop is yielded between them, so one long candidate no longer stalls other requests. Size `RERANK_CANDIDATES` so that candidates × ~40 ms (Apple Silicon) fits within `RERANK_TIMEOUT_MS`; on slower CPUs lower the count or raise the timeout.
 
 ## Usage
 
@@ -459,7 +481,11 @@ knowledge-server stop
 knowledge-server status
 ```
 
-Shows whether the server is running, entry counts, last consolidation time, and pending sessions.
+Shows whether the server is running, entry counts, last consolidation time, and pending sessions. For the last 7 days it also shows, per source, episodes captured versus activations injected, and warns when a source is captured but never injected.
+
+Activation telemetry is kept in the `activation_event` table of the server state DB. It holds ids, counts, scores, latency and a client tag, never prompt or entry text, and rows older than 90 days are pruned.
+
+To replay prompts from a local JSONL file without changing any store, run `bun run bench/replay-activation.ts prompts.jsonl`. Each line is `{"prompt": "..."}`. Keep the file outside the repo. The script prints cap-hit, zero-hit, hub-concentration and latency figures.
 
 ### Trigger consolidation manually
 

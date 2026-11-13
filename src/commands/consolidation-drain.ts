@@ -87,6 +87,10 @@ export async function drainConsolidation(
 	let totalUpdated = 0;
 
 	while (true) {
+		// Nothing pending: stop without starting a batch. An empty batch still scans
+		// every store to ensure embeddings, so it is skipped rather than run to find out.
+		if ((await consolidation.checkPending()).pendingSessions === 0) break;
+
 		const acquired = await tryAcquireLock(consolidation, lockTimeoutMs);
 		if (!acquired) {
 			console.error(

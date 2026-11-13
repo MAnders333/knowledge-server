@@ -324,4 +324,17 @@ export const MIGRATIONS: Array<{
 			// SQLite stores require no schema changes.
 		},
 	},
+	{
+		version: 18,
+		label:
+			"drop strength and last_accessed_at indexes — strength is computed on read",
+		up: (db) => {
+			// Every update to an indexed column is a full row rewrite; these two
+			// indexes were rewritten on each decay pass and each access. Strength is
+			// computed on read, so no index is needed for it. (Postgres also drops the
+			// HNSW re-insert cost tied to these updates.)
+			db.exec("DROP INDEX IF EXISTS idx_entry_strength");
+			db.exec("DROP INDEX IF EXISTS idx_entry_accessed");
+		},
+	},
 ];

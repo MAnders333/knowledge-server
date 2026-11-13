@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DEFAULT_SQLITE_PATH } from "../../config-file.js";
+import { computeStrength } from "../../consolidation/decay.js";
 import { logger } from "../../logger.js";
 import { clampKnowledgeType } from "../../types.js";
 import type {
@@ -23,6 +24,22 @@ import {
 	EXPECTED_TABLE_COLUMNS,
 	SCHEMA_VERSION,
 } from "./schema.js";
+
+/**
+ * knowledge_entry columns read by rowToEntry(), without the embedding BLOB.
+ * Every read that does not score vectors uses this list, so a 3072-d float32
+ * vector (12 KB as a BLOB) is only materialised where cosine similarity needs it.
+ * Keep in sync with RawEntryRow.
+ */
+const ENTRY_COLUMNS =
+	"id, type, content, topics, confidence, source, status, strength, created_at, updated_at, last_accessed_at, access_count, observation_count, superseded_by, derived_from, is_synthesized";
+
+/** ENTRY_COLUMNS qualified with a table alias (for joins). */
+function qualifiedEntryColumns(alias: string): string {
+	return ENTRY_COLUMNS.split(", ")
+		.map((c) => `${alias}.${c}`)
+		.join(", ");
+}
 
 /**
  * SQLite database layer for the knowledge graph.
@@ -233,7 +250,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 
 	async getEntry(id: string): Promise<KnowledgeEntry | null> {
 		const row = this.db
-			.prepare("SELECT * FROM knowledge_entry WHERE id = ?")
+			.prepare(`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE id = ?`)
 			.get(id) as RawEntryRow | null;
 
 		return row ? this.rowToEntry(row) : null;
@@ -242,7 +259,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 	async getActiveEntries(): Promise<KnowledgeEntry[]> {
 		const rows = this.db
 			.prepare(
-				"SELECT * FROM knowledge_entry WHERE status = 'active' ORDER BY strength DESC",
+				`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE status = 'active' ORDER BY strength DESC`,
 			)
 			.all() as RawEntryRow[];
 
@@ -259,7 +276,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 	> {
 		const rows = this.db
 			.prepare(
-				"SELECT * FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL ORDER BY strength DESC",
+				`SELECT ${ENTRY_COLUMNS}, embedding FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL ORDER BY strength DESC`,
 			)
 			.all() as RawEntryRow[];
 
@@ -271,6 +288,39 @@ export class KnowledgeDB implements IKnowledgeStore {
 	}
 
 	/**
+	 * id + embedding of every active or conflicted entry, for the full-scan path.
+	 * Other columns are not read, so no entry object is built per row.
+	 */
+	async scanEmbeddings(): Promise<
+		Array<{ id: string; embedding: Float32Array }>
+	> {
+		const rows = this.db
+			.prepare(
+				"SELECT id, embedding FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL",
+			)
+			.all() as Array<{ id: string; embedding: Uint8Array }>;
+		return rows.map((r) => ({
+			id: r.id,
+			embedding: blobToFloat32(r.embedding),
+		}));
+	}
+
+	/**
+	 * Full entries (no embedding) for the given active or conflicted ids.
+	 */
+	async getEntriesByIds(ids: string[]): Promise<KnowledgeEntry[]> {
+		if (ids.length === 0) return [];
+		const rows = this.db
+			.prepare(
+				`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry
+         WHERE status IN ('active', 'conflicted')
+           AND id IN (SELECT value FROM json_each(?))`,
+			)
+			.all(JSON.stringify(ids)) as RawEntryRow[];
+		return rows.map((r) => this.rowToEntry(r));
+	}
+
+	/**
 	 * Get a single active or conflicted entry that has an embedding.
 	 * Used to probe embedding dimensions without loading all entries into memory.
 	 */
@@ -279,7 +329,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 	> {
 		const row = this.db
 			.prepare(
-				"SELECT * FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL LIMIT 1",
+				`SELECT ${ENTRY_COLUMNS}, embedding FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL LIMIT 1`,
 			)
 			.get() as RawEntryRow | undefined;
 
@@ -299,7 +349,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 	async getActiveAndConflictedEntries(): Promise<KnowledgeEntry[]> {
 		const rows = this.db
 			.prepare(
-				"SELECT * FROM knowledge_entry WHERE status IN ('active', 'conflicted') ORDER BY updated_at DESC",
+				`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE status IN ('active', 'conflicted') ORDER BY updated_at DESC`,
 			)
 			.all() as RawEntryRow[];
 		return rows.map((r) => this.rowToEntry(r));
@@ -311,7 +361,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 	async getEntriesMissingEmbeddings(): Promise<KnowledgeEntry[]> {
 		const rows = this.db
 			.prepare(
-				"SELECT * FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NULL ORDER BY updated_at DESC",
+				`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE status IN ('active', 'conflicted') AND embedding IS NULL ORDER BY updated_at DESC`,
 			)
 			.all() as RawEntryRow[];
 
@@ -324,7 +374,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 	async getEntriesByStatus(status: KnowledgeStatus): Promise<KnowledgeEntry[]> {
 		const rows = this.db
 			.prepare(
-				"SELECT * FROM knowledge_entry WHERE status = ? ORDER BY updated_at DESC",
+				`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry WHERE status = ? ORDER BY updated_at DESC`,
 			)
 			.all(status) as RawEntryRow[];
 
@@ -355,7 +405,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 			conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 		const rows = this.db
 			.prepare(
-				`SELECT * FROM knowledge_entry ${where} ORDER BY created_at DESC`,
+				`SELECT ${ENTRY_COLUMNS} FROM knowledge_entry ${where} ORDER BY created_at DESC`,
 			)
 			.all(...values) as RawEntryRow[];
 
@@ -390,17 +440,6 @@ export class KnowledgeDB implements IKnowledgeStore {
          WHERE id = ?`,
 			)
 			.run(Date.now(), Date.now(), id);
-	}
-
-	/**
-	 * Batch update strength scores (used during decay).
-	 */
-	async updateStrength(id: string, strength: number): Promise<void> {
-		this.db
-			.prepare(
-				"UPDATE knowledge_entry SET strength = ?, updated_at = ? WHERE id = ?",
-			)
-			.run(strength, Date.now(), id);
 	}
 
 	/**
@@ -447,7 +486,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 
 		const rows = this.db
 			.prepare(
-				`SELECT DISTINCT ke.*
+				`SELECT DISTINCT ${qualifiedEntryColumns("ke")}, ke.embedding
          FROM knowledge_entry ke, json_each(ke.topics) t
          WHERE ke.status IN ('active', 'conflicted')
            AND t.value IN (SELECT value FROM json_each(?))
@@ -813,7 +852,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 		// `supports` relations: source_id = synthesized entry, target_id = source entry
 		const rows = this.db
 			.prepare(
-				`SELECT kr.source_id AS synth_id, ke.*
+				`SELECT kr.source_id AS synth_id, ${qualifiedEntryColumns("ke")}
          FROM knowledge_relation kr
          JOIN knowledge_entry ke ON ke.id = kr.target_id
          WHERE kr.type = 'supports'
@@ -882,7 +921,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 			embedding = Array.from(float32);
 		}
 
-		return {
+		const entry: KnowledgeEntry = {
 			id: row.id,
 			type: row.type as KnowledgeEntry["type"],
 			content: row.content,
@@ -890,7 +929,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 			confidence: row.confidence,
 			source: row.source,
 			status: row.status as KnowledgeEntry["status"],
-			strength: row.strength,
+			strength: 0,
 			createdAt: row.created_at,
 			updatedAt: row.updated_at,
 			lastAccessedAt: row.last_accessed_at,
@@ -901,6 +940,10 @@ export class KnowledgeDB implements IKnowledgeStore {
 			isSynthesized: row.is_synthesized === 1,
 			embedding,
 		};
+		// Strength is computed on read (see computeStrength). The stored column is
+		// only written when an entry is archived, so it is not a live value.
+		entry.strength = computeStrength(entry);
+		return entry;
 	}
 
 	/**
@@ -1035,6 +1078,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 			lastMembershipChangedAt: number;
 			createdAt: number;
 			memberIds: string[];
+			memberJoinedAt: Map<string, number>;
 		}>
 	> {
 		const clusterRows = this.db
@@ -1052,19 +1096,25 @@ export class KnowledgeDB implements IKnowledgeStore {
 
 		const memberRows = this.db
 			.prepare(
-				`SELECT cluster_id, entry_id FROM knowledge_cluster_member
+				`SELECT cluster_id, entry_id, joined_at FROM knowledge_cluster_member
          WHERE cluster_id IN (SELECT value FROM json_each(?))`,
 			)
 			.all(JSON.stringify(clusterRows.map((r) => r.id))) as Array<{
 			cluster_id: string;
 			entry_id: string;
+			joined_at: number;
 		}>;
 
 		const membersByCluster = new Map<string, string[]>();
+		const joinedByCluster = new Map<string, Map<string, number>>();
 		for (const m of memberRows) {
 			const arr = membersByCluster.get(m.cluster_id);
 			if (arr) arr.push(m.entry_id);
 			else membersByCluster.set(m.cluster_id, [m.entry_id]);
+			const joined = joinedByCluster.get(m.cluster_id);
+			if (joined) joined.set(m.entry_id, m.joined_at);
+			else
+				joinedByCluster.set(m.cluster_id, new Map([[m.entry_id, m.joined_at]]));
 		}
 
 		return clusterRows.map((r) => ({
@@ -1075,6 +1125,7 @@ export class KnowledgeDB implements IKnowledgeStore {
 			lastMembershipChangedAt: r.last_membership_changed_at,
 			createdAt: r.created_at,
 			memberIds: membersByCluster.get(r.id) ?? [],
+			memberJoinedAt: joinedByCluster.get(r.id) ?? new Map(),
 		}));
 	}
 
@@ -1151,10 +1202,16 @@ export class KnowledgeDB implements IKnowledgeStore {
 					}
 				}
 
-				// Replace membership: delete existing rows, insert new set.
+				// Sync membership: drop members that left, keep joined_at for members that
+				// stayed (synthesis ripeness counts members who joined since the last
+				// synthesis), and add new members with joined_at = now.
 				this.db
-					.prepare("DELETE FROM knowledge_cluster_member WHERE cluster_id = ?")
-					.run(cluster.id);
+					.prepare(
+						`DELETE FROM knowledge_cluster_member
+               WHERE cluster_id = ?
+                 AND entry_id NOT IN (SELECT value FROM json_each(?))`,
+					)
+					.run(cluster.id, JSON.stringify(cluster.memberIds));
 
 				for (const entryId of cluster.memberIds) {
 					this.db
@@ -1270,6 +1327,17 @@ function blobToFloats(blob: Uint8Array): number[] {
 }
 
 /**
+ * View a BLOB of raw float32 bytes as a Float32Array without converting it to
+ * number[]. Copies only when the blob is not 4-byte aligned.
+ */
+function blobToFloat32(blob: Uint8Array): Float32Array {
+	if (blob.byteOffset % 4 === 0) {
+		return new Float32Array(blob.buffer, blob.byteOffset, blob.byteLength / 4);
+	}
+	return new Float32Array(blob.slice().buffer);
+}
+
+/**
  * Raw row shape from SQLite (snake_case columns).
  */
 interface RawEntryRow {
@@ -1289,5 +1357,6 @@ interface RawEntryRow {
 	superseded_by: string | null;
 	derived_from: string;
 	is_synthesized: number;
-	embedding: Uint8Array | null;
+	/** Present only in queries that select the embedding column. */
+	embedding?: Uint8Array | null;
 }

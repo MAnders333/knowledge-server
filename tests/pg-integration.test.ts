@@ -35,6 +35,7 @@ import { SCHEMA_VERSION } from "../src/db/postgres/schema";
 import { ServerStateDB } from "../src/db/state/index";
 import { PostgresServerStateDB } from "../src/db/state/postgres";
 import { logger } from "../src/logger";
+import type { KnowledgeEntry } from "../src/types";
 
 const PG_URI = process.env.PG_TEST_URI;
 // Non-owner role password, built at runtime so no credential literal sits in source.
@@ -253,13 +254,73 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		expect(entry?.lastAccessedAt).toBeGreaterThanOrEqual(now);
 	});
 
-	it("updates strength", async () => {
-		await db.insertEntry(makeEntry("test-strength", { strength: 1.0 }));
+	it("scanEmbeddings and getEntriesByIds return id/vector and plain entries", async () => {
+		await db.insertEntry(makeEntry("scan-pg-a", { embedding: [0.5, -1, 2] }));
+		await db.insertEntry(
+			makeEntry("scan-pg-c", { status: "conflicted", embedding: [1, 1, 1] }),
+		);
+		await db.insertEntry(
+			makeEntry("scan-pg-old", { status: "superseded", embedding: [9, 9, 9] }),
+		);
+		await db.insertEntry(makeEntry("scan-pg-none"));
 
-		await db.updateStrength("test-strength", 0.42);
+		const rows = await db.scanEmbeddings();
+		expect(rows.map((r) => r.id).sort()).toEqual(["scan-pg-a", "scan-pg-c"]);
+		const a = rows.find((r) => r.id === "scan-pg-a");
+		expect(a?.embedding).toBeInstanceOf(Float32Array);
+		expect(Array.from(a?.embedding ?? [])).toEqual([0.5, -1, 2]);
+
+		const hydrated = await db.getEntriesByIds([
+			"scan-pg-a",
+			"scan-pg-old",
+			"scan-pg-none",
+		]);
+		expect(hydrated.map((e) => e.id).sort()).toEqual([
+			"scan-pg-a",
+			"scan-pg-none",
+		]);
+		for (const entry of hydrated) expect(entry.embedding).toBeUndefined();
+	});
+
+	it("reports strength computed on read, not the stored column", async () => {
+		const now = Date.now();
+		await db.insertEntry(
+			makeEntry("test-strength", {
+				confidence: 0.9,
+				strength: 1.0,
+				lastAccessedAt: now - 400 * 86_400_000,
+			}),
+		);
 
 		const entry = await db.getEntry("test-strength");
-		expect(entry?.strength).toBeCloseTo(0.42);
+		expect(entry?.strength).toBeLessThan(0.05);
+		const [stored] = await truncSql`
+			SELECT strength FROM knowledge_entry WHERE id = 'test-strength'
+		`;
+		expect(Number(stored.strength)).toBe(1.0);
+	});
+
+	it("migration v18 drops the strength and last_accessed_at indexes", async () => {
+		const names = await truncSql`
+			SELECT indexname FROM pg_indexes
+			WHERE tablename = 'knowledge_entry'
+			  AND indexname IN ('idx_entry_strength', 'idx_entry_accessed')
+		`;
+		expect(names).toHaveLength(0);
+		const v18 = PG_MIGRATIONS.find((m) => m.version === 18);
+		expect(v18).toBeDefined();
+		// Recreate the legacy indexes, then run the migration step on them.
+		await truncSql`CREATE INDEX IF NOT EXISTS idx_entry_strength ON knowledge_entry(strength)`;
+		await truncSql`CREATE INDEX IF NOT EXISTS idx_entry_accessed ON knowledge_entry(last_accessed_at)`;
+		await truncSql.begin(async (tx) => {
+			await (v18 as (typeof PG_MIGRATIONS)[number]).up(tx as never);
+		});
+		const after = await truncSql`
+			SELECT indexname FROM pg_indexes
+			WHERE tablename = 'knowledge_entry'
+			  AND indexname IN ('idx_entry_strength', 'idx_entry_accessed')
+		`;
+		expect(after).toHaveLength(0);
 	});
 
 	it("filters entries by status", async () => {
@@ -329,13 +390,14 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		const embedding = [0.1, 0.2, 0.3, 0.4, 0.5];
 		await db.insertEntry(makeEntry("emb-1", { embedding }));
 
-		const entry = await db.getEntry("emb-1");
-		expect(entry?.embedding).toBeDefined();
-		expect(entry?.embedding?.length).toBe(5);
+		// Plain reads never carry the embedding; scoring reads do.
+		expect((await db.getEntry("emb-1"))?.embedding).toBeUndefined();
+		const [scored] = (await db.getActiveEntriesWithEmbeddings()).filter(
+			(e) => e.id === "emb-1",
+		);
+		expect(scored?.embedding.length).toBe(5);
 		for (let i = 0; i < embedding.length; i++) {
-			expect(
-				Math.abs((entry?.embedding?.[i] ?? 0) - embedding[i]),
-			).toBeLessThan(0.0001);
+			expect(Math.abs(scored.embedding[i] - embedding[i])).toBeLessThan(0.0001);
 		}
 	});
 
@@ -390,9 +452,11 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		const cleared = await db.clearAllEmbeddings();
 		expect(cleared).toBe(2);
 
-		expect((await db.getEntry("e1"))?.embedding).toBeUndefined();
-		expect((await db.getEntry("e2"))?.embedding).toBeUndefined();
-		expect((await db.getEntry("e3"))?.embedding).toBeDefined();
+		const withBlob = await truncSql`
+			SELECT id FROM knowledge_entry WHERE id IN ('e1', 'e2', 'e3') AND embedding IS NOT NULL
+		`;
+		// Superseded entry should retain its embedding; active and conflicted ones lost theirs.
+		expect(withBlob.map((r) => r.id)).toEqual(["e3"]);
 	});
 
 	// ── Stats ──
@@ -711,9 +775,11 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 
 		const entry = await db.getEntry("merge-emb");
 		expect(entry?.content).toBe("Updated with embedding");
-		expect(entry?.embedding).toBeDefined();
-		expect(entry?.embedding?.length).toBe(3);
-		expect(entry?.embedding?.[0]).toBeCloseTo(0.9);
+		const [merged] = (await db.getActiveEntriesWithEmbeddings()).filter(
+			(e) => e.id === "merge-emb",
+		);
+		expect(merged?.embedding.length).toBe(3);
+		expect(merged?.embedding[0]).toBeCloseTo(0.9);
 	});
 
 	// ── Overlapping Topics ──
@@ -952,8 +1018,13 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		expect(result).toHaveLength(1);
 		const expected = await pg.getEntry("parity-1");
 		expect(expected).not.toBeNull();
-		expect(result[0].entry).toEqual(expected);
-		expect(result[0].entry.embedding).toHaveLength(8);
+		// ANN rows carry the same plain fields as getEntry, and no embedding.
+		// Strength is computed on read against the clock, so compare it separately.
+		const { strength: annStrength, ...annPlain } = result[0].entry;
+		const { strength: plainStrength, ...plain } = expected as KnowledgeEntry;
+		expect(annPlain).toEqual(plain);
+		expect(annStrength).toBeCloseTo(plainStrength, 3);
+		expect(result[0].entry.embedding).toBeUndefined();
 	});
 
 	it("findContradictionCandidates returns every entry field including the embedding", async () => {
@@ -979,8 +1050,12 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 		expect(res).toHaveLength(1);
 		const expected = await pg.getEntry("contra-parity");
 		expect(expected).not.toBeNull();
-		expect(res[0]).toEqual(expected);
-		expect(res[0].embedding).toHaveLength(8);
+		const { embedding, strength, ...plain } = res[0];
+		const { strength: plainStrength, ...expectedPlain } =
+			expected as KnowledgeEntry;
+		expect(plain).toEqual(expectedPlain);
+		expect(strength).toBeCloseTo(plainStrength, 3);
+		expect(embedding).toHaveLength(8);
 	});
 
 	it("findSimilarEntries latches the ef_search fallback only for unsupported-setting errors", async () => {

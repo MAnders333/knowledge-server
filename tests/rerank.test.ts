@@ -45,6 +45,21 @@ function makeStoreStub(
 		getEntry: mock(() => Promise.resolve(null)),
 		getActiveEntries: mock(() => Promise.resolve([])),
 		getActiveEntriesWithEmbeddings: mock(() => Promise.resolve(entries)),
+		scanEmbeddings: mock(() =>
+			Promise.resolve(
+				entries.map((e) => ({
+					id: e.id,
+					embedding: Float32Array.from(e.embedding),
+				})),
+			),
+		),
+		getEntriesByIds: mock((ids: string[]) =>
+			Promise.resolve(
+				entries
+					.filter((e) => ids.includes(e.id))
+					.map(({ embedding: _embedding, ...rest }) => rest),
+			),
+		),
 		getOneEntryWithEmbedding: mock(() => Promise.resolve(null)),
 		getActiveAndConflictedEntries: mock(() => Promise.resolve([])),
 		getEntriesMissingEmbeddings: mock(() => Promise.resolve([])),
@@ -52,7 +67,6 @@ function makeStoreStub(
 		getEntries: mock(() => Promise.resolve([])),
 		recordAccess: mock(() => Promise.resolve()),
 		reinforceObservation: mock(() => Promise.resolve()),
-		updateStrength: mock(() => Promise.resolve()),
 		getStats: mock(() => Promise.resolve({})),
 		getEntriesWithOverlappingTopics: mock(() => Promise.resolve([])),
 		applyContradictionResolution: mock(() => Promise.resolve()),

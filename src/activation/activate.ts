@@ -5,16 +5,50 @@ import { logger } from "../logger.js";
 import type {
 	ActivationResult,
 	ContradictionAnnotation,
+	GateMode,
 	KnowledgeEntry,
 } from "../types.js";
 import {
 	EmbeddingClient,
 	bulkEmbedOptions,
-	cosineSimilarity,
+	cosineToPrepared,
 	describeError,
 	formatEmbeddingText,
+	prepareQuery,
+	storedNorm,
 } from "./embeddings.js";
 import type { RerankScorer } from "./rerank.js";
+
+/** Server-side cap on activation cues per call (see normalizeCues). */
+export const MAX_CUES = 12;
+
+/**
+ * Dedupe and cap activation cues. Applied wherever cues enter the engine:
+ * splitIntoCues and every activate() call (the /activate `q` list, the MCP tool
+ * and the plugin all go through it).
+ *
+ *   - Cues are compared by a normalised key (trimmed, whitespace collapsed,
+ *     lowercased). The first occurrence wins and keeps its original text.
+ *     Blank cues are dropped.
+ *   - More than MAX_CUES unique cues keep the first ceil(MAX_CUES/2) and the last
+ *     floor(MAX_CUES/2). The last cue is the holistic full message, so it is kept.
+ *
+ * Deterministic: the same input always yields the same output.
+ */
+export function normalizeCues(cues: readonly string[]): string[] {
+	const seen = new Set<string>();
+	const unique: string[] = [];
+	for (const cue of cues) {
+		const key = cue.replace(/\s+/g, " ").trim().toLowerCase();
+		if (key.length === 0 || seen.has(key)) continue;
+		seen.add(key);
+		unique.push(cue);
+	}
+	if (unique.length <= MAX_CUES) return unique;
+	const head = Math.ceil(MAX_CUES / 2);
+	const tail = Math.floor(MAX_CUES / 2);
+	return [...unique.slice(0, head), ...unique.slice(unique.length - tail)];
+}
 
 /**
  * Split a prompt into activation cues for multi-topic retrieval.
@@ -23,9 +57,9 @@ import type { RerankScorer } from "./rerank.js";
  *   1. Per-line segments — each newline is a topic boundary (Shift+Enter in most UIs).
  *      Segments shorter than MIN_CUE_CHARS are skipped (greetings, "yes", "ok", etc.)
  *   2. The full trimmed prompt as a holistic cue — captures overall intent that no
- *      individual line may fully express.
- *   3. Deduplication — if the message is a single line, the segment and the full
- *      message are the same string; the Set removes the duplicate.
+ *      individual line may fully express. It is always the last cue.
+ *   3. normalizeCues — duplicates (by normalised key) are dropped and the list is
+ *      capped at MAX_CUES.
  *
  * All resulting cues are embedded in a single batched API call downstream.
  *
@@ -41,8 +75,122 @@ export function splitIntoCues(prompt: string): string[] {
 		.split("\n")
 		.map((s) => s.trim())
 		.filter((s) => s.length >= MIN_CUE_CHARS);
-	// Union: unique segments + full message (Set deduplicates single-line messages)
-	return [...new Set([...segments, trimmed])];
+	return normalizeCues([...segments, trimmed]);
+}
+
+/** Per-store admission state within one activate() call (see callStore). */
+interface StoreSlot {
+	inFlight: number;
+	/** The store has returned a result in this activation; the in-flight cap lifts. */
+	answered: boolean;
+	/** Callers parked until one of this store's in-flight calls settles. */
+	waiting: Array<() => void>;
+}
+
+interface BreakerState {
+	status: "closed" | "open" | "half-open";
+	/** Consecutive failures while closed. */
+	failures: number;
+	openedAt: number;
+}
+
+/**
+ * Per-store circuit breaker for the activation fan-out. State is keyed by store
+ * id and lives as long as the ActivationEngine (one per process), so it is shared
+ * across activations.
+ *
+ *   closed    — calls go through; `threshold` consecutive failures open it.
+ *   open      — calls are refused (no timeout wait, no pool slot) for `windowMs`.
+ *   half-open — after the window exactly one probe call is admitted. Success
+ *               closes the circuit; failure re-opens it for another window.
+ *
+ * Warns once per state change (open, probe succeeded, probe failed), never per call.
+ */
+export class StoreBreaker {
+	private readonly states = new Map<string, BreakerState>();
+	private readonly threshold: number;
+	private readonly windowMs: number;
+	private readonly now: () => number;
+
+	constructor(opts: {
+		threshold: number;
+		windowMs: number;
+		now?: () => number;
+	}) {
+		this.threshold = opts.threshold;
+		this.windowMs = opts.windowMs;
+		this.now = opts.now ?? Date.now;
+	}
+
+	private stateOf(id: string): BreakerState {
+		let s = this.states.get(id);
+		if (!s) {
+			s = { status: "closed", failures: 0, openedAt: 0 };
+			this.states.set(id, s);
+		}
+		return s;
+	}
+
+	/** True when a new activation should leave this store out. */
+	isBlocked(id: string): boolean {
+		const s = this.states.get(id);
+		if (!s || s.status === "closed") return false;
+		if (s.status === "half-open") return true;
+		return this.now() - s.openedAt < this.windowMs;
+	}
+
+	/** Max calls in flight for this store before it has answered in an activation. */
+	budget(id: string): number {
+		const s = this.stateOf(id);
+		return s.status === "closed" ? Math.max(1, this.threshold - s.failures) : 1;
+	}
+
+	/** Admit one call. After the window, the first caller becomes the probe. */
+	admit(id: string): boolean {
+		const s = this.stateOf(id);
+		if (s.status === "closed") return true;
+		if (s.status === "open" && this.now() - s.openedAt >= this.windowMs) {
+			s.status = "half-open";
+			return true;
+		}
+		return false;
+	}
+
+	/** Record the outcome of an admitted call. `detail` is used in the warning. */
+	record(id: string, ok: boolean, detail: string): void {
+		const s = this.stateOf(id);
+		const windowS = this.windowMs / 1000;
+		if (ok) {
+			if (s.status === "half-open") {
+				s.status = "closed";
+				s.failures = 0;
+				logger.warn(`[activation] Store "${id}" recovered — circuit closed.`);
+			} else if (s.status === "closed") {
+				s.failures = 0;
+			}
+			return;
+		}
+		if (s.status === "closed") {
+			s.failures++;
+			if (s.failures < this.threshold) return;
+			this.open(s);
+			logger.warn(
+				`[activation] Store "${id}" failed ${this.threshold} times in a row ` +
+					`(${detail}) — circuit open, skipping it for ${windowS}s.`,
+			);
+		} else if (s.status === "half-open") {
+			this.open(s);
+			logger.warn(
+				`[activation] Store "${id}" probe failed (${detail}) — ` +
+					`circuit re-opened for ${windowS}s.`,
+			);
+		}
+	}
+
+	private open(s: BreakerState): void {
+		s.status = "open";
+		s.openedAt = this.now();
+	}
 }
 
 /**
@@ -82,13 +230,10 @@ export class ActivationEngine {
 	private readonly reranker: RerankScorer | null;
 
 	/**
-	 * Per-store timestamp (ms since epoch) of the last failure.
-	 * Stores in this map are excluded from fan-out until RETRY_INTERVAL_MS
-	 * elapses, after which they are retried. This prevents a dead store
-	 * (e.g. remote Postgres behind a VPN that went down) from blocking
-	 * every activation call with a TCP timeout.
+	 * Per-store circuit breaker (see StoreBreaker). A store that keeps failing is
+	 * skipped for STORE_RETRY_INTERVAL_MS instead of costing a timeout per cue.
 	 */
-	private unreachableSince: Map<string, number> = new Map();
+	private readonly breaker: StoreBreaker;
 
 	/**
 	 * Last logged ANN vs full-scan partition of reachable stores. Used to log the
@@ -99,7 +244,10 @@ export class ActivationEngine {
 	/** Per-store call timeout — a dead store is skipped after this duration. */
 	private static readonly STORE_TIMEOUT_MS = 5_000;
 
-	/** How long to skip a failed store before retrying it. */
+	/** Consecutive store failures that open the circuit. */
+	private static readonly STORE_FAILURE_THRESHOLD = 3;
+
+	/** How long an open circuit skips a store before one half-open probe. */
 	private static readonly STORE_RETRY_INTERVAL_MS = 60_000;
 
 	/**
@@ -122,77 +270,96 @@ export class ActivationEngine {
 		this.writableDbs = writableDbs ?? [writableDb];
 		this.embeddings = new EmbeddingClient();
 		this.reranker = reranker ?? null;
+		this.breaker = new StoreBreaker({
+			threshold: ActivationEngine.STORE_FAILURE_THRESHOLD,
+			windowMs: ActivationEngine.STORE_RETRY_INTERVAL_MS,
+		});
 	}
 
 	/**
-	 * Read stores that are either healthy or due for a retry.
-	 * Stores that failed within the last STORE_RETRY_INTERVAL_MS are excluded
-	 * so a dead store doesn't block every activation call. After the retry
-	 * interval elapses the store is included again — if it's still down it
-	 * will fail, be re-marked, and excluded for another interval.
+	 * Read stores that the circuit breaker does not block. A store is left out of
+	 * a new activation while its circuit is open (or its half-open probe is in
+	 * flight); once the window elapses it becomes eligible for one probe call.
 	 */
 	private reachableReadDbs(): IKnowledgeStore[] {
-		const now = Date.now();
-		return this.readDbs.filter((db) => {
-			const since = this.unreachableSince.get(db.id);
-			if (since === undefined) return true;
-			return now - since >= ActivationEngine.STORE_RETRY_INTERVAL_MS;
-		});
+		return this.readDbs.filter((db) => !this.breaker.isBlocked(db.id));
 	}
 
 	/**
 	 * Fan out a function across stores, tolerating per-store failures.
 	 *
-	 * Each store call is wrapped in a per-store timeout (STORE_TIMEOUT_MS).
-	 * Results are collected via Promise.allSettled so one dead store cannot
-	 * reject the entire operation — the remaining stores' results are returned.
-	 *
-	 * Failed stores are marked unreachable (see reachableReadDbs) so subsequent
-	 * activation calls skip them for STORE_RETRY_INTERVAL_MS, avoiding repeated
-	 * timeouts on every call.
+	 * Each store call is bounded by STORE_TIMEOUT_MS; the timer is cleared when the
+	 * call settles. One dead store cannot reject the operation: its result is
+	 * dropped and the remaining stores' results are returned.
 	 */
 	private async fanOutSafe<T>(
 		stores: IKnowledgeStore[],
 		fn: (db: IKnowledgeStore) => Promise<T>,
 		label: string,
+		slots: Map<string, StoreSlot>,
 	): Promise<T[]> {
 		if (stores.length === 0) return [];
+		const results = await Promise.all(
+			stores.map((db) => this.callStore(db, fn, label, slots)),
+		);
+		return results.flatMap((r) => (r.ok ? [r.value] : []));
+	}
 
-		const results = await Promise.allSettled(
-			stores.map((db) =>
-				Promise.race([
-					fn(db),
-					new Promise<never>((_, reject) =>
-						setTimeout(
-							() =>
-								reject(
-									new Error(
-										`timeout after ${ActivationEngine.STORE_TIMEOUT_MS / 1000}s`,
-									),
-								),
-							ActivationEngine.STORE_TIMEOUT_MS,
+	/**
+	 * One store call under the circuit breaker, within one activation.
+	 *
+	 * Until the store answers in this activation, at most breaker.budget() of its
+	 * calls are in flight, so a dead store receives at most STORE_FAILURE_THRESHOLD
+	 * calls however many cues fan out. Calls the breaker refuses return at once:
+	 * no timeout wait, no warning.
+	 */
+	private async callStore<T>(
+		db: IKnowledgeStore,
+		fn: (db: IKnowledgeStore) => Promise<T>,
+		label: string,
+		slots: Map<string, StoreSlot>,
+	): Promise<{ ok: true; value: T } | { ok: false }> {
+		const slot: StoreSlot = slots.get(db.id) ?? {
+			inFlight: 0,
+			answered: false,
+			waiting: [],
+		};
+		slots.set(db.id, slot);
+		while (!slot.answered && slot.inFlight >= this.breaker.budget(db.id)) {
+			await new Promise<void>((resolve) => slot.waiting.push(resolve));
+		}
+		if (!this.breaker.admit(db.id)) return { ok: false };
+
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timeout = new Promise<never>((_, reject) => {
+			timer = setTimeout(
+				() =>
+					reject(
+						new Error(
+							`timeout after ${ActivationEngine.STORE_TIMEOUT_MS / 1000}s`,
 						),
 					),
-				]),
-			),
-		);
-
-		const ok: T[] = [];
-		for (let i = 0; i < results.length; i++) {
-			const r = results[i];
-			if (r.status === "fulfilled") {
-				this.unreachableSince.delete(stores[i].id);
-				ok.push(r.value);
-			} else {
-				this.unreachableSince.set(stores[i].id, Date.now());
-				logger.warn(
-					`[activation] Store "${stores[i].id}" failed during ${label} — skipping. ` +
-						`Will retry in ${ActivationEngine.STORE_RETRY_INTERVAL_MS / 1000}s. ` +
-						`Reason: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`,
-				);
-			}
+				ActivationEngine.STORE_TIMEOUT_MS,
+			);
+		});
+		slot.inFlight++;
+		try {
+			const value = await Promise.race([fn(db), timeout]);
+			slot.answered = true;
+			this.breaker.record(db.id, true, label);
+			return { ok: true, value };
+		} catch (err) {
+			this.breaker.record(
+				db.id,
+				false,
+				`${label}: ${err instanceof Error ? err.message : String(err)}`,
+			);
+			return { ok: false };
+		} finally {
+			clearTimeout(timer);
+			slot.inFlight--;
+			for (const wake of slot.waiting.splice(0)) wake();
 		}
-		return ok;
 	}
 
 	/**
@@ -219,10 +386,15 @@ export class ActivationEngine {
 			limit?: number;
 			/** Min similarity threshold. Overrides config.activation.similarityThreshold. */
 			threshold?: number;
+			/**
+			 * Read-only: no access records (recordAccess), so measuring activation
+			 * never changes the store. Used by the replay harness and the CLI.
+			 */
+			dryRun?: boolean;
 		},
 	): Promise<ActivationResult> {
-		const queryList = (Array.isArray(queries) ? queries : [queries]).filter(
-			(q) => q.trim().length > 0,
+		const queryList = normalizeCues(
+			Array.isArray(queries) ? queries : [queries],
 		);
 		if (queryList.length === 0) {
 			return { entries: [], query: "", totalActive: 0 };
@@ -233,6 +405,7 @@ export class ActivationEngine {
 		// For a single string, queryList[0] === queryList[last], so this is always correct.
 		const primaryQuery = queryList[queryList.length - 1];
 
+		const dryRun = options?.dryRun ?? false;
 		const maxResults = options?.limit ?? config.activation.maxResults;
 		const similarityThreshold =
 			options?.threshold ?? config.activation.similarityThreshold;
@@ -243,6 +416,8 @@ export class ActivationEngine {
 		const fetchLimit = this.reranker
 			? Math.max(config.activation.rerank.candidates, maxResults)
 			: maxResults;
+
+		const slots = new Map<string, StoreSlot>();
 
 		// Embed all queries in a single batched API call
 		const queryEmbeddings = await this.embeddings.embedBatch(queryList);
@@ -284,7 +459,7 @@ export class ActivationEngine {
 			};
 		}> = [];
 
-		// Split *reachable* read stores by retrieval path. Unreachable stores are
+		// Split non-blocked read stores by retrieval path. Circuit-open stores are
 		// already excluded by reachableReadDbs().
 		const reachable = this.reachableReadDbs();
 		const annDbs: IKnowledgeStore[] = [];
@@ -306,8 +481,8 @@ export class ActivationEngine {
 		}
 
 		// Run all retrieval work concurrently. fanOutSafe tolerates per-store
-		// failures (a dead store is skipped after STORE_TIMEOUT_MS and marked
-		// unreachable) and returns [] for an empty store list, so a topology
+		// failures (a failing store trips its circuit breaker and is skipped) and
+		// returns [] for an empty store list, so a topology
 		// without ANN or without scan stores makes no calls for that path.
 		// - ANN: one fan-out per query vector, fetchLimit per query vector per
 		//   store, flattened across stores so annResultsPerQuery is
@@ -325,6 +500,7 @@ export class ActivationEngine {
 									// biome-ignore lint/style/noNonNullAssertion: guarded by storeSupportsAnn
 									db.findSimilarEntries!(qEmb, fetchLimit, similarityThreshold),
 								"ANN search",
+								slots,
 							)
 						).flat(),
 					),
@@ -336,22 +512,42 @@ export class ActivationEngine {
 							? db.getActiveEntryCount()
 							: Promise.resolve(0),
 					"active entry count",
+					slots,
 				),
 				this.fanOutSafe(
 					scanDbs,
-					(db) => db.getActiveEntriesWithEmbeddings(),
+					async (db) => ({ db, rows: await db.scanEmbeddings() }),
 					"full-scan load",
+					slots,
 				),
 			]);
 
-		// Scan stores: entries synced to several scan stores share an ID -
-		// deduplicate among scan stores keeping the first occurrence.
+		// Scan stores: score id + embedding rows only. Entries synced to several scan
+		// stores share an ID, so the first occurrence is scored and the rest skipped.
+		const preparedQueries = queryEmbeddings.map((q) => prepareQuery(q));
 		const scanSeenIds = new Set<string>();
-		const scanEntries = scanEntriesPerStore.flat().filter((e) => {
-			if (scanSeenIds.has(e.id)) return false;
-			scanSeenIds.add(e.id);
-			return true;
-		});
+		const scanHits: Array<{
+			db: IKnowledgeStore;
+			id: string;
+			rawSimilarity: number;
+		}> = [];
+		for (const { db, rows } of scanEntriesPerStore) {
+			for (const row of rows) {
+				if (scanSeenIds.has(row.id)) continue;
+				scanSeenIds.add(row.id);
+				const bNorm = storedNorm(row.embedding);
+				let rawSimilarity = Number.NEGATIVE_INFINITY;
+				for (const q of preparedQueries) {
+					rawSimilarity = Math.max(
+						rawSimilarity,
+						cosineToPrepared(q, row.embedding, bNorm),
+					);
+				}
+				// ANN stores filter by threshold in the DB; apply the same cut here.
+				if (rawSimilarity < similarityThreshold) continue;
+				scanHits.push({ db, id: row.id, rawSimilarity });
+			}
+		}
 
 		// Merge candidates from both paths: entry ID -> best rawSimilarity across
 		// all query vectors and stores. ANN candidates are inserted first, so on a
@@ -360,14 +556,11 @@ export class ActivationEngine {
 		const bestById = new Map<
 			string,
 			{
-				entry: KnowledgeEntry & { embedding: number[] };
+				entry: KnowledgeEntry;
 				rawSimilarity: number;
 			}
 		>();
-		const keepBest = (
-			entry: KnowledgeEntry & { embedding: number[] },
-			rawSimilarity: number,
-		) => {
+		const keepBest = (entry: KnowledgeEntry, rawSimilarity: number) => {
 			const existing = bestById.get(entry.id);
 			if (!existing || rawSimilarity > existing.rawSimilarity) {
 				bestById.set(entry.id, { entry, rawSimilarity });
@@ -378,15 +571,25 @@ export class ActivationEngine {
 				keepBest(entry, similarity);
 			}
 		}
-		for (const entry of scanEntries) {
-			const rawSimilarity = Math.max(
-				...queryEmbeddings.map((qEmb) =>
-					cosineSimilarity(qEmb, entry.embedding),
-				),
-			);
-			// ANN stores filter by threshold in the DB; apply the same cut here.
-			if (rawSimilarity < similarityThreshold) continue;
-			keepBest(entry, rawSimilarity);
+		// Hydrate only the scan hits that cleared the threshold.
+		const hitIdsByStore = new Map<IKnowledgeStore, string[]>();
+		for (const hit of scanHits) {
+			const ids = hitIdsByStore.get(hit.db);
+			if (ids) ids.push(hit.id);
+			else hitIdsByStore.set(hit.db, [hit.id]);
+		}
+		const hydrated = (
+			await this.fanOutSafe(
+				[...hitIdsByStore.keys()],
+				(db) => db.getEntriesByIds(hitIdsByStore.get(db) ?? []),
+				"entry hydrate",
+				slots,
+			)
+		).flat();
+		const hydratedById = new Map(hydrated.map((e) => [e.id, e]));
+		for (const hit of scanHits) {
+			const entry = hydratedById.get(hit.id);
+			if (entry) keepBest(entry, hit.rawSimilarity);
 		}
 
 		for (const { entry, rawSimilarity } of bestById.values()) {
@@ -423,7 +626,16 @@ export class ActivationEngine {
 			perStoreCounts.reduce((sum, n) => sum + n, 0) + scanSeenIds.size;
 
 		if (scored.length === 0) {
-			return { entries: [], query: primaryQuery, totalActive };
+			return {
+				entries: [],
+				query: primaryQuery,
+				totalActive,
+				telemetry: {
+					cueCount: queryList.length,
+					nCandidates: 0,
+					gateMode: this.reranker ? "dense" : "off",
+				},
+			};
 		}
 
 		// ── Second stage: cross-encoder rerank ─────────────────────────────────
@@ -437,6 +649,8 @@ export class ActivationEngine {
 		//
 		// Fail-open: any reranker error (model load, inference, timeout) logs a
 		// warning and leaves the dense-only ordering intact.
+		const nCandidates = scored.length;
+		let gateMode: GateMode = this.reranker ? "dense" : "off";
 		if (this.reranker && scored.length > 1) {
 			// Bound the rerank input: across multiple cues and stores the pool
 			// can exceed `candidates` — keep the dense-best slice.
@@ -455,6 +669,7 @@ export class ActivationEngine {
 					scored[i].rerankScore = scores[i];
 					scored[i].similarity = scores[i] * scored[i].staleness.strength;
 				}
+				gateMode = "rerank";
 			} catch (err) {
 				logger.warn(
 					`[activation] Rerank failed — using dense-only ordering. Reason: ${err instanceof Error ? err.message : String(err)}`,
@@ -466,9 +681,12 @@ export class ActivationEngine {
 		scored.sort((a, b) => b.similarity - a.similarity);
 		scored.splice(maxResults);
 
-		// Record access for activated entries (reinforces their strength)
-		for (const { entry } of scored) {
-			await this.db.recordAccess(entry.id);
+		// Record access for activated entries (reinforces their strength).
+		// Skipped in dryRun so measuring never changes the store.
+		if (!dryRun) {
+			for (const { entry } of scored) {
+				await this.db.recordAccess(entry.id);
+			}
 		}
 
 		// ── Relation-aware activation: pull in supports sources ───────────────────
@@ -497,6 +715,7 @@ export class ActivationEngine {
 				this.reachableReadDbs(),
 				(db) => db.getSupportSourcesForIds(synthesizedIds),
 				"support sources lookup",
+				slots,
 			);
 			const sourcesMap = mergeMaps(sourceMaps);
 
@@ -538,7 +757,7 @@ export class ActivationEngine {
 						},
 					});
 					scoredIdSet.add(source.id);
-					await this.db.recordAccess(source.id);
+					if (!dryRun) await this.db.recordAccess(source.id);
 				}
 
 				// Respect maxResults cap for the outer loop too.
@@ -564,6 +783,7 @@ export class ActivationEngine {
 			this.reachableReadDbs(),
 			(db) => db.getContradictPairsForIds(conflictedIds),
 			"contradict pairs lookup",
+			slots,
 		);
 		const contradictPairs = mergeMaps(contradictMaps);
 
@@ -603,6 +823,7 @@ export class ActivationEngine {
 			),
 			query: primaryQuery,
 			totalActive,
+			telemetry: { cueCount: queryList.length, nCandidates, gateMode },
 		};
 	}
 

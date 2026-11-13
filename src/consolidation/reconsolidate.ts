@@ -5,6 +5,7 @@ import {
 	formatEmbeddingText,
 } from "../activation/embeddings.js";
 import { config } from "../config.js";
+import { approxTokens } from "../daemon/readers/shared.js";
 import type { IKnowledgeStore } from "../db/index.js";
 import { logger } from "../logger.js";
 import { clampKnowledgeType } from "../types.js";
@@ -37,6 +38,67 @@ const CLUSTER_ASSIGNMENT_THRESHOLD =
  * Configurable via CLUSTER_MIN_MEMBERS env var (see config.ts).
  */
 const CLUSTER_MIN_MEMBERS = config.consolidation.clusterMinMembers;
+
+/**
+ * Choose the cluster members sent to synthesizePrinciple for one call.
+ * Members are ranked by cosine similarity to the cluster centroid (closest first),
+ * capped at SYNTHESIS_MAX_PEERS, then trimmed furthest-first until the approximate
+ * prompt size fits SYNTHESIS_MAX_PROMPT_TOKENS. The closest member is always kept.
+ */
+function selectSynthesisPeers(
+	clusterId: string,
+	peers: Array<KnowledgeEntry & { embedding: number[] }>,
+	centroid: number[],
+): Array<KnowledgeEntry & { embedding: number[] }> {
+	const ranked = peers
+		.map((peer) => ({ peer, sim: cosineSimilarity(peer.embedding, centroid) }))
+		.sort((a, b) => b.sim - a.sim);
+
+	const { synthesisMaxPeers, synthesisMaxPromptTokens } = config.consolidation;
+	const selected: Array<KnowledgeEntry & { embedding: number[] }> = [];
+	let tokens = 0;
+	for (const { peer } of ranked) {
+		if (selected.length >= synthesisMaxPeers) break;
+		const peerTokens = approxTokens(`${peer.content} ${peer.topics.join(" ")}`);
+		if (selected.length > 0 && tokens + peerTokens > synthesisMaxPromptTokens)
+			break;
+		selected.push(peer);
+		tokens += peerTokens;
+	}
+
+	if (selected.length < peers.length) {
+		logger.log(
+			`[synthesis] cluster ${clusterId}: capped peers ${peers.length}→${selected.length} (~${tokens} tokens)`,
+		);
+	}
+	return selected;
+}
+
+/**
+ * True when an already-synthesized cluster has changed materially since its last
+ * synthesis: at least SYNTHESIS_MIN_NEW_MEMBERS current members joined since, or at
+ * least SYNTHESIS_MIN_NEW_FRACTION of its members did. A member counts as new when its
+ * persisted join time is absent (joined in this pass) or after lastSynthesizedAt.
+ * Members that only left never count.
+ */
+function hasMaterialChange(
+	memberIds: string[],
+	joinedAt: Map<string, number>,
+	lastSynthesizedAt: number,
+): boolean {
+	let newSince = 0;
+	for (const id of memberIds) {
+		const joined = joinedAt.get(id);
+		if (joined === undefined || joined > lastSynthesizedAt) newSince++;
+	}
+	if (newSince === 0) return false;
+	const { synthesisMinNewMembers, synthesisMinNewFraction } =
+		config.consolidation;
+	return (
+		newSince >= synthesisMinNewMembers ||
+		newSince >= synthesisMinNewFraction * memberIds.length
+	);
+}
 
 /**
  * Handles the reconsolidation of a single extracted knowledge entry
@@ -307,11 +369,15 @@ export class Reconsolidator {
 	 *    - Persisted clusters with no match → deleted (entries dispersed).
 	 *
 	 * 3. RIPENESS CHECK:
-	 *    - last_membership_changed_at > last_synthesized_at OR last_synthesized_at IS NULL.
 	 *    - Minimum CLUSTER_MIN_MEMBERS (env: CLUSTER_MIN_MEMBERS) members.
+	 *    - last_synthesized_at IS NULL, OR a material change since then: at least
+	 *      SYNTHESIS_MIN_NEW_MEMBERS members (or SYNTHESIS_MIN_NEW_FRACTION of members)
+	 *      joined after last_synthesized_at (see hasMaterialChange).
 	 *
 	 * 4. SYNTHESIS (per ripe cluster):
-	 *    - All members are peers (no anchor/neighbor distinction).
+	 *    - All members are candidate peers (no anchor/neighbor distinction), but the
+	 *      prompt carries at most SYNTHESIS_MAX_PEERS, closest to centroid first, within
+	 *      SYNTHESIS_MAX_PROMPT_TOKENS (see selectSynthesisPeers).
 	 *    - LLM returns array of zero or more principles.
 	 *    - Each result routed through reconsolidate() for deduplication.
 	 *    - Write last_synthesized_at on cluster after successful synthesis attempt.
@@ -415,11 +481,13 @@ export class Reconsolidator {
 			isNew: boolean;
 			membershipChanged: boolean;
 			lastSynthesizedAt: number | null;
+			joinedAt: Map<string, number>;
 		}> = inMemoryClusters.map((cluster, idx) => {
 			// Find the persisted cluster that matched this in-memory cluster (if any)
 			let matchedId: string | null = null;
 			let lastSynthesizedAt: number | null = null;
 			let previousMemberIds: string[] = [];
+			let previousJoinedAt = new Map<string, number>();
 
 			for (const [persistedId, inMemIdx] of persistedToInMemory) {
 				if (inMemIdx === idx) {
@@ -430,6 +498,7 @@ export class Reconsolidator {
 					if (persistedCluster) {
 						lastSynthesizedAt = persistedCluster.lastSynthesizedAt;
 						previousMemberIds = persistedCluster.memberIds;
+						previousJoinedAt = persistedCluster.memberJoinedAt;
 					}
 					break;
 				}
@@ -452,6 +521,7 @@ export class Reconsolidator {
 				isNew,
 				membershipChanged,
 				lastSynthesizedAt: isNew ? null : lastSynthesizedAt,
+				joinedAt: previousJoinedAt,
 			};
 		});
 
@@ -475,11 +545,16 @@ export class Reconsolidator {
 		let synthesized = 0;
 
 		for (const cluster of resolvedClusters) {
-			// Ripeness: must have changed membership since last synthesis (or never synthesized)
-			// AND meet minimum member count.
+			// Ripeness: never synthesized, or materially changed since last synthesis,
+			// AND meets minimum member count.
 			const isRipe =
 				cluster.memberIds.length >= CLUSTER_MIN_MEMBERS &&
-				(cluster.lastSynthesizedAt === null || cluster.membershipChanged);
+				(cluster.lastSynthesizedAt === null ||
+					hasMaterialChange(
+						cluster.memberIds,
+						cluster.joinedAt,
+						cluster.lastSynthesizedAt,
+					));
 
 			if (!isRipe) continue;
 
@@ -497,10 +572,18 @@ export class Reconsolidator {
 			);
 
 			const synthStart = Date.now();
+			const sentPeers = selectSynthesisPeers(
+				cluster.id,
+				peers,
+				cluster.centroid,
+			);
+			// Only peers actually sent may be cited: the LLM cannot cite what it never saw.
+			const sentIdSet = new Set(sentPeers.map((p) => p.id));
+
 			let results: Awaited<ReturnType<typeof this.llm.synthesizePrinciple>>;
 			try {
 				results = await this.llm.synthesizePrinciple(
-					peers.map((p) => ({
+					sentPeers.map((p) => ({
 						id: p.id,
 						content: p.content,
 						type: p.type,
@@ -548,16 +631,15 @@ export class Reconsolidator {
 						formatEmbeddingText(result.type, result.content, result.topics),
 					);
 
-					// Validate sourceIds are from the cluster member set (hallucination guard)
-					const memberIdSet = new Set(cluster.memberIds);
+					// Validate sourceIds are from the peers sent (hallucination guard)
 					const validatedSourceIds = result.sourceIds.filter((id) =>
-						memberIdSet.has(id),
+						sentIdSet.has(id),
 					);
 					const droppedCount =
 						result.sourceIds.length - validatedSourceIds.length;
 					if (droppedCount > 0) {
 						logger.warn(
-							`[synthesis] Dropped ${droppedCount} sourceId(s) from LLM result for cluster ${cluster.id} (not cluster members).`,
+							`[synthesis] Dropped ${droppedCount} sourceId(s) from LLM result for cluster ${cluster.id} (not peers sent to the LLM).`,
 						);
 					}
 

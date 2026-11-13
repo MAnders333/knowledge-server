@@ -173,15 +173,152 @@ describe("KnowledgeDB", () => {
 			embedding,
 		});
 
-		const entry = await db.getEntry("test-emb");
-		expect(entry?.embedding).toBeDefined();
-		expect(entry?.embedding?.length).toBe(5);
+		// Plain reads never carry the embedding BLOB; scoring reads do.
+		expect((await db.getEntry("test-emb"))?.embedding).toBeUndefined();
+		const [scored] = (await db.getActiveEntriesWithEmbeddings()).filter(
+			(e) => e.id === "test-emb",
+		);
+		expect(scored?.embedding.length).toBe(5);
 		// Float32 precision — check approximate equality
 		for (let i = 0; i < embedding.length; i++) {
-			expect(Math.abs(entry?.embedding?.[i] - embedding[i])).toBeLessThan(
-				0.0001,
-			);
+			expect(Math.abs(scored.embedding[i] - embedding[i])).toBeLessThan(0.0001);
 		}
+	});
+
+	it("reports strength computed on read; the stored column is not rewritten", async () => {
+		const now = Date.now();
+		await db.insertEntry({
+			id: "live-strength",
+			type: "fact",
+			content: "Strength is live",
+			topics: [],
+			confidence: 0.9,
+			source: "test",
+			status: "active",
+			strength: 1.0,
+			createdAt: now - 400 * 86_400_000,
+			updatedAt: now,
+			lastAccessedAt: now - 400 * 86_400_000,
+			accessCount: 0,
+			observationCount: 1,
+			supersededBy: null,
+			derivedFrom: [],
+		});
+		const live = (await db.getEntry("live-strength"))?.strength ?? 1;
+		expect(live).toBeLessThan(0.05);
+		const raw = new Database(join(tempDir, "test.db"), { readonly: true });
+		try {
+			const row = raw
+				.prepare("SELECT strength FROM knowledge_entry WHERE id = ?")
+				.get("live-strength") as { strength: number };
+			expect(row.strength).toBe(1.0);
+		} finally {
+			raw.close();
+		}
+		// Ordering and the review stale filter use the live value.
+		const stale = (await db.getActiveEntries()).filter(
+			(e) => e.id === "live-strength",
+		);
+		expect(stale[0]?.strength).toBeLessThan(0.3);
+	});
+
+	it("scanEmbeddings returns id and vector only, for active and conflicted entries", async () => {
+		const now = Date.now();
+		const base = {
+			type: "fact" as const,
+			topics: ["t"],
+			confidence: 0.5,
+			source: "test",
+			strength: 1.0,
+			createdAt: now,
+			updatedAt: now,
+			lastAccessedAt: now,
+			accessCount: 0,
+			observationCount: 1,
+			supersededBy: null,
+			derivedFrom: [],
+		};
+		await db.insertEntry({
+			...base,
+			id: "scan-a",
+			content: "a",
+			status: "active",
+			embedding: [0.5, -1, 2],
+		});
+		await db.insertEntry({
+			...base,
+			id: "scan-c",
+			content: "c",
+			status: "conflicted",
+			embedding: [1, 1, 1],
+		});
+		await db.insertEntry({
+			...base,
+			id: "scan-old",
+			content: "o",
+			status: "superseded",
+			embedding: [9, 9, 9],
+		});
+		await db.insertEntry({
+			...base,
+			id: "scan-none",
+			content: "n",
+			status: "active",
+		});
+
+		const rows = await db.scanEmbeddings();
+		expect(rows.map((r) => r.id).sort()).toEqual(["scan-a", "scan-c"]);
+		const a = rows.find((r) => r.id === "scan-a");
+		expect(a).toBeDefined();
+		expect(a?.embedding).toBeInstanceOf(Float32Array);
+		expect(Array.from(a?.embedding ?? [])).toEqual([0.5, -1, 2]);
+
+		const hydrated = await db.getEntriesByIds([
+			"scan-a",
+			"scan-old",
+			"scan-none",
+		]);
+		// Hydration returns active/conflicted rows whatever their embedding state.
+		expect(hydrated.map((e) => e.id).sort()).toEqual(["scan-a", "scan-none"]);
+		expect(hydrated[0].embedding).toBeUndefined();
+		expect(hydrated[0].content).toBe("a");
+		expect(await db.getEntriesByIds([])).toEqual([]);
+	});
+
+	it("plain entry reads never carry the embedding", async () => {
+		const now = Date.now();
+		await db.insertEntry({
+			id: "plain-1",
+			type: "fact",
+			content: "Plain read",
+			topics: ["t"],
+			confidence: 0.5,
+			source: "test",
+			status: "active",
+			strength: 1.0,
+			createdAt: now,
+			updatedAt: now,
+			lastAccessedAt: now,
+			accessCount: 0,
+			observationCount: 1,
+			supersededBy: null,
+			derivedFrom: [],
+			embedding: [0.1, 0.2, 0.3],
+		});
+		const reads = [
+			await db.getEntry("plain-1"),
+			...(await db.getActiveEntries()),
+			...(await db.getActiveAndConflictedEntries()),
+			...(await db.getEntriesByStatus("active")),
+			...(await db.getEntries({ status: "active" })),
+		];
+		expect(reads.length).toBeGreaterThanOrEqual(5);
+		for (const entry of reads) {
+			expect(entry?.embedding).toBeUndefined();
+		}
+		expect(
+			(await db.getActiveEntriesWithEmbeddings()).map((e) => e.id),
+		).toEqual(["plain-1"]);
 	});
 
 	it("should manage consolidation state", async () => {
@@ -436,10 +573,23 @@ describe("KnowledgeDB", () => {
 		const cleared = await db.clearAllEmbeddings();
 		expect(cleared).toBe(2); // only active + conflicted
 
-		expect((await db.getEntry("e1"))?.embedding).toBeUndefined();
-		expect((await db.getEntry("e2"))?.embedding).toBeUndefined();
-		// Superseded entry should retain its embedding
-		expect((await db.getEntry("e3"))?.embedding).toBeDefined();
+		const embeddingBlobs = new Database(join(tempDir, "test.db"), {
+			readonly: true,
+		});
+		const hasBlob = (id: string) =>
+			(
+				embeddingBlobs
+					.prepare("SELECT embedding FROM knowledge_entry WHERE id = ?")
+					.get(id) as { embedding: Uint8Array | null }
+			).embedding !== null;
+		try {
+			expect(hasBlob("e1")).toBe(false);
+			expect(hasBlob("e2")).toBe(false);
+			// Superseded entry should retain its embedding
+			expect(hasBlob("e3")).toBe(true);
+		} finally {
+			embeddingBlobs.close();
+		}
 	});
 
 	it("clearAllEmbeddings returns 0 when no embeddings exist", async () => {
@@ -657,6 +807,55 @@ describe("KnowledgeDB — cluster CRUD", () => {
 		const after = (await db.getClustersWithMembers())[0];
 		expect(after.lastMembershipChangedAt).toBe(before); // unchanged
 		expect(after.centroid[0]).toBeCloseTo(0.6); // centroid updated
+	});
+
+	it("persistClusters keeps joined_at for members that stay and stamps new members", async () => {
+		const centroid = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+		await insertEntry("e1", centroid);
+		await insertEntry("e2", centroid);
+
+		await db.persistClusters([
+			{
+				id: "c1",
+				centroid,
+				memberIds: ["e1"],
+				isNew: true,
+				membershipChanged: true,
+			},
+		]);
+		const first = (await db.getClustersWithMembers())[0].memberJoinedAt.get(
+			"e1",
+		);
+		expect(first).toBeNumber();
+
+		await Bun.sleep(10);
+		await db.persistClusters([
+			{
+				id: "c1",
+				centroid,
+				memberIds: ["e1", "e2"],
+				isNew: false,
+				membershipChanged: true,
+			},
+		]);
+		const joined = (await db.getClustersWithMembers())[0].memberJoinedAt;
+		expect(joined.get("e1")).toBe(first as number);
+		expect(joined.get("e2") as number).toBeGreaterThan(first as number);
+
+		// Members that left are removed; the remaining member keeps its timestamp.
+		await db.persistClusters([
+			{
+				id: "c1",
+				centroid,
+				memberIds: ["e2"],
+				isNew: false,
+				membershipChanged: true,
+			},
+		]);
+		const after = (await db.getClustersWithMembers())[0];
+		expect(after.memberIds).toEqual(["e2"]);
+		expect(after.memberJoinedAt.has("e1")).toBe(false);
+		expect(after.memberJoinedAt.get("e2")).toBe(joined.get("e2") as number);
 	});
 
 	it("persistClusters deletes stale clusters not in the new set", async () => {

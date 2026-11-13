@@ -1,6 +1,7 @@
 import postgres from "postgres";
 import { logger } from "../../logger.js";
 import type {
+	ActivationEventRow,
 	ConsolidationState,
 	PendingEpisode,
 	ProcessedRange,
@@ -34,6 +35,13 @@ const PG_STATE_MIGRATIONS: Array<{
 			await tx.unsafe(PG_ATTEMPTS_TABLE);
 		},
 	},
+	{
+		version: 3,
+		label: "activation_event table (content-free measurement)",
+		up: async (tx: TxSql) => {
+			await tx.unsafe(PG_ACTIVATION_EVENT_TABLE);
+		},
+	},
 ];
 const STATE_SCHEMA_VERSION = latestVersion(PG_STATE_MIGRATIONS);
 
@@ -43,6 +51,42 @@ const PG_ATTEMPTS_TABLE = `
     failed_attempts INTEGER NOT NULL DEFAULT 0,
     last_error      TEXT
   );
+`;
+
+// Content-free measurement rows: ids, counts, scores, latency, and a session
+// hash. Never prompt text. entry_ids / raw_sims / rerank_scores are JSON text.
+const PG_ACTIVATION_EVENT_TABLE = `
+  CREATE TABLE IF NOT EXISTS activation_event (
+    id                       BIGSERIAL PRIMARY KEY,
+    ts                       BIGINT    NOT NULL,
+    client                   TEXT      NOT NULL,
+    session_hash             TEXT,
+    prompt_chars             INTEGER   NOT NULL,
+    cue_count                INTEGER   NOT NULL,
+    n_candidates             INTEGER   NOT NULL,
+    n_returned               INTEGER   NOT NULL,
+    entry_ids                TEXT      NOT NULL,
+    raw_sims                 TEXT      NOT NULL,
+    rerank_scores            TEXT,
+    gate_mode                TEXT      NOT NULL CHECK (gate_mode IN ('rerank', 'dense', 'off')),
+    latency_ms               INTEGER   NOT NULL,
+    client_deadline_exceeded BOOLEAN   NOT NULL DEFAULT FALSE
+  );
+
+  -- CREATE INDEX checks table ownership before IF NOT EXISTS skips, so an
+  -- upgrade run by a role that does not own the table would fail. Create the
+  -- indexes only when missing.
+  DO $$
+  BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes
+                   WHERE schemaname = current_schema() AND indexname = 'idx_activation_event_ts') THEN
+      CREATE INDEX idx_activation_event_ts ON activation_event(ts);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes
+                   WHERE schemaname = current_schema() AND indexname = 'idx_activation_event_client_ts') THEN
+      CREATE INDEX idx_activation_event_client_ts ON activation_event(client, ts);
+    END IF;
+  END $$;
 `;
 
 const PG_CREATE_STATE_TABLES = `
@@ -103,7 +147,29 @@ const PG_CREATE_STATE_TABLES = `
     (id, last_consolidated_at, total_sessions_processed, total_entries_created, total_entries_updated)
   VALUES (1, 0, 0, 0, 0)
   ON CONFLICT (id) DO NOTHING;
+
+  ${PG_ACTIVATION_EVENT_TABLE}
 `;
+
+/** Column values for one activation_event row. Arrays are stored as JSON text. */
+function activationEventColumns(r: ActivationEventRow) {
+	return {
+		ts: r.ts,
+		client: r.client,
+		session_hash: r.sessionHash,
+		prompt_chars: r.promptChars,
+		cue_count: r.cueCount,
+		n_candidates: r.nCandidates,
+		n_returned: r.nReturned,
+		entry_ids: JSON.stringify(r.entryIds),
+		raw_sims: JSON.stringify(r.rawSims),
+		rerank_scores:
+			r.rerankScores === null ? null : JSON.stringify(r.rerankScores),
+		gate_mode: r.gateMode,
+		latency_ms: r.latencyMs,
+		client_deadline_exceeded: r.clientDeadlineExceeded,
+	};
+}
 
 /**
  * PostgresServerStateDB — Postgres-backed implementation of IServerStateDB.
@@ -191,6 +257,7 @@ export class PostgresServerStateDB implements IServerStateDB {
 	 * under a transaction-scoped advisory lock, and re-reads the version under the
 	 * lock, so concurrent server/daemon starts do not both run the ALTER.
 	 * v2: pending_episodes gains failed_attempts / last_error (dead-lettering).
+	 * v3: activation_event table (content-free measurement).
 	 */
 	private async upgradeSchema(): Promise<void> {
 		await this.sql.begin(async (tx: TxSql) => {
@@ -471,6 +538,54 @@ export class PostgresServerStateDB implements IServerStateDB {
 					total_entries_updated    = 0
 			`;
 		});
+	}
+
+	// ── Activation Events (measurement, content-free) ─────────────────────────
+
+	async insertActivationEvents(rows: ActivationEventRow[]): Promise<void> {
+		if (rows.length === 0) return;
+		await this.initialize();
+		// One multi-row INSERT is a single atomic statement. Arrays are stored as
+		// JSON text, the same encoding the SQLite backend uses.
+		await this.sql`
+			INSERT INTO activation_event ${this.sql(rows.map(activationEventColumns))}
+		`;
+	}
+
+	async pruneActivationEvents(cutoffMs: number): Promise<number> {
+		await this.initialize();
+		const result = await this.sql`
+			DELETE FROM activation_event WHERE ts < ${cutoffMs}
+		`;
+		return result.count;
+	}
+
+	async countActivationsByClient(
+		sinceMs: number,
+	): Promise<Record<string, number>> {
+		await this.initialize();
+		const rows = await this.sql`
+			SELECT client, COUNT(*) AS n FROM activation_event
+			WHERE ts >= ${sinceMs}
+			GROUP BY client
+		`;
+		return Object.fromEntries(
+			rows.map((r) => [r.client as string, Number(r.n)]),
+		);
+	}
+
+	async countEpisodesBySource(
+		sinceMs: number,
+	): Promise<Record<string, number>> {
+		await this.initialize();
+		const rows = await this.sql`
+			SELECT source, COUNT(*) AS n FROM consolidated_episode
+			WHERE processed_at >= ${sinceMs}
+			GROUP BY source
+		`;
+		return Object.fromEntries(
+			rows.map((r) => [r.source as string, Number(r.n)]),
+		);
 	}
 
 	// ── Close ─────────────────────────────────────────────────────────────────

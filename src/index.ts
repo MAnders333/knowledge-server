@@ -7,6 +7,7 @@ import { serve } from "bun";
 // @ts-ignore — Bun supports JSON imports natively
 import pkg from "../package.json" with { type: "json" };
 import { ActivationEngine } from "./activation/activate.js";
+import { ActivationEventRecorder } from "./activation/events.js";
 import { createRerankerFromConfig } from "./activation/rerank.js";
 import { createApp } from "./api/server.js";
 import { runActivate } from "./commands/activate.js";
@@ -23,10 +24,10 @@ import { runStop } from "./commands/stop.js";
 import { downloadAndInstallDaemon, runUpdate } from "./commands/update.js";
 import { config, validateConfig } from "./config.js";
 import { ConsolidationEngine } from "./consolidation/consolidate.js";
-import { runPollTick } from "./consolidation/poll.js";
+import { runDecayTick, runPollTick } from "./consolidation/poll.js";
 import { PendingEpisodesReader } from "./consolidation/readers/pending.js";
 import { StoreRegistry } from "./db/store-registry.js";
-import { logger } from "./logger.js";
+import { logger, parseLogLevel } from "./logger.js";
 import { main as mcpMain } from "./mcp/index.js";
 import { tightenOwnedPrivatePaths } from "./private-files.js";
 import { errCode } from "./utils.js";
@@ -236,7 +237,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	}
 
 	// Initialize logger first so all subsequent output (including config errors) is captured.
-	logger.init(config.logPath);
+	logger.init(config.logPath, parseLogLevel(process.env.LOG_LEVEL));
 	// Upgraded installs may have group/other-readable logs, DBs or .env (server.log can hold an old admin token).
 	tightenOwnedPrivatePaths();
 
@@ -365,6 +366,10 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		}
 	}
 
+	// Content-free activation telemetry: pruned at startup and daily, flushed on shutdown.
+	const activationEvents = new ActivationEventRecorder(serverStateDb);
+	activationEvents.start();
+
 	// Create HTTP app
 	const app = createApp(
 		db,
@@ -377,6 +382,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		registry.readStores(),
 		registry.writableStores(),
 		registry.port,
+		activationEvents,
 	);
 
 	// port/host/daemonAutoSpawn come from the registry (config.jsonc with env var override)
@@ -600,6 +606,9 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	//                   Enabled by CONSOLIDATION_POLL_INTERVAL_MS (default: disabled).
 	//                   Fires only when pending sessions exist; skips silently otherwise.
 	//
+	//   Decay loop    — strength decay and archiving, every DECAY_INTERVAL_MS (default 24 h),
+	//                   whether or not sessions are pending.
+	//
 	// Both loops share the same tryLock() / unlock() so they can never run concurrently
 	// with each other or with a manual API-triggered consolidation.
 	let shutdownRequested = false;
@@ -619,6 +628,12 @@ Run \`knowledge-server help-advanced\` for additional commands.
 
 		while (!shutdownRequested) {
 			try {
+				// Nothing pending: finish without an empty batch (which would still scan
+				// every store to ensure embeddings).
+				if ((await consolidation.checkPending()).pendingSessions === 0) {
+					logger.log(`[${label}] Complete — all sessions processed.`);
+					break;
+				}
 				if (!consolidation.tryLock()) {
 					// Another path holds the lock — yield and retry.
 					await new Promise((resolve) => setTimeout(resolve, 2000));
@@ -689,6 +704,39 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		activeLoops.push(runConsolidationDrain("startup consolidation"));
 	}
 
+	// Interruptible sleep: checks shutdownRequested every second rather than
+	// sleeping for the full interval. This lets shutdown complete immediately
+	// instead of waiting up to an interval (e.g. 8h) for the setTimeout.
+	const interruptibleSleep = async (ms: number) => {
+		const end = Date.now() + ms;
+		while (!shutdownRequested) {
+			const remaining = end - Date.now();
+			if (remaining <= 0) break;
+			await new Promise((resolve) =>
+				setTimeout(resolve, Math.min(1000, remaining)),
+			);
+		}
+	};
+
+	// Decay schedule — independent of pending work, so idle installs still archive.
+	// The first run waits a minute so startup consolidation is not competing with it.
+	const DECAY_FIRST_RUN_DELAY_MS = 60_000;
+	const DECAY_LOCK_RETRY_MS = 5 * 60_000;
+	const decayIntervalMs = config.decay.intervalMs;
+	if (decayIntervalMs > 0) {
+		activeLoops.push(
+			(async () => {
+				await interruptibleSleep(DECAY_FIRST_RUN_DELAY_MS);
+				while (!shutdownRequested) {
+					const tick = await runDecayTick(consolidation);
+					await interruptibleSleep(
+						tick.status === "busy" ? DECAY_LOCK_RETRY_MS : decayIntervalMs,
+					);
+				}
+			})(),
+		);
+	}
+
 	// Polling loop — default 8h, skips silently when no sessions are pending.
 	const pollIntervalMs = config.consolidation.pollIntervalMs;
 	if (pollIntervalMs > 0) {
@@ -699,20 +747,6 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		logger.log(
 			`✓ Auto-consolidation polling enabled (every ${intervalLabel}). Set CONSOLIDATION_POLL_INTERVAL_MS=0 to disable.`,
 		);
-
-		// Interruptible sleep: checks shutdownRequested every second rather than
-		// sleeping for the full interval. This lets shutdown complete immediately
-		// instead of waiting up to pollIntervalMs (e.g. 8h) for the setTimeout.
-		const interruptibleSleep = async (ms: number) => {
-			const end = Date.now() + ms;
-			while (!shutdownRequested) {
-				const remaining = end - Date.now();
-				if (remaining <= 0) break;
-				await new Promise((resolve) =>
-					setTimeout(resolve, Math.min(1000, remaining)),
-				);
-			}
-		};
 
 		activeLoops.push(
 			(async () => {
@@ -768,6 +802,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 			}
 		}
 		consolidation.close();
+		await activationEvents.stop();
 		await registry.close();
 		removeOwnPidFile(config.pidPath);
 		process.exit(0);
