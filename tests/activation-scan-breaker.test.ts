@@ -173,12 +173,10 @@ describe("circuit breaker: keyed by store and operation", () => {
 		}
 		expect(ann.findSimilarEntries.mock.calls.length).toBe(3);
 
-		// The circuit is open: the fourth activation must not wait for a timeout.
-		const started = performance.now();
+		// The circuit is open: the fourth activation skips the ANN search. The call
+		// count is the proof; no timing is asserted.
 		const fourth = await engine.activate("single cue number 3 for the store");
-		const elapsed = performance.now() - started;
 
-		expect(elapsed).toBeLessThan(STORE_TIMEOUT_MS * 0.75);
 		expect(ann.findSimilarEntries.mock.calls.length).toBe(3);
 		expect(ann.getActiveEntryCount.mock.calls.length).toBe(4);
 		expect([...totals, fourth.totalActive]).toEqual([2, 2, 2, 2]);

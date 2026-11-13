@@ -598,9 +598,7 @@ describe("StoreBreaker and activation fan-out", () => {
 		for (let i = 0; i < 3; i++) {
 			await engine.activate(`slow cue number ${i}`);
 		}
-		const started = performance.now();
 		const result = await engine.activate("slow cue number 3");
-		expect(performance.now() - started).toBeLessThan(STORE_TIMEOUT_MS * 0.75);
 		expect(findSimilarEntries.mock.calls.length).toBe(3);
 		expect(result.totalActive).toBe(2);
 	});

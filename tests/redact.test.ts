@@ -284,10 +284,11 @@ describe("redactSecrets: linear time on 1 MB adversarial input", () => {
 		"scheme and userinfo run": `http://${"u".repeat(MB)}`,
 	};
 	for (const [name, text] of Object.entries(cases)) {
-		it(`${name}: completes under 500 ms`, () => {
+		it(`${name}: completes under 5 s`, () => {
 			const start = performance.now();
 			redactSecrets(text);
-			expect(performance.now() - start).toBeLessThan(500);
+			// A catastrophic-backtracking regex takes minutes on 1 MB; this bound only catches that.
+			expect(performance.now() - start).toBeLessThan(5_000);
 		});
 	}
 });

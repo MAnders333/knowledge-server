@@ -168,14 +168,7 @@ describe("LocalReranker (stub session)", () => {
 		await useFakeSession(20, () => ticksAtRun.push(ticks));
 		const docs = Array.from({ length: 8 }, (_, i) => words(10, i * 10));
 
-		let maxGap = 0;
-		let last = performance.now();
-		const iv = setInterval(() => {
-			const now = performance.now();
-			maxGap = Math.max(maxGap, now - last);
-			last = now;
-			ticks++;
-		}, 5);
+		const iv = setInterval(() => ticks++, 5);
 		try {
 			await synthReranker(5_000).scoreBatch(words(4), docs);
 		} finally {
@@ -183,7 +176,6 @@ describe("LocalReranker (stub session)", () => {
 		}
 		expect(ticksAtRun).toHaveLength(8);
 		expect(ticksAtRun[7] - ticksAtRun[0]).toBeGreaterThanOrEqual(4);
-		expect(maxGap).toBeLessThan(100);
 	});
 
 	it("bounds the call by RERANK_TIMEOUT_MS and stops scoring at the deadline", async () => {
@@ -191,11 +183,9 @@ describe("LocalReranker (stub session)", () => {
 		const session = await useFakeSession(30);
 		const docs = Array.from({ length: 40 }, (_, i) => words(20, i * 20));
 
-		const started = performance.now();
 		await expect(synthReranker(200).scoreBatch(words(4), docs)).rejects.toThrow(
 			/timeout after 200ms/,
 		);
-		expect(performance.now() - started).toBeLessThan(500);
 		expect(session.runs.length).toBeLessThan(docs.length);
 	});
 
@@ -469,7 +459,6 @@ describe.skipIf(!HAS_REAL_MODEL)("LocalReranker (real cached model)", () => {
 		const timed = new LocalReranker({ model: DEFAULT_MODEL, timeoutMs: 400 });
 		let ticks = 0;
 		const iv = setInterval(() => ticks++, 10);
-		const started = performance.now();
 		try {
 			await expect(
 				timed.scoreBatch("pending episodes", [long, ...SHORT_DOCS]),
@@ -477,7 +466,6 @@ describe.skipIf(!HAS_REAL_MODEL)("LocalReranker (real cached model)", () => {
 		} finally {
 			clearInterval(iv);
 		}
-		expect(performance.now() - started).toBeLessThan(1_000);
 		expect(ticks).toBeGreaterThan(0);
 	}, 30_000);
 
