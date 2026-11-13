@@ -459,6 +459,7 @@ describe.skipIf(!HAS_REAL_MODEL)("LocalReranker (real cached model)", () => {
 		const timed = new LocalReranker({ model: DEFAULT_MODEL, timeoutMs: 400 });
 		let ticks = 0;
 		const iv = setInterval(() => ticks++, 10);
+		const started = performance.now();
 		try {
 			await expect(
 				timed.scoreBatch("pending episodes", [long, ...SHORT_DOCS]),
@@ -466,6 +467,7 @@ describe.skipIf(!HAS_REAL_MODEL)("LocalReranker (real cached model)", () => {
 		} finally {
 			clearInterval(iv);
 		}
+		expect(performance.now() - started).toBeLessThan(2_000);
 		expect(ticks).toBeGreaterThan(0);
 	}, 30_000);
 
