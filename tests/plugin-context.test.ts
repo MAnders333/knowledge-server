@@ -345,3 +345,21 @@ describe.each(drivers)("%s activation URL bounds", (_name, driver) => {
 		expect(queries[11]).toBe(prompt);
 	});
 });
+
+// Each plugin is a standalone file, so the query builder is copied into all three.
+// This keeps the copies from drifting: the same prompt must produce the same URL.
+it("sends identical activation queries from every plugin", async () => {
+	const prompt = [
+		"Look at the deployment notes for the staging cluster.",
+		"日本語のテキストを書きます。".repeat(120),
+		Array.from({ length: 14 }, (_, i) => `follow-up line number ${i}`).join(
+			"\n",
+		),
+	].join("\n");
+	const urls: string[] = [];
+	for (const [, driver] of drivers) {
+		await injected(driver, { entries: [item("Use port 4321.")] }, prompt);
+		urls.push(lastActivateUrl);
+	}
+	expect(new Set(urls).size).toBe(1);
+});
