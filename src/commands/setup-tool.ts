@@ -846,7 +846,9 @@ const CODEX_HOOK_PATH_MARKER = "/hooks/claude-code/user-prompt?client=codex";
  * hooks.json timeout to match.
  *
  * Auth: the admin bearer is sent only when KNOWLEDGE_ADMIN_TOKEN is set in the hook's
- * environment. The `${VAR:+…}` expansion adds the header, or leaves it out.
+ * environment. The header is a here-document on fd 3, which the shell expands into a
+ * pipe; curl reads it with `-H @/dev/fd/3`. The token is therefore never in curl's
+ * argv, where other local users can read it with `ps`.
  *
  * `--noproxy '*'`: loopback must never go through an HTTP proxy from the
  * environment (the prompt would leave the machine). `--fail`: an error body is
@@ -857,8 +859,14 @@ function codexHookCommand(): string {
 	const url = `http://${resolvedHost}:${resolvedPort}${CODEX_HOOK_PATH_MARKER}`;
 	// POSIX single-quoting: host and port come from config, so the URL is always quoted.
 	const quoted = `'${url.replace(/'/g, "'\\''")}'`;
-	const auth = `\${KNOWLEDGE_ADMIN_TOKEN:+-H "Authorization: Bearer $KNOWLEDGE_ADMIN_TOKEN"}`;
-	return `curl -s --noproxy '*' --fail --max-time 4 ${auth} --data-binary @- ${quoted} || true`;
+	// `${…:+…}` adds the header option only when the token is set. The here-document
+	// is unused otherwise.
+	const auth = "${KNOWLEDGE_ADMIN_TOKEN:+-H @/dev/fd/3}";
+	return [
+		`curl -s --noproxy '*' --fail --max-time 4 ${auth} --data-binary @- ${quoted} 3<<KS_AUTH || true`,
+		"Authorization: Bearer $KNOWLEDGE_ADMIN_TOKEN",
+		"KS_AUTH",
+	].join("\n");
 }
 
 /**

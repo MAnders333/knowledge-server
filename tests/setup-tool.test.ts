@@ -399,9 +399,9 @@ describe("setupCodex UserPromptSubmit hook", () => {
 		expect(handlers[0].type).toBe("command");
 		expect(handlers[0].timeout).toBe(5);
 		expect(handlers[0].command).toContain(
-			"curl -s --noproxy '*' --fail --max-time 4 ${KNOWLEDGE_ADMIN_TOKEN:+-H",
+			"curl -s --noproxy '*' --fail --max-time 4 ${KNOWLEDGE_ADMIN_TOKEN:+-H @/dev/fd/3} --data-binary @-",
 		);
-		expect(handlers[0].command?.endsWith("|| true")).toBe(true);
+		expect(handlers[0].command?.split("\n")[0].endsWith("|| true")).toBe(true);
 	});
 
 	it("is idempotent: a second run leaves hooks.json byte-identical", () => {
@@ -472,7 +472,8 @@ describe("setupCodex UserPromptSubmit hook", () => {
 		expect(readFileSync(HOOKS_PATH(), "utf8")).toBe("{ broken");
 	});
 
-	it("sends the admin bearer only when KNOWLEDGE_ADMIN_TOKEN is set", async () => {
+	it("sends the admin bearer only when KNOWLEDGE_ADMIN_TOKEN is set, and never in curl's argv", async () => {
+		const token = "stable-admin-token-0123456789";
 		setupCodex();
 		const command = knowledgeHandlers()[0]?.command ?? "";
 		const received: Array<string | null> = [];
@@ -484,6 +485,15 @@ describe("setupCodex UserPromptSubmit hook", () => {
 				return Response.json({});
 			},
 		});
+		// A curl shim records the arguments it starts with, then runs the real curl.
+		const shimDir = mkdtempSync(join(tmpdir(), "setup-codex-curl-"));
+		const argvLog = join(shimDir, "argv.txt");
+		const realCurl = Bun.which("curl") ?? "/usr/bin/curl";
+		writeFileSync(
+			join(shimDir, "curl"),
+			`#!/bin/sh\nprintf '%s\\n' "$@" > "${argvLog}"\nexec "${realCurl}" "$@"\n`,
+		);
+		chmodSync(join(shimDir, "curl"), 0o755);
 		try {
 			// Only the origin changes: the command, header expansion included, runs as written.
 			// The hook runs asynchronously: a blocking spawn would stall the stub server.
@@ -491,21 +501,30 @@ describe("setupCodex UserPromptSubmit hook", () => {
 				/'http:\/\/[^']+'/,
 				`'http://127.0.0.1:${server.port}/hooks/claude-code/user-prompt?client=codex'`,
 			);
-			const run = async (env: Record<string, string>) => {
+			const run = async (env: Record<string, string>): Promise<string[]> => {
 				const proc = Bun.spawn(["sh", "-c", local], {
-					env: { PATH: process.env.PATH ?? "/usr/bin:/bin", ...env },
+					env: {
+						PATH: `${shimDir}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+						...env,
+					},
 					stdin: Buffer.from('{"prompt":"hello"}'),
 					stdout: "pipe",
 					stderr: "pipe",
 				});
 				await proc.exited;
+				return readFileSync(argvLog, "utf8").split("\n");
 			};
-			await run({});
-			await run({ KNOWLEDGE_ADMIN_TOKEN: "stable-admin-token-0123456789" });
+			const argvUnset = await run({});
+			const argvSet = await run({ KNOWLEDGE_ADMIN_TOKEN: token });
+
+			expect(argvUnset).not.toContain("-H");
+			expect(argvSet).toContain("-H");
+			expect(argvSet.join("\n")).not.toContain(token);
 		} finally {
 			server.stop(true);
+			rmSync(shimDir, { recursive: true, force: true });
 		}
-		expect(received).toEqual([null, "Bearer stable-admin-token-0123456789"]);
+		expect(received).toEqual([null, `Bearer ${token}`]);
 	});
 });
 
