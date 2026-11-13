@@ -124,6 +124,14 @@ const KNOWLEDGE_SERVER_URL_SAFE =
 		_parsedUrl.hostname === "localhost" ||
 		_parsedUrl.hostname === "[::1]");
 
+/**
+ * Headers for read calls. A stable KNOWLEDGE_ADMIN_TOKEN makes the server require it
+ * on every route except /health, so it is sent when set and never otherwise.
+ */
+const AUTH_HEADERS: Record<string, string> = process.env.KNOWLEDGE_ADMIN_TOKEN
+	? { Authorization: `Bearer ${process.env.KNOWLEDGE_ADMIN_TOKEN}` }
+	: {};
+
 /** Response shape of GET /activate (mirrors plugin/knowledge.ts). */
 interface ActivateResponse {
 	entries: Array<{
@@ -382,6 +390,7 @@ export default function knowledgeExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		try {
 			const health = await fetch(`${KNOWLEDGE_SERVER_URL}/status`, {
+				headers: AUTH_HEADERS,
 				signal: AbortSignal.timeout(2000),
 			});
 			if (health.ok) {
@@ -419,7 +428,7 @@ export default function knowledgeExtension(pi: ExtensionAPI) {
 			const response = await fetch(
 				`${KNOWLEDGE_SERVER_URL}/activate?${params.toString()}`,
 				{
-					headers: { "x-knowledge-client": "omp" },
+					headers: { "x-knowledge-client": "omp", ...AUTH_HEADERS },
 					signal: AbortSignal.timeout(5000),
 				},
 			);

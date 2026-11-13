@@ -83,6 +83,14 @@ const KNOWLEDGE_SERVER_URL_SAFE =
 		_parsedUrl.hostname === "localhost" ||
 		_parsedUrl.hostname === "[::1]");
 
+/**
+ * Headers for read calls. A stable KNOWLEDGE_ADMIN_TOKEN makes the server require it
+ * on every route except /health, so it is sent when set and never otherwise.
+ */
+const AUTH_HEADERS: Record<string, string> = process.env.KNOWLEDGE_ADMIN_TOKEN
+	? { Authorization: `Bearer ${process.env.KNOWLEDGE_ADMIN_TOKEN}` }
+	: {};
+
 const safeLog = async (
 	client: Parameters<Plugin>[0]["client"],
 	level: "debug" | "info" | "warn" | "error",
@@ -351,6 +359,7 @@ export const KnowledgePlugin: Plugin = async (ctx) => {
 	// Verify server is reachable on plugin load — but never throw
 	try {
 		const health = await fetch(`${KNOWLEDGE_SERVER_URL}/status`, {
+			headers: AUTH_HEADERS,
 			signal: AbortSignal.timeout(2000),
 		});
 		if (health.ok) {
@@ -422,7 +431,7 @@ export const KnowledgePlugin: Plugin = async (ctx) => {
 				const response = await fetch(
 					`${KNOWLEDGE_SERVER_URL}/activate?${params.toString()}`,
 					{
-						headers: { "x-knowledge-client": "opencode" },
+						headers: { "x-knowledge-client": "opencode", ...AUTH_HEADERS },
 						signal: AbortSignal.timeout(5000),
 					},
 				);
@@ -485,6 +494,7 @@ export const KnowledgePlugin: Plugin = async (ctx) => {
 		"experimental.session.compacting": async (_input, output) => {
 			try {
 				const response = await fetch(`${KNOWLEDGE_SERVER_URL}/status`, {
+					headers: AUTH_HEADERS,
 					signal: AbortSignal.timeout(2000),
 				});
 				if (!response.ok) return;
