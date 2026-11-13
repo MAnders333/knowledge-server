@@ -10,6 +10,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
+	chmodSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
@@ -17,15 +18,18 @@ import {
 	readFileSync,
 	readlinkSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	setupClaudeCode,
 	setupCodex,
 	setupCursor,
 	setupOhMyPi,
 	stripJsoncComments,
+	writeOpenCodeMcpEntry,
 } from "../src/commands/setup-tool";
 import {
 	type SetupIsolation,
@@ -395,7 +399,7 @@ describe("setupCodex UserPromptSubmit hook", () => {
 		expect(handlers[0].type).toBe("command");
 		expect(handlers[0].timeout).toBe(5);
 		expect(handlers[0].command).toContain(
-			"curl -s --noproxy '*' --fail --max-time 4 --data-binary @-",
+			"curl -s --noproxy '*' --fail --max-time 4 ${KNOWLEDGE_ADMIN_TOKEN:+-H",
 		);
 		expect(handlers[0].command?.endsWith("|| true")).toBe(true);
 	});
@@ -466,6 +470,165 @@ describe("setupCodex UserPromptSubmit hook", () => {
 		writeFileSync(HOOKS_PATH(), "{ broken");
 		setupCodex();
 		expect(readFileSync(HOOKS_PATH(), "utf8")).toBe("{ broken");
+	});
+
+	it("sends the admin bearer only when KNOWLEDGE_ADMIN_TOKEN is set", async () => {
+		setupCodex();
+		const command = knowledgeHandlers()[0]?.command ?? "";
+		const received: Array<string | null> = [];
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(req) {
+				received.push(req.headers.get("authorization"));
+				return Response.json({});
+			},
+		});
+		try {
+			// Only the origin changes: the command, header expansion included, runs as written.
+			// The hook runs asynchronously: a blocking spawn would stall the stub server.
+			const local = command.replace(
+				/'http:\/\/[^']+'/,
+				`'http://127.0.0.1:${server.port}/hooks/claude-code/user-prompt?client=codex'`,
+			);
+			const run = async (env: Record<string, string>) => {
+				const proc = Bun.spawn(["sh", "-c", local], {
+					env: { PATH: process.env.PATH ?? "/usr/bin:/bin", ...env },
+					stdin: Buffer.from('{"prompt":"hello"}'),
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				await proc.exited;
+			};
+			await run({});
+			await run({ KNOWLEDGE_ADMIN_TOKEN: "stable-admin-token-0123456789" });
+		} finally {
+			server.stop(true);
+		}
+		expect(received).toEqual([null, "Bearer stable-admin-token-0123456789"]);
+	});
+});
+
+// ── setupClaudeCode UserPromptSubmit hook ────────────────────────────────────
+
+describe("setupClaudeCode UserPromptSubmit hook", () => {
+	const settingsPath = () => join(isolation.home, ".claude", "settings.json");
+	const readHandlers = (): Array<Record<string, unknown>> => {
+		const settings = JSON.parse(readFileSync(settingsPath(), "utf8")) as {
+			hooks: {
+				UserPromptSubmit: Array<{ hooks?: Array<Record<string, unknown>> }>;
+			};
+		};
+		return settings.hooks.UserPromptSubmit.flatMap(
+			(group) => group.hooks ?? [],
+		);
+	};
+	const knowledgeHandlers = () =>
+		readHandlers().filter((h) =>
+			String(h.url).includes("/hooks/claude-code/user-prompt"),
+		);
+
+	it("writes the hook with the admin bearer and allows that variable to be expanded", () => {
+		setupClaudeCode();
+		expect(knowledgeHandlers()).toEqual([
+			{
+				type: "http",
+				url: expect.stringContaining("/hooks/claude-code/user-prompt"),
+				timeout: 5,
+				headers: { Authorization: "Bearer $KNOWLEDGE_ADMIN_TOKEN" },
+				allowedEnvVars: ["KNOWLEDGE_ADMIN_TOKEN"],
+			},
+		]);
+	});
+
+	it("upgrades a hook written before the token header, and a re-run is byte-identical", () => {
+		setupClaudeCode();
+		const url = knowledgeHandlers()[0].url;
+		writeFileSync(
+			settingsPath(),
+			JSON.stringify({
+				hooks: {
+					UserPromptSubmit: [{ hooks: [{ type: "http", url, timeout: 5 }] }],
+				},
+			}),
+		);
+
+		setupClaudeCode();
+		expect(knowledgeHandlers()).toHaveLength(1);
+		expect(knowledgeHandlers()[0].headers).toEqual({
+			Authorization: "Bearer $KNOWLEDGE_ADMIN_TOKEN",
+		});
+
+		const first = readFileSync(settingsPath(), "utf8");
+		setupClaudeCode();
+		expect(readFileSync(settingsPath(), "utf8")).toBe(first);
+	});
+
+	it("keeps the user's own hooks", () => {
+		mkdirSync(join(isolation.home, ".claude"), { recursive: true });
+		writeFileSync(
+			settingsPath(),
+			JSON.stringify({
+				hooks: {
+					UserPromptSubmit: [
+						{ hooks: [{ type: "command", command: "user-hook.sh" }] },
+					],
+				},
+			}),
+		);
+		setupClaudeCode();
+		expect(readHandlers().map((h) => h.command)).toContain("user-hook.sh");
+		expect(knowledgeHandlers()).toHaveLength(1);
+	});
+});
+
+// ── Config file modes ────────────────────────────────────────────────────────
+
+describe("setup keeps config file modes", () => {
+	const modeOf = (path: string) => statSync(path).mode & 0o777;
+
+	it("creates new Codex config and hooks files 0600", () => {
+		setupCodex();
+		expect(modeOf(join(isolation.home, ".codex", "config.toml"))).toBe(0o600);
+		expect(modeOf(join(isolation.home, ".codex", "hooks.json"))).toBe(0o600);
+	});
+
+	it("keeps the mode of an existing Codex config.toml", () => {
+		mkdirSync(join(isolation.home, ".codex"), { recursive: true });
+		const configPath = join(isolation.home, ".codex", "config.toml");
+		writeFileSync(configPath, '[model]\nname = "o4-mini"\n');
+		chmodSync(configPath, 0o640);
+		setupCodex();
+		expect(modeOf(configPath)).toBe(0o640);
+	});
+
+	it("keeps the mode of an existing Cursor mcp.json", () => {
+		mkdirSync(join(isolation.home, ".cursor"), { recursive: true });
+		const mcpPath = join(isolation.home, ".cursor", "mcp.json");
+		writeFileSync(mcpPath, JSON.stringify({ mcpServers: {} }));
+		chmodSync(mcpPath, 0o640);
+		setupCursor();
+		expect(modeOf(mcpPath)).toBe(0o640);
+	});
+
+	it("keeps the mode of an existing opencode.jsonc", () => {
+		const dir = join(isolation.home, ".config", "opencode");
+		mkdirSync(dir, { recursive: true });
+		const configPath = join(dir, "opencode.jsonc");
+		writeFileSync(configPath, "{}");
+		chmodSync(configPath, 0o640);
+		writeOpenCodeMcpEntry(dir);
+		expect(modeOf(configPath)).toBe(0o640);
+	});
+
+	it("creates a new Claude settings.json 0600 and keeps an existing mode", () => {
+		const settingsPath = join(isolation.home, ".claude", "settings.json");
+		setupClaudeCode();
+		expect(modeOf(settingsPath)).toBe(0o600);
+
+		chmodSync(settingsPath, 0o640);
+		setupClaudeCode();
+		expect(modeOf(settingsPath)).toBe(0o640);
 	});
 });
 
