@@ -82,9 +82,7 @@ function serverBaseUrl(): string {
  * on every route except /health, so it is sent when set and never otherwise. Flagging
  * is read-level too and sends the same header.
  */
-export function readCallHeaders(
-	adminToken: string | null,
-): Record<string, string> {
+function readCallHeaders(adminToken: string | null): Record<string, string> {
 	return adminToken ? { Authorization: `Bearer ${adminToken}` } : {};
 }
 
