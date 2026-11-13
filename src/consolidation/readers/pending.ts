@@ -1,10 +1,17 @@
-import type { IServerStateDB } from "../../db/interface.js";
+import {
+	type IServerStateDB,
+	PENDING_EPISODE_MAX_ATTEMPTS,
+} from "../../db/interface.js";
+import { logger } from "../../logger.js";
 import type {
 	Episode,
+	EpisodeKey,
+	EpisodeOutcome,
 	IEpisodeReader,
 	PendingEpisode,
 	ProcessedRange,
 } from "../../types.js";
+import { episodeKeyId } from "../../types.js";
 
 /**
  * PendingEpisodesReader — drains the `pending_episodes` staging table.
@@ -52,15 +59,17 @@ export class PendingEpisodesReader implements IEpisodeReader {
 	 * Pre-load all pending episodes from the staging table.
 	 * Called by ConsolidationEngine before getCandidateSessions.
 	 */
-	async prepare(afterMessageTimeCreated: number): Promise<void> {
+	async prepare(
+		afterMessageTimeCreated: number,
+		isBlocked?: (episode: EpisodeKey & { directory: string }) => boolean,
+	): Promise<void> {
 		this._cachedRows = [];
 		this._cachedCandidates = [];
 		this._prepared = false;
 
-		const rows = await this.db.getPendingEpisodes(
-			afterMessageTimeCreated,
-			2000,
-		);
+		const rows = (
+			await this.db.getPendingEpisodes(afterMessageTimeCreated, 2000)
+		).filter((row) => !isBlocked?.(row));
 
 		// Group by session_id, track max_message_time per session.
 		const sessionMap = new Map<string, number>();
@@ -120,20 +129,53 @@ export class PendingEpisodesReader implements IEpisodeReader {
 	}
 
 	/**
-	 * Delete consolidated rows from pending_episodes to keep the table lean.
-	 * Called by ConsolidationEngine after cursor is advanced.
-	 * Receives all candidate session IDs (not just those that produced episodes)
-	 * so fully-processed sessions also get their rows cleaned up.
+	 * Settle pending rows after a consolidation batch (see EpisodeOutcome):
+	 * - completed episodes: rows are deleted.
+	 * - failed episodes: rows are kept and failed_attempts is incremented. A row
+	 *   that reaches PENDING_EPISODE_MAX_ATTEMPTS is dead-lettered (logged loudly
+	 *   and excluded from future reads).
+	 * Rows in neither list (lock held, store unavailable) are left untouched so
+	 * they are retried on the next run.
 	 */
-	async afterConsolidated(sessionIds: string[]): Promise<void> {
-		const sessionIdSet = new Set(sessionIds);
-		const idsToDelete = this._cachedRows
-			.filter((r) => sessionIdSet.has(r.sessionId))
-			.map((r) => r.id);
-		await this.db.deletePendingEpisodes(idsToDelete);
-		this._cachedRows = this._cachedRows.filter(
-			(r) => !sessionIdSet.has(r.sessionId),
+	async afterConsolidated(outcome: EpisodeOutcome): Promise<void> {
+		const rowsByKey = new Map<string, PendingEpisode[]>();
+		for (const row of this._cachedRows) {
+			const key = episodeKeyId(row);
+			const bucket = rowsByKey.get(key);
+			if (bucket) bucket.push(row);
+			else rowsByKey.set(key, [row]);
+		}
+
+		const completedIds = outcome.completed.flatMap(
+			(key) => rowsByKey.get(episodeKeyId(key))?.map((row) => row.id) ?? [],
 		);
+
+		const failedIdsByError = new Map<string, string[]>();
+		for (const { episode, error } of outcome.failed) {
+			for (const row of rowsByKey.get(episodeKeyId(episode)) ?? []) {
+				const ids = failedIdsByError.get(error) ?? [];
+				ids.push(row.id);
+				failedIdsByError.set(error, ids);
+				if ((row.failedAttempts ?? 0) + 1 >= PENDING_EPISODE_MAX_ATTEMPTS) {
+					logger.error(
+						`[consolidation/pending] Dead-lettering episode ${episode.source}/${episode.sessionId} ` +
+							`[${episode.startMessageId}..${episode.endMessageId}] after ${PENDING_EPISODE_MAX_ATTEMPTS} failed attempts. ` +
+							`It will not be retried; the row is kept in pending_episodes for inspection. Last error: ${error}`,
+					);
+				}
+			}
+		}
+
+		await this.db.deletePendingEpisodes(completedIds);
+		for (const [error, ids] of failedIdsByError) {
+			await this.db.recordPendingEpisodeFailures(ids, error.slice(0, 1000));
+		}
+
+		const settled = new Set([
+			...completedIds,
+			...[...failedIdsByError.values()].flat(),
+		]);
+		this._cachedRows = this._cachedRows.filter((r) => !settled.has(r.id));
 	}
 
 	close(): void {

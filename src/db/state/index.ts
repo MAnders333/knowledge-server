@@ -9,8 +9,16 @@ import type {
 	ProcessedRange,
 } from "../../types.js";
 import { ensurePrivateFile } from "../../utils.js";
-import type { IServerStateDB } from "../interface.js";
+import {
+	type IServerStateDB,
+	PENDING_EPISODE_MAX_ATTEMPTS,
+} from "../interface.js";
+import {
+	assertNotNewerThanCode,
+	pendingMigrations,
+} from "../migration-registry.js";
 import { runStateMigrations } from "./migrations.js";
+import { SERVER_LOCAL_MIGRATIONS } from "./schema.js";
 import {
 	SERVER_LOCAL_CREATE_TABLES,
 	SERVER_LOCAL_SCHEMA_VERSION,
@@ -81,6 +89,22 @@ export class ServerStateDB implements IServerStateDB {
 					.get() as { version: number } | null
 			)?.version ?? 0;
 
+		assertNotNewerThanCode(
+			currentVersion,
+			SERVER_LOCAL_SCHEMA_VERSION,
+			"state.db",
+		);
+		if (currentVersion > 0) {
+			// Every version after the stored one must be registered. The state tables
+			// themselves are created idempotently below.
+			pendingMigrations(
+				SERVER_LOCAL_MIGRATIONS,
+				currentVersion,
+				SERVER_LOCAL_SCHEMA_VERSION,
+				"state.db",
+			);
+		}
+
 		// Always ensure applied_migrations exists — it was added in v1 but may be
 		// absent from existing v1 DBs created before this table was introduced.
 		this.db.exec(`
@@ -117,13 +141,19 @@ export class ServerStateDB implements IServerStateDB {
 	// ── Pending Episodes ──────────────────────────────────────────────────────
 
 	async insertPendingEpisode(episode: PendingEpisode): Promise<void> {
+		// Skip a range already staged, e.g. two daemons uploading the same session.
+		// Plain SQL: no unique index or table ownership needed.
 		this.db
 			.prepare(
 				`INSERT OR IGNORE INTO pending_episodes
          (id, user_id, source, session_id, start_message_id, end_message_id,
           session_title, project_name, directory, content, content_type,
           session_timestamp, max_message_time, approx_tokens, uploaded_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+         WHERE NOT EXISTS (
+           SELECT 1 FROM pending_episodes
+           WHERE user_id = ? AND source = ? AND session_id = ? AND start_message_id = ? AND end_message_id = ?
+         )`,
 			)
 			.run(
 				episode.id,
@@ -141,6 +171,11 @@ export class ServerStateDB implements IServerStateDB {
 				episode.maxMessageTime,
 				episode.approxTokens,
 				episode.uploadedAt,
+				episode.userId,
+				episode.source,
+				episode.sessionId,
+				episode.startMessageId,
+				episode.endMessageId,
 			);
 	}
 
@@ -150,12 +185,9 @@ export class ServerStateDB implements IServerStateDB {
 	): Promise<PendingEpisode[]> {
 		const rows = this.db
 			.prepare(
-				`SELECT * FROM pending_episodes
-         WHERE max_message_time > ?
-         ORDER BY max_message_time ASC
-         LIMIT ?`,
+				"SELECT p.*, COALESCE(a.failed_attempts, 0) AS failed_attempts FROM pending_episodes p LEFT JOIN pending_episode_attempts a ON a.id = p.id WHERE p.max_message_time > ? AND COALESCE(a.failed_attempts, 0) < ? ORDER BY p.max_message_time ASC LIMIT ?",
 			)
-			.all(afterMaxMessageTime, limit) as Array<{
+			.all(afterMaxMessageTime, PENDING_EPISODE_MAX_ATTEMPTS, limit) as Array<{
 			id: string;
 			user_id: string;
 			source: string;
@@ -171,6 +203,7 @@ export class ServerStateDB implements IServerStateDB {
 			max_message_time: number;
 			approx_tokens: number;
 			uploaded_at: number;
+			failed_attempts: number;
 		}>;
 
 		return rows.map((r) => ({
@@ -189,23 +222,69 @@ export class ServerStateDB implements IServerStateDB {
 			maxMessageTime: r.max_message_time,
 			approxTokens: r.approx_tokens,
 			uploadedAt: r.uploaded_at,
+			failedAttempts: r.failed_attempts,
 		}));
 	}
 
 	async countPendingSessions(): Promise<number> {
 		const row = this.db
-			.prepare("SELECT COUNT(DISTINCT session_id) as n FROM pending_episodes")
-			.get() as { n: number } | undefined;
+			.prepare(
+				"SELECT COUNT(DISTINCT p.session_id) as n FROM pending_episodes p LEFT JOIN pending_episode_attempts a ON a.id = p.id WHERE COALESCE(a.failed_attempts, 0) < ?",
+			)
+			.get(PENDING_EPISODE_MAX_ATTEMPTS) as { n: number } | undefined;
 		return row?.n ?? 0;
 	}
 
 	async deletePendingEpisodes(ids: string[]): Promise<void> {
 		if (ids.length === 0) return;
+		const json = JSON.stringify(ids);
+		this.db.transaction(() => {
+			this.db
+				.prepare(
+					"DELETE FROM pending_episode_attempts WHERE id IN (SELECT value FROM json_each(?))",
+				)
+				.run(json);
+			this.db
+				.prepare(
+					"DELETE FROM pending_episodes WHERE id IN (SELECT value FROM json_each(?))",
+				)
+				.run(json);
+		})();
+	}
+
+	async recordPendingEpisodeFailures(
+		ids: string[],
+		error: string,
+	): Promise<void> {
+		if (ids.length === 0) return;
 		this.db
 			.prepare(
-				"DELETE FROM pending_episodes WHERE id IN (SELECT value FROM json_each(?))",
+				`INSERT INTO pending_episode_attempts (id, failed_attempts, last_error)
+         SELECT value, 1, ? FROM json_each(?) WHERE true
+         ON CONFLICT (id) DO UPDATE SET
+           failed_attempts = failed_attempts + 1,
+           last_error = excluded.last_error`,
 			)
-			.run(JSON.stringify(ids));
+			.run(error, JSON.stringify(ids));
+	}
+
+	async countDeadLetteredEpisodes(): Promise<number> {
+		const row = this.db
+			.prepare(
+				`SELECT COUNT(*) as n FROM pending_episodes p
+         JOIN pending_episode_attempts a ON a.id = p.id
+         WHERE a.failed_attempts >= ?`,
+			)
+			.get(PENDING_EPISODE_MAX_ATTEMPTS) as { n: number } | undefined;
+		return row?.n ?? 0;
+	}
+
+	async retryDeadLetteredEpisodes(): Promise<number> {
+		return this.db
+			.prepare(
+				"DELETE FROM pending_episode_attempts WHERE failed_attempts >= ?",
+			)
+			.run(PENDING_EPISODE_MAX_ATTEMPTS).changes;
 	}
 
 	// ── Episode Tracking ──────────────────────────────────────────────────────
@@ -350,12 +429,24 @@ export class ServerStateDB implements IServerStateDB {
 	}
 
 	/**
-	 * Wipe all staging data: pending_episodes, consolidated_episode, and reset
-	 * consolidation_state counters. Called when reinitializing the knowledge store.
+	 * Wipe staging data and reset consolidation_state counters. Pending episodes
+	 * are deleted for `userId` only when given (see IServerStateDB.reinitialize).
 	 */
-	async reinitialize(): Promise<void> {
+	async reinitialize(userId?: string): Promise<void> {
 		this.db.transaction(() => {
-			this.db.exec("DELETE FROM pending_episodes");
+			if (userId === undefined) {
+				this.db.exec("DELETE FROM pending_episode_attempts");
+				this.db.exec("DELETE FROM pending_episodes");
+			} else {
+				this.db
+					.prepare(
+						"DELETE FROM pending_episode_attempts WHERE id IN (SELECT id FROM pending_episodes WHERE user_id = ?)",
+					)
+					.run(userId);
+				this.db
+					.prepare("DELETE FROM pending_episodes WHERE user_id = ?")
+					.run(userId);
+			}
 			this.db.exec("DELETE FROM consolidated_episode");
 			this.db.exec(
 				`UPDATE consolidation_state SET

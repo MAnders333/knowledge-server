@@ -13,6 +13,10 @@ import type {
 } from "../../types.js";
 import { ensurePrivateFile } from "../../utils.js";
 import type { IKnowledgeStore } from "../interface.js";
+import {
+	assertNotNewerThanCode,
+	pendingMigrations,
+} from "../migration-registry.js";
 import { MIGRATIONS } from "./migrations.js";
 import {
 	CREATE_TABLES,
@@ -79,11 +83,29 @@ export class KnowledgeDB implements IKnowledgeStore {
 					.get() as { version: number } | null
 			)?.version ?? 0;
 
-		let migratedTo = currentVersion;
-		for (const migration of MIGRATIONS) {
-			if (migratedTo >= migration.version) continue;
+		// A database written by a newer build must not be opened: old code on a newer
+		// schema can corrupt it. Refuse it and leave every table untouched.
+		assertNotNewerThanCode(currentVersion, SCHEMA_VERSION, "knowledge.db");
+
+		// An existing database runs only the versions it is missing. A fresh database
+		// (no knowledge tables yet) runs the whole idempotent chain.
+		const hasKnowledgeTables =
+			this.db
+				.prepare(
+					"SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_entry'",
+				)
+				.get() !== null;
+		const from = hasKnowledgeTables
+			? currentVersion
+			: MIGRATIONS[0].version - 1;
+		for (const migration of pendingMigrations(
+			MIGRATIONS,
+			from,
+			SCHEMA_VERSION,
+			"knowledge.db",
+		)) {
 			logger.log(
-				`[db] Applying incremental migration v${migratedTo} → v${migration.version}: ${migration.label}.`,
+				`[db] Applying incremental migration → v${migration.version}: ${migration.label}.`,
 			);
 			this.db.transaction(() => {
 				migration.up(this.db);
@@ -93,47 +115,12 @@ export class KnowledgeDB implements IKnowledgeStore {
 					)
 					.run(migration.version, Date.now());
 			})();
-			migratedTo = migration.version;
 			logger.log(
 				`[db] Incremental migration → v${migration.version} complete.`,
 			);
 		}
-		// ─────────────────────────────────────────────────────────────────────────
 
-		// After migrations, check whether the DB is still behind or has schema drift.
-		// This handles DBs that are too old for incremental migration (pre-v6) or
-		// where a migration left an inconsistent state.
-		const postMigrationVersion = migratedTo;
-		const remainingDrift =
-			postMigrationVersion >= SCHEMA_VERSION ? [] : this.getSchemaDrift();
-
-		const needsReset =
-			(postMigrationVersion > 0 && postMigrationVersion < SCHEMA_VERSION) ||
-			remainingDrift.length > 0;
-
-		if (needsReset) {
-			const driftDetail =
-				remainingDrift.length > 0
-					? ` (missing columns: ${remainingDrift.map((d) => `${d.table}.${d.column}`).join(", ")})`
-					: "";
-			logger.warn(
-				`[db] Schema mismatch: DB is v${postMigrationVersion}, code expects v${SCHEMA_VERSION}${driftDetail}. Dropping and recreating all tables. All existing knowledge data has been cleared.`,
-			);
-			this.db.transaction(() => {
-				this.db.exec("DROP TABLE IF EXISTS knowledge_cluster_member");
-				this.db.exec("DROP TABLE IF EXISTS knowledge_cluster");
-				this.db.exec("DROP TABLE IF EXISTS knowledge_relation");
-				this.db.exec("DROP TABLE IF EXISTS knowledge_entry");
-				this.db.exec("DROP TABLE IF EXISTS embedding_metadata");
-				this.db.exec("DROP TABLE IF EXISTS schema_version");
-				// Note: consolidated_episode, consolidation_state, pending_episodes,
-				// and daemon_cursor are NOT dropped here — they live in state.db
-				// (ServerStateDB). Dropping them from legacy knowledge.db would be
-				// a no-op on v13+ DBs and dangerous on pre-migration DBs.
-			})();
-		}
-
-		// Create all tables (idempotent on a fresh DB; re-creates after reset).
+		// Create all tables (idempotent: a fresh database gets the full current schema).
 		this.db.exec(CREATE_TABLES);
 
 		// Stamp the current schema version if not already recorded.

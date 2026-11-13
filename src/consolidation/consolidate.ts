@@ -8,13 +8,16 @@ import { logger } from "../logger.js";
 import type {
 	ConsolidationResult,
 	Episode,
+	EpisodeKey,
+	EpisodeOutcome,
 	IEpisodeReader,
 	KnowledgeEntry,
 } from "../types.js";
-import { clampKnowledgeType } from "../types.js";
+import { clampKnowledgeType, episodeKeyId } from "../types.js";
 import { ContradictionScanner } from "./contradiction.js";
 import { computeStrength } from "./decay.js";
 import type { DomainResolution, DomainRouter } from "./domain-router.js";
+import { isDeterministicFailure } from "./errors.js";
 import { ConsolidationLLM, formatEpisodes } from "./llm.js";
 import type { ExtractedKnowledge } from "./llm.js";
 import { Reconsolidator } from "./reconsolidate.js";
@@ -31,6 +34,29 @@ import { Reconsolidator } from "./reconsolidate.js";
  * will ultimately be processed alone.
  */
 const MAX_CHUNK_TOKENS = 150_000;
+
+/**
+ * How a chunk ended in processChunk():
+ * - completed: every store that received entries succeeded; episodes are recorded.
+ * - deferred:  nothing was written because a store was unavailable or its lock
+ *              was held by another process. Not counted as an attempt.
+ * - failed:    extraction or a store write threw. The episodes stay pending and
+ *              their failed-attempt count is incremented.
+ */
+type ChunkOutcome = "completed" | "deferred" | "transient" | "failed";
+
+interface ChunkResult {
+	outcome: ChunkOutcome;
+	error?: string;
+	created: number;
+	updated: number;
+	conflictsDetected: number;
+	conflictsResolved: number;
+	touchedStores: Set<IKnowledgeStore>;
+}
+
+/** Thrown when another process holds a store's consolidation lock. The chunk is deferred, not failed. */
+class StoreLockHeldError extends Error {}
 
 /**
  * The consolidation engine — the heart of the knowledge system.
@@ -178,8 +204,10 @@ export class ConsolidationEngine {
 	 *   that the next synthesis pass will cluster and merge). The in-process lock
 	 *   (Layer 1) ensures synthesis and consolidation never overlap on the same instance.
 	 */
-	async consolidate(): Promise<ConsolidationResult> {
-		return await this._consolidate();
+	async consolidate(
+		options: { attempted?: Set<string> } = {},
+	): Promise<ConsolidationResult> {
+		return await this._consolidate(options.attempted ?? new Set());
 	}
 
 	/**
@@ -196,7 +224,9 @@ export class ConsolidationEngine {
 	 * 6. Apply decay to all active entries
 	 * 7. Generate embeddings for new/updated entries
 	 */
-	private async _consolidate(): Promise<ConsolidationResult> {
+	private async _consolidate(
+		attempted: Set<string>,
+	): Promise<ConsolidationResult> {
 		const startTime = Date.now();
 		const state = await this.serverStateDb.getConsolidationState();
 
@@ -216,7 +246,7 @@ export class ConsolidationEngine {
 
 		// Process each reader source independently with its own cursor.
 		for (const reader of this.readers) {
-			const sourceTotals = await this.consolidateSource(reader);
+			const sourceTotals = await this.consolidateSource(reader, attempted);
 			totalSessionsProcessed += sourceTotals.sessionsProcessed;
 			totalSegmentsProcessed += sourceTotals.segmentsProcessed;
 			totalCreated += sourceTotals.entriesCreated;
@@ -304,7 +334,10 @@ export class ConsolidationEngine {
 	 * Run consolidation for a single source reader.
 	 * Returns partial counts that the caller aggregates across all readers.
 	 */
-	private async consolidateSource(reader: IEpisodeReader): Promise<{
+	private async consolidateSource(
+		reader: IEpisodeReader,
+		attempted: Set<string>,
+	): Promise<{
 		sessionsProcessed: number;
 		segmentsProcessed: number;
 		entriesCreated: number;
@@ -322,7 +355,12 @@ export class ConsolidationEngine {
 		//    skips this source rather than aborting the entire consolidation run.
 		if (reader.prepare) {
 			try {
-				await reader.prepare(afterMessageTimeCreated);
+				await reader.prepare(
+					afterMessageTimeCreated,
+					(episode) =>
+						attempted.has(episodeKeyId(episode)) ||
+						this.isStoreUnavailable(episode.directory),
+				);
 			} catch (err) {
 				logger.error(
 					`[consolidation/${reader.source}] prepare() failed — skipping source this run:`,
@@ -437,6 +475,9 @@ export class ConsolidationEngine {
 			}
 		}
 
+		const outcome: EpisodeOutcome = { completed: [], failed: [] };
+		const completedSessionIds = new Set<string>();
+
 		for (let ci = 0; ci < chunks.length; ci++) {
 			const chunk = chunks[ci];
 			const chunkLabel = `${ci + 1}/${chunks.length}`;
@@ -450,27 +491,56 @@ export class ConsolidationEngine {
 
 			// Use the first episode's source as the log label — all episodes in a
 			// domain-grouped chunk share the same original source.
-			const counts = await this.processChunk(
+			const result = await this.processChunk(
 				chunk[0]?.source ?? reader.source,
 				chunk,
 			);
-			totalCreated += counts.created;
-			totalUpdated += counts.updated;
-			totalConflictsDetected += counts.conflictsDetected;
-			totalConflictsResolved += counts.conflictsResolved;
-			for (const s of counts.touchedStores) sourceTouchedStores.add(s);
+			totalCreated += result.created;
+			totalUpdated += result.updated;
+			totalConflictsDetected += result.conflictsDetected;
+			totalConflictsResolved += result.conflictsResolved;
+			for (const s of result.touchedStores) sourceTouchedStores.add(s);
+
+			const keys: EpisodeKey[] = chunk.map((ep) => ({
+				source: ep.source,
+				sessionId: ep.sessionId,
+				startMessageId: ep.startMessageId,
+				endMessageId: ep.endMessageId,
+			}));
+			for (const key of keys) attempted.add(episodeKeyId(key));
+			if (result.outcome === "completed") {
+				outcome.completed.push(...keys);
+				for (const ep of chunk) completedSessionIds.add(ep.sessionId);
+			} else if (result.outcome === "failed") {
+				const error = result.error ?? "unknown error";
+				for (const episode of keys) outcome.failed.push({ episode, error });
+			}
 		}
 
-		// 7. Post-consolidation hook — PendingEpisodesReader deletes processed rows from
-		//    pending_episodes to keep the table lean.
-		//    Use candidateIds (all processed candidates) rather than episodes.map(sessionId)
-		//    so sessions where all episodes were already processed also get cleaned up.
+		// Episodes consolidated in an earlier run can still have pending rows (e.g. a
+		// crash between recordEpisode and the row delete). They are done; clean them up.
+		for (const [sessionId, ranges] of processedRanges) {
+			for (const range of ranges) {
+				outcome.completed.push({
+					source: range.source,
+					sessionId,
+					startMessageId: range.startMessageId,
+					endMessageId: range.endMessageId,
+				});
+			}
+		}
+
+		// Post-consolidation hook: PendingEpisodesReader deletes completed rows,
+		// counts failed attempts, and leaves deferred rows for the next run.
 		if (reader.afterConsolidated) {
-			await reader.afterConsolidated(candidateIds);
+			await reader.afterConsolidated(outcome);
 		}
 
 		return {
-			sessionsProcessed: candidateSessions.length,
+			// Sessions with at least one episode completed this run. This is the drain
+			// loops' progress signal: 0 means nothing was settled, so they stop rather
+			// than re-running deferred or failing work indefinitely.
+			sessionsProcessed: completedSessionIds.size,
 			segmentsProcessed: episodes.length,
 			entriesCreated: totalCreated,
 			entriesUpdated: totalUpdated,
@@ -485,7 +555,8 @@ export class ConsolidationEngine {
 	 *
 	 * Pass 1 — Extract: call the LLM to extract knowledge entries from the episodes.
 	 *   Token budget is checked here; oversized chunks are split and processed
-	 *   recursively. This pass is pure LLM I/O — no DB reads or writes.
+	 *   recursively. This pass is pure LLM I/O — no DB reads or writes. A failure
+	 *   here fails the chunk instead of throwing, so later chunks still run.
 	 *
 	 * Pass 2 — Dispatch per store: group the extracted entries by their resolved
 	 *   domain store, then for each store:
@@ -493,29 +564,29 @@ export class ConsolidationEngine {
 	 *     b. Reconsolidate all entries for that store (dedup/merge against existing).
 	 *     c. Contradiction scan within-store only (domain isolation by design).
 	 *
-	 * recordEpisode is called after both passes succeed so that a crash in Pass 2
-	 * causes the chunk to be re-processed from scratch on the next run (safe because
-	 * reconsolidate() is idempotent via embedding-similarity dedup).
+	 * Outcome (see ChunkOutcome): the chunk is "completed" only when every store
+	 * that received entries succeeded. Only then are its episodes recorded in
+	 * consolidated_episode. A failed store makes the chunk "failed"; a store whose
+	 * lock was held makes it "deferred". Neither records anything, so the pending
+	 * rows stay for the next run. Re-extraction dedups against what was already
+	 * written, because reconsolidate() is idempotent via embedding similarity.
+	 *
+	 * The outcome depends only on the stores the chunk's entries were written to,
+	 * not on each episode's own directory. An episode whose entries all landed in
+	 * another store therefore completes instead of being re-extracted forever.
 	 */
 	private async processChunk(
 		source: string,
 		chunk: ReturnType<IEpisodeReader["getNewEpisodes"]>,
-	): Promise<{
-		created: number;
-		updated: number;
-		conflictsDetected: number;
-		conflictsResolved: number;
-		touchedStores: Set<IKnowledgeStore>;
-	}> {
-		if (chunk.length === 0) {
-			return {
-				created: 0,
-				updated: 0,
-				conflictsDetected: 0,
-				conflictsResolved: 0,
-				touchedStores: new Set(),
-			};
-		}
+	): Promise<ChunkResult> {
+		const none = {
+			created: 0,
+			updated: 0,
+			conflictsDetected: 0,
+			conflictsResolved: 0,
+			touchedStores: new Set<IKnowledgeStore>(),
+		};
+		if (chunk.length === 0) return { outcome: "completed", ...none };
 
 		// ── Pass 1: Extract ──────────────────────────────────────────────────────
 		// Domain routing: use the first episode's directory as the domain hint for
@@ -531,20 +602,32 @@ export class ConsolidationEngine {
 			logger.warn(
 				`[consolidation/${source}] Skipping chunk — target store for domain "${domainResolution.domainId}" is unavailable. Episodes will be retried on next run.`,
 			);
-			return {
-				created: 0,
-				updated: 0,
-				conflictsDetected: 0,
-				conflictsResolved: 0,
-				touchedStores: new Set(),
-			};
+			return { outcome: "deferred", ...none };
 		}
 
-		const extracted = await this.extractFromChunk(
-			source,
-			chunk,
-			domainResolution,
-		);
+		// Check the lock before paying for LLM extraction: if another process holds the
+		// default store's lock, the write phase would defer this chunk anyway.
+		if (!(await this.storeLockIsFree(domainResolution?.store ?? this.db))) {
+			logger.log(
+				`[consolidation/${source}] Deferring chunk — store consolidation lock held by another process; no extraction run.`,
+			);
+			return { outcome: "deferred", ...none };
+		}
+
+		let extracted: ExtractedKnowledge[];
+		try {
+			extracted = await this.extractFromChunk(source, chunk, domainResolution);
+		} catch (err) {
+			logger.error(
+				`[consolidation/${source}] Extraction failed for a chunk of ${chunk.length} episodes — episodes kept for retry:`,
+				err,
+			);
+			return {
+				outcome: isDeterministicFailure(err) ? "failed" : "transient",
+				error: `extraction failed: ${err instanceof Error ? err.message : String(err)}`,
+				...none,
+			};
+		}
 
 		// ── Pass 2: Dispatch per store ───────────────────────────────────────────
 		// Group extracted entries by their resolved target store. Each entry may have
@@ -570,10 +653,7 @@ export class ConsolidationEngine {
 		// backed by the same database are serialized correctly across processes.
 		//
 		// Promise.allSettled (not Promise.all) so a failure in one store does not
-		// abort the others mid-flight. Each store's result is inspected independently:
-		// - Successful stores contribute their counts and are recorded.
-		// - Failed stores are logged; their episodes are NOT recorded as processed,
-		//   so they will be re-processed on the next consolidation run.
+		// abort the others mid-flight. Each store's result is inspected independently.
 		const settled = await Promise.allSettled(
 			[...storeGroups.entries()].map(([store, entriesForStore]) =>
 				this.consolidateExtractedToStore(
@@ -591,7 +671,9 @@ export class ConsolidationEngine {
 		let chunkConflictsDetected = 0;
 		let chunkConflictsResolved = 0;
 		const touchedStores = new Set<IKnowledgeStore>();
-		const succeededStores = new Set<IKnowledgeStore>();
+		let deferred = false;
+		let failure: string | undefined;
+		let transientFailure: string | undefined;
 
 		for (const result of settled) {
 			if (result.status === "fulfilled") {
@@ -601,41 +683,37 @@ export class ConsolidationEngine {
 				chunkConflictsDetected += counts.conflictsDetected;
 				chunkConflictsResolved += counts.conflictsResolved;
 				if (counts.created > 0 || counts.updated > 0) touchedStores.add(store);
-				succeededStores.add(store);
+			} else if (result.reason instanceof StoreLockHeldError) {
+				deferred = true;
 			} else {
+				const reason =
+					result.reason instanceof Error
+						? result.reason.message
+						: String(result.reason);
+				if (isDeterministicFailure(result.reason)) {
+					failure ??= `store write failed: ${reason}`;
+				} else {
+					transientFailure ??= `store write failed (transient): ${reason}`;
+				}
 				logger.error(
-					`[consolidation/${source}] Store consolidation failed — episodes for that store will be retried on next run:`,
+					`[consolidation/${source}] Store consolidation failed — episodes kept for retry:`,
 					result.reason,
 				);
 			}
 		}
 
-		// Record each episode as processed only if its target store succeeded.
-		// Episodes whose store failed are left in pending_episodes for retry.
-		// This prevents successful stores from being re-processed on the next run
-		// just because a sibling store failed.
-		//
-		// When extraction produced no entries (empty storeGroups), all episodes
-		// are recorded unconditionally — there were no store writes to fail.
-		//
-		// An episode's store is determined by its directory (same logic as groupByDomain).
-		// LLM-rerouted entries (where individual entries went to a different store than
-		// the episode's default) are a known limitation: if entry-store != episode-store,
-		// the episode may be recorded while some of its entries land in a failed store.
-		// This is acceptable — reconsolidate() is idempotent, so re-extraction on retry
-		// deduplicates against what was already written.
-		//
-		// succeededStores uses reference equality on IKnowledgeStore object instances.
-		// This is safe because resolveEpisodeStore() and groupExtractedByStore() both
-		// look up stores from the same Map<string, IKnowledgeStore> in DomainRouter,
-		// guaranteeing the same object instance is returned for the same store ID.
-		const extractionProducedNoEntries = storeGroups.size === 0;
-		const entriesPerEp = Math.round(
-			(chunkCreated + chunkUpdated) / Math.max(chunk.length, 1),
-		);
-		for (const ep of chunk) {
-			const epStore = this.resolveEpisodeStore(ep.directory);
-			if (extractionProducedNoEntries || succeededStores.has(epStore)) {
+		let outcome: ChunkOutcome = "completed";
+		if (failure !== undefined) outcome = "failed";
+		else if (transientFailure !== undefined) outcome = "transient";
+		else if (deferred) outcome = "deferred";
+
+		if (outcome === "completed") {
+			// Only reached when every store that received entries succeeded, or when
+			// extraction produced no entries at all (nothing to fail).
+			const entriesPerEp = Math.round(
+				(chunkCreated + chunkUpdated) / Math.max(chunk.length, 1),
+			);
+			for (const ep of chunk) {
 				await this.serverStateDb.recordEpisode(
 					ep.source,
 					ep.sessionId,
@@ -648,12 +726,26 @@ export class ConsolidationEngine {
 		}
 
 		return {
+			outcome,
+			error: failure,
 			created: chunkCreated,
 			updated: chunkUpdated,
 			conflictsDetected: chunkConflictsDetected,
 			conflictsResolved: chunkConflictsResolved,
 			touchedStores,
 		};
+	}
+
+	/** Whether the store's consolidation lock is free right now (checked, not held). */
+	private async storeLockIsFree(store: IKnowledgeStore): Promise<boolean> {
+		if (!(await store.tryAcquireConsolidationLock())) return false;
+		await store.releaseConsolidationLock();
+		return true;
+	}
+
+	/** True when the episode's target store is unavailable; its rows wait for a later run. */
+	private isStoreUnavailable(directory: string): boolean {
+		return this.domainRouter?.resolve(directory).storeUnavailable ?? false;
 	}
 
 	/**
@@ -708,25 +800,6 @@ export class ConsolidationEngine {
 			`[consolidation/${source}] Extracted ${extracted.length} entries in ${((Date.now() - extractStart) / 1000).toFixed(1)}s.`,
 		);
 		return extracted;
-	}
-
-	/**
-	 * Resolve the target store for a single episode based on its directory.
-	 * Uses the same domain-routing logic as groupExtractedByStore so that
-	 * resolveEpisodeStore(ep.directory) and the store used for that episode's
-	 * entries always return the same IKnowledgeStore instance.
-	 */
-	private resolveEpisodeStore(directory: string): IKnowledgeStore {
-		if (!this.domainRouter) return this.db;
-		const resolution = this.domainRouter.resolve(directory);
-		const store = this.domainRouter.resolveStore(resolution.domainId ?? "");
-		if (!store) {
-			logger.warn(
-				`[consolidation] resolveEpisodeStore: no store for domain "${resolution.domainId}" (directory: "${directory}") — falling back to primary store. Check domain routing config.`,
-			);
-			return this.db;
-		}
-		return store;
 	}
 
 	/**
@@ -811,9 +884,11 @@ export class ConsolidationEngine {
 			logger.log(
 				`[consolidation/${source}] Skipping store — consolidation lock held by another process. Episodes will be retried.`,
 			);
-			// Throw so Promise.allSettled marks this store as rejected and its
-			// episodes are NOT recorded as processed, leaving them for retry.
-			throw new Error("consolidation lock held by another process");
+			// Typed so processChunk defers this store (retry later, no attempt
+			// counted) instead of treating it as a failed write.
+			throw new StoreLockHeldError(
+				"consolidation lock held by another process",
+			);
 		}
 
 		try {

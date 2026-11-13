@@ -4,6 +4,44 @@ import { bufferToFloats, floatsToVectorLiteral } from "./embedding-codec.js";
 // biome-ignore lint: TS limitation with Omit stripping call signatures from postgres Sql
 type TxSql = any;
 
+/** halfvec HNSW supports up to 4000 dimensions. */
+const HALFVEC_HNSW_MAX_DIMS = 4000;
+
+/**
+ * Run the pgvector part of a migration under a SAVEPOINT.
+ *
+ * Postgres aborts the whole transaction on the first failed statement (SQLSTATE
+ * 25P02). Catching the error in JS does not help: the schema_version stamp that
+ * follows would fail too, the migration would roll back, and the store could never
+ * start (no pgvector installed, a privilege error, or an index build that runs out
+ * of memory). Under a savepoint only the vector work is rolled back. The version is
+ * still stamped, and ensureVectorColumn() at startup, which runs outside any
+ * transaction and degrades on its own, retries the vector setup on later starts.
+ */
+async function bestEffortVectorStep(
+	outer: TxSql,
+	version: number,
+	step: (sql: TxSql) => Promise<void>,
+): Promise<void> {
+	try {
+		await outer.savepoint(step);
+	} catch (err) {
+		logger.warn(
+			`[pg-db] Migration v${version}: pgvector setup skipped — vector search stays off for this store until ensureVectorColumn() succeeds on a later startup. Error: ${err instanceof Error ? err.message : String(err)}`,
+		);
+	}
+}
+
+/** Create the halfvec HNSW index. Errors propagate to the caller's savepoint. */
+async function createHalfvecIndex(sql: TxSql, dims: number): Promise<void> {
+	await sql.unsafe(`
+		CREATE INDEX IF NOT EXISTS idx_entry_embedding_halfvec_hnsw
+		ON knowledge_entry
+		USING hnsw ((embedding_vec::halfvec(${dims})) halfvec_cosine_ops)
+		WITH (m = 16, ef_construction = 64)
+	`);
+}
+
 /**
  * Incremental PostgreSQL migration registry.
  *
@@ -314,47 +352,41 @@ export const PG_MIGRATIONS: Array<{
 	{
 		version: 16,
 		label: "pgvector: add embedding_vec column and ANN index",
-		up: async (sql: TxSql) => {
-			// NOTE: CREATE EXTENSION cannot run inside a transaction block on
-			// Postgres ≤ 14 and some managed providers (RDS, etc.).  Extension
-			// installation is handled by PostgresKnowledgeDB.ensureVectorColumn()
-			// which runs outside any transaction at startup.  The migration only
-			// sets up the column and index — it assumes the extension is already
-			// present or will be installed by ensureVectorColumn() after migrations.
+		up: (outer: TxSql) =>
+			bestEffortVectorStep(outer, 16, async (sql: TxSql) => {
+				// Install pgvector before anything references its type. CREATE EXTENSION
+				// runs inside the savepoint; if the server cannot provide the extension,
+				// the savepoint rolls back and ensureVectorColumn() degrades at startup.
+				await sql`CREATE EXTENSION IF NOT EXISTS vector`;
 
-			// ── 1. Add embedding_vec column if absent ─────────────────────────────
-			// We keep the existing BYTEA `embedding` column as the authoritative
-			// source of truth (SQLite compatibility, crash-recovery, re-embed path).
-			// `embedding_vec` is a derived, Postgres-only column used exclusively for
-			// ANN index search.  Its dimension is read from embedding_metadata so we
-			// don't hard-code it; if no metadata exists yet we defer column creation
-			// to the setEmbeddingMetadata() path (see PostgresKnowledgeDB).
-			const vecColExists = await sql`
-				SELECT 1 FROM information_schema.columns
-				WHERE table_schema = current_schema()
-				  AND table_name   = 'knowledge_entry'
-				  AND column_name  = 'embedding_vec'
-			`;
-
-			if (vecColExists.length === 0) {
-				// Read the dimension from the singleton metadata row.
+				// The BYTEA `embedding` column stays the source of truth (SQLite
+				// compatibility, crash-recovery, re-embed path). `embedding_vec` is a
+				// derived, Postgres-only column used for ANN index search. Its dimension
+				// comes from embedding_metadata. Without that row the column is created
+				// later by setEmbeddingMetadata() → ensureVectorColumn().
 				const meta = await sql`
 					SELECT dimensions FROM embedding_metadata WHERE id = 1
 				`;
+				if (meta.length === 0) return;
+				const dims = Number(meta[0].dimensions);
 
-				if (meta.length > 0) {
-					const dims = Number(meta[0].dimensions);
+				const vecColExists = await sql`
+					SELECT 1 FROM information_schema.columns
+					WHERE table_schema = current_schema()
+					  AND table_name   = 'knowledge_entry'
+					  AND column_name  = 'embedding_vec'
+				`;
+				if (vecColExists.length === 0) {
 					// ALTER TABLE with a dynamic dimension: use sql.unsafe so we can
-					// interpolate `dims` into the DDL string.  The value comes from our
+					// interpolate `dims` into the DDL string. The value comes from our
 					// own DB row (not user input) so this is safe.
 					await sql.unsafe(
 						`ALTER TABLE knowledge_entry ADD COLUMN embedding_vec vector(${dims})`,
 					);
 
-					// ── 3. Backfill embedding_vec from existing BYTEA embeddings ──────
-					// ::bit(32)::float4 is not a valid cast in standard Postgres 16, so
-					// we fetch BYTEA rows and convert in JS, then write back in a single
-					// batched UNNEST UPDATE (one round-trip regardless of row count).
+					// Backfill embedding_vec from existing BYTEA embeddings. ::bit(32)::float4
+					// is not a valid cast in standard Postgres 16, so we fetch BYTEA rows and
+					// convert in JS, then write back in a single batched UNNEST UPDATE.
 					const toBackfill = await sql<
 						{ id: string; embedding: Buffer }[]
 					>`SELECT id, embedding FROM knowledge_entry WHERE embedding IS NOT NULL`;
@@ -376,172 +408,122 @@ export const PG_MIGRATIONS: Array<{
 							`[pg-db] Migration v16: backfilled embedding_vec for ${toBackfill.length} rows.`,
 						);
 					}
+				}
 
-					// ── 4. Create ANN index (best-effort) ────────────────────────────
-					// Use halfvec HNSW + exact rerank path to support large embeddings.
-					// HNSW supports halfvec up to 4000 dimensions.
-					if (dims <= 4000) {
-						try {
-							await sql.unsafe(`
-								CREATE INDEX IF NOT EXISTS idx_entry_embedding_halfvec_hnsw
-								ON knowledge_entry
-								USING hnsw ((embedding_vec::halfvec(${dims})) halfvec_cosine_ops)
-								WITH (m = 16, ef_construction = 64)
-							`);
-						} catch (err) {
-							logger.warn(
-								`[pg-db] Migration v16: ANN index creation skipped. ANN search disabled for this store. Error: ${err instanceof Error ? err.message : String(err)}`,
-							);
-						}
-					} else {
-						logger.warn(
-							`[pg-db] Migration v16: embedding dimension ${dims} exceeds halfvec HNSW limit (4000). ANN index skipped for this store.`,
-						);
-					}
+				// ANN index: halfvec HNSW + exact rerank, which supports large embeddings.
+				if (dims <= HALFVEC_HNSW_MAX_DIMS) {
+					await createHalfvecIndex(sql, dims);
+				} else {
+					logger.warn(
+						`[pg-db] Migration v16: embedding dimension ${dims} exceeds halfvec HNSW limit (${HALFVEC_HNSW_MAX_DIMS}). ANN index skipped for this store.`,
+					);
 				}
-				// If no embedding_metadata exists yet the column and index are created
-				// lazily by ensureVectorColumn() called from setEmbeddingMetadata().
-			} else {
-				// Column already exists — ensure ANN index exists when dimensions are known.
-				const meta = await sql`
-					SELECT dimensions FROM embedding_metadata WHERE id = 1
-				`;
-				if (meta.length > 0) {
-					const dims = Number(meta[0].dimensions);
-					if (dims <= 4000) {
-						try {
-							await sql.unsafe(`
-								CREATE INDEX IF NOT EXISTS idx_entry_embedding_halfvec_hnsw
-								ON knowledge_entry
-								USING hnsw ((embedding_vec::halfvec(${dims})) halfvec_cosine_ops)
-								WITH (m = 16, ef_construction = 64)
-							`);
-						} catch (err) {
-							logger.warn(
-								`[pg-db] Migration v16: existing embedding_vec found, but ANN index creation skipped. ANN search disabled for this store. Error: ${err instanceof Error ? err.message : String(err)}`,
-							);
-						}
-					} else {
-						logger.warn(
-							`[pg-db] Migration v16: embedding dimension ${dims} exceeds halfvec HNSW limit (4000). ANN index skipped for this store.`,
-						);
-					}
-				}
-			}
-		},
+			}),
 	},
 	{
 		version: 17,
 		label: "pgvector: repair embedding_vec backfill + halfvec ANN index",
-		up: async (sql: TxSql) => {
-			const meta = await sql`
-				SELECT dimensions FROM embedding_metadata WHERE id = 1
-			`;
-			if (meta.length === 0) {
-				// No embedding model configured yet; column/index are created lazily when
-				// setEmbeddingMetadata() runs.
-				return;
-			}
+		up: (outer: TxSql) =>
+			bestEffortVectorStep(outer, 17, async (sql: TxSql) => {
+				await sql`CREATE EXTENSION IF NOT EXISTS vector`;
 
-			const dims = Number(meta[0].dimensions);
-
-			// Ensure embedding_vec exists with the correct dimensions.
-			const vecColExists = await sql`
-				SELECT 1 FROM information_schema.columns
-				WHERE table_schema = current_schema()
-				  AND table_name   = 'knowledge_entry'
-				  AND column_name  = 'embedding_vec'
-			`;
-
-			if (vecColExists.length === 0) {
-				await sql.unsafe(
-					`ALTER TABLE knowledge_entry ADD COLUMN embedding_vec vector(${dims})`,
-				);
-			} else {
-				const dimRows = await sql`
-					SELECT format_type(atttypid, atttypmod) AS declared_type
-					FROM pg_attribute
-					WHERE attrelid = 'knowledge_entry'::regclass
-					  AND attname  = 'embedding_vec'
-					  AND attnum   > 0
+				const meta = await sql`
+					SELECT dimensions FROM embedding_metadata WHERE id = 1
 				`;
-				if (dimRows.length > 0) {
-					const declared = String(
-						(dimRows[0] as { declared_type: string }).declared_type,
+				if (meta.length === 0) {
+					// No embedding model configured yet; column/index are created lazily when
+					// setEmbeddingMetadata() runs.
+					return;
+				}
+
+				const dims = Number(meta[0].dimensions);
+
+				// Ensure embedding_vec exists with the correct dimensions.
+				const vecColExists = await sql`
+					SELECT 1 FROM information_schema.columns
+					WHERE table_schema = current_schema()
+					  AND table_name   = 'knowledge_entry'
+					  AND column_name  = 'embedding_vec'
+				`;
+
+				if (vecColExists.length === 0) {
+					await sql.unsafe(
+						`ALTER TABLE knowledge_entry ADD COLUMN embedding_vec vector(${dims})`,
 					);
-					const m = declared.match(/\((\d+)\)/);
-					const storedDim = m ? Number(m[1]) : -1;
-					if (storedDim !== -1 && storedDim !== dims) {
-						await sql`DROP INDEX IF EXISTS idx_entry_embedding_vec_hnsw`;
-						await sql`DROP INDEX IF EXISTS idx_entry_embedding_halfvec_hnsw`;
-						await sql`ALTER TABLE knowledge_entry DROP COLUMN embedding_vec`;
-						await sql.unsafe(
-							`ALTER TABLE knowledge_entry ADD COLUMN embedding_vec vector(${dims})`,
+				} else {
+					const dimRows = await sql`
+						SELECT format_type(atttypid, atttypmod) AS declared_type
+						FROM pg_attribute
+						WHERE attrelid = 'knowledge_entry'::regclass
+						  AND attname  = 'embedding_vec'
+						  AND attnum   > 0
+					`;
+					if (dimRows.length > 0) {
+						const declared = String(
+							(dimRows[0] as { declared_type: string }).declared_type,
 						);
+						const m = declared.match(/\((\d+)\)/);
+						const storedDim = m ? Number(m[1]) : -1;
+						if (storedDim !== -1 && storedDim !== dims) {
+							await sql`DROP INDEX IF EXISTS idx_entry_embedding_vec_hnsw`;
+							await sql`DROP INDEX IF EXISTS idx_entry_embedding_halfvec_hnsw`;
+							await sql`ALTER TABLE knowledge_entry DROP COLUMN embedding_vec`;
+							await sql.unsafe(
+								`ALTER TABLE knowledge_entry ADD COLUMN embedding_vec vector(${dims})`,
+							);
+						}
 					}
 				}
-			}
 
-			// Repair backfill for rows that have BYTEA embedding but missing embedding_vec.
-			const toBackfill = await sql<{ id: string; embedding: Buffer }[]>`
-				SELECT id, embedding
-				FROM knowledge_entry
-				WHERE embedding IS NOT NULL
-				  AND embedding_vec IS NULL
-			`;
-
-			if (toBackfill.length > 0) {
-				const ids: string[] = [];
-				const vecs: string[] = [];
-				for (const row of toBackfill) {
-					ids.push(row.id);
-					vecs.push(floatsToVectorLiteral(bufferToFloats(row.embedding)));
-				}
-				await sql.unsafe(
-					"UPDATE knowledge_entry SET embedding_vec = v.vec::vector " +
-						"FROM (SELECT UNNEST($1::text[]) AS id, UNNEST($2::text[]) AS vec) v " +
-						"WHERE knowledge_entry.id = v.id",
-					[ids, vecs],
-				);
-				logger.log(
-					`[pg-db] Migration v17: backfilled embedding_vec for ${toBackfill.length} rows.`,
-				);
-			}
-
-			// Replace legacy vector HNSW index with halfvec ANN index when supported.
-			await sql`DROP INDEX IF EXISTS idx_entry_embedding_vec_hnsw`;
-			if (dims <= 4000) {
-				// Skip CREATE INDEX if the halfvec HNSW index is already present.
-				// CREATE INDEX IF NOT EXISTS still requires table ownership and
-				// fails with "must be owner of table" on managed Postgres where
-				// the schema was bootstrapped by a separate admin user. When the
-				// index exists from a prior run, treat that as success.
-				const hnswExists = await sql`
-					SELECT 1 FROM pg_class c
-					JOIN pg_namespace n ON n.oid = c.relnamespace
-					WHERE c.relkind = 'i'
-					  AND n.nspname = current_schema()
-					  AND c.relname = 'idx_entry_embedding_halfvec_hnsw'
+				// Repair backfill for rows that have BYTEA embedding but missing embedding_vec.
+				const toBackfill = await sql<{ id: string; embedding: Buffer }[]>`
+					SELECT id, embedding
+					FROM knowledge_entry
+					WHERE embedding IS NOT NULL
+					  AND embedding_vec IS NULL
 				`;
-				if (hnswExists.length === 0) {
-					try {
-						await sql.unsafe(`
-							CREATE INDEX IF NOT EXISTS idx_entry_embedding_halfvec_hnsw
-							ON knowledge_entry
-							USING hnsw ((embedding_vec::halfvec(${dims})) halfvec_cosine_ops)
-							WITH (m = 16, ef_construction = 64)
-						`);
-					} catch (err) {
-						logger.warn(
-							`[pg-db] Migration v17: ANN index creation skipped. ANN search disabled for this store. Error: ${err instanceof Error ? err.message : String(err)}`,
-						);
+
+				if (toBackfill.length > 0) {
+					const ids: string[] = [];
+					const vecs: string[] = [];
+					for (const row of toBackfill) {
+						ids.push(row.id);
+						vecs.push(floatsToVectorLiteral(bufferToFloats(row.embedding)));
 					}
+					await sql.unsafe(
+						"UPDATE knowledge_entry SET embedding_vec = v.vec::vector " +
+							"FROM (SELECT UNNEST($1::text[]) AS id, UNNEST($2::text[]) AS vec) v " +
+							"WHERE knowledge_entry.id = v.id",
+						[ids, vecs],
+					);
+					logger.log(
+						`[pg-db] Migration v17: backfilled embedding_vec for ${toBackfill.length} rows.`,
+					);
 				}
-			} else {
-				logger.warn(
-					`[pg-db] Migration v17: embedding dimension ${dims} exceeds halfvec HNSW limit (4000). ANN index skipped for this store.`,
-				);
-			}
-		},
+
+				// Replace legacy vector HNSW index with halfvec ANN index when supported.
+				await sql`DROP INDEX IF EXISTS idx_entry_embedding_vec_hnsw`;
+				if (dims <= HALFVEC_HNSW_MAX_DIMS) {
+					// Skip CREATE INDEX if the halfvec HNSW index is already present.
+					// CREATE INDEX IF NOT EXISTS still requires table ownership and fails
+					// with "must be owner of table" on managed Postgres where the schema was
+					// bootstrapped by a separate admin user. When the index exists from a
+					// prior run, treat that as success.
+					const hnswExists = await sql`
+						SELECT 1 FROM pg_class c
+						JOIN pg_namespace n ON n.oid = c.relnamespace
+						WHERE c.relkind = 'i'
+						  AND n.nspname = current_schema()
+						  AND c.relname = 'idx_entry_embedding_halfvec_hnsw'
+					`;
+					if (hnswExists.length === 0) {
+						await createHalfvecIndex(sql, dims);
+					}
+				} else {
+					logger.warn(
+						`[pg-db] Migration v17: embedding dimension ${dims} exceeds halfvec HNSW limit (${HALFVEC_HNSW_MAX_DIMS}). ANN index skipped for this store.`,
+					);
+				}
+			}),
 	},
 ];

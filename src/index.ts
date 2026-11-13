@@ -23,6 +23,7 @@ import { runStop } from "./commands/stop.js";
 import { downloadAndInstallDaemon, runUpdate } from "./commands/update.js";
 import { config, validateConfig } from "./config.js";
 import { ConsolidationEngine } from "./consolidation/consolidate.js";
+import { runPollTick } from "./consolidation/poll.js";
 import { PendingEpisodesReader } from "./consolidation/readers/pending.js";
 import { StoreRegistry } from "./db/store-registry.js";
 import { logger } from "./logger.js";
@@ -37,6 +38,23 @@ import { errCode } from "./utils.js";
 // So argv[2] is always the subcommand regardless of how the binary is invoked.
 const subcommand = process.argv[2];
 const subcommandArgs = process.argv.slice(3);
+
+/**
+ * Release resources on a fatal exit: kill the auto-spawned daemon child and
+ * remove this process's PID file. Set by main() once the PID file is written.
+ */
+let releaseOnFatal: (() => void) | null = null;
+
+/** Remove the PID file only if it still names this process (guards a racing second instance). */
+function removeOwnPidFile(pidPath: string | undefined): void {
+	if (!pidPath || !existsSync(pidPath)) return;
+	try {
+		const stored = Number.parseInt(readFileSync(pidPath, "utf8").trim(), 10);
+		if (stored === process.pid) unlinkSync(pidPath);
+	} catch {
+		// Non-fatal — process is exiting anyway.
+	}
+}
 
 /**
  * Knowledge Server — main entry point.
@@ -98,7 +116,9 @@ async function main() {
 			for (const err of errors) console.error(`  ✗ ${err}`);
 			process.exit(1);
 		}
-		await runConsolidate();
+		await runConsolidate({
+			retryDead: subcommandArgs.includes("--retry-dead"),
+		});
 		process.exit(0);
 	}
 
@@ -176,7 +196,7 @@ Commands:
   (no command)              Start the HTTP server
   stop                      Stop the running HTTP server
   status                    Show server state and knowledge graph stats
-  consolidate               Run a manual consolidation cycle
+  consolidate [--retry-dead] Run a manual consolidation cycle (--retry-dead requeues dead-lettered episodes)
   process-inbox [dir]       Upload local files and run full pipeline (upload → consolidate → synthesize)
   claude-auth               Authenticate with a Claude Pro/Max subscription (optional)
   activate <query>          Test knowledge activation for a query
@@ -397,12 +417,18 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		process.exit(1);
 	}
 
+	let daemonChild: ReturnType<typeof Bun.spawn> | null = null;
+
 	if (config.pidPath) {
 		writeFileSync(config.pidPath, String(process.pid), {
 			encoding: "utf8",
 			mode: 0o600,
 		});
 	}
+	releaseOnFatal = () => {
+		daemonChild?.kill();
+		removeOwnPidFile(config.pidPath);
+	};
 
 	logger.raw(`\n✓ HTTP API listening on http://${host}:${port}`);
 	logger.raw("  GET  /activate?q=...                  — Activate knowledge");
@@ -455,7 +481,6 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	//
 	// The daemon child inherits the server's environment so it picks up the
 	// same KNOWLEDGE_* env vars. Its stdout/stderr are forwarded to the server log.
-	let daemonChild: ReturnType<typeof Bun.spawn> | null = null;
 
 	if (daemonAutoSpawn) {
 		// Resolve the daemon command to spawn.
@@ -586,6 +611,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	 * Caller is responsible for acquiring/releasing the lock.
 	 */
 	async function runConsolidationDrain(label: string): Promise<void> {
+		const attempted = new Set<string>();
 		let batch = 1;
 		let consecutiveErrors = 0;
 		const MAX_CONSECUTIVE_ERRORS = 3;
@@ -601,7 +627,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 				logger.log(`[${label}] Batch ${batch}...`);
 				let result: Awaited<ReturnType<typeof consolidation.consolidate>>;
 				try {
-					result = await consolidation.consolidate();
+					result = await consolidation.consolidate({ attempted });
 				} finally {
 					consolidation.unlock();
 				}
@@ -693,13 +719,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 				while (!shutdownRequested) {
 					await interruptibleSleep(pollIntervalMs);
 					if (shutdownRequested) break;
-					const { pendingSessions } = await consolidation.checkPending();
-					if (pendingSessions > 0) {
-						logger.log(
-							`[poll] ${pendingSessions} pending sessions — starting consolidation.`,
-						);
-						await runConsolidationDrain("poll");
-					}
+					await runPollTick(consolidation, runConsolidationDrain);
 				}
 			})(),
 		);
@@ -749,19 +769,7 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		}
 		consolidation.close();
 		await registry.close();
-		// Clean up PID file on graceful shutdown — only if it still points to us.
-		// Guards against a race where a second instance already overwrote the file.
-		if (config.pidPath && existsSync(config.pidPath)) {
-			try {
-				const stored = Number.parseInt(
-					readFileSync(config.pidPath, "utf8").trim(),
-					10,
-				);
-				if (stored === process.pid) unlinkSync(config.pidPath);
-			} catch {
-				// Non-fatal — process is exiting anyway.
-			}
-		}
+		removeOwnPidFile(config.pidPath);
 		process.exit(0);
 	}
 
@@ -779,5 +787,14 @@ Run \`knowledge-server help-advanced\` for additional commands.
 
 main().catch((e) => {
 	logger.error("Fatal error:", e);
+	releaseOnFatal?.();
+	process.exit(1);
+});
+
+// Any rejection that escapes its caller would otherwise end the process without
+// cleanup (Bun exits 1 with no PID or daemon teardown). Log it and release first.
+process.on("unhandledRejection", (reason) => {
+	logger.error("[fatal] Unhandled promise rejection:", reason);
+	releaseOnFatal?.();
 	process.exit(1);
 });

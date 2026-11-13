@@ -15,7 +15,9 @@ import {
  * Runs a full consolidation drain: repeatedly processes batches of pending
  * sessions until none remain. Prints live progress to stdout.
  */
-export async function runConsolidate(): Promise<void> {
+export async function runConsolidate(
+	options: { retryDead?: boolean } = {},
+): Promise<void> {
 	// Log to both stdout and the server log file so all consolidation activity
 	// (whether triggered via HTTP, polling, or CLI) appears in one place.
 	const { config } = await import("../config.js");
@@ -38,6 +40,10 @@ export async function runConsolidate(): Promise<void> {
 	);
 
 	try {
+		if (options.retryDead) {
+			const requeued = await serverStateDb.retryDeadLetteredEpisodes();
+			console.log(`Re-queued ${requeued} dead-lettered episode(s).`);
+		}
 		// Check for embedding model change before consolidating — ensures all
 		// vectors are consistent when reconsolidation compares new extractions
 		// against existing entries.

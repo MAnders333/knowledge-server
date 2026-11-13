@@ -17,7 +17,16 @@
  *   the staging tables are copied from knowledge.db to state.db automatically.
  */
 
-export const SERVER_LOCAL_SCHEMA_VERSION = 1;
+import { latestVersion } from "../migration-registry.js";
+
+export const SERVER_LOCAL_MIGRATIONS = [
+	{ version: 1, label: "baseline state schema" },
+	{ version: 2, label: "pending_episode_attempts table" },
+] as const;
+
+export const SERVER_LOCAL_SCHEMA_VERSION = latestVersion(
+	SERVER_LOCAL_MIGRATIONS,
+);
 
 // Schema is always additive (CREATE TABLE IF NOT EXISTS), so column-manifest
 // drift detection is not used for state.db. See KnowledgeDB (knowledge.db)
@@ -39,7 +48,8 @@ export const SERVER_LOCAL_CREATE_TABLES = `
 
   -- Pending episodes — staging table written by the daemon, drained by the server.
   -- user_id is set by the daemon from KNOWLEDGE_USER_ID / hostname (provenance only).
-  -- Rows are deleted after successful consolidation.
+  -- Rows are deleted after successful consolidation. Failure counts live in
+  -- pending_episode_attempts.
   CREATE TABLE IF NOT EXISTS pending_episodes (
     id               TEXT    PRIMARY KEY,
     user_id          TEXT    NOT NULL DEFAULT 'default',
@@ -57,6 +67,16 @@ export const SERVER_LOCAL_CREATE_TABLES = `
     approx_tokens    INTEGER NOT NULL DEFAULT 0,
     uploaded_at      INTEGER NOT NULL
   );
+
+  -- Failed-attempt bookkeeping, kept apart from pending_episodes. A separate table
+  -- means a schema upgrade never needs ALTER TABLE on pending_episodes, which a
+  -- non-owner role cannot run on a shared Postgres state DB.
+  CREATE TABLE IF NOT EXISTS pending_episode_attempts (
+    id              TEXT    PRIMARY KEY,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT
+  );
+
 
   CREATE INDEX IF NOT EXISTS idx_pending_source_time
     ON pending_episodes(source, max_message_time);

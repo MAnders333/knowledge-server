@@ -142,6 +142,11 @@ export interface PendingEpisode extends Episode {
 	source: string;
 	/** Unix ms timestamp when the daemon uploaded this row. */
 	uploadedAt: number;
+	/**
+	 * Consolidation attempts that failed for this row. Populated by
+	 * getPendingEpisodes(); absent when the row is being inserted by the daemon.
+	 */
+	failedAttempts?: number;
 }
 
 /**
@@ -164,6 +169,30 @@ export interface ProcessedRange {
 	source: string;
 	startMessageId: string;
 	endMessageId: string;
+}
+
+/** Identifies one episode by its consolidation key (source, session, message range). */
+export interface EpisodeKey {
+	source: string;
+	sessionId: string;
+	startMessageId: string;
+	endMessageId: string;
+}
+
+/**
+ * Per-batch outcome handed to IEpisodeReader.afterConsolidated().
+ *
+ * - completed: episodes that are fully handled (recorded as consolidated, or
+ *   already processed in an earlier run). Their pending rows are deleted.
+ * - failed: episodes whose extraction or store write failed. Their pending rows
+ *   are kept and the failed-attempt count is incremented.
+ *
+ * Episodes in neither list (store lock held by another process, store
+ * unavailable) are deferred: nothing is written and nothing is counted.
+ */
+export interface EpisodeOutcome {
+	completed: EpisodeKey[];
+	failed: Array<{ episode: EpisodeKey; error: string }>;
 }
 
 /**
@@ -210,13 +239,19 @@ export interface IEpisodeReader {
 	 * (e.g. PendingEpisodesReader fetches from the pending_episodes table).
 	 * Not called for readers that don't implement it (backwards-compatible).
 	 */
-	prepare?(afterMessageTimeCreated: number): Promise<void>;
+	prepare?(
+		afterMessageTimeCreated: number,
+		isBlocked?: (episode: EpisodeKey & { directory: string }) => boolean,
+	): Promise<void>;
 
 	/**
-	 * Optional post-consolidation hook called after episodes are recorded.
-	 * Used by PendingEpisodesReader to delete consolidated rows from pending_episodes.
+	 * Optional post-consolidation hook called once per consolidation batch.
+	 * Used by PendingEpisodesReader to delete rows whose episodes were fully
+	 * handled and to count failed attempts on rows that were not.
+	 * Rows that are neither completed nor failed (lock held, store unavailable)
+	 * are left untouched for retry.
 	 */
-	afterConsolidated?(sessionIds: string[]): Promise<void>;
+	afterConsolidated?(outcome: EpisodeOutcome): Promise<void>;
 
 	/** Release any held resources (DB connections, file handles, etc.). */
 	close(): void;
@@ -288,4 +323,14 @@ export interface ConsolidationResult {
 	conflictsDetected: number;
 	conflictsResolved: number;
 	duration: number; // ms
+}
+
+/** Stable identity of an episode, matching the consolidation key. */
+export function episodeKeyId(key: EpisodeKey): string {
+	return JSON.stringify([
+		key.source,
+		key.sessionId,
+		key.startMessageId,
+		key.endMessageId,
+	]);
 }

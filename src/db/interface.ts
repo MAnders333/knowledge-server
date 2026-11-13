@@ -8,6 +8,14 @@ import type {
 } from "../types.js";
 
 /**
+ * Number of failed consolidation attempts after which a pending episode is
+ * dead-lettered: its row is kept for inspection but excluded from
+ * getPendingEpisodes() and countPendingSessions(), so it cannot stall newer
+ * sessions. Dead-lettered rows are removed only by reinitialize.
+ */
+export const PENDING_EPISODE_MAX_ATTEMPTS = 5;
+
+/**
  * Server state database interface — staging and bookkeeping tables.
  *
  * Can be backed by local SQLite (state.db, default) or remote Postgres.
@@ -39,6 +47,7 @@ export interface IServerStateDB {
 	/**
 	 * Fetch pending episodes from all sources and users, ordered by max_message_time ASC.
 	 * Drains everything in the staging table — source and user_id are provenance only.
+	 * Rows dead-lettered (failed_attempts >= PENDING_EPISODE_MAX_ATTEMPTS) are excluded.
 	 */
 	getPendingEpisodes(
 		afterMaxMessageTime: number,
@@ -53,8 +62,23 @@ export interface IServerStateDB {
 	/**
 	 * Count distinct pending session IDs without loading episode content.
 	 * Efficient O(1)-memory alternative to fetching all rows for counting.
+	 * Dead-lettered rows are excluded.
 	 */
 	countPendingSessions(): Promise<number>;
+
+	/**
+	 * Record a failed consolidation attempt for the given pending rows: increments
+	 * failed_attempts and stores the error message. Rows are kept for retry.
+	 */
+	recordPendingEpisodeFailures(ids: string[], error: string): Promise<void>;
+	/** Number of pending episodes that reached PENDING_EPISODE_MAX_ATTEMPTS. */
+	countDeadLetteredEpisodes(): Promise<number>;
+
+	/**
+	 * Requeue dead-lettered episodes by clearing their attempt counts.
+	 * Returns the number of episodes requeued.
+	 */
+	retryDeadLetteredEpisodes(): Promise<number>;
 
 	// ── Episode Tracking (idempotency) ────────────────────────────────────────
 
@@ -96,16 +120,17 @@ export interface IServerStateDB {
 	updateConsolidationState(state: Partial<ConsolidationState>): Promise<void>;
 
 	/**
-	 * Wipe staging data: pending_episodes, consolidated_episode, and reset
-	 * consolidation_state counters.
+	 * Wipe staging data: consolidated_episode and the consolidation_state counters,
+	 * plus pending_episodes.
+	 *
+	 * When `userId` is given, only that user's pending episodes are deleted; other
+	 * users' unconsolidated episodes on a shared state DB are kept. Omit it for a
+	 * full reset of every user's pending episodes.
 	 *
 	 * daemon_cursor lives in DaemonDB (src/db/daemon/index.ts), not here.
 	 * Call DaemonDB.resetDaemonCursors() separately if re-upload is also needed.
-	 *
-	 * Use for re-consolidation with updated domain routing context. On shared
-	 * stores this is safe because session_ids are per-user by nature.
 	 */
-	reinitialize(): Promise<void>;
+	reinitialize(userId?: string): Promise<void>;
 
 	close(): Promise<void>;
 }

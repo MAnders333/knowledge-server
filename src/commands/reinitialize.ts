@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { config } from "../config.js";
 import { DaemonDB } from "../db/daemon/index.js";
 import { StoreRegistry } from "../db/store-registry.js";
+import { currentUserId } from "../user-id.js";
 import { errCode } from "../utils.js";
 
 /**
@@ -19,9 +20,10 @@ import { errCode } from "../utils.js";
  *   Use when: connecting to a new or existing store for the first time.
  *
  * --reset-state
- *   Also wipes consolidated_episode and resets consolidation_state counters.
+ *   Also wipes consolidated_episode and resets consolidation_state counters, and
+ *   deletes this user's pending episodes (user_id = resolved user). Other users'
+ *   pending episodes on a shared state DB are kept.
  *   Episodes re-upload AND re-consolidate under the current domain config.
- *   Safe for shared stores (session IDs are per-machine by nature).
  *   Use when: retroactively rerouting knowledge after adding a new domain.
  *
  * --reset-store
@@ -204,9 +206,9 @@ export async function runReinitialize(args: string[]): Promise<void> {
 			);
 
 			if (resetState) {
-				await serverStateDb.reinitialize();
+				await serverStateDb.reinitialize(currentUserId());
 				console.log(
-					"  ✓ Wiped consolidated_episode and reset consolidation state",
+					`  ✓ Deleted pending episodes for user "${currentUserId()}", wiped consolidated_episode and reset consolidation state`,
 				);
 			}
 
