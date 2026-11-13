@@ -377,3 +377,117 @@ describe("OhMyPiEpisodeReader — poison pills (ARC-07)", () => {
 		}
 	});
 });
+
+describe("OhMyPiEpisodeReader — injected context is never re-captured", () => {
+	it("skips the custom_message the extension injects and any message carrying the tag", () => {
+		// plugin/omp-knowledge.ts returns its block as a custom message, which oh-my-pi
+		// stores as a custom_message entry. Only the user and assistant text around it
+		// may be captured.
+		const sessionsDir = join(root, "agent", "sessions");
+		const projectDir = join(sessionsDir, "-test-project");
+		mkdirSync(projectDir, { recursive: true });
+		const injected = [
+			"<addrl-activated-knowledge>",
+			"## Recalled Knowledge (from prior sessions)",
+			"- [fact] (id 0f1e2d3c) Use port 4321.",
+			"</addrl-activated-knowledge>",
+		].join("\n");
+		const at = (ms: number) => new Date(T0 + ms).toISOString();
+		const lines = [
+			JSON.stringify({
+				type: "session",
+				version: 3,
+				id: SESSION_ID,
+				timestamp: "2026-09-28T09:31:42.306Z",
+				cwd: CWD,
+			}),
+			JSON.stringify({
+				type: "message",
+				id: "00000001",
+				parentId: null,
+				timestamp: at(1000),
+				message: { role: "user", content: "how does the launcher work" },
+			}),
+			JSON.stringify({
+				type: "custom_message",
+				id: "00000002",
+				parentId: "00000001",
+				timestamp: at(2000),
+				customType: "knowledge",
+				content: injected,
+				display: false,
+				attribution: "agent",
+			}),
+			JSON.stringify({
+				type: "message",
+				id: "00000003",
+				parentId: "00000002",
+				timestamp: at(3000),
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "the launcher execs the binary" }],
+				},
+			}),
+			JSON.stringify({
+				type: "message",
+				id: "00000004",
+				parentId: "00000003",
+				timestamp: at(4000),
+				message: { role: "user", content: `and the PID file\n${injected}` },
+			}),
+			JSON.stringify({
+				type: "message",
+				id: "00000005",
+				parentId: "00000004",
+				timestamp: at(5000),
+				message: {
+					role: "assistant",
+					content: [
+						{ type: "text", text: "the PID file prevents double starts" },
+					],
+				},
+			}),
+			JSON.stringify({
+				type: "message",
+				id: "00000006",
+				parentId: "00000005",
+				timestamp: at(6000),
+				message: { role: "user", content: "and the cache layer" },
+			}),
+			JSON.stringify({
+				type: "message",
+				id: "00000007",
+				parentId: "00000006",
+				timestamp: at(7000),
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "the cache is per process" }],
+				},
+			}),
+		];
+		writeFileSync(
+			join(
+				projectDir,
+				"2026-09-28T09-31-42-306Z_01a0e75b-1962-7000-b289-432b0cefbdbe.jsonl",
+			),
+			`${lines.join("\n")}\n`,
+		);
+
+		const reader = new OhMyPiEpisodeReader([sessionsDir]);
+		try {
+			const candidates = reader.getCandidateSessions(0);
+			const episodes = reader.getNewEpisodes(
+				candidates.map((c) => c.id),
+				new Map(),
+			);
+			const content = episodes.map((e) => e.content).join("\n");
+			expect(content).toContain("how does the launcher work");
+			expect(content).toContain("the launcher execs the binary");
+			expect(content).toContain("the PID file prevents double starts");
+			expect(content).not.toContain("addrl-activated-knowledge");
+			expect(content).not.toContain("Use port 4321");
+		} finally {
+			reader.close();
+		}
+	});
+});

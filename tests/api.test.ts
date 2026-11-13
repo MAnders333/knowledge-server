@@ -461,6 +461,92 @@ describe("HTTP API", () => {
 		).toBeCloseTo(0.44);
 	});
 
+	// -- POST /entries/:id/flag --
+
+	async function insertForFlag(id: string, status: "active" | "archived") {
+		await db.insertEntry({
+			id,
+			type: "fact",
+			content: `Flag target ${id}`,
+			topics: [],
+			confidence: 0.8,
+			source: "test",
+			status,
+			strength: 1.0,
+			createdAt: Date.now(),
+			updatedAt: Date.now(),
+			lastAccessedAt: Date.now(),
+			accessCount: 0,
+			observationCount: 1,
+			supersededBy: null,
+			derivedFrom: [],
+		});
+	}
+
+	function postFlag(path: string, body: unknown, authorized = true) {
+		return request(path, {
+			method: "POST",
+			headers: {
+				...(authorized ? { Authorization: `Bearer ${TEST_ADMIN_TOKEN}` } : {}),
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify(body),
+		});
+	}
+
+	it("POST /entries/:id/flag should return 401 without token", async () => {
+		const id = "c0ffee00-0000-4000-8000-000000000001";
+		await insertForFlag(id, "active");
+		const res = await postFlag(
+			`/entries/${id}/flag`,
+			{ reason: "wrong" },
+			false,
+		);
+		expect(res.status).toBe(401);
+	});
+
+	it("flags an active entry by its short id: status becomes conflicted and the row is kept", async () => {
+		const id = "c0ffee00-0000-4000-8000-000000000002";
+		await insertForFlag(id, "active");
+		const res = await postFlag("/entries/c0ffee00/flag", {
+			reason: "outdated",
+		});
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ ok: true, id, status: "conflicted" });
+		const after = await request(`/entries/${id}`);
+		expect((await after.json()).entry.status).toBe("conflicted");
+	});
+
+	it("rejects a reason outside wrong, outdated and irrelevant", async () => {
+		const id = "c0ffee00-0000-4000-8000-000000000003";
+		await insertForFlag(id, "active");
+		const res = await postFlag(`/entries/${id}/flag`, { reason: "delete-it" });
+		expect(res.status).toBe(400);
+	});
+
+	it("refuses to flag an entry that is not active", async () => {
+		const id = "c0ffee00-0000-4000-8000-000000000004";
+		await insertForFlag(id, "archived");
+		const res = await postFlag(`/entries/${id}/flag`, { reason: "wrong" });
+		expect(res.status).toBe(409);
+	});
+
+	it("returns 404 for an id that matches no entry", async () => {
+		const res = await postFlag("/entries/ffffffff/flag", { reason: "wrong" });
+		expect(res.status).toBe(404);
+	});
+
+	it("refuses a short id that matches more than one entry and changes neither", async () => {
+		await insertForFlag("deadbeef-0000-4000-8000-000000000001", "active");
+		await insertForFlag("deadbeef-0000-4000-8000-000000000002", "active");
+		const res = await postFlag("/entries/deadbeef/flag", { reason: "wrong" });
+		expect(res.status).toBe(409);
+		const first = await request(
+			"/entries/deadbeef-0000-4000-8000-000000000001",
+		);
+		expect((await first.json()).entry.status).toBe("active");
+	});
+
 	it("PATCH /entries/:id should return 400 with no valid fields", async () => {
 		await db.insertEntry({
 			id: "patch-noop",

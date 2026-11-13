@@ -98,6 +98,7 @@ jobs:
         run: |
           cp plugin/knowledge.ts dist/knowledge.ts
           cp plugin/pi-knowledge.ts dist/pi-knowledge.ts
+          cp plugin/omp-knowledge.ts dist/omp-knowledge.ts
           cp commands/consolidate.md dist/consolidate.md
           cp commands/knowledge-review.md dist/knowledge-review.md
           cp scripts/install.sh dist/install.sh
@@ -117,6 +118,7 @@ jobs:
             knowledge-daemon-${{ matrix.suffix }}
             knowledge.ts
             pi-knowledge.ts
+            omp-knowledge.ts
             consolidate.md
             knowledge-review.md
           )
@@ -155,6 +157,7 @@ jobs:
             dist/SHA256SUMS-${{ matrix.suffix }}
             dist/knowledge.ts
             dist/pi-knowledge.ts
+            dist/omp-knowledge.ts
             dist/consolidate.md
             dist/knowledge-review.md
             dist/install.sh
@@ -194,13 +197,14 @@ jobs:
             release-darwin-arm64/SHA256SUMS-darwin-arm64 \
             release-linux-x64/knowledge.ts \
             release-linux-x64/pi-knowledge.ts \
+            release-linux-x64/omp-knowledge.ts \
             release-linux-x64/consolidate.md \
             release-linux-x64/knowledge-review.md \
             release-linux-x64/install.sh
 
       - name: Verify every expected asset is present
         run: |
-          expected="knowledge-server-linux-x64 knowledge-server-linux-x64.gz knowledge-daemon-linux-x64 knowledge-daemon-linux-x64.gz SHA256SUMS-linux-x64 knowledge-server-darwin-arm64 knowledge-server-darwin-arm64.gz knowledge-daemon-darwin-arm64 knowledge-daemon-darwin-arm64.gz SHA256SUMS-darwin-arm64 knowledge.ts pi-knowledge.ts consolidate.md knowledge-review.md install.sh"
+          expected="knowledge-server-linux-x64 knowledge-server-linux-x64.gz knowledge-daemon-linux-x64 knowledge-daemon-linux-x64.gz SHA256SUMS-linux-x64 knowledge-server-darwin-arm64 knowledge-server-darwin-arm64.gz knowledge-daemon-darwin-arm64 knowledge-daemon-darwin-arm64.gz SHA256SUMS-darwin-arm64 knowledge.ts pi-knowledge.ts omp-knowledge.ts consolidate.md knowledge-review.md install.sh"
           present="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
           missing=0
           for name in $expected; do

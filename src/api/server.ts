@@ -305,6 +305,38 @@ export function createApp(
 		return inReadOnly ? "read-only" : null;
 	}
 
+	/**
+	 * Find a writable entry by full id or by the short id shown in injected lines
+	 * (a prefix of at least 8 hex characters). A prefix that matches more than one
+	 * entry yields "ambiguous" so the caller never flags the wrong one.
+	 */
+	async function findEntryByRef(
+		ref: string,
+	): Promise<
+		| { entry: KnowledgeEntry; store: IKnowledgeStore }
+		| "read-only"
+		| "ambiguous"
+		| null
+	> {
+		if (ref.length === 36 || !/^[0-9a-f-]{8,35}$/i.test(ref)) {
+			return findWritableEntry(ref);
+		}
+		const needle = ref.toLowerCase();
+		const matches: Array<{ entry: KnowledgeEntry; store: IKnowledgeStore }> =
+			[];
+		for (const store of readDbs) {
+			for (const entry of await store.getEntries({})) {
+				if (entry.id.toLowerCase().startsWith(needle)) {
+					matches.push({ entry, store });
+				}
+			}
+		}
+		if (matches.length === 0) return null;
+		if (matches.length > 1) return "ambiguous";
+		const [only] = matches;
+		return writableDbs.includes(only.store) ? only : "read-only";
+	}
+
 	// -- Helpers --
 
 	/**
@@ -854,6 +886,59 @@ export function createApp(
 			logger.error("[entries/patch] Failed to update entry:", e);
 			return c.json({ error: "Failed to update entry" }, 500);
 		}
+	});
+
+	// POST /entries/:id/flag — an agent reports an entry as wrong, outdated or irrelevant.
+	// The entry is queued for review by moving it to status 'conflicted' (it stays in
+	// the store and in /review). Only active entries can be flagged. :id is the full
+	// entry id or the short id shown in injected lines.
+	app.post("/entries/:id/flag", jsonBodyLimit, async (c) => {
+		if (!requireAdminToken(c)) {
+			return c.json({ error: "Unauthorized" }, 401);
+		}
+		const located = await findEntryByRef(c.req.param("id"));
+		if (located === "read-only") {
+			return c.json({ error: "Entry is in a read-only store" }, 403);
+		}
+		if (located === "ambiguous") {
+			return c.json(
+				{ error: "Id prefix matches more than one entry; use the full id" },
+				409,
+			);
+		}
+		if (!located) {
+			return c.json({ error: "Entry not found" }, 404);
+		}
+		const { entry, store: entryStore } = located;
+
+		let body: Record<string, unknown>;
+		try {
+			body = await c.req.json();
+		} catch {
+			return c.json({ error: "Invalid JSON body" }, 400);
+		}
+		const reasons = ["wrong", "outdated", "irrelevant"];
+		if (typeof body.reason !== "string" || !reasons.includes(body.reason)) {
+			return c.json(
+				{ error: `reason must be one of: ${reasons.join(", ")}` },
+				400,
+			);
+		}
+		if (entry.status !== "active") {
+			return c.json(
+				{ error: `Entry is not active (status: ${entry.status})` },
+				409,
+			);
+		}
+		try {
+			const entryService = serviceByStore.get(entryStore) ?? service;
+			await entryService.updateEntry(entry.id, { status: "conflicted" });
+		} catch (e) {
+			logger.error("[entries/flag] Failed to flag entry:", e);
+			return c.json({ error: "Failed to flag entry" }, 500);
+		}
+		logger.log(`[entries/flag] ${entry.id.slice(0, 8)} reason=${body.reason}`);
+		return c.json({ ok: true, id: entry.id, status: "conflicted" });
 	});
 
 	// POST /entries/:id/resolve — resolve a conflicted entry pair via one of three outcomes:

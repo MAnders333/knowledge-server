@@ -38,6 +38,24 @@ export const activateInputSchema = {
 		),
 };
 
+/**
+ * Zod input schema for the `knowledge_flag` MCP tool. `id` is the full entry id or
+ * the short id shown in injected lines, e.g. "(id 1a2b3c4d)".
+ */
+export const flagInputSchema = {
+	id: z
+		.string()
+		.regex(/^[0-9a-f-]{8,36}$/i)
+		.describe(
+			"Entry id as shown in an injected line, e.g. '1a2b3c4d' from '(id 1a2b3c4d)'.",
+		),
+	reason: z
+		.enum(["wrong", "outdated", "irrelevant"])
+		.describe(
+			"Why the entry should not be used: wrong (factually incorrect), outdated (was true, no longer), irrelevant (does not apply here).",
+		),
+};
+
 /** Base URL of the knowledge HTTP server (config.jsonc / KNOWLEDGE_PORT, see resolveServerAddress). */
 function serverBaseUrl(): string {
 	const { host, port } = resolveServerAddress();
@@ -114,7 +132,7 @@ async function tryAutoStart(timeoutMs = 8000): Promise<boolean> {
 /**
  * MCP server interface for the knowledge system.
  *
- * Exposes a single tool: `activate`
+ * Exposes two tools: `activate` (recall) and `knowledge_flag` (report a wrong entry)
  *
  * Rather than embedding the ActivationEngine directly (which requires DB access
  * and LLM credentials for embedding), this server delegates to the already-running
@@ -218,6 +236,66 @@ export async function main() {
 					: `Error activating knowledge: ${e}`;
 				return {
 					content: [{ type: "text" as const, text: msg }],
+					isError: true,
+				};
+			}
+		},
+	);
+
+	server.tool(
+		"knowledge_flag",
+		"Report a recalled knowledge entry that is wrong, outdated or irrelevant, using the id shown in its injected line. The entry is queued for review and marked conflicted; nothing is deleted. Requires KNOWLEDGE_ADMIN_TOKEN in this process's environment.",
+		flagInputSchema,
+		async ({ id, reason }) => {
+			if (!config.adminToken) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: "knowledge_flag needs KNOWLEDGE_ADMIN_TOKEN set in the environment of the knowledge MCP process (the same stable token the server runs with). Nothing was flagged.",
+						},
+					],
+					isError: true,
+				};
+			}
+			try {
+				const response = await fetch(
+					`${baseUrl}/entries/${encodeURIComponent(id)}/flag`,
+					{
+						method: "POST",
+						headers: {
+							Authorization: `Bearer ${config.adminToken}`,
+							"Content-Type": "application/json",
+						},
+						body: JSON.stringify({ reason }),
+						signal: AbortSignal.timeout(15_000),
+					},
+				);
+				if (!response.ok) {
+					const body = await response.text();
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: `Knowledge server error (${response.status}): ${body}`,
+							},
+						],
+						isError: true,
+					};
+				}
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `Flagged entry ${id} (${reason}). It is queued for review and no longer active.`,
+						},
+					],
+				};
+			} catch (e) {
+				return {
+					content: [
+						{ type: "text" as const, text: `Error flagging entry: ${e}` },
+					],
 					isError: true,
 				};
 			}

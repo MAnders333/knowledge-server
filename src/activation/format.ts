@@ -35,7 +35,7 @@ const NOTICE =
 
 /** Minimal shape the formatter needs; ActivationResult entries satisfy it. */
 export interface ActivatedKnowledgeItem {
-	entry: { type: string; content: string };
+	entry: { id: string; type: string; content: string };
 	staleness: { mayBeStale: boolean; lastAccessedDaysAgo: number };
 	contradiction?: { conflictingContent: string; caveat: string };
 }
@@ -66,13 +66,20 @@ function cleanForBlock(text: string, maxChars: number): string {
 	return escapeUntrusted(capped);
 }
 
+/** Characters of the entry id shown in each line. Enough to find the entry via `knowledge_flag`. */
+export const SHORT_ID_CHARS = 8;
+
 function formatLine(item: ActivatedKnowledgeItem): string {
+	const id = cleanForBlock(
+		item.entry.id.slice(0, SHORT_ID_CHARS),
+		SHORT_ID_CHARS,
+	);
 	const type = cleanForBlock(item.entry.type, 32);
 	const content = cleanForBlock(item.entry.content, MAX_ENTRY_CHARS);
 	const contradiction = item.contradiction
 		? ` [CONFLICTED — conflicts with: "${cleanForBlock(item.contradiction.conflictingContent, MAX_ENTRY_CHARS)}". ${cleanForBlock(item.contradiction.caveat, 300)}]`
 		: "";
-	return `- [${type}] ${content}${staleTag(item.staleness)}${contradiction}`;
+	return `- [${type}] (id ${id}) ${content}${staleTag(item.staleness)}${contradiction}`;
 }
 
 /**

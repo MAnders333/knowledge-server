@@ -13,10 +13,12 @@ import { logger } from "../logger.js";
 import type { Episode, KnowledgeType } from "../types.js";
 import type { DomainContext } from "./domain-router.js";
 import {
+	type ContradictionConflict,
+	type ContradictionReplyFormat,
 	MalformedLlmOutputError,
-	contradictionItemSchema,
 	extractedItemSchema,
 	mergeDecisionSchema,
+	parseContradictionReply,
 	parseItems,
 	synthesisItemSchema,
 } from "./llm-output.js";
@@ -888,22 +890,25 @@ If no meaningful synthesis is possible, return: []`;
 	}
 
 	/**
-	 * Post-extraction contradiction scan.
+	 * Post-extraction contradiction check for one batch of candidates.
 	 *
-	 * For a newly inserted/updated entry, checks a set of topic-overlapping
-	 * candidates (in the contradiction scan band — too dissimilar for decideMerge,
-	 * but related enough to potentially contradict) and attempts resolution.
+	 * Candidates are shown as numbered entries ([1]..[n]). The model replies with a
+	 * wrapper object whose `checked` must equal the batch size:
+	 * - default ("verdicts"): {"checked", "results"} with one verdict per candidate,
+	 *   including no_conflict. This is the prompt the scan was tuned on.
+	 * - CONTRADICTION_CONFLICTS_ONLY=true ("conflicts"): {"checked", "conflicts"}
+	 *   listing only contradicting candidates. Saves about 65% of output tokens per
+	 *   call but is not validated for recall; enable only after an online spot-check.
 	 *
-	 * Uses the contradiction model (Sonnet — nuanced semantic reasoning).
-	 *
-	 * Returns only genuine contradictions — `no_conflict` results are filtered
-	 * before returning. Possible resolutions in the returned array:
+	 * Uses the contradiction model. Returns only genuine contradictions. Possible
+	 * resolutions in the returned array:
 	 * - "supersede_old" — new entry is more correct; existing entry marked superseded
 	 * - "supersede_new" — existing entry is more correct; new entry marked superseded
 	 * - "merge"         — contradiction resolves into a unified entry
 	 * - "irresolvable"  — genuine tie; both entries flagged for human review
 	 *
-	 * @throws MalformedLlmOutputError (a SyntaxError) when the response is not a JSON array.
+	 * @throws MalformedLlmOutputError (a SyntaxError) when the reply does not match
+	 *         the wrapper shape or `checked` differs from the batch size.
 	 */
 	async detectAndResolveContradiction(
 		newEntry: {
@@ -925,20 +930,86 @@ If no meaningful synthesis is possible, return: []`;
 	): Promise<ContradictionResult[]> {
 		if (candidates.length === 0) return [];
 
+		const format: ContradictionReplyFormat = config.consolidation
+			.contradictionConflictsOnly
+			? "conflicts"
+			: "verdicts";
+
 		// Entry fields are untrusted: each is escaped and wrapped in a data tag.
 		const candidateList = candidates
 			.map(
 				(c, i) =>
-					`[${i + 1}] id: ${c.id}
+					`[${i + 1}]
 type: ${untrustedLine("candidate_type", c.type)} | confidence: ${c.confidence} | created: ${new Date(c.createdAt).toISOString().split("T")[0]}
 topics: ${untrustedList("candidate_topics", c.topics)}
 content: ${untrustedField("candidate_content", c.content)}`,
 			)
 			.join("\n\n");
 
-		const systemPrompt = `You are a knowledge integrity checker. You will be shown a NEWLY ADDED knowledge entry and a list of EXISTING entries that share related topics.
+		const userPrompt = `NEW ENTRY (just added):
+type: ${untrustedLine("new_entry_type", newEntry.type)} | confidence: ${newEntry.confidence} | created: ${new Date(newEntry.createdAt).toISOString().split("T")[0]}
+topics: ${untrustedList("new_entry_topics", newEntry.topics)}
+content: ${untrustedField("new_entry_content", newEntry.content)}
 
-Your job is to check each existing entry for genuine contradiction with the new entry, and if a contradiction exists, determine how to resolve it.
+EXISTING CANDIDATES (${candidates.length}, numbered; "candidate" refers to these numbers):
+
+${candidateList}
+
+Return the JSON object. "checked" must be ${candidates.length}.`;
+
+		const response = await complete(
+			"contradiction",
+			config.llm.contradictionModel,
+			contradictionSystemPrompt(format),
+			userPrompt,
+		);
+
+		let conflicts: ContradictionConflict[];
+		try {
+			conflicts = parseContradictionReply(
+				parseJSON(response, false),
+				candidates.length,
+				format,
+			);
+		} catch (err) {
+			logger.error(
+				"[llm] Failed to parse contradiction response:",
+				response.slice(0, 500),
+			);
+			throw err;
+		}
+
+		// A merge without usable merged content is dropped, so the candidate is left unchanged.
+		const results: ContradictionResult[] = [];
+		for (const r of conflicts) {
+			if (
+				r.resolution === "merge" &&
+				(r.mergedContent === undefined || r.mergedType === undefined)
+			) {
+				logger.warn(
+					`[llm] contradiction: merge for candidate [${r.index}] has no usable merged content — dropped`,
+				);
+				continue;
+			}
+			results.push({
+				candidateId: candidates[r.index - 1].id,
+				resolution: r.resolution,
+				reason: r.reason,
+				mergedContent: r.mergedContent,
+				mergedType: r.mergedType,
+				mergedTopics: r.mergedTopics,
+				mergedConfidence: r.mergedConfidence,
+			});
+		}
+		return results;
+	}
+}
+
+/** System prompt for the contradiction check. The verdict and conflicts-only formats differ only in the reply shape. */
+function contradictionSystemPrompt(format: ContradictionReplyFormat): string {
+	const shared = `You are a knowledge integrity checker. You will be shown a NEWLY ADDED knowledge entry and numbered EXISTING candidates that share related topics.
+
+Your job is to check each candidate for genuine contradiction with the new entry, and if a contradiction exists, determine how to resolve it.
 
 CONTRADICTION means the two entries make mutually exclusive claims about the same subject. Examples:
 - "The server runs on port 8080" vs "The server port was changed to 9090" → contradiction
@@ -950,7 +1021,7 @@ NOT a contradiction:
 - One entry being more specific than the other (that's refinement, not contradiction)
 - Temporal statements that don't overlap ("In Q1 we used X" vs "In Q3 we switched to Y")
 
-For each existing entry, respond with one of these resolutions:
+Resolutions:
 - "no_conflict"   — no genuine contradiction
 - "supersede_old" — new entry is more correct/recent; existing entry should be superseded
 - "supersede_new" — existing entry is more correct; new entry should be downgraded
@@ -959,76 +1030,17 @@ For each existing entry, respond with one of these resolutions:
 
 ${UNTRUSTED_DATA_RULE}
 
-Respond ONLY with a JSON array — one object per candidate, in the same order.`;
+Output ONLY one JSON object, nothing else. "checked" must equal the number of candidates shown.`;
 
-		const userPrompt = `NEW ENTRY (just added):
-id: ${newEntry.id}
-type: ${untrustedLine("new_entry_type", newEntry.type)} | confidence: ${newEntry.confidence} | created: ${new Date(newEntry.createdAt).toISOString().split("T")[0]}
-topics: ${untrustedList("new_entry_topics", newEntry.topics)}
-content: ${untrustedField("new_entry_content", newEntry.content)}
-
-EXISTING CANDIDATES to check:
-${candidateList}
-
-Respond with a JSON array (one result per candidate, same order):
-[
-  {
-    "candidateId": "...",
-    "resolution": "no_conflict|supersede_old|supersede_new|merge|irresolvable",
-    "reason": "one sentence explaining why",
-    "mergedContent": "only if resolution is merge — the unified entry content",
-    "mergedType": "only if resolution is merge",
-    "mergedTopics": [],
-    "mergedConfidence": 0.0
-  }
-]`;
-
-		const response = await complete(
-			"contradiction",
-			config.llm.contradictionModel,
-			systemPrompt,
-			userPrompt,
-		);
-
-		const parsed = parseJSON(response, true);
-		if (!Array.isArray(parsed)) {
-			logger.error(
-				"[llm] Failed to parse contradiction response:",
-				response.slice(0, 500),
-			);
-			throw new MalformedLlmOutputError("contradiction");
-		}
-
-		// Keep only genuine contradictions. A merge without usable merged content
-		// is dropped, so the candidate is left unchanged.
-		const results: ContradictionResult[] = [];
-		for (const r of parseItems(
-			parsed,
-			contradictionItemSchema,
-			"contradiction",
-		)) {
-			if (r.resolution === "no_conflict") continue;
-			if (
-				r.resolution === "merge" &&
-				(r.mergedContent === undefined || r.mergedType === undefined)
-			) {
-				logger.warn(
-					`[llm] contradiction: merge for candidate ${JSON.stringify(r.candidateId)} has no usable merged content — dropped`,
-				);
-				continue;
-			}
-			results.push({
-				candidateId: r.candidateId,
-				resolution: r.resolution,
-				reason: r.reason,
-				mergedContent: r.mergedContent,
-				mergedType: r.mergedType,
-				mergedTopics: r.mergedTopics,
-				mergedConfidence: r.mergedConfidence,
-			});
-		}
-		return results;
+	if (format === "conflicts") {
+		return `${shared}
+{"checked": <number of candidates reviewed>, "conflicts": [{"candidate": <candidate number>, "type": "<supersede_old|supersede_new|merge|irresolvable>", "reason": "<one sentence>", "mergedContent": "<merge only>", "mergedType": "<merge only>", "mergedTopics": [], "mergedConfidence": 0.0}]}
+- List only candidates that contradict the new entry. Use "conflicts": [] when none do.
+- Do not list non-conflicts.`;
 	}
+	return `${shared}
+{"checked": <number of candidates reviewed>, "results": [{"candidate": <candidate number>, "resolution": "<no_conflict|supersede_old|supersede_new|merge|irresolvable>", "reason": "<one sentence>", "mergedContent": "<merge only>", "mergedType": "<merge only>", "mergedTopics": [], "mergedConfidence": 0.0}]}
+- One entry in "results" for every candidate, in order. Use "no_conflict" for candidates that do not contradict the new entry.`;
 }
 
 export interface ExtractedKnowledge {

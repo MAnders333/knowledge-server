@@ -124,6 +124,11 @@ export const REVIEW_STALE_STRENGTH_THRESHOLD = 0.3;
 export const DEFAULT_RECONSOLIDATION_THRESHOLD = 0.78;
 /** Lower bound of the contradiction scan band. */
 export const DEFAULT_CONTRADICTION_MIN_SIMILARITY = 0.4;
+/**
+ * Most candidates checked per entry and per scan path, ranked by similarity.
+ * Unbounded by default: a lower cap has not been validated for recall.
+ */
+export const DEFAULT_CONTRADICTION_MAX_CANDIDATES = Number.POSITIVE_INFINITY;
 /** Minimum raw cosine similarity to activate an entry. */
 export const DEFAULT_ACTIVATION_SIMILARITY_THRESHOLD = 0.42;
 /**
@@ -464,6 +469,26 @@ export const config = {
 			process.env.CONTRADICTION_MIN_SIMILARITY,
 			DEFAULT_CONTRADICTION_MIN_SIMILARITY,
 		),
+		// Most candidates sent to the contradiction check per entry and scan path,
+		// highest similarity first. Unset = no cap. Lower values cut LLM calls but
+		// lose detections past the cap.
+		contradictionMaxCandidates: parseIntEnv(
+			process.env.CONTRADICTION_MAX_CANDIDATES,
+			DEFAULT_CONTRADICTION_MAX_CANDIDATES,
+			1,
+		),
+		// Contradiction reply format. false (default): one verdict per candidate, the
+		// format the scan was tuned on. true: list conflicts only, which saves about
+		// 65% of output tokens per call but is not validated for recall; enable only
+		// after an online spot-check.
+		contradictionConflictsOnly:
+			process.env.CONTRADICTION_CONFLICTS_ONLY === "true",
+		// An entry whose best candidate is below this similarity is not scanned.
+		// 0 disables the floor (every in-band candidate is checked).
+		contradictionMinTopSimilarity: parseFloatEnv(
+			process.env.CONTRADICTION_MIN_TOP_SIMILARITY,
+			0,
+		),
 		// Cosine similarity threshold for assigning an entry to an existing cluster
 		// during greedy clustering. Kept broad by default — heterogeneous members give
 		// the LLM more cross-domain material to generalize from.
@@ -541,6 +566,15 @@ export const config = {
 		rerank: {
 			// Default on. RERANK_ENABLED=false restores pure dense ordering.
 			enabled: process.env.RERANK_ENABLED !== "false",
+			// "local" (default) runs the in-process cross-encoder below. "remote"
+			// scores candidates with a listwise decision model on the LLM gateway.
+			// Remote sends the query tail and candidate text off-machine on every
+			// activation, so it runs only when set explicitly. See rerank-remote.ts.
+			// Unknown values are reported by validateConfig() and run as local.
+			provider:
+				process.env.RERANK_PROVIDER?.trim().toLowerCase() === "remote"
+					? "remote"
+					: "local",
 			// Hugging Face model ID. Default is the classic English MS MARCO
 			// cross-encoder (int8 ONNX, ~23MB, ~40ms/pair on Apple Silicon WASM).
 			// For multilingual knowledge bases use a multilingual ONNX
@@ -552,17 +586,33 @@ export const config = {
 				join(homedir(), ".local", "share", "knowledge-server", "models"),
 			// Candidate pool size fetched by dense retrieval when reranking is
 			// active (overfetch). Must be >= activation.maxResults to be useful.
-			candidates: parseIntEnv(process.env.RERANK_CANDIDATES, 40, 1),
-			// Hard timeout per rerank call; on expiry the result is abandoned
-			// and dense-only ordering is used.
-			timeoutMs: parseIntEnv(process.env.RERANK_TIMEOUT_MS, 2_000, 100),
-			// Query side of each pair: the last N tokens of the prompt. The
-			// rerank query is capped so a long prompt cannot squeeze documents
+			// 16 keeps a pool of 256-token documents inside the timeout on the
+			// hardware measured for this default; raise it where the CPU has room.
+			candidates: parseIntEnv(process.env.RERANK_CANDIDATES, 16, 1),
+			// Hard timeout per local rerank call; on expiry the result is abandoned
+			// and dense-only ordering is used. Kept well under the 5 s plugin
+			// budget, which also covers the embedding call and store reads.
+			timeoutMs: parseIntEnv(process.env.RERANK_TIMEOUT_MS, 3_000, 100),
+			// Query side of each pair: the last N tokens of the prompt (remote:
+			// N x 4 characters). Capped so a long prompt cannot squeeze documents
 			// out of the model window.
-			maxQueryTokens: parseIntEnv(process.env.RERANK_MAX_QUERY_TOKENS, 64, 1),
-			// Document side of each pair: the first N tokens of the candidate.
-			// 128 keeps a 40-pair batch near 1.5 s on one WASM thread.
-			maxDocTokens: parseIntEnv(process.env.RERANK_MAX_DOC_TOKENS, 128, 1),
+			maxQueryTokens: parseIntEnv(process.env.RERANK_MAX_QUERY_TOKENS, 128, 1),
+			// Document side of each pair: the first N tokens of the candidate
+			// (remote: N x 4 characters). A 128-token cap scored below BM25 on
+			// SciFact abstracts; memory entries are mostly short, so 256 keeps
+			// nearly all of them whole.
+			maxDocTokens: parseIntEnv(process.env.RERANK_MAX_DOC_TOKENS, 256, 1),
+			// Remote listwise decision model, used only when provider is "remote".
+			remote: {
+				model: process.env.RERANK_REMOTE_MODEL || "clef",
+				// Budget for the whole gateway request. It sits inside the 5 s plugin
+				// budget; on expiry the batch uses dense ordering.
+				timeoutMs: parseIntEnv(
+					process.env.RERANK_REMOTE_TIMEOUT_MS,
+					4_000,
+					100,
+				),
+			},
 		},
 	},
 } as const;
@@ -598,8 +648,8 @@ export function resolveEnvFilePath(): string {
 
 // Placeholder values shipped in the .env template — used to detect unconfigured installs.
 // Update these if the template values in install.sh change.
-const PLACEHOLDER_API_KEY = "your-api-key-here";
-const PLACEHOLDER_ENDPOINT = "https://your-llm-endpoint.example.com";
+export const PLACEHOLDER_API_KEY = "your-api-key-here";
+export const PLACEHOLDER_ENDPOINT = "https://your-llm-endpoint.example.com";
 const PLACEHOLDER_ADMIN_TOKEN = "your-stable-token-here";
 
 export function validateConfig(): string[] {
@@ -723,6 +773,19 @@ export function validateConfig(): string[] {
 	// the resolved host may come from config.jsonc (not just KNOWLEDGE_HOST env var),
 	// and the registry is created after validateConfig() runs.
 
+	// RERANK_PROVIDER must name a provider. A typo is reported here, and it never
+	// enables remote reranking.
+	const rawRerankProvider = process.env.RERANK_PROVIDER?.trim().toLowerCase();
+	if (
+		rawRerankProvider &&
+		rawRerankProvider !== "local" &&
+		rawRerankProvider !== "remote"
+	) {
+		errors.push(
+			`RERANK_PROVIDER must be "local" or "remote" (got "${process.env.RERANK_PROVIDER}").`,
+		);
+	}
+
 	// Error only when the user explicitly configured OPENCODE_DB_PATH but the file
 	// doesn't exist — a typo or stale path is worth surfacing as a hard error.
 	// When using the default auto-detected path, a missing file is non-fatal: the
@@ -840,6 +903,28 @@ export function validateConfig(): string[] {
 		liveReconsolidationThreshold,
 		`Must be strictly below the ${liveReconsolidationThreshold} reconsolidation threshold. Default is ${config.consolidation.contradictionMinSimilarity}.`,
 		true, // hiExclusive
+	);
+	validateIntMin(
+		process.env.CONTRADICTION_MAX_CANDIDATES,
+		"CONTRADICTION_MAX_CANDIDATES",
+		1,
+		"Leave unset for no cap.",
+	);
+	if (
+		process.env.CONTRADICTION_CONFLICTS_ONLY !== undefined &&
+		process.env.CONTRADICTION_CONFLICTS_ONLY !== "true" &&
+		process.env.CONTRADICTION_CONFLICTS_ONLY !== "false"
+	) {
+		errors.push(
+			`CONTRADICTION_CONFLICTS_ONLY must be "true" or "false" (got "${process.env.CONTRADICTION_CONFLICTS_ONLY}"). Default is false.`,
+		);
+	}
+	validateFloatRange(
+		process.env.CONTRADICTION_MIN_TOP_SIMILARITY,
+		"CONTRADICTION_MIN_TOP_SIMILARITY",
+		0,
+		1,
+		"Leave unset to disable the floor.",
 	);
 	validateFloatRange(
 		process.env.ACTIVATION_SIMILARITY_THRESHOLD,

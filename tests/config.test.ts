@@ -22,9 +22,11 @@ const ENV_VARS = [
 	"DECAY_ARCHIVE_THRESHOLD",
 	"RECONSOLIDATION_SIMILARITY_THRESHOLD",
 	"CONTRADICTION_MIN_SIMILARITY",
+	"CONTRADICTION_CONFLICTS_ONLY",
 	"ACTIVATION_SIMILARITY_THRESHOLD",
 	"EMBEDDING_DIMENSIONS",
 	"OPENAI_MAX_TOKENS_PARAM",
+	"RERANK_PROVIDER",
 ] as const;
 
 type EnvVar = (typeof ENV_VARS)[number];
@@ -56,6 +58,22 @@ function envErrors(): string[] {
 }
 
 // ── baseline ──────────────────────────────────────────────────────────────────
+
+describe("validateConfig — CONTRADICTION_CONFLICTS_ONLY", () => {
+	it("accepts true and false", () => {
+		for (const value of ["true", "false"]) {
+			process.env.CONTRADICTION_CONFLICTS_ONLY = value;
+			expect(envErrors()).toEqual([]);
+		}
+	});
+
+	it("rejects any other value", () => {
+		process.env.CONTRADICTION_CONFLICTS_ONLY = "yes";
+		expect(
+			envErrors().some((e) => e.includes("CONTRADICTION_CONFLICTS_ONLY")),
+		).toBe(true);
+	});
+});
 
 describe("validateConfig — float-range baseline (all optional vars unset)", () => {
 	it("produces no float-range errors when optional vars are unset", () => {
@@ -314,5 +332,23 @@ describe("validateConfig — multiple errors accumulated", () => {
 		expect(
 			errors.filter((e) => e.includes("EMBEDDING_DIMENSIONS")),
 		).toHaveLength(1);
+	});
+});
+
+// ── RERANK_PROVIDER ───────────────────────────────────────────────────────────
+
+describe("validateConfig — RERANK_PROVIDER", () => {
+	it("accepts local and remote, in any case", () => {
+		for (const value of ["local", "remote", " Remote "]) {
+			process.env.RERANK_PROVIDER = value;
+			expect(envErrors()).toEqual([]);
+		}
+	});
+
+	it("reports an unknown provider instead of running a silent fallback", () => {
+		process.env.RERANK_PROVIDER = "remtoe";
+		const errors = envErrors();
+		expect(errors).toHaveLength(1);
+		expect(errors[0]).toContain('RERANK_PROVIDER must be "local" or "remote"');
 	});
 });

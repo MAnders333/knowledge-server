@@ -2,6 +2,11 @@ import { existsSync } from "node:fs";
 import { rename, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import {
+	EXTENSION_ASSETS,
+	readExtensionTargets,
+	refreshExtensionTargets,
+} from "./extension-targets.js";
+import {
 	REPO,
 	detectPlatform,
 	downloadVerified,
@@ -381,12 +386,6 @@ export async function runUpdate(
 
 	// Plugin and command files live one level above libexec/ (install.sh layout).
 	const inferredInstallDir = dirname(libexecDir);
-	const pluginNames = [
-		"knowledge.ts",
-		"pi-knowledge.ts",
-		"consolidate.md",
-		"knowledge-review.md",
-	];
 	const assets: ReleaseAsset[] = [
 		{
 			name: `knowledge-server-${platform}`,
@@ -403,20 +402,22 @@ export async function runUpdate(
 			smokeArgs: ["--version"],
 		},
 	];
-	// Plugin/command files are refreshed only when a previous install placed
-	// them. pi-knowledge.ts and the *.md files are optional, knowledge.ts is not.
-	const pluginDest = join(inferredInstallDir, "knowledge.ts");
-	if (existsSync(pluginDest)) {
-		for (const name of pluginNames) {
-			const dest = join(inferredInstallDir, name);
-			if (name !== "knowledge.ts" && !existsSync(dest)) continue;
-			assets.push({
-				name,
-				url: releaseAssetUrl(targetVersion, name),
-				dest,
-				gzip: false,
-			});
-		}
+	// Plugin and command files are refreshed when they exist in <install-dir>/
+	// (install.sh and earlier updates place them there). Every copy that setup-tool
+	// made in a tool's config dir is registered and refreshed too, so registered
+	// assets are fetched even when they are not yet on disk.
+	const targets = readExtensionTargets(inferredInstallDir);
+	const refresh = new Set<string>(targets.map((t) => t.asset));
+	for (const name of EXTENSION_ASSETS) {
+		if (existsSync(join(inferredInstallDir, name))) refresh.add(name);
+	}
+	for (const name of refresh) {
+		assets.push({
+			name,
+			url: releaseAssetUrl(targetVersion, name),
+			dest: join(inferredInstallDir, name),
+			gzip: false,
+		});
 	}
 
 	process.stdout.write("  Verifying, staging and installing... ");
@@ -429,6 +430,17 @@ export async function runUpdate(
 	} catch (err) {
 		console.error(`\n  ✗ ${err instanceof Error ? err.message : err}`);
 		process.exit(1);
+	}
+
+	// Copy the verified plugin and command files over their registered copies.
+	for (const outcome of refreshExtensionTargets(inferredInstallDir, targets)) {
+		if (outcome.status === "refreshed") {
+			console.log(`  ✓ Refreshed ${outcome.target.dst}`);
+		} else {
+			console.warn(
+				`  ⚠ Not refreshed ${outcome.target.dst}: ${outcome.reason}`,
+			);
+		}
 	}
 
 	// Remove the now-obsolete knowledge-server-mcp binary if it exists alongside

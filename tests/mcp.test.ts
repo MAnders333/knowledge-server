@@ -11,7 +11,7 @@
  */
 import { describe, expect, it } from "bun:test";
 import { z } from "zod";
-import { activateInputSchema } from "../src/mcp/index";
+import { activateInputSchema, flagInputSchema } from "../src/mcp/index";
 
 const activateSchema = z.object(activateInputSchema);
 
@@ -138,5 +138,49 @@ describe("MCP activate schema — combined valid inputs", () => {
 			expect(result.data.limit).toBe(8);
 			expect(result.data.threshold).toBeCloseTo(0.3);
 		}
+	});
+});
+
+// ── knowledge_flag ────────────────────────────────────────────────────────────
+
+const flagSchema = z.object(flagInputSchema);
+
+describe("MCP knowledge_flag schema", () => {
+	it("accepts the full entry id and the short id shown in injected lines", () => {
+		expect(
+			flagSchema.safeParse({
+				id: "0f1e2d3c-4b5a-4968-8777-665544332211",
+				reason: "wrong",
+			}).success,
+		).toBe(true);
+		expect(
+			flagSchema.safeParse({ id: "0f1e2d3c", reason: "outdated" }).success,
+		).toBe(true);
+	});
+
+	it("accepts each of the three reasons", () => {
+		for (const reason of ["wrong", "outdated", "irrelevant"]) {
+			expect(flagSchema.safeParse({ id: "0f1e2d3c", reason }).success).toBe(
+				true,
+			);
+		}
+	});
+
+	it("rejects an unknown reason", () => {
+		expect(
+			flagSchema.safeParse({ id: "0f1e2d3c", reason: "delete" }).success,
+		).toBe(false);
+	});
+
+	it("rejects an id with characters outside hex and dashes", () => {
+		expect(
+			flagSchema.safeParse({ id: "0f1e2d3c; drop", reason: "wrong" }).success,
+		).toBe(false);
+	});
+
+	it("rejects an id shorter than 8 characters", () => {
+		expect(flagSchema.safeParse({ id: "0f1e", reason: "wrong" }).success).toBe(
+			false,
+		);
 	});
 });

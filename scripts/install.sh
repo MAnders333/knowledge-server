@@ -219,7 +219,7 @@ main() {
   # ── Download and verify ─────────────────────────────────────────────────────
   local server_asset="knowledge-server-$platform"
   local daemon_asset="knowledge-daemon-$platform"
-  local plugin_assets=(knowledge.ts pi-knowledge.ts consolidate.md knowledge-review.md)
+  local plugin_assets=(knowledge.ts pi-knowledge.ts omp-knowledge.ts consolidate.md knowledge-review.md)
 
   echo "Downloading checksums..."
   fetch_asset "$base_url/SHA256SUMS-$platform" "$STAGE_DIR/SHA256SUMS"

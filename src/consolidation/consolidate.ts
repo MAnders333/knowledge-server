@@ -1212,7 +1212,14 @@ export class ConsolidationEngine {
 								`[consolidation/${source}] ${decision.action === "update" ? "Updated" : "Replaced"}: ${JSON.stringify(nearest.content)} → ${JSON.stringify(content)}`,
 							);
 							updated++;
-							contradictionCandidates.add(nearest.id);
+							// Only a changed entry needs a contradiction check. An update that
+							// keeps the same content, type and topics was already checked.
+							const unchanged =
+								decision.content === nearest.content &&
+								safeType === nearest.type &&
+								JSON.stringify(decision.topics ?? []) ===
+									JSON.stringify(nearest.topics ?? []);
+							if (!unchanged) contradictionCandidates.add(nearest.id);
 							const existingCached = entriesMap.get(nearest.id);
 							if (existingCached) {
 								entriesMap.set(nearest.id, {

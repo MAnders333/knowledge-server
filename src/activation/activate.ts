@@ -18,6 +18,7 @@ import {
 	prepareQuery,
 	storedNorm,
 } from "./embeddings.js";
+import { RerankSkippedError } from "./rerank-remote.js";
 import type { RerankScorer } from "./rerank.js";
 
 /** Server-side cap on activation cues per call (see normalizeCues). */
@@ -674,9 +675,18 @@ export class ActivationEngine {
 				componentHealth.recordSuccess("rerank");
 			} catch (err) {
 				componentHealth.recordFailure("rerank", err);
-				logger.warn(
-					`[activation] Rerank failed — using dense-only ordering. Reason: ${err instanceof Error ? err.message : String(err)}`,
-				);
+				const reason = err instanceof Error ? err.message : String(err);
+				const { provider, model } = this.reranker.identity;
+				if (err instanceof RerankSkippedError) {
+					// The remote breaker warns once when it opens; skipped calls stay quiet.
+					logger.log(
+						`[activation] Rerank skipped — dense-only ordering. provider=${provider} model=${model} gate_mode=dense. Reason: ${reason}`,
+					);
+				} else {
+					logger.warn(
+						`[activation] Rerank failed — using dense-only ordering. provider=${provider} model=${model} gate_mode=dense. Reason: ${reason}`,
+					);
+				}
 			}
 		}
 

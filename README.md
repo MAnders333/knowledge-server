@@ -11,7 +11,7 @@ No prompting required. No manual notes. Just context that was missing before.
 
 Everything happens in the background. The tool reads your sessions, extracts what's worth keeping, and injects relevant entries before the LLM sees your next message. You don't interact with it directly.
 
-Works with [OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview), [Cursor](https://cursor.com), [Codex CLI](https://github.com/openai/codex), and [VSCode](https://code.visualstudio.com) (GitHub Copilot). Single machine or shared across a team — knowledge accumulates in a shared database that everyone's agent draws from.
+Captures knowledge from [OpenCode](https://opencode.ai), [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview), [Codex CLI](https://github.com/openai/codex), [pi](https://github.com/earendil-works/pi-mono), [oh-my-pi](https://www.npmjs.com/package/@oh-my-pi/pi-coding-agent), [Cursor](https://cursor.com) and [VSCode](https://code.visualstudio.com) (GitHub Copilot) sessions. Knowledge is injected before each prompt into OpenCode, Claude Code, Codex CLI, pi and oh-my-pi; Cursor and VSCode get MCP tools only. See [Injected into](#injected-into-tool-support). Single machine or shared across a team — knowledge accumulates in a shared database that everyone's agent draws from.
 
 ## Install
 
@@ -31,6 +31,8 @@ curl -fsSL https://raw.githubusercontent.com/MAnders333/knowledge-server/main/sc
    knowledge-server setup-tool cursor       # Cursor
    knowledge-server setup-tool codex        # Codex CLI
    knowledge-server setup-tool vscode       # VSCode / GitHub Copilot
+   knowledge-server setup-tool pi           # pi
+   knowledge-server setup-tool oh-my-pi     # oh-my-pi
    ```
 3. Start the server: `knowledge-server`
 
@@ -43,7 +45,7 @@ knowledge-server update                              # latest release
 knowledge-server update --version v3.10.2 --force    # older release (downgrades need --force)
 ```
 
-Every downloaded file is checked against the release's `SHA256SUMS` before anything is replaced. The new binaries must also pass a smoke test. The previous binaries are kept as `*.prev`, and a failed post-install check restores them.
+Every downloaded file is checked against the release's `SHA256SUMS` before anything is replaced. The new binaries must also pass a smoke test. The previous binaries are kept as `*.prev`, and a failed post-install check restores them. `update` also refreshes the copies that `setup-tool` placed in tool directories (the OpenCode plugin and commands, the pi and oh-my-pi extensions), so they stay on the installed version.
 
 ### From source
 
@@ -65,6 +67,8 @@ bun run start setup-tool claude-code  # Claude Code
 bun run start setup-tool cursor       # Cursor
 bun run start setup-tool codex        # Codex CLI
 bun run start setup-tool vscode       # VSCode
+bun run start setup-tool pi           # pi
+bun run start setup-tool oh-my-pi     # oh-my-pi
 ```
 
 All setup steps are idempotent — re-running is safe.
@@ -133,7 +137,7 @@ Entries have a strength score that decays with time and inactivity, and increase
 
 The daemon and server share the same database. In single-machine setups this is a local SQLite file. In team setups, both point at a shared Postgres instance.
 
-## Supported session sources
+## Captured from (session sources)
 
 | Source | What is read | Platform |
 |---|---|---|
@@ -151,6 +155,28 @@ The daemon and server share the same database. In single-machine setups this is 
 All sources are auto-detected. Disable any with `OPENCODE_ENABLED=false`, etc. Override a path with `OPENCODE_DB_PATH`, etc.
 
 The local-files source is opt-in by directory presence: if `~/knowledge/` does not exist it is silently skipped.
+
+## Injected into (tool support)
+
+Each tool can be a source (its sessions are captured), a target (knowledge is injected before each prompt), or both.
+
+| Tool | Captured from | Injected into | How injection works |
+|---|---|---|---|
+| OpenCode | yes | yes | Plugin `chat.message` hook (`setup-tool opencode`) + MCP |
+| Claude Code | yes | yes | `UserPromptSubmit` HTTP hook (`setup-tool claude-code`) + MCP |
+| Codex CLI | yes | yes | `UserPromptSubmit` command hook in `~/.codex/hooks.json` (`setup-tool codex`) + MCP |
+| pi | yes | yes | `before_agent_start` extension (`setup-tool pi`) |
+| oh-my-pi | yes | yes | `before_agent_start` extension in each `~/.omp` agent layer (`setup-tool oh-my-pi`) |
+| Cursor | yes | no | MCP tool only |
+| VSCode (GitHub Copilot) | yes | no | MCP tool only |
+
+Cursor and VSCode are capture-only in practice. Cursor's session-start hook is not used because it runs before any prompt exists, so there is nothing to match entries against. VSCode is wired to MCP only. An MCP tool runs only when the agent chooses to call it, and agents almost never do so unprompted. Knowledge captured from these tools reaches the other tools, not the ones they run.
+
+Codex: after `setup-tool codex`, open Codex, run `/hooks`, and trust the knowledge-server hook. Codex does not run a new or changed hook until it is trusted, so trust it again after a port change. Codex limits each hook's output to about 2,500 tokens and saves the rest to a file. The injected block is capped at 6,000 characters, which is usually under that limit.
+
+Each injected entry starts with a short id, for example `(id 1a2b3c4d)`. When an entry is wrong or outdated, the agent can call the `knowledge_flag` MCP tool with that id. The entry is queued for review (status `conflicted`) and is not deleted. The MCP process needs `KNOWLEDGE_ADMIN_TOKEN` in its environment for this.
+
+`knowledge-server status` shows, per source, the episodes captured in the last 7 days next to the activations received, and warns when a source is captured but nothing was injected.
 
 ## Components
 
@@ -185,12 +211,13 @@ Hono-based HTTP server. Binds to `127.0.0.1:3179` by default.
 | `/entries/:id/resolve` | POST | admin | Resolve a conflicted entry pair |
 | `/entries/:id` | DELETE | admin | Hard-delete an entry |
 | `/review` | GET | — | Surface conflicted, stale, and team-relevant entries |
-| `/hooks/claude-code/user-prompt` | POST | — | Claude Code `UserPromptSubmit` hook endpoint |
+| `/hooks/claude-code/user-prompt` | POST | — | `UserPromptSubmit` hook endpoint for Claude Code; Codex CLI uses it too, with `?client=codex` |
+| `/entries/:id/flag` | POST | admin | Queue an active entry for review (status `conflicted`); accepts the short id shown in injected lines |
 | `/mcp` | ALL | — / admin | MCP streamable-http endpoint |
 
 ### MCP server
 
-Exposes a single tool: `activate`. Agents use this for deliberate recall mid-task.
+Exposes two tools. `activate` recalls knowledge mid-task. `knowledge_flag` reports an entry (by its id) as `wrong`, `outdated` or `irrelevant`; the entry is queued for review and kept, not deleted.
 
 Two connection modes:
 
@@ -442,6 +469,9 @@ All sources are auto-detected. Override paths or disable sources via environment
 | `CONSOLIDATION_MIN_MESSAGES` | `4` | Minimum messages for a session to be eligible |
 | `RECONSOLIDATION_SIMILARITY_THRESHOLD` | `0.78` | Near-duplicate merge cutoff |
 | `CONTRADICTION_MIN_SIMILARITY` | `0.4` | Lower bound of the contradiction scan band |
+| `CONTRADICTION_MAX_CANDIDATES` | unset (no cap) | Most candidates checked per entry and scan path, highest similarity first; checked in batches of 10 |
+| `CONTRADICTION_MIN_TOP_SIMILARITY` | unset | Skip an entry whose best candidate is below this similarity (unset = no floor) |
+| `CONTRADICTION_CONFLICTS_ONLY` | `false` | Opt-in: reply lists conflicts only (about 65% fewer output tokens per call). Recall is not validated; enable only after an online spot-check |
 
 ### Decay
 
@@ -458,21 +488,31 @@ All sources are auto-detected. Override paths or disable sources via environment
 | `ACTIVATION_MAX_RESULTS` | `10` | Max entries returned per activation |
 | `ACTIVATION_SIMILARITY_THRESHOLD` | `0.42` | Minimum cosine similarity to activate |
 
-### Reranking (local cross-encoder)
+### Reranking
 
-Dense retrieval overfetches `RERANK_CANDIDATES` entries and a local cross-encoder re-scores them. It runs offline after a one-time model download (~23MB). The default model is pinned to a Hugging Face revision and checksum. If reranking fails or times out, activation uses dense ordering.
+Dense retrieval overfetches `RERANK_CANDIDATES` entries and a second stage re-scores them. If reranking fails or times out, activation uses dense ordering. Two providers are available:
+
+- `local` (default): an in-process cross-encoder. It runs offline after a one-time model download (~23MB). The default model is pinned to a Hugging Face revision and checksum. Nothing leaves the machine.
+- `remote` (opt-in): one listwise call per activation to a decision model on the LLM gateway (`RERANK_REMOTE_MODEL`, default `clef`). It uses the gateway in `LLM_BASE_ENDPOINT` and `LLM_API_KEY`; per-provider keys are not used. It needs no local model memory and does not block the event loop. After 3 consecutive failures remote reranking pauses for 60 s, and dense ordering is used meanwhile.
+
+> **Privacy: `RERANK_PROVIDER=remote` sends content off this machine.** On every activation the remote provider sends (1) the query tail, the last `RERANK_MAX_QUERY_TOKENS` tokens of the prompt, and (2) the text of each candidate entry, its first `RERANK_MAX_DOC_TOKENS` tokens with its type and topics. Only the candidates dense retrieval returned for that prompt are sent, never the whole store. The gateway forwards the request to the hosting provider of `RERANK_REMOTE_MODEL`. Retention and processing terms are those of the gateway and the model host, which this project does not control. Keep the default `local` provider unless you accept that.
 
 | Variable | Default | Description |
 |---|---|---|
 | `RERANK_ENABLED` | `true` | `false` restores dense-only ordering |
-| `RERANK_MODEL` | `Xenova/ms-marco-MiniLM-L-6-v2` | Hugging Face ONNX cross-encoder. **The default is English-only.** For other languages use a multilingual ONNX export with a WordPiece `tokenizer.json`. Other models are fetched from `main` without a checksum |
-| `RERANK_MODELS_DIR` | `~/.local/share/knowledge-server/models` | Model cache |
-| `RERANK_CANDIDATES` | `40` | Dense candidates scored per activation |
-| `RERANK_TIMEOUT_MS` | `2000` | Budget for one rerank call. On expiry the whole batch falls back to dense ordering (no partial scores) |
-| `RERANK_MAX_QUERY_TOKENS` | `64` | Last N tokens of the prompt used as the rerank query |
-| `RERANK_MAX_DOC_TOKENS` | `128` | First N tokens of each candidate that is scored |
+| `RERANK_PROVIDER` | `local` | `local` or `remote`. Any other value fails validation. `remote` sends content off this machine (see the privacy note) |
+| `RERANK_MODEL` | `Xenova/ms-marco-MiniLM-L-6-v2` | Local Hugging Face ONNX cross-encoder. **The default is English-only.** For other languages use a multilingual ONNX export with a WordPiece `tokenizer.json`. Other models are fetched from `main` without a checksum |
+| `RERANK_MODELS_DIR` | `~/.local/share/knowledge-server/models` | Local model cache |
+| `RERANK_CANDIDATES` | `16` | Dense candidates scored per activation. Remote scores at most 40 |
+| `RERANK_TIMEOUT_MS` | `3000` | Budget for one local rerank call. On expiry the whole batch falls back to dense ordering (no partial scores) |
+| `RERANK_MAX_QUERY_TOKENS` | `128` | Last N tokens of the prompt used as the rerank query (remote: N × 4 characters) |
+| `RERANK_MAX_DOC_TOKENS` | `256` | First N tokens of each candidate that is scored (remote: N × 4 characters). Shorter caps lowered quality on long documents |
+| `RERANK_REMOTE_MODEL` | `clef` | Gateway decision model for `RERANK_PROVIDER=remote`. Lower-tier models (for example `clef-flash`) scored below BM25 in our evaluation |
+| `RERANK_REMOTE_TIMEOUT_MS` | `4000` | Budget for one gateway call. It sits inside the 5 s plugin budget; on expiry dense ordering is used |
 
-Pairs are scored one at a time and the event loop is yielded between them, so one long candidate no longer stalls other requests. Size `RERANK_CANDIDATES` so that candidates × ~40 ms (Apple Silicon) fits within `RERANK_TIMEOUT_MS`; on slower CPUs lower the count or raise the timeout.
+Remote mode needs both `LLM_BASE_ENDPOINT` and `LLM_API_KEY`. If either is missing (or still a template placeholder), the server logs a warning at startup and uses the local reranker.
+
+Pairs are scored one at a time and the event loop is yielded between them, so one long candidate no longer stalls other requests. Latency grows with the token caps. Measured on a 10-core Apple Silicon machine at a load average of about 12, 16 candidates at the defaults took a median of 2.5 s and 20 candidates took 3.2 s. With long prompts and long candidates on every pair, 16 candidates took 3.9 s, so those calls fall back to dense ordering. On slower CPUs lower `RERANK_CANDIDATES` or `RERANK_MAX_QUERY_TOKENS`, or raise `RERANK_TIMEOUT_MS`. Keep it well under 5 s, because the plugin gives up after that.
 
 ## Usage
 

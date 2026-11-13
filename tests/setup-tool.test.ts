@@ -11,8 +11,11 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
 	existsSync,
+	lstatSync,
+	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	readlinkSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
@@ -21,6 +24,7 @@ import { join } from "node:path";
 import {
 	setupCodex,
 	setupCursor,
+	setupOhMyPi,
 	stripJsoncComments,
 } from "../src/commands/setup-tool";
 import {
@@ -334,5 +338,164 @@ describe("setup runs never register a background service", () => {
 		expect(existsSync(isolation.callsLog)).toBe(false);
 		expect(existsSync(join(isolation.home, "Library"))).toBe(false);
 		expect(existsSync(join(isolation.home, ".config", "systemd"))).toBe(false);
+	});
+});
+
+// ── setupCodex UserPromptSubmit hook ─────────────────────────────────────────
+
+describe("setupCodex UserPromptSubmit hook", () => {
+	let codexHome: string;
+	let origCodexHome: string | undefined;
+
+	beforeEach(() => {
+		codexHome = mkdtempSync(join(tmpdir(), "setup-codex-hook-"));
+		origCodexHome = process.env.CODEX_HOME;
+		process.env.CODEX_HOME = codexHome;
+	});
+
+	afterEach(() => {
+		rmSync(codexHome, { recursive: true, force: true });
+		if (origCodexHome === undefined) {
+			Reflect.deleteProperty(process.env, "CODEX_HOME");
+		} else {
+			process.env.CODEX_HOME = origCodexHome;
+		}
+	});
+
+	type Handler = { type?: string; command?: string; timeout?: number };
+	type Group = { hooks?: Handler[] };
+	const HOOKS_PATH = () => join(codexHome, "hooks.json");
+	const readGroups = (): Group[] => {
+		const file = JSON.parse(readFileSync(HOOKS_PATH(), "utf8")) as {
+			hooks: { UserPromptSubmit: Group[] };
+		};
+		return file.hooks.UserPromptSubmit;
+	};
+	const knowledgeHandlers = (): Handler[] =>
+		readGroups()
+			.flatMap((g) => g.hooks ?? [])
+			.filter((h) =>
+				h.command?.includes("/hooks/claude-code/user-prompt?client=codex"),
+			);
+
+	it("writes a command hook that posts to the endpoint with a 5 s timeout and never fails the prompt", () => {
+		setupCodex();
+		const handlers = knowledgeHandlers();
+		expect(handlers).toHaveLength(1);
+		expect(handlers[0].type).toBe("command");
+		expect(handlers[0].timeout).toBe(5);
+		expect(handlers[0].command).toContain(
+			"curl -s --max-time 4 --data-binary @-",
+		);
+		expect(handlers[0].command?.endsWith("|| true")).toBe(true);
+	});
+
+	it("is idempotent: a second run leaves hooks.json byte-identical", () => {
+		setupCodex();
+		const first = readFileSync(HOOKS_PATH(), "utf8");
+		setupCodex();
+		expect(readFileSync(HOOKS_PATH(), "utf8")).toBe(first);
+		expect(knowledgeHandlers()).toHaveLength(1);
+	});
+
+	it("keeps the user's own hooks", () => {
+		const guard = {
+			matcher: "Bash",
+			hooks: [{ type: "command", command: "guard.sh", timeout: 30 }],
+		};
+		writeFileSync(
+			HOOKS_PATH(),
+			JSON.stringify({
+				hooks: {
+					PreToolUse: [guard],
+					UserPromptSubmit: [
+						{ hooks: [{ type: "command", command: "user-hook.sh" }] },
+					],
+				},
+			}),
+		);
+		setupCodex();
+		const file = JSON.parse(readFileSync(HOOKS_PATH(), "utf8")) as {
+			hooks: { PreToolUse: unknown[] };
+		};
+		expect(file.hooks.PreToolUse).toEqual([guard]);
+		const commands = readGroups()
+			.flatMap((g) => g.hooks ?? [])
+			.map((h) => h.command);
+		expect(commands).toContain("user-hook.sh");
+		expect(knowledgeHandlers()).toHaveLength(1);
+	});
+
+	it("replaces a handler left by an older port instead of adding a second one", () => {
+		writeFileSync(
+			HOOKS_PATH(),
+			JSON.stringify({
+				hooks: {
+					UserPromptSubmit: [
+						{
+							hooks: [
+								{
+									type: "command",
+									command:
+										"curl -s --max-time 4 --data-binary @- 'http://127.0.0.1:1111/hooks/claude-code/user-prompt?client=codex' || true",
+									timeout: 5,
+								},
+							],
+						},
+					],
+				},
+			}),
+		);
+		setupCodex();
+		const handlers = knowledgeHandlers();
+		expect(handlers).toHaveLength(1);
+		expect(handlers[0].command).not.toContain("127.0.0.1:1111");
+	});
+
+	it("leaves a malformed hooks.json untouched instead of overwriting it", () => {
+		writeFileSync(HOOKS_PATH(), "{ broken");
+		setupCodex();
+		expect(readFileSync(HOOKS_PATH(), "utf8")).toBe("{ broken");
+	});
+});
+
+// ── setupOhMyPi ──────────────────────────────────────────────────────────────
+
+describe("setupOhMyPi", () => {
+	let ompRoot: string;
+
+	beforeEach(() => {
+		ompRoot = mkdtempSync(join(tmpdir(), "setup-omp-"));
+	});
+
+	afterEach(() => {
+		rmSync(ompRoot, { recursive: true, force: true });
+	});
+
+	it("places the extension in the shared agent layer and every profile layer", () => {
+		const shared = join(ompRoot, "agent");
+		const work = join(ompRoot, "profiles", "work", "agent");
+		mkdirSync(shared, { recursive: true });
+		mkdirSync(work, { recursive: true });
+		// A profile without an agent dir gets no extension directory.
+		mkdirSync(join(ompRoot, "profiles", "empty"), { recursive: true });
+
+		setupOhMyPi(ompRoot);
+
+		for (const layer of [shared, work]) {
+			const dst = join(layer, "extensions", "knowledge.ts");
+			// Tests run from source, so placement is a symlink to the repo file.
+			expect(lstatSync(dst).isSymbolicLink()).toBe(true);
+			expect(readlinkSync(dst)).toMatch(/plugin\/omp-knowledge\.ts$/);
+		}
+		expect(existsSync(join(ompRoot, "profiles", "empty", "extensions"))).toBe(
+			false,
+		);
+	});
+
+	it("writes no settings.json, because oh-my-pi auto-discovers agent extensions", () => {
+		mkdirSync(join(ompRoot, "agent"), { recursive: true });
+		setupOhMyPi(ompRoot);
+		expect(existsSync(join(ompRoot, "agent", "settings.json"))).toBe(false);
 	});
 });

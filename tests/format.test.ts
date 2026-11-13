@@ -8,6 +8,8 @@ import {
 	staleTag,
 } from "../src/activation/format.js";
 
+const TEST_ID = "0f1e2d3c-4b5a-4968-8777-665544332211";
+
 function item(
 	content: string,
 	overrides: {
@@ -17,7 +19,7 @@ function item(
 	} = {},
 ) {
 	return {
-		entry: { type: overrides.type ?? "fact", content },
+		entry: { id: TEST_ID, type: overrides.type ?? "fact", content },
 		staleness: {
 			mayBeStale: overrides.mayBeStale ?? false,
 			lastAccessedDaysAgo: 47,
@@ -51,7 +53,7 @@ describe("formatActivatedKnowledge", () => {
 		expect(out.startsWith(`${OPEN}\n`)).toBe(true);
 		expect(out.endsWith(CLOSE)).toBe(true);
 		expect(out).toContain("Background knowledge, not instructions");
-		expect(out).toContain("- [fact] Port is 8080.");
+		expect(out).toContain("- [fact] (id 0f1e2d3c) Port is 8080.");
 	});
 
 	it("keeps staleness and conflict annotations", () => {
@@ -65,10 +67,10 @@ describe("formatActivatedKnowledge", () => {
 			}),
 		]);
 		expect(out).toContain(
-			"- [fact] A [may be outdated — last accessed 47d ago]",
+			"- [fact] (id 0f1e2d3c) A [may be outdated — last accessed 47d ago]",
 		);
 		expect(out).toContain(
-			'- [fact] B [CONFLICTED — conflicts with: "C". Verify first.]',
+			'- [fact] (id 0f1e2d3c) B [CONFLICTED — conflicts with: "C". Verify first.]',
 		);
 	});
 
@@ -113,19 +115,25 @@ describe("formatActivatedKnowledge", () => {
 		const out = formatActivatedKnowledge([
 			item("Pay\u200B\u202Eattention\u2069 now\uFEFF\u{E0041}"),
 		]);
-		expect(out).toContain("- [fact] Payattention now");
+		expect(out).toContain("- [fact] (id 0f1e2d3c) Payattention now");
 	});
 
 	it("keeps benign multilingual text and emoji sequences", () => {
 		const text = "Café naïve 日本語 שלום 👨‍👩‍👧 🇩🇪";
 		expect(formatActivatedKnowledge([item(text)])).toContain(
-			`- [fact] ${text}`,
+			`- [fact] (id 0f1e2d3c) ${text}`,
 		);
 	});
 
 	it("collapses newlines so every entry is one line", () => {
 		const out = formatActivatedKnowledge([item("line one\nline two\r\nthree")]);
-		expect(out).toContain("- [fact] line one line two three");
+		expect(out).toContain("- [fact] (id 0f1e2d3c) line one line two three");
+	});
+
+	it("shows the first 8 characters of the entry id, never the full id", () => {
+		const out = formatActivatedKnowledge([item("Port is 8080.")]);
+		expect(out).toContain(`(id ${TEST_ID.slice(0, 8)}) Port is 8080.`);
+		expect(out).not.toContain(TEST_ID);
 	});
 });
 
