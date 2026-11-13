@@ -50,7 +50,7 @@ jobs:
       # release-please-config.json sets "draft": true, so this creates a draft
       # release (with its tag, via force-tag-creation). Nothing is installable
       # until the publish job below promotes it.
-      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         if: ${{ steps.head.outputs.current == 'true' }}
         with:
@@ -75,7 +75,7 @@ jobs:
             suffix: darwin-arm64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Build the commit release-please tagged, not whatever main points at now.
           ref: ${{ needs.release-please.outputs.sha }}
@@ -170,7 +170,7 @@ jobs:
           subject-path: dist/install.sh
 
       - name: Stage release files
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-${{ matrix.suffix }}
           if-no-files-found: error
@@ -203,7 +203,7 @@ jobs:
       TAG: ${{ needs.release-please.outputs.tag_name }}
     steps:
       - name: Download staged files
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: release-*
           path: artifacts
