@@ -12,7 +12,9 @@
  * fake timer cannot model.
  */
 import {
+	afterAll,
 	afterEach,
+	beforeAll,
 	beforeEach,
 	describe,
 	expect,
@@ -34,10 +36,10 @@ import * as ort from "onnxruntime-web";
 import { LocalReranker } from "../src/activation/rerank";
 import { RerankSkippedError } from "../src/activation/rerank-remote";
 import { config } from "../src/config";
+import { REAL_MODELS_DIR } from "./support/real-home-guard.js";
 
 const SYNTH_MODEL = "test-org/synthetic-reranker"; // not pinned → no checksum
 const DEFAULT_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"; // pinned
-const REAL_MODELS_DIR = config.activation.rerank.modelsDir;
 const HAS_REAL_MODEL = existsSync(
 	join(REAL_MODELS_DIR, DEFAULT_MODEL, "onnx", "model_quantized.onnx"),
 );
@@ -435,6 +437,16 @@ const SHORT_DOCS = Array.from(
 );
 
 describe.skipIf(!HAS_REAL_MODEL)("LocalReranker (real cached model)", () => {
+	// The preload moved HOME to a temp dir, so the reranker must read the real cache.
+	let sandboxModelsDir = "";
+	beforeAll(() => {
+		sandboxModelsDir = config.activation.rerank.modelsDir;
+		config.activation.rerank.modelsDir = REAL_MODELS_DIR;
+	});
+	afterAll(() => {
+		config.activation.rerank.modelsDir = sandboxModelsDir;
+	});
+
 	it("scores 40 short pairs with the pinned default model, yielding between runs", async () => {
 		const reranker = new LocalReranker({
 			model: DEFAULT_MODEL,
