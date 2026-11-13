@@ -49,6 +49,101 @@ function row(overrides: Partial<ActivationEventRow> = {}): ActivationEventRow {
 	};
 }
 
+/**
+ * state DB as the v3 release wrote it (schema v1-v3). Frozen on purpose: the
+ * upgrade under test is what brings it to the current version.
+ */
+const V3_STATE_SQL = `
+  CREATE TABLE state_schema_version (
+    version INTEGER NOT NULL UNIQUE,
+    applied_at BIGINT NOT NULL
+  );
+  INSERT INTO state_schema_version (version, applied_at) VALUES (1, 0), (2, 0), (3, 0);
+
+  CREATE TABLE pending_episodes (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL DEFAULT 'default',
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    start_message_id TEXT NOT NULL,
+    end_message_id TEXT NOT NULL,
+    session_title TEXT NOT NULL DEFAULT '',
+    project_name TEXT NOT NULL DEFAULT '',
+    directory TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL,
+    content_type TEXT NOT NULL CHECK(content_type IN ('messages', 'compaction_summary', 'document')),
+    session_timestamp BIGINT NOT NULL DEFAULT 0,
+    max_message_time BIGINT NOT NULL DEFAULT 0,
+    approx_tokens INTEGER NOT NULL DEFAULT 0,
+    uploaded_at BIGINT NOT NULL
+  );
+  CREATE INDEX idx_pending_source_time ON pending_episodes(source, max_message_time);
+
+  CREATE TABLE pending_episode_attempts (
+    id TEXT PRIMARY KEY,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
+  );
+
+  CREATE TABLE activation_event (
+    id BIGSERIAL PRIMARY KEY,
+    ts BIGINT NOT NULL,
+    client TEXT NOT NULL,
+    session_hash TEXT,
+    prompt_chars INTEGER NOT NULL,
+    cue_count INTEGER NOT NULL,
+    n_candidates INTEGER NOT NULL,
+    n_returned INTEGER NOT NULL,
+    entry_ids TEXT NOT NULL,
+    raw_sims TEXT NOT NULL,
+    rerank_scores TEXT,
+    gate_mode TEXT NOT NULL CHECK (gate_mode IN ('rerank', 'dense', 'off')),
+    latency_ms INTEGER NOT NULL,
+    client_deadline_exceeded BOOLEAN NOT NULL DEFAULT FALSE
+  );
+  CREATE INDEX idx_activation_event_ts ON activation_event(ts);
+  CREATE INDEX idx_activation_event_client_ts ON activation_event(client, ts);
+
+  CREATE TABLE consolidated_episode (
+    source TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    start_message_id TEXT NOT NULL,
+    end_message_id TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    processed_at BIGINT NOT NULL,
+    entries_created INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (source, session_id, start_message_id, end_message_id)
+  );
+
+  CREATE TABLE consolidation_state (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    last_consolidated_at BIGINT NOT NULL DEFAULT 0,
+    total_sessions_processed BIGINT NOT NULL DEFAULT 0,
+    total_entries_created BIGINT NOT NULL DEFAULT 0,
+    total_entries_updated BIGINT NOT NULL DEFAULT 0
+  );
+  INSERT INTO consolidation_state (id) VALUES (1);
+
+  INSERT INTO pending_episodes (id, source, session_id, start_message_id, end_message_id, content, content_type, max_message_time, uploaded_at)
+    VALUES ('ep-v3', 'opencode', 's1', 'a', 'b', 'staged text', 'messages', 1, 1);
+  INSERT INTO activation_event (ts, client, prompt_chars, cue_count, n_candidates, n_returned, entry_ids, raw_sims, gate_mode, latency_ms)
+    VALUES (1000, 'opencode', 42, 2, 5, 1, '["entry-1"]', '[0.5]', 'off', 12);
+`;
+
+/** The v4 release: four activation_event columns, stamped v4. */
+const V4_STATE_SQL = `
+  ALTER TABLE activation_event ADD COLUMN gate_dropped INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE activation_event ADD COLUMN budget_dropped INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE activation_event ADD COLUMN deduped INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE activation_event ADD COLUMN injected_tokens INTEGER NOT NULL DEFAULT 0;
+  INSERT INTO state_schema_version (version, applied_at) VALUES (4, 0);
+`;
+
+const LEGACY_FIXTURES = [
+	{ label: "v3", sql: V3_STATE_SQL },
+	{ label: "v4", sql: V3_STATE_SQL + V4_STATE_SQL },
+] as const;
+
 // Each test gets its own database, so the fresh-install and upgrade paths run
 // for real instead of against whatever the other PG suites left behind.
 describe.skipIf(!PG_URI)("PostgresServerStateDB activation_event", () => {
@@ -103,14 +198,14 @@ describe.skipIf(!PG_URI)("PostgresServerStateDB activation_event", () => {
 		});
 	}
 
-	it("fresh init stamps schema v5 and creates activation_event", async () => {
+	it("fresh init stamps schema v6 and creates activation_event", async () => {
 		const state = new PostgresServerStateDB(testUri);
 		try {
 			await state.initialize();
 		} finally {
 			await state.close();
 		}
-		expect(await schemaVersions()).toEqual([5]);
+		expect(await schemaVersions()).toEqual([6]);
 		expect(await activationTableExists()).toBe(true);
 	});
 
@@ -140,7 +235,7 @@ describe.skipIf(!PG_URI)("PostgresServerStateDB activation_event", () => {
 		} finally {
 			await state.close();
 		}
-		expect(await schemaVersions()).toEqual([2, 3, 4, 5]);
+		expect(await schemaVersions()).toEqual([2, 3, 4, 5, 6]);
 		expect(await activationTableExists()).toBe(true);
 	});
 
@@ -168,7 +263,7 @@ describe.skipIf(!PG_URI)("PostgresServerStateDB activation_event", () => {
 		} finally {
 			await state.close();
 		}
-		expect(await schemaVersions()).toEqual([4, 5]);
+		expect(await schemaVersions()).toEqual([4, 5, 6]);
 		const stored = await withDb(
 			(sql) => sql`SELECT ts, rerank_model FROM activation_event ORDER BY ts`,
 		);
@@ -297,4 +392,57 @@ describe.skipIf(!PG_URI)("PostgresServerStateDB activation_event", () => {
 			await state.close();
 		}
 	});
+
+	for (const fixture of LEGACY_FIXTURES) {
+		it(`upgrades a ${fixture.label} state DB through v6 and keeps its rows`, async () => {
+			await withDb((sql) => sql.unsafe(fixture.sql));
+
+			const state = new PostgresServerStateDB(testUri);
+			try {
+				expect((await state.getPendingEpisodes(0)).map((e) => e.id)).toEqual([
+					"ep-v3",
+				]);
+				await state.insertActivationEvents([
+					row({ ts: 2_000, rerankModel: "remote/jev-1.14.0" }),
+				]);
+				expect(await state.countActivationsByClient(0)).toEqual({
+					opencode: 1,
+					"claude-code": 1,
+				});
+			} finally {
+				await state.close();
+			}
+
+			expect(await schemaVersions()).toEqual([1, 2, 3, 4, 5, 6]);
+			const stored = await withDb(
+				(sql) => sql`
+					SELECT ts, gate_dropped, injected_tokens, rerank_model
+					FROM activation_event ORDER BY ts
+				`,
+			);
+			expect(
+				stored.map((r) => ({
+					ts: Number(r.ts),
+					gate_dropped: Number(r.gate_dropped),
+					injected_tokens: Number(r.injected_tokens),
+					rerank_model: r.rerank_model,
+				})),
+			).toEqual([
+				{ ts: 1_000, gate_dropped: 0, injected_tokens: 0, rerank_model: null },
+				{
+					ts: 2_000,
+					gate_dropped: 0,
+					injected_tokens: 0,
+					rerank_model: "remote/jev-1.14.0",
+				},
+			]);
+			const index = await withDb(
+				(sql) => sql`
+					SELECT indexname FROM pg_indexes
+					WHERE schemaname = current_schema() AND indexname = 'idx_pending_session'
+				`,
+			);
+			expect(index.length).toBe(1);
+		});
+	}
 });

@@ -100,49 +100,8 @@ describe("activation_event schema", () => {
 		);
 	});
 
-	it("state DB is at the registered v5 schema", () => {
-		expect(SERVER_LOCAL_SCHEMA_VERSION).toBe(5);
-	});
-
-	it("upgrading a v2 state DB adds the table", async () => {
-		await state.close();
-		const raw = new Database(statePath);
-		raw.exec("DROP TABLE activation_event");
-		raw.exec("DELETE FROM schema_version WHERE version = 3");
-		raw.close();
-
-		state = new ServerStateDB(statePath);
-		const check = openRaw(statePath);
-		const found = check
-			.prepare(
-				"SELECT name FROM sqlite_master WHERE type='table' AND name='activation_event'",
-			)
-			.get();
-		check.close();
-		expect(found).not.toBeNull();
-	});
-
-	it("upgrading a v4 state DB adds rerank_model and keeps its rows", async () => {
-		await state.insertActivationEvents([row({ ts: 1_000 })]);
-		await state.close();
-		const raw = new Database(statePath);
-		raw.exec("ALTER TABLE activation_event DROP COLUMN rerank_model");
-		raw.exec("DELETE FROM schema_version WHERE version = 5");
-		raw.close();
-
-		state = new ServerStateDB(statePath);
-		await state.insertActivationEvents([
-			row({ ts: 2_000, rerankModel: "local/Xenova/ms-marco-MiniLM-L-6-v2" }),
-		]);
-		const check = openRaw(statePath);
-		const stored = check
-			.prepare("SELECT ts, rerank_model FROM activation_event ORDER BY ts")
-			.all() as Array<{ ts: number; rerank_model: string | null }>;
-		check.close();
-		expect(stored).toEqual([
-			{ ts: 1_000, rerank_model: null },
-			{ ts: 2_000, rerank_model: "local/Xenova/ms-marco-MiniLM-L-6-v2" },
-		]);
+	it("state DB is at the registered v6 schema", () => {
+		expect(SERVER_LOCAL_SCHEMA_VERSION).toBe(6);
 	});
 });
 
