@@ -1724,6 +1724,104 @@ describe.skipIf(!PG_URI)("PostgresKnowledgeDB integration", () => {
 	});
 });
 
+// ── Migration v14: staging tables leave Postgres ─────────────────────────────
+
+describe.skipIf(!PG_URI)("PostgreSQL migration v14 (staging tables)", () => {
+	const uri = PG_URI as string;
+	// A private schema per run: the migration works on current_schema(), so these
+	// tables never touch the schema the other suites use.
+	const schema = `ks_v14_${crypto.randomUUID().replaceAll("-", "")}`;
+	let admin: postgres.Sql;
+	let sql: postgres.Sql;
+
+	beforeAll(async () => {
+		admin = postgres(uri, { max: 1 });
+		await admin.unsafe(`CREATE SCHEMA ${schema}`);
+		sql = postgres(uri, { max: 1, connection: { search_path: schema } });
+	});
+
+	beforeEach(async () => {
+		await admin.unsafe(`DROP SCHEMA ${schema} CASCADE`);
+		await admin.unsafe(`CREATE SCHEMA ${schema}`);
+	});
+
+	afterAll(async () => {
+		await sql.end();
+		await admin.unsafe(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+		await admin.end();
+	});
+
+	const createStagingTable = async (name: string, rows: number) => {
+		await sql.unsafe(`CREATE TABLE ${name} (id TEXT PRIMARY KEY)`);
+		await sql.unsafe(
+			`INSERT INTO ${name} (id) SELECT 'row-' || g FROM generate_series(1, $1::int) g`,
+			[rows],
+		);
+	};
+	const rowCount = async (name: string) => {
+		const [row] = await sql.unsafe<{ n: number }[]>(
+			`SELECT COUNT(*)::int AS n FROM ${name}`,
+		);
+		return row.n;
+	};
+	const tableNames = async () => {
+		const rows = await admin<{ table_name: string }[]>`
+			SELECT table_name FROM information_schema.tables
+			WHERE table_schema = ${schema}
+			ORDER BY table_name
+		`;
+		return rows.map((r) => r.table_name);
+	};
+	const runV14 = () =>
+		sql.begin(async (tx) => {
+			await (
+				PG_MIGRATIONS.find(
+					(m) => m.version === 14,
+				) as (typeof PG_MIGRATIONS)[number]
+			).up(tx as never);
+		});
+
+	it("drops empty staging tables", async () => {
+		await createStagingTable("pending_episodes", 0);
+		await createStagingTable("consolidated_episode", 0);
+		await createStagingTable("consolidation_state", 0);
+
+		await runV14();
+
+		expect(await tableNames()).toEqual([]);
+	});
+
+	it("renames staging tables that hold rows to legacy_* and keeps the rows", async () => {
+		await createStagingTable("pending_episodes", 2);
+		await createStagingTable("consolidated_episode", 0);
+		await createStagingTable("consolidation_state", 1);
+
+		await runV14();
+
+		expect(await tableNames()).toEqual([
+			"legacy_consolidation_state",
+			"legacy_pending_episodes",
+		]);
+		expect(await rowCount("legacy_pending_episodes")).toBe(2);
+		expect(await rowCount("legacy_consolidation_state")).toBe(1);
+	});
+
+	it("leaves the tables alone when a Postgres state DB in the same schema owns them", async () => {
+		await sql.unsafe(
+			"CREATE TABLE state_schema_version (version INTEGER NOT NULL)",
+		);
+		await createStagingTable("pending_episodes", 1);
+
+		await runV14();
+
+		expect(await tableNames()).toEqual([
+			"pending_episodes",
+			"state_schema_version",
+		]);
+		expect(await rowCount("pending_episodes")).toBe(1);
+	});
+});
+
 // ── Migrations v16/v17: pgvector setup from a v15 store ──────────────────────
 
 describe.skipIf(!PG_URI)("PostgreSQL migrations v16/v17", () => {
