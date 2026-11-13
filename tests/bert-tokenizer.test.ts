@@ -96,11 +96,11 @@ describe("BertWordPieceTokenizer (synthetic vocab)", () => {
 		expect(tokenTypeIds).toEqual([0, 0, 0, 1, 1]);
 	});
 
-	it("batch-encodes with right padding and attention masks", () => {
+	it("batchFromIds right-pads pairs and marks the padding in the mask", () => {
 		const tok = makeTokenizer();
-		const enc = tok.batchEncodePairs(
-			["hello", "hello world"],
-			["world", "hello"],
+		const enc = tok.batchFromIds(
+			[tok.encode("hello"), tok.encode("hello world")],
+			[tok.encode("world"), tok.encode("hello")],
 		);
 		// Pair 1: [CLS] hello [SEP] world [SEP]  (5)
 		// Pair 2: [CLS] hello world [SEP] hello [SEP] (6) → seqLen 6
@@ -142,7 +142,7 @@ describe("BertWordPieceTokenizer truncation and id-level pairs", () => {
 		expect(tok.encodeHead("hello", 5)).toEqual([10]);
 	});
 
-	it("batchFromIds pads id-level pairs like batchEncodePairs", () => {
+	it("batchFromIds pads id-level pairs to the longest", () => {
 		const tok = makeTokenizer();
 		const enc = tok.batchFromIds([[10]], [[11, 11]]);
 		expect(enc.dims).toEqual([1, 6]); // [CLS] hello [SEP] world world [SEP]
