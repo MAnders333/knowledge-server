@@ -73,12 +73,23 @@ const RULES: ReadonlyArray<RedactionRule> = [
 	},
 	{
 		kind: "env_secret",
-		re: /^([ \t]*(?:export[ \t]+)?[A-Za-z0-9_]{0,64}(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE)[A-Za-z0-9_]{0,64}=)(?!\[REDACTED:)[^\r\n]+/gim,
+		re: /^([ \t]*(?:export[ \t]+)?[A-Za-z0-9_]{0,64}(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE)[A-Za-z0-9_]{0,64}=)(?!\[REDACTED:)(?![ \t]*(?:\$|(?:true|false|none|null|undefined|nil)\b))(?![^\r\n]*[(\[])[^\r\n]+/gim,
 		keep: true,
 	},
 	{
 		kind: "keyed_entropy",
 		re: /((?:api[_-]?key|secret|token|password|credential|auth)["']?[ \t]*[:=][ \t]*["']?)[A-Za-z0-9+/=_-]{32,}/gi,
+		keep: true,
+	},
+	{
+		// Credential assignments the rules above miss: mid-line, lowercase, or in
+		// `key: value` / `key=value` form. The key is a `_`/`-` joined name ending in
+		// a credential word. The value must look like a secret: it contains a digit or
+		// one of `+=!@#%^*`, or it is 16+ letters. Values stop at quotes, brackets and
+		// `.` or `$`, and a value starting with `~` or `/` is a path. So `primary_key=True`,
+		// `cache_key=build_key(x)` and `partition_key: user_id` are kept.
+		kind: "keyed_secret",
+		re: /((?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9]*[_-](?:password|passwd|secret|token|key)["']?[ \t]*[=:][ \t]*["']?)(?!\[REDACTED:)(?![~/])(?:(?=[^\s"'`,;&()[\]{}<>.$]{0,64}?[0-9+=!@#%^*])|(?=[A-Za-z]{16}))[^\s"'`,;&()[\]{}<>.$]{4,}/gi,
 		keep: true,
 	},
 ];

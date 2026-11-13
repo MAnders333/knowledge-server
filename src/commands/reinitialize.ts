@@ -3,10 +3,16 @@ import { resolveDataDir } from "../config-file.js";
 import { config } from "../config.js";
 import { DaemonDB } from "../db/daemon/index.js";
 import { StoreRegistry } from "../db/store-registry.js";
+import {
+	type ProcessTable,
+	classifyPidFile,
+	isServerCommand,
+	locatePidFile,
+	systemProcessTable,
+} from "../process-identity.js";
 import { lockHolder } from "../process-lock.js";
 import { daemonLockPath } from "../runtime-files.js";
 import { currentUserId } from "../user-id.js";
-import { errCode } from "../utils.js";
 
 /**
  * Why a reinitialize must not run while a knowledge-daemon holds the lock for
@@ -25,6 +31,25 @@ export function liveDaemonRefusal(dataDir: string): string | null {
 		"  Linux service:  systemctl --user stop knowledge-daemon",
 		'  otherwise:      kill <pid>   (the "pid" field of daemon.lock in the data directory)',
 	].join("\n");
+}
+
+/**
+ * Why a reinitialize must not run while the server holds the PID file contents
+ * `raw`, or null when no server is live. A PID that is alive but whose command
+ * line cannot be read counts as live: the server cannot be ruled out.
+ */
+export function serverRefusal(
+	raw: string,
+	table: ProcessTable = systemProcessTable,
+): string | null {
+	const state = classifyPidFile(raw, table, isServerCommand);
+	if (state.kind === "running") {
+		return `Server is running (PID ${state.pid}). Stop it first:\n  knowledge-server stop`;
+	}
+	if (state.kind === "unverified") {
+		return `PID ${state.pid} is alive but its command line is unreadable, so the server cannot be ruled out. If it is the server, stop it first (kill ${state.pid}); otherwise remove the PID file.`;
+	}
+	return null;
 }
 
 /**
@@ -103,28 +128,12 @@ export async function runReinitialize(args: string[]): Promise<void> {
 	// command's deletes are not coordinated — running both at once can corrupt
 	// in-flight consolidation state or leave knowledge entries in a mixed state.
 	// Run unconditionally so even the default cursor-reset is guarded.
-	const pidPath = config.pidPath;
-	if (pidPath && existsSync(pidPath)) {
-		const pid = Number.parseInt(readFileSync(pidPath, "utf8").trim(), 10);
-		if (!Number.isNaN(pid) && pid > 0) {
-			// Send signal 0 to probe liveness without killing the process.
-			// kill(pid, 0) succeeds (no throw) when alive and we have permission.
-			// EPERM: process exists but we can't signal it — still alive (e.g. daemon).
-			// ESRCH: no such process — dead.
-			// Unknown codes are treated as dead (defensive — avoids blocking reinitialize
-			// on unexpected OS errors). Matches the pattern used in stop.ts.
-			let alive = true;
-			try {
-				process.kill(pid, 0);
-			} catch (e: unknown) {
-				alive = errCode(e) === "EPERM"; // EPERM = exists, no permission; ESRCH = dead
-			}
-			if (alive) {
-				console.error(
-					`Server is running (PID ${pid}). Stop it first:\n  knowledge-server stop`,
-				);
-				process.exit(1);
-			}
+	const located = locatePidFile(config.pidPath, null);
+	if (located !== null) {
+		const refusal = serverRefusal(readFileSync(located, "utf8"));
+		if (refusal) {
+			console.error(refusal);
+			process.exit(1);
 		}
 	}
 

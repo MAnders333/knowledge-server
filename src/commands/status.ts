@@ -2,7 +2,13 @@ import { existsSync, readFileSync } from "node:fs";
 import pkg from "../../package.json" with { type: "json" };
 import { resolveServerAddress } from "../config-file.js";
 import { StoreRegistry } from "../db/store-registry.js";
-import { errCode } from "../utils.js";
+import {
+	type ProcessTable,
+	classifyPidFile,
+	isServerCommand,
+	locatePidFile,
+	systemProcessTable,
+} from "../process-identity.js";
 
 /** Window for the per-source capture vs injection check. */
 export const COVERAGE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
@@ -87,35 +93,44 @@ export async function fetchServerHealth(
 }
 
 /**
+ * The server line of `status`, from the contents of the PID file. A PID counts as
+ * running only when it still runs knowledge-server (see `classifyPidFile`).
+ */
+export function serverStateLine(
+	raw: string,
+	table: ProcessTable = systemProcessTable,
+): string {
+	const state = classifyPidFile(raw, table, isServerCommand);
+	switch (state.kind) {
+		case "invalid":
+			return "unknown (malformed PID file)";
+		case "running":
+			return `running (PID ${state.pid})`;
+		case "unverified":
+			return `unknown (PID ${state.pid} is alive; its command line is unreadable)`;
+		case "stale":
+			return state.reason === "dead"
+				? "stopped (stale PID file)"
+				: `stopped (stale PID file; PID ${state.pid} belongs to another program)`;
+	}
+}
+
+/**
  * `knowledge-server status`
  *
  * Prints a human-readable summary of the knowledge store and whether the
  * HTTP server is currently running (detected via PID file).
  */
-export async function runStatus(pidPath: string): Promise<void> {
+export async function runStatus(
+	pidPath: string,
+	legacyPidPath: string | null = null,
+): Promise<void> {
 	// Server running state — detected via PID file.
-	let serverLine: string;
-	if (!pidPath || !existsSync(pidPath)) {
-		serverLine = "stopped";
-	} else {
-		const raw = readFileSync(pidPath, "utf8").trim();
-		const pid = Number.parseInt(raw, 10);
-		if (Number.isNaN(pid)) {
-			serverLine = "unknown (malformed PID file)";
-		} else {
-			const isAlive = (() => {
-				try {
-					process.kill(pid, 0);
-					return true;
-				} catch (e) {
-					return errCode(e) === "EPERM";
-				}
-			})();
-			serverLine = isAlive
-				? `running (PID ${pid})`
-				: "stopped (stale PID file)";
-		}
-	}
+	const located = locatePidFile(pidPath, legacyPidPath);
+	const serverLine =
+		located === null
+			? "stopped"
+			: serverStateLine(readFileSync(located, "utf8"));
 
 	const address = resolveServerAddress();
 	const serverHealth = await fetchServerHealth(
