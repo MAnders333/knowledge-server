@@ -497,7 +497,7 @@ All sources are auto-detected. Override paths or disable sources via environment
 | `ACTIVATION_MAX_RESULTS` | `10` | Max entries returned per activation |
 | `ACTIVATION_SIMILARITY_THRESHOLD` | `0.42` | Minimum cosine similarity to activate |
 | `ACTIVATION_PRECISION_GATE` | `on` | `off` disables the floors and the token budget below (dedupe is separate). The render cap still applies, so the block never exceeds the formatter's 6,000-character limit |
-| `RERANK_FLOOR` | unset | Absolute rerank-score floor for the configured scorer. Unset: relative rule only, since no per-model floor is calibrated yet. Applies to the top entry too |
+| `RERANK_FLOOR` | unset | Absolute rerank-score floor for the configured scorer. Unset: relative rule only; no absolute floor is enabled by default. The benchmark's suggested value for `jev-1.14.0` is `0.2`, with a precision trade-off (see the note under Reranking). Applies to the top entry too |
 | `RERANK_REL_FRAC` | `0.35` | With rerank, a candidate must reach this fraction of the best rerank score (floor = max of this and `RERANK_FLOOR`) |
 | `ACTIVATION_DENSE_MARGIN` | `0` | Used when rerank did not run (disabled, failed, or timed out): raw cosine must clear the similarity threshold by this margin. At `0` the dense fallback adds no filtering beyond the threshold |
 | `ACTIVATION_TOKEN_BUDGET` | `1500` | Estimated tokens (chars / 4) for the injected entries. The top entry is always kept. Values above `1500` are clamped to it: the formatter caps the block at 6,000 characters, so an entry counted here is always an entry rendered |
@@ -522,11 +522,11 @@ Hosts of the models seen on the maintainer's gateway. Check the routing of your 
 | Model | Hosted by (as seen on the maintainer's gateway) | Notes |
 |---|---|---|
 | `jev-1.14.0`, `jev-latest` | TypeSafe (Jev) | Also reachable directly at `https://api.typesafe.ai/v1/systemone` with a TypeSafe key (`RERANK_REMOTE_URL` and `RERANK_REMOTE_API_KEY`). No `-eu` variant on the gateway |
-| `clef` | Cloudflare | `clef-eu` may exist on your gateway; confirm its hosting with your gateway administrator |
-| `decision-1` | Microsoft | `decision-1-eu` may exist on your gateway; confirm its hosting with your gateway administrator |
+| `clef` | Cloudflare | `clef-eu` is not a twin: on NFCorpus it scored 0.016 nDCG lower than `clef` (CI +0.002 to +0.031). Confirm its hosting with your gateway administrator |
+| `decision-1` | Microsoft | `decision-1-eu` scored the same as `decision-1` on both corpora. Confirm its hosting with your gateway administrator |
 | `pplx-decider-v1-27b` | Perplexity | |
 
-The default name `jev-1.14.0` exists on the maintainer's gateway and on TypeSafe's direct API. Any other endpoint needs the model name it offers. Cost is per input token (output tokens are free). A per-1,000-activation cost has not been measured yet; compute it from the `input_tokens` value in the `[rerank]` log line.
+The default name `jev-1.14.0` exists on the maintainer's gateway and on TypeSafe's direct API. Any other endpoint needs the model name it offers. The gateway decides where a model runs.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -534,7 +534,7 @@ The default name `jev-1.14.0` exists on the maintainer's gateway and on TypeSafe
 | `RERANK_PROVIDER` | `local` | `local` or `remote`. Any other value fails validation. `remote` sends content off this machine (see the privacy note) |
 | `RERANK_MODEL` | `Xenova/ms-marco-MiniLM-L-6-v2` | Local Hugging Face ONNX cross-encoder. **The default is English-only.** For other languages use a multilingual ONNX export with a WordPiece `tokenizer.json`. Other models are fetched from `main` without a checksum |
 | `RERANK_MODELS_DIR` | `~/.local/share/knowledge-server/models` | Local model cache |
-| `RERANK_CANDIDATES` | `16` | Dense candidates scored per activation. Remote scores at most 40 |
+| `RERANK_CANDIDATES` | `16` (local); `30` with `RERANK_PROVIDER=remote` | Dense candidates scored per activation. Remote scores at most 40 in one call. 30 was the benchmark's choice: 16 to 40 gave +0.030 nDCG on NFCorpus (CI +0.014 to +0.047) and +0.011 on SciFact (not significant) |
 | `RERANK_TIMEOUT_MS` | `3000` | Budget for one local rerank call. On expiry the whole batch falls back to dense ordering (no partial scores) |
 | `RERANK_MAX_QUERY_TOKENS` | `128` | Last N tokens of the prompt used as the rerank query (remote: N × 4 characters) |
 | `RERANK_MAX_DOC_TOKENS` | `256` | First N tokens of each candidate that is scored (remote: N × 4 characters). Shorter caps lowered quality on long documents |
@@ -544,6 +544,19 @@ The default name `jev-1.14.0` exists on the maintainer's gateway and on TypeSafe
 | `RERANK_REMOTE_TIMEOUT_MS` | `4000` | Budget for one call, including one retry after a 429 whose `Retry-After` fits in what is left. It sits inside the 5 s plugin budget; on expiry dense ordering is used |
 
 Remote mode needs an endpoint (`RERANK_REMOTE_URL`, or `LLM_BASE_ENDPOINT`) and a key (`RERANK_REMOTE_API_KEY`, or `LLM_API_KEY` for the gateway's own origin). If either is missing (or still a template placeholder), the server logs a warning at startup and uses the local reranker. When remote reranking is active, startup also rejects `RERANK_CANDIDATES` above 40, and any configuration whose request could exceed about 100,000 characters: `RERANK_CANDIDATES × (RERANK_MAX_DOC_TOKENS × 4 + 512) + RERANK_MAX_QUERY_TOKENS × 4`. The defaults give about 25,000.
+
+The default model is the pinned `jev-1.14.0`: its quality is within the confidence interval of `jev-1.13.0`, `clef` and `pplx-decider-v1-27b`, it costs about a sixth of `clef`, and it had the lowest measured p95 with no errors or 429s.
+
+**Measured (benchmark, 2026-11-13).** SciFact and NFCorpus, 150 queries each, dense top-40 candidates with 256-token documents, one call per query. The host was a shared 10-core Mac under load 5 to 16, so latency is an upper bound.
+
+- Cost per 1,000 activations (input tokens; output tokens are free): `jev-1.14.0` $0.25 at 16 candidates and $0.61 at 40 (30 was not measured); `clef` $1.50 at 16 and $3.72 at 40; `pplx-decider-v1-27b` about $0.22 at 16. `decision-1` returns no `usage.cost` on the gateway, so it shows as $0 here; its billing is unknown.
+- Latency, `jev-1.14.0`: p50 456 ms and p95 587 ms at 16 candidates, concurrency 1 (357 and 405 ms at concurrency 4); p95 561 ms at 40 candidates, concurrency 1 (654 ms at concurrency 4). `clef`: p95 1,113 ms at 16 candidates and 2,558 ms at 40. No timeouts, errors or 429s in any cell.
+- Scores are ranking signals, not probabilities. On the benchmark's labels only 60 to 70% of candidates scoring above 0.9 were relevant, so any score cut-off is a choice to verify, not a calibrated probability.
+- Repeated identical requests are not bit-exact on `jev-1.14.0`: over 20 repeated queries, 2 top-1 choices flipped (`clef` was exact on the same 20). Dense order is kept as the input order; order changed nDCG by at most ±0.003 in the benchmark.
+
+**Absolute floor (not enabled).** The benchmark suggests `RERANK_FLOOR=0.2` for `jev-1.14.0`. On its labels that keeps 15% (SciFact) and 46% (NFCorpus) of candidates, with recall 0.83 and 0.86, but precision of only 0.36 and 0.39. The labels count any judged link as relevant, which is looser than memory relevance. The relative rule alone keeps 39% and 63% of candidates when the top score is below 0.3; at 0.2 the floor keeps 1.4% and 4.7% of those. Verify on your own memory entries before setting it. The per-model floor table in `gate.ts` is empty.
+
+**EU variants.** `decision-1-eu` matches `decision-1` on both corpora. `clef-eu` does not match `clef` exactly (on NFCorpus `clef` scored 0.016 nDCG higher), so it is not a drop-in twin. `jev` has no `-eu` variant on the gateway.
 
 Pairs are scored one at a time and the event loop is yielded between them, so one long candidate no longer stalls other requests. Latency grows with the token caps. Measured on a 10-core Apple Silicon machine at a load average of about 12, 16 candidates at the defaults took a median of 2.5 s and 20 candidates took 3.2 s. With long prompts and long candidates on every pair, 16 candidates took 3.9 s, so those calls fall back to dense ordering. On slower CPUs lower `RERANK_CANDIDATES` or `RERANK_MAX_QUERY_TOKENS`, or raise `RERANK_TIMEOUT_MS`. Keep it well under 5 s, because the plugin gives up after that.
 
