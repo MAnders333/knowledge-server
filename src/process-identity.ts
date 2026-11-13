@@ -68,27 +68,34 @@ function literal(text: string): string {
 /**
  * True when a command line runs the compiled `binary`, or runs `bun` on the
  * source `sourceEntry` (for example `src/index.ts`). The executable path may
- * contain spaces, so the match is on the whole command line, not on tokens.
+ * contain spaces, so the match is on the whole command line. Unless `takesArgs`,
+ * the binary or entry point must be the last thing on the line: a process started
+ * with a subcommand (`knowledge-server status`, `bun run src/index.ts mcp`) is a
+ * different process from the server.
  */
 function isCommandOf(
 	command: string,
 	binary: string,
 	sourceEntry: string,
+	takesArgs: boolean,
 ): boolean {
 	const cmd = command.trim();
-	if (new RegExp(`^(?:.*/)?${literal(binary)}(?:\\s|$)`).test(cmd)) return true;
+	const end = takesArgs ? "(?:\\s|$)" : "\\s*$";
+	if (new RegExp(`^(?:.*/)?${literal(binary)}${end}`).test(cmd)) return true;
 	return (
 		/^(?:.*\/)?bun\s/.test(cmd) &&
-		new RegExp(`(?:^|[\\s/])${literal(sourceEntry)}(?:\\s|$)`).test(cmd)
+		new RegExp(`(?:^|[\\s/])${literal(sourceEntry)}${end}`).test(cmd)
 	);
 }
 
+/** The server takes no arguments: a server process has nothing after its entry point. */
 export function isServerCommand(command: string): boolean {
-	return isCommandOf(command, "knowledge-server", "src/index.ts");
+	return isCommandOf(command, "knowledge-server", "src/index.ts", false);
 }
 
+/** The daemon is started with flags (for example `--interval`), so arguments are allowed. */
 export function isDaemonCommand(command: string): boolean {
-	return isCommandOf(command, "knowledge-daemon", "src/daemon/index.ts");
+	return isCommandOf(command, "knowledge-daemon", "src/daemon/index.ts", true);
 }
 
 type PidFileState =
@@ -115,4 +122,22 @@ export function classifyPidFile(
 	return isExpected(command)
 		? { kind: "running", pid }
 		: { kind: "stale", pid, reason: "other-program" };
+}
+
+/** What startup does with the contents of an existing PID file. */
+export type StartupPidAction = "refuse" | "remove" | "keep";
+
+/**
+ * Startup refuses only when the PID file names a running server, and removes a
+ * stale or malformed file. When the PID is alive but its command line cannot be
+ * read, the file is kept: the port bind decides whether another server holds the port.
+ */
+export function startupPidAction(
+	raw: string,
+	table: ProcessTable,
+): StartupPidAction {
+	const state = classifyPidFile(raw, table, isServerCommand);
+	if (state.kind === "running") return "refuse";
+	if (state.kind === "unverified") return "keep";
+	return "remove";
 }

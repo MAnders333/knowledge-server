@@ -33,9 +33,9 @@ import { logger, parseLogLevel } from "./logger.js";
 import { main as mcpMain } from "./mcp/index.js";
 import { tightenOwnedPrivatePaths } from "./private-files.js";
 import {
-	classifyPidFile,
-	isServerCommand,
 	locatePidFile,
+	parsePid,
+	startupPidAction,
 	systemProcessTable,
 } from "./process-identity.js";
 import { lockHolder } from "./process-lock.js";
@@ -358,30 +358,29 @@ Run \`knowledge-server help-advanced\` for additional commands.
 	const adminToken = config.adminToken ?? randomBytes(24).toString("hex");
 
 	// PID file guard — check before serve() so we never bind the port if another
-	// instance is already running. A PID file counts as a live server only when its
-	// PID still runs knowledge-server; a PID that is dead, reused by another program,
-	// or unreadable is stale and replaced. The actual write happens after serve()
-	// succeeds so the file only exists when a port is truly bound.
+	// instance is already running. The file blocks startup only when its PID runs
+	// knowledge-server. A dead, reused or malformed PID is stale and replaced. A PID
+	// that is alive but whose command line cannot be read is kept: the port bind
+	// decides. The actual write happens after serve() succeeds so the file only
+	// exists when a port is truly bound.
 	const located = locatePidFile(config.pidPath, config.legacyPidPath);
 	if (located !== null) {
-		const state = classifyPidFile(
-			readFileSync(located, "utf8"),
-			systemProcessTable,
-			isServerCommand,
-		);
-		if (state.kind === "running") {
+		const raw = readFileSync(located, "utf8");
+		const action = startupPidAction(raw, systemProcessTable);
+		if (action === "refuse") {
 			logger.error(
-				`Server already running at PID ${state.pid}. Run \`knowledge-server stop\` first.`,
+				`Server already running at PID ${parsePid(raw)}. Run \`knowledge-server stop\` first.`,
 			);
 			process.exit(1);
 		}
-		// Stale file — remove and continue. Wrapped in try/catch to handle
-		// a TOCTOU race where two concurrent starts both pass the check and the
-		// second unlinkSync hits ENOENT.
-		try {
-			unlinkSync(located);
-		} catch (e) {
-			if (errCode(e) !== "ENOENT") throw e;
+		if (action === "remove") {
+			// Wrapped in try/catch to handle a TOCTOU race where two concurrent starts
+			// both see the stale file and the second unlinkSync hits ENOENT.
+			try {
+				unlinkSync(located);
+			} catch (e) {
+				if (errCode(e) !== "ENOENT") throw e;
+			}
 		}
 	}
 

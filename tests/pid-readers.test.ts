@@ -10,7 +10,7 @@ import {
 	pidFileCandidates,
 } from "../src/process-identity";
 
-const SERVER = "/usr/local/libexec/knowledge-server --port 3179";
+const SERVER = "/usr/local/libexec/knowledge-server";
 const OTHER = "/usr/bin/some-other-tool --serve";
 const PID = "4242";
 

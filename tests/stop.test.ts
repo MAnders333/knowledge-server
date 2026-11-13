@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type StopDeps, runStop } from "../src/commands/stop";
 
-const SERVER = "/usr/local/libexec/knowledge-server --port 3179";
+const SERVER = "/usr/local/libexec/knowledge-server";
 const SOURCE_SERVER = "/opt/homebrew/bin/bun run /work/repo/src/index.ts";
 const DAEMON = "/usr/local/libexec/knowledge-daemon --interval=300";
 const UNRELATED = "/usr/bin/some-other-tool --serve";

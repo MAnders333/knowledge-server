@@ -5,6 +5,7 @@ import {
 	isDaemonCommand,
 	isServerCommand,
 	parsePid,
+	startupPidAction,
 } from "../src/process-identity";
 
 function table(procs: Record<number, string | null>): ProcessTable {
@@ -29,9 +30,7 @@ describe("parsePid", () => {
 
 describe("isServerCommand and isDaemonCommand", () => {
 	it("recognises the compiled binaries", () => {
-		expect(
-			isServerCommand("/usr/local/libexec/knowledge-server --port 1"),
-		).toBe(true);
+		expect(isServerCommand("/usr/local/libexec/knowledge-server")).toBe(true);
 		expect(isDaemonCommand("/usr/local/libexec/knowledge-daemon")).toBe(true);
 	});
 
@@ -44,9 +43,9 @@ describe("isServerCommand and isDaemonCommand", () => {
 	});
 
 	it("matches an install path that contains spaces", () => {
-		expect(
-			isServerCommand("/Users/me/My Apps/libexec/knowledge-server --port 3179"),
-		).toBe(true);
+		expect(isServerCommand("/Users/me/My Apps/libexec/knowledge-server")).toBe(
+			true,
+		);
 		expect(
 			isServerCommand("/opt/My Tools/bun run /Users/me/My Repo/src/index.ts"),
 		).toBe(true);
@@ -113,5 +112,60 @@ describe("classifyPidFile", () => {
 				isServer,
 			),
 		).toEqual({ kind: "running", pid: 9 });
+	});
+});
+
+describe("server identity with subcommands", () => {
+	it("does not treat a process started with a subcommand as the server", () => {
+		for (const command of [
+			"/usr/local/libexec/knowledge-server mcp",
+			"/usr/local/libexec/knowledge-server status",
+			"/usr/local/libexec/knowledge-server consolidate --retry-dead",
+			"/Users/me/My Apps/knowledge-server reinitialize --confirm",
+			"bun run /repo/src/index.ts mcp",
+			"bun run /repo/src/index.ts consolidate",
+		]) {
+			expect(isServerCommand(command), command).toBe(false);
+		}
+	});
+
+	it("still recognises the server started with no arguments", () => {
+		expect(isServerCommand("bun run --watch src/index.ts")).toBe(true);
+		expect(isServerCommand("/usr/local/libexec/knowledge-server")).toBe(true);
+	});
+
+	it("keeps accepting daemon flags", () => {
+		expect(
+			isDaemonCommand("/usr/local/libexec/knowledge-daemon --interval=300"),
+		).toBe(true);
+	});
+});
+
+describe("startupPidAction", () => {
+	const SERVER = "/usr/local/libexec/knowledge-server";
+
+	it("refuses to start while the PID file names a running server", () => {
+		expect(startupPidAction("9", table({ 9: SERVER }))).toBe("refuse");
+	});
+
+	it("keeps the file when the PID is alive but its command line is unreadable", () => {
+		expect(startupPidAction("9", table({ 9: null }))).toBe("keep");
+	});
+
+	it("removes the file when the PID is gone", () => {
+		expect(startupPidAction("9", table({}))).toBe("remove");
+	});
+
+	it("removes the file when the PID now runs another program or a server subcommand", () => {
+		expect(
+			startupPidAction("9", table({ 9: "/usr/bin/some-other-tool" })),
+		).toBe("remove");
+		expect(startupPidAction("9", table({ 9: `${SERVER} status` }))).toBe(
+			"remove",
+		);
+	});
+
+	it("removes a malformed file", () => {
+		expect(startupPidAction("-1", table({ 9: SERVER }))).toBe("remove");
 	});
 });
