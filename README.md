@@ -442,7 +442,7 @@ Credentials and paths stay in `.env`:
 | `KNOWLEDGE_ALLOWED_HOSTS` | *(empty)* | Extra `Host` names the API accepts, comma-separated (`name` or `name:port`). `localhost`, `127.0.0.1`, `[::1]` and the bind host are always accepted. Needed when a reverse proxy forwards a different hostname. |
 | `REDACT_SECRETS` | `true` | Scrub credentials (private keys, cloud/SaaS/LLM API tokens, JWTs, `Authorization` headers, `*_SECRET`/`*_TOKEN`/`*_PASSWORD`/`*_API_KEY` values, URL passwords, long keyed secrets) from transcript text before it is staged, sent to an LLM or embedding API, or stored. Set `false` to disable. Counts are logged per run; values are never logged. |
 | `KNOWLEDGE_LOG_PATH` | `~/.local/share/knowledge-server/server.log` | Log file. Set to `""` to disable. When stdout or stderr already points at this file (the launchd plist does this), each line is written once. |
-| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. `info` logs lengths, ids and similarity scores; consolidation and contradiction decisions at `info` include entry text. `warn` suppresses those lines. |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. `info` logs lengths, ids, counts and similarity scores; entry and episode text is logged only at `debug`. `warn` suppresses info lines. |
 | `LOG_MAX_BYTES` | `20971520` (20 MB) | Size at which the active log rotates. Rotation keeps `server.log.1` to `server.log.3` and drops the oldest, so the files total about four times this value. `0` disables rotation. Rotated copies can hold text written by earlier versions, including an old admin token; delete them once you no longer need them. |
 
 ### Session sources
@@ -668,7 +668,7 @@ knowledge-server reinitialize --reset-store --store=personal --confirm
 knowledge-server reinitialize --reset-store --dry-run
 ```
 
-**Note:** Stop both the server and the daemon before running any reinitialize variant. The command exits with an error if either is live. The server is checked by its PID file: run `knowledge-server stop`. The daemon is checked by its lock file (`daemon.lock` in the data directory): an upload cycle that is in flight writes a fresh `daemon_cursor` after the reset, which defeats the full re-ingest. Stop the daemon with its service command when it is registered as one: `launchctl bootout gui/$(id -u)/com.knowledge-server.daemon` on macOS, or `systemctl --user stop knowledge-daemon` on Linux. Otherwise run `kill <pid>`, using the `pid` field of `daemon.lock`.
+**Note:** Stop both the server and the daemon before running any reinitialize variant. The command exits with an error if either is live. The server is checked by its PID file: run `knowledge-server stop`. The daemon is checked by its lock file (`daemon.lock` in the data directory): an upload cycle that is in flight writes a fresh `daemon_cursor` after the reset, which defeats the full re-ingest. Stop the daemon with its service command when it is registered as one: `launchctl bootout gui/$(id -u)/com.knowledge-server.daemon` on macOS, or `systemctl --user stop knowledge-daemon` on Linux. Otherwise, check the PID first: `ps -p <pid> -o command=` must show `knowledge-daemon`, because a lock left by a crashed daemon can name a PID that another process now uses. Then run `kill <pid>`, using the `pid` field of `daemon.lock`.
 
 `--dry-run` and `--confirm` are mutually exclusive — `--dry-run` previews the action without requiring `--confirm`.
 

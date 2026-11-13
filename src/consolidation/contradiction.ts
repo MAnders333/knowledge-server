@@ -159,12 +159,12 @@ export class ContradictionScanner {
 			for (const result of results) {
 				if (!validCandidateIds.has(result.candidateId)) {
 					logger.warn(
-						`[contradiction] ${logPrefix}LLM returned candidateId "${result.candidateId}" not in candidate list — skipping`,
+						`[contradiction] ${logPrefix}LLM returned a candidateId that is not in the candidate list — skipping`,
 					);
 					continue;
 				}
 				detected++;
-				logger.log(
+				logger.debug(
 					`[contradiction] ${logPrefix}${result.resolution}: ${JSON.stringify(entry.content)} vs candidate ${result.candidateId} (sim=${simById.get(result.candidateId)?.toFixed(3)}) — ${JSON.stringify(result.reason)}`,
 				);
 
@@ -307,7 +307,7 @@ export class ContradictionScanner {
 
 			if (midBandCandidates.length === 0) continue;
 
-			logger.log(
+			logger.debug(
 				`[contradiction] Checking ${midBandCandidates.length} candidates for ${JSON.stringify(entry.content)}`,
 			);
 
@@ -373,7 +373,7 @@ export class ContradictionScanner {
 
 			if (intraChunkCandidates.length === 0) continue;
 
-			logger.log(
+			logger.debug(
 				`[contradiction] Intra-chunk: checking ${intraChunkCandidates.length} same-chunk candidates for ${JSON.stringify(entryA.content)}`,
 			);
 

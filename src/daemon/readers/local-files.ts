@@ -136,7 +136,7 @@ export class LocalFilesEpisodeReader implements IEpisodeReader {
 			// will handle it, but surface it in logs so large files are visible.
 			if (tokens > MAX_TOKENS_PER_EPISODE) {
 				logger.warn(
-					`[local-files] "${title}" is ~${tokens} tokens — exceeds soft limit (${MAX_TOKENS_PER_EPISODE}), will be processed in a single chunk.`,
+					`[local-files] ${filePath} is ~${tokens} tokens — exceeds soft limit (${MAX_TOKENS_PER_EPISODE}), will be processed in a single chunk.`,
 				);
 			}
 

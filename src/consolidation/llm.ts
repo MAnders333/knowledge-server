@@ -550,7 +550,10 @@ ${episodeSummaries}
 		const parsed = parseJSON(response, true);
 		if (!Array.isArray(parsed)) {
 			logger.error(
-				"[llm] Failed to parse extraction response:",
+				`[llm] Failed to parse extraction response (${response.length} chars).`,
+			);
+			logger.debug(
+				"[llm] Extraction response preview:",
 				response.slice(0, 500),
 			);
 			throw new MalformedLlmOutputError("extraction");
@@ -571,7 +574,7 @@ ${episodeSummaries}
 					: undefined;
 			if (validDomainIds && item.domain !== undefined && domain === undefined) {
 				logger.warn(
-					`[llm] extractKnowledge: LLM returned unknown domain ${JSON.stringify(item.domain)} — ignoring. Valid: ${[...validDomainIds].join(", ")}`,
+					`[llm] extractKnowledge: LLM returned an unknown domain (${String(item.domain).length} chars) — ignoring. Valid: ${[...validDomainIds].join(", ")}`,
 				);
 			}
 			return {
@@ -682,7 +685,10 @@ Rules for the response array:
 
 		if (!Array.isArray(parsed) || parsed.length !== pairs.length) {
 			logger.warn(
-				`[llm] batchDecideMerge parse failure (got ${Array.isArray(parsed) ? parsed.length : "non-array"}, expected ${pairs.length}) — defaulting all to insert: ${response.slice(0, 200)}`,
+				`[llm] batchDecideMerge parse failure (got ${Array.isArray(parsed) ? parsed.length : "non-array"}, expected ${pairs.length}, ${response.length} chars) — defaulting all to insert.`,
+			);
+			logger.debug(
+				`[llm] batchDecideMerge response preview: ${response.slice(0, 200)}`,
 			);
 			return pairs.map(() => ({ action: "insert" }) as MergeDecision);
 		}
@@ -864,7 +870,10 @@ If no meaningful synthesis is possible, return: []`;
 		if (!Array.isArray(parsed)) {
 			// Synthesis is best-effort per cluster: a non-array response means "no synthesis".
 			logger.warn(
-				`[llm] synthesizePrinciple: response is not a JSON array — no synthesis: ${response.slice(0, 200)}`,
+				`[llm] synthesizePrinciple: response is not a JSON array (${response.length} chars) — no synthesis.`,
+			);
+			logger.debug(
+				`[llm] synthesizePrinciple response preview: ${response.slice(0, 200)}`,
 			);
 			return [];
 		}
@@ -973,7 +982,10 @@ Return the JSON object. "checked" must be ${candidates.length}.`;
 			);
 		} catch (err) {
 			logger.error(
-				"[llm] Failed to parse contradiction response:",
+				`[llm] Failed to parse contradiction response (${response.length} chars).`,
+			);
+			logger.debug(
+				"[llm] Contradiction response preview:",
 				response.slice(0, 500),
 			);
 			throw err;

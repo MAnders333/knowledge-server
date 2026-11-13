@@ -113,9 +113,19 @@ logger.init(
 // does not exit, so launchd/systemd do not restart it in a loop. A one-shot run
 // (--once, cron/on-demand) has nothing to wait for and exits instead.
 const daemonLockFile = daemonLockPath(dataDir);
+// A daemon that finds its lock taken over stops at once: another daemon now owns
+// the data directory. launchd/systemd restart this process, and the restart waits.
+const onDaemonLockLost = () => {
+	logger.error(
+		"[daemon] daemon.lock was taken over by another process. Exiting so only one daemon writes.",
+	);
+	process.exit(1);
+};
 let daemonLock: LockHandle;
 if (onceFlag) {
-	const lock = tryAcquireProcessLock(daemonLockFile);
+	const lock = tryAcquireProcessLock(daemonLockFile, {
+		onLost: onDaemonLockLost,
+	});
 	if (!lock) {
 		const holder = lockHolder(daemonLockFile);
 		const who = holder && holder.pid > 0 ? ` (PID ${holder.pid})` : "";
@@ -133,6 +143,7 @@ if (onceFlag) {
 				`[daemon] Another knowledge-daemon${who} already runs for ${dataDir}. Waiting to take over; retrying every ${DAEMON_LOCK_RETRY_MS / 1000} s.`,
 			);
 		},
+		onLost: onDaemonLockLost,
 	});
 	daemonLock = lock;
 	if (waited) logger.log("[daemon] Took over the daemon lock; starting.");
@@ -180,6 +191,9 @@ const uploader = new EpisodeUploader(readers, serverStateDb, daemonDb, userId, {
 	initialLookbackDays: parseInitialLookbackDays(
 		process.env.INITIAL_LOOKBACK_DAYS,
 	),
+	// Only the daemon honours reinitialize's full re-ingest request. Other uploaders
+	// (process-inbox) must not clear it, or the daemon would skip its history.
+	fullBackfillRequests: true,
 });
 
 const closeResources = async () => {

@@ -17,11 +17,11 @@ import { clampKnowledgeType } from "../types.js";
 import { scrubUntrusted } from "./untrusted.js";
 
 /** Longest content string accepted from the model for storage. */
-export const MAX_STORED_CONTENT_CHARS = 8000;
+const MAX_STORED_CONTENT_CHARS = 8000;
 /** Most topics kept per entry. */
-export const MAX_TOPICS = 10;
+const MAX_TOPICS = 10;
 /** Longest single topic kept. Longer topics are dropped, not truncated. */
-export const MAX_TOPIC_CHARS = 100;
+const MAX_TOPIC_CHARS = 100;
 
 /** Thrown when a model response does not have the shape we asked for. */
 export class MalformedLlmOutputError extends SyntaxError {
@@ -47,9 +47,10 @@ export function parseItems<S extends z.ZodTypeAny>(
 			out.push(result.data);
 			return;
 		}
-		// Log paths and messages only, never the values (they are model output).
+		// Log paths and issue codes only. Zod messages can echo the received value
+		// (an enum mismatch quotes it), and that value is model output.
 		const reason = result.error.issues
-			.map((issue) => `${issue.path.join(".") || "(item)"}: ${issue.message}`)
+			.map((issue) => `${issue.path.join(".") || "(item)"}: ${issue.code}`)
 			.join("; ");
 		logger.warn(`[llm] ${label}: dropped item ${i + 1} (${reason})`);
 	});
@@ -150,14 +151,14 @@ export const synthesisItemSchema = z.object({
 
 // ── Contradiction (one batch per call, wrapper object) ──────────────────────
 
-export const CONTRADICTION_TYPES = [
+const CONTRADICTION_TYPES = [
 	"supersede_old",
 	"supersede_new",
 	"merge",
 	"irresolvable",
 ] as const;
 
-export type ContradictionType = (typeof CONTRADICTION_TYPES)[number];
+type ContradictionType = (typeof CONTRADICTION_TYPES)[number];
 
 /**
  * Reply shape. "verdicts" (default): one result per candidate, `no_conflict`

@@ -998,7 +998,9 @@ export function createApp(
 			logger.error("[entries/flag] Failed to flag entry:", e);
 			return c.json({ error: "Failed to flag entry" }, 500);
 		}
-		logger.log(`[entries/flag] ${entry.id.slice(0, 8)} reason=${body.reason}`);
+		logger.log(
+			`[entries/flag] ${entry.id.slice(0, 8)} reason length ${body.reason.length}`,
+		);
 		return c.json({ ok: true, id: entry.id, status: "conflicted" });
 	});
 
