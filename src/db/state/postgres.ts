@@ -611,13 +611,14 @@ export class PostgresServerStateDB implements IServerStateDB {
 		return result.count;
 	}
 
+	/** Injected activations per client since sinceMs: only those that returned entries and were not cut off by the client deadline. */
 	async countActivationsByClient(
 		sinceMs: number,
 	): Promise<Record<string, number>> {
 		await this.initialize();
 		const rows = await this.sql`
 			SELECT client, COUNT(*) AS n FROM activation_event
-			WHERE ts >= ${sinceMs}
+			WHERE ts >= ${sinceMs} AND n_returned > 0 AND client_deadline_exceeded = FALSE
 			GROUP BY client
 		`;
 		return Object.fromEntries(

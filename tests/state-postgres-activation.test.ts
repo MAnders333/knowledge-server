@@ -299,11 +299,9 @@ describe.skipIf(!PG_URI)("PostgresServerStateDB activation_event", () => {
 
 			expect(await state.countActivationsByClient(0)).toEqual({
 				"claude-code": 2,
-				opencode: 1,
 			});
 			expect(await state.countActivationsByClient(1_500)).toEqual({
 				"claude-code": 1,
-				opencode: 1,
 			});
 			expect(await state.countActivationsByClient(4_000)).toEqual({});
 		} finally {
@@ -388,6 +386,30 @@ describe.skipIf(!PG_URI)("PostgresServerStateDB activation_event", () => {
 				"claude-code": 1,
 			});
 			expect(await state.countEpisodesBySource(800)).toEqual({});
+		} finally {
+			await state.close();
+		}
+	});
+
+	it("counts only activations that injected entries", async () => {
+		const state = new PostgresServerStateDB(testUri);
+		try {
+			await state.initialize();
+			await state.insertActivationEvents([
+				row({ ts: 1_000 }),
+				row({
+					ts: 1_500,
+					nReturned: 0,
+					entryIds: [],
+					rawSims: [],
+					rerankScores: null,
+					rerankModel: null,
+				}),
+				row({ ts: 2_000, clientDeadlineExceeded: true }),
+			]);
+			expect(await state.countActivationsByClient(0)).toEqual({
+				"claude-code": 1,
+			});
 		} finally {
 			await state.close();
 		}

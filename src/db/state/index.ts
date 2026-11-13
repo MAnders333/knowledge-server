@@ -512,12 +512,13 @@ export class ServerStateDB implements IServerStateDB {
 		return Number(res.changes);
 	}
 
+	/** Injected activations per client since sinceMs: only those that returned entries and were not cut off by the client deadline. */
 	async countActivationsByClient(
 		sinceMs: number,
 	): Promise<Record<string, number>> {
 		const rows = this.db
 			.prepare(
-				"SELECT client, COUNT(*) AS n FROM activation_event WHERE ts >= ? GROUP BY client",
+				"SELECT client, COUNT(*) AS n FROM activation_event WHERE ts >= ? AND n_returned > 0 AND client_deadline_exceeded = 0 GROUP BY client",
 			)
 			.all(sinceMs) as Array<{ client: string; n: number }>;
 		return Object.fromEntries(rows.map((r) => [r.client, Number(r.n)]));

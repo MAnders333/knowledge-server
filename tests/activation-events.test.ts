@@ -106,11 +106,19 @@ describe("activation_event schema", () => {
 });
 
 describe("ServerStateDB activation methods", () => {
-	it("counts injections per client inside the window", async () => {
+	it("counts only activations that injected entries, per client, inside the window", async () => {
 		const now = Date.now();
 		await state.insertActivationEvents([
 			row({ client: "opencode", ts: now }),
 			row({ client: "opencode", ts: now - 1000 }),
+			row({
+				client: "opencode",
+				ts: now - 2000,
+				nReturned: 0,
+				entryIds: [],
+				rawSims: [],
+			}),
+			row({ client: "opencode", ts: now - 3000, clientDeadlineExceeded: true }),
 			row({ client: "pi", ts: now - 10 * 24 * 3600 * 1000 }),
 		]);
 		expect(await state.countActivationsByClient(now - 3600 * 1000)).toEqual({
