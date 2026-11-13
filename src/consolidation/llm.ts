@@ -5,6 +5,7 @@ import { generateText } from "ai";
 import {
 	ANTHROPIC_BETA_HEADERS,
 	ANTHROPIC_OAUTH_USER_AGENT,
+	assertOAuthBaseUrl,
 	getAccessToken,
 	hasOAuthTokens,
 } from "../auth/claude-oauth.js";
@@ -187,6 +188,7 @@ function createModel(modelString: string) {
 			// silent token refresh. The placeholder apiKey is never sent (x-api-key is
 			// deleted by the wrapper before every request).
 			if (!apiKey && hasOAuthTokens()) {
+				assertOAuthBaseUrl(baseURL);
 				const provider = createAnthropic({
 					...(baseURL && { baseURL }),
 					apiKey: "oauth-placeholder",

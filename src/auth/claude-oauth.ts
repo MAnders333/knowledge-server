@@ -400,3 +400,28 @@ export async function runOAuthFlow(): Promise<OAuthTokens> {
 		expires_at: expiresAtFrom(data.expires_in),
 	};
 }
+
+/** The only host a Claude subscription OAuth token may be sent to. */
+const ANTHROPIC_API_HOST = "api.anthropic.com";
+
+/**
+ * Throws unless `baseURL` is the official Anthropic API. A subscription OAuth
+ * token is an Anthropic bearer credential, so it must not reach a proxy or a
+ * gateway. The message names the host only: never the URL's credentials or the
+ * token.
+ */
+export function assertOAuthBaseUrl(baseURL: string | undefined): void {
+	if (!baseURL) return;
+	let url: URL;
+	try {
+		url = new URL(baseURL);
+	} catch {
+		throw new Error(
+			"Claude subscription OAuth is not used: the Anthropic base URL is not a valid URL. Set ANTHROPIC_API_KEY instead.",
+		);
+	}
+	if (url.protocol === "https:" && url.hostname === ANTHROPIC_API_HOST) return;
+	throw new Error(
+		`Claude subscription OAuth is only sent to ${ANTHROPIC_API_HOST}, but the Anthropic base URL is ${url.protocol}//${url.hostname}. Set ANTHROPIC_API_KEY for that endpoint, or unset ANTHROPIC_BASE_URL and LLM_BASE_ENDPOINT.`,
+	);
+}
