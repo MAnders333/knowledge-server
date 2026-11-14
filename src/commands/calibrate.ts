@@ -285,7 +285,7 @@ const UNRELATED: CalibrationPair[] = [
 ];
 
 /** Compute percentile from a sorted array. */
-function percentile(sorted: number[], p: number): number {
+export function percentile(sorted: number[], p: number): number {
 	if (sorted.length === 0) return 0;
 	const idx = (p / 100) * (sorted.length - 1);
 	const lo = Math.floor(idx);
@@ -305,6 +305,9 @@ function percentile(sorted: number[], p: number): number {
  * different model, cosine similarity distributions shift and the defaults may
  * no longer be correct. This command measures the actual distribution and
  * recommends values tuned to the active model.
+ *
+ * Cluster assignment (CLUSTER_ASSIGNMENT_THRESHOLD) is not covered here; see
+ * `calibrate --clusters` (calibrate-clusters.ts).
  */
 export async function runCalibrate(): Promise<void> {
 	const model = config.embedding.model;
@@ -574,5 +577,12 @@ export async function runCalibrate(): Promise<void> {
 			"  All thresholds match the current defaults \u2014 no changes needed.",
 		);
 	}
+	console.log("");
+	console.log(
+		"  Cluster assignment (CLUSTER_ASSIGNMENT_THRESHOLD) is not derived here.",
+	);
+	console.log(
+		"  Run `knowledge-server calibrate --clusters` to simulate synthesis clustering on your KB.",
+	);
 	console.log("");
 }

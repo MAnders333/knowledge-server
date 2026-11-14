@@ -22,7 +22,10 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import * as aiModule from "ai";
 import { ActivationEngine } from "../src/activation/activate";
-import { drainConsolidation } from "../src/commands/consolidation-drain";
+import {
+	drainConsolidation,
+	runSynthesisPass,
+} from "../src/commands/consolidation-drain";
 import { config } from "../src/config";
 import type { KnowledgeServerConfig } from "../src/config-file";
 import { ConsolidationEngine } from "../src/consolidation/consolidate";
@@ -1021,5 +1024,445 @@ describe("provider failures from a real model call", () => {
 		const rows = await state.getPendingEpisodes(0);
 		expect(rows.map((r) => r.id)).toContain("row-billing");
 		expect(storedLastError("row-billing")).toBeNull();
+	});
+});
+
+describe("synthesis after a drain with provider failures", () => {
+	/** A unit vector, so five copies of it form one ripe cluster. */
+	const CLUSTER_VEC = new Array<number>(384).fill(0);
+	CLUSTER_VEC[0] = 1;
+
+	async function insertRipeCluster(): Promise<void> {
+		for (let i = 0; i < 5; i++) {
+			await db.insertEntry(
+				makeEntry({
+					id: `ripe-${i}`,
+					content: `ripe content ${i}`,
+					embedding: CLUSTER_VEC,
+				}),
+			);
+		}
+	}
+
+	it("skips synthesis when the drain's only batch hit provider failures", async () => {
+		await insertRipeCluster();
+		await state.insertPendingEpisode(
+			pendingRow({ id: "row-down", sessionId: "session-down" }),
+		);
+		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockRejectedValue(
+			Object.assign(new Error("Too Many Requests"), { statusCode: 429 }),
+		);
+		const synth = spyOn(
+			ConsolidationLLM.prototype,
+			"synthesizePrinciple",
+		).mockResolvedValue([]);
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+
+		const drain = await drainConsolidation(engine);
+		expect(drain.providerFailed).toBe(true);
+		await runSynthesisPass(engine, drain.providerFailed);
+
+		expect(synth).not.toHaveBeenCalled();
+		expect(
+			warn.mock.calls.some((c) =>
+				String(c[0]).includes("provider failures in this drain"),
+			),
+		).toBe(true);
+
+		// The cluster was not marked: it is still ripe once the provider is back.
+		warn.mockRestore();
+		await engine.runSynthesis();
+		expect(synth).toHaveBeenCalledTimes(1);
+	});
+
+	it("runs synthesis when the drain completes a chunk", async () => {
+		await insertRipeCluster();
+		await state.insertPendingEpisode(
+			pendingRow({ id: "row-ok", sessionId: "session-ok" }),
+		);
+		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockResolvedValue([]);
+		const synth = spyOn(
+			ConsolidationLLM.prototype,
+			"synthesizePrinciple",
+		).mockResolvedValue([]);
+
+		const drain = await drainConsolidation(engine);
+		expect(drain.providerFailed).toBe(false);
+		await runSynthesisPass(engine, drain.providerFailed);
+
+		expect(synth).toHaveBeenCalledTimes(1);
+	});
+
+	/** Two pending sessions; row-a is the older one, so it is extracted first. */
+	async function insertTwoPending(): Promise<void> {
+		await state.insertPendingEpisode(
+			pendingRow({
+				id: "row-a",
+				sessionId: "session-a",
+				maxMessageTime: Date.now() - 2000,
+			}),
+		);
+		await state.insertPendingEpisode(
+			pendingRow({
+				id: "row-b",
+				sessionId: "session-b",
+				maxMessageTime: Date.now() - 1000,
+			}),
+		);
+	}
+
+	it("skips synthesis when a 429 lands mid-batch and the next pass is empty", async () => {
+		await insertRipeCluster();
+		await insertTwoPending();
+		const savedMax = config.consolidation.maxSessionsPerRun;
+		config.consolidation.maxSessionsPerRun = 2;
+		// row-a completes; row-b hits the rate limit within the same batch.
+		const extract = spyOn(ConsolidationLLM.prototype, "extractKnowledge")
+			.mockResolvedValueOnce([])
+			.mockRejectedValueOnce(
+				Object.assign(new Error("Too Many Requests"), { statusCode: 429 }),
+			);
+		const synth = spyOn(
+			ConsolidationLLM.prototype,
+			"synthesizePrinciple",
+		).mockResolvedValue([]);
+		spyOn(console, "warn").mockImplementation(() => {});
+
+		let drain: Awaited<ReturnType<typeof drainConsolidation>>;
+		try {
+			drain = await drainConsolidation(engine);
+		} finally {
+			config.consolidation.maxSessionsPerRun = savedMax;
+		}
+		expect(drain.providerFailed).toBe(true);
+		await runSynthesisPass(engine, drain.providerFailed);
+
+		// The second batch found nothing to extract: row-b is still pending and was not retried.
+		expect(extract).toHaveBeenCalledTimes(2);
+		expect((await state.getPendingEpisodes(0)).map((r) => r.id)).toEqual([
+			"row-b",
+		]);
+		expect(synth).not.toHaveBeenCalled();
+	});
+
+	it("skips synthesis when a later batch is all transient after an earlier completed batch", async () => {
+		await insertRipeCluster();
+		await insertTwoPending();
+		const savedMax = config.consolidation.maxSessionsPerRun;
+		config.consolidation.maxSessionsPerRun = 1;
+		spyOn(ConsolidationLLM.prototype, "extractKnowledge")
+			.mockResolvedValueOnce([])
+			.mockRejectedValueOnce(
+				Object.assign(new Error("Too Many Requests"), { statusCode: 429 }),
+			);
+		const synth = spyOn(
+			ConsolidationLLM.prototype,
+			"synthesizePrinciple",
+		).mockResolvedValue([]);
+		spyOn(console, "warn").mockImplementation(() => {});
+
+		let drain: Awaited<ReturnType<typeof drainConsolidation>>;
+		try {
+			drain = await drainConsolidation(engine);
+		} finally {
+			config.consolidation.maxSessionsPerRun = savedMax;
+		}
+		expect(drain.totalSessions).toBe(1);
+		expect(drain.providerFailed).toBe(true);
+		await runSynthesisPass(engine, drain.providerFailed);
+		expect(synth).not.toHaveBeenCalled();
+	});
+
+	it("a later completed chunk clears an earlier 429 in the same batch", async () => {
+		await insertRipeCluster();
+		await insertTwoPending();
+		const savedMax = config.consolidation.maxSessionsPerRun;
+		config.consolidation.maxSessionsPerRun = 2;
+		// row-a is rate limited, row-b completes after it, so the run ends with no streak.
+		spyOn(ConsolidationLLM.prototype, "extractKnowledge")
+			.mockRejectedValueOnce(
+				Object.assign(new Error("Too Many Requests"), { statusCode: 429 }),
+			)
+			.mockResolvedValueOnce([]);
+		const synth = spyOn(
+			ConsolidationLLM.prototype,
+			"synthesizePrinciple",
+		).mockResolvedValue([]);
+
+		let drain: Awaited<ReturnType<typeof drainConsolidation>>;
+		try {
+			drain = await drainConsolidation(engine);
+		} finally {
+			config.consolidation.maxSessionsPerRun = savedMax;
+		}
+		expect(drain.providerFailed).toBe(false);
+		await runSynthesisPass(engine, drain.providerFailed);
+		expect(synth).toHaveBeenCalledTimes(1);
+	});
+
+	it("a deterministic 400 does not trip the breaker", async () => {
+		await insertRipeCluster();
+		await state.insertPendingEpisode(
+			pendingRow({ id: "row-bad", sessionId: "session-bad" }),
+		);
+		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockRejectedValue(
+			Object.assign(new Error("invalid request"), { statusCode: 400 }),
+		);
+		const synth = spyOn(
+			ConsolidationLLM.prototype,
+			"synthesizePrinciple",
+		).mockResolvedValue([]);
+
+		const drain = await drainConsolidation(engine);
+		expect(drain.providerFailed).toBe(false);
+		await runSynthesisPass(engine, drain.providerFailed);
+		expect(synth).toHaveBeenCalledTimes(1);
+	});
+
+	it("a context-length rejection wrapped in a 503 is dead-lettered and does not trip the breaker", async () => {
+		await insertRipeCluster();
+		await state.insertPendingEpisode(
+			pendingRow({ id: "row-long", sessionId: "session-long" }),
+		);
+		spyOn(aiModule, "generateText").mockRejectedValue(
+			Object.assign(new Error("Upstream error"), {
+				name: "AI_APICallError",
+				statusCode: 503,
+				responseBody: JSON.stringify({
+					error: {
+						message: "This model's maximum context length is 200000 tokens.",
+						type: "invalid_request_error",
+						code: "context_length_exceeded",
+					},
+				}),
+			}),
+		);
+		const synth = spyOn(
+			ConsolidationLLM.prototype,
+			"synthesizePrinciple",
+		).mockResolvedValue([]);
+		spyOn(console, "error").mockImplementation(() => {});
+
+		for (let i = 0; i < PENDING_EPISODE_MAX_ATTEMPTS; i++) {
+			const drain = await drainConsolidation(engine);
+			expect(drain.providerFailed).toBe(false);
+			await runSynthesisPass(engine, drain.providerFailed);
+		}
+
+		expect(await state.getPendingEpisodes(0)).toEqual([]);
+		expect(await state.countDeadLetteredEpisodes()).toBe(1);
+		expect(synth).toHaveBeenCalled();
+	});
+
+	it("keeps the provider-failure flag when consolidate() throws after a 429", async () => {
+		await insertRipeCluster();
+		await state.insertPendingEpisode(
+			pendingRow({ id: "row-down", sessionId: "session-down" }),
+		);
+		spyOn(ConsolidationLLM.prototype, "extractKnowledge").mockRejectedValue(
+			Object.assign(new Error("Too Many Requests"), { statusCode: 429 }),
+		);
+		const realConsolidate = engine.consolidate.bind(engine);
+		spyOn(engine, "consolidate").mockImplementation(async (options) => {
+			await realConsolidate(options);
+			throw new Error("consolidate.lock was taken over");
+		});
+		const synth = spyOn(
+			ConsolidationLLM.prototype,
+			"synthesizePrinciple",
+		).mockResolvedValue([]);
+		spyOn(console, "error").mockImplementation(() => {});
+		spyOn(console, "warn").mockImplementation(() => {});
+
+		const drain = await drainConsolidation(engine);
+		expect(drain.providerFailed).toBe(true);
+		await runSynthesisPass(engine, drain.providerFailed);
+		expect(synth).not.toHaveBeenCalled();
+	});
+
+	it("a drain with no pending sessions still runs synthesis", async () => {
+		await insertRipeCluster();
+		const synth = spyOn(
+			ConsolidationLLM.prototype,
+			"synthesizePrinciple",
+		).mockResolvedValue([]);
+
+		const drain = await drainConsolidation(engine);
+		expect(drain.providerFailed).toBe(false);
+		await runSynthesisPass(engine, drain.providerFailed);
+
+		expect(synth).toHaveBeenCalledTimes(1);
+	});
+
+	it("a deterministic-only batch after a 429 batch keeps the flag", async () => {
+		await insertRipeCluster();
+		await insertTwoPending();
+		await state.insertPendingEpisode(
+			pendingRow({
+				id: "row-c",
+				sessionId: "session-c",
+				maxMessageTime: Date.now(),
+			}),
+		);
+		const savedMax = config.consolidation.maxSessionsPerRun;
+		config.consolidation.maxSessionsPerRun = 2;
+		// Batch 1: row-a completes, then row-b is rate limited, so the batch has
+		// sessionsProcessed > 0 and the drain continues. Batch 2: row-c fails
+		// deterministically and gives no provider signal, so the earlier 429 must
+		// still count.
+		const extract = spyOn(ConsolidationLLM.prototype, "extractKnowledge")
+			.mockResolvedValueOnce([])
+			.mockRejectedValueOnce(
+				Object.assign(new Error("Too Many Requests"), { statusCode: 429 }),
+			)
+			.mockRejectedValueOnce(
+				Object.assign(new Error("invalid request"), { statusCode: 400 }),
+			);
+		const synth = spyOn(
+			ConsolidationLLM.prototype,
+			"synthesizePrinciple",
+		).mockResolvedValue([]);
+		spyOn(console, "warn").mockImplementation(() => {});
+
+		let drain: Awaited<ReturnType<typeof drainConsolidation>>;
+		try {
+			drain = await drainConsolidation(engine);
+		} finally {
+			config.consolidation.maxSessionsPerRun = savedMax;
+		}
+		// Proves batch 2 ran: three extractions, the last one being row-c.
+		expect(extract).toHaveBeenCalledTimes(3);
+		expect(drain.providerFailed).toBe(true);
+		await runSynthesisPass(engine, drain.providerFailed);
+		expect(synth).not.toHaveBeenCalled();
+	});
+
+	it("a deterministic 400 after a 429 in the same batch keeps the streak", async () => {
+		await insertRipeCluster();
+		await insertTwoPending();
+		const savedMax = config.consolidation.maxSessionsPerRun;
+		config.consolidation.maxSessionsPerRun = 2;
+		// row-a is rate limited, then row-b fails deterministically in the same batch.
+		spyOn(ConsolidationLLM.prototype, "extractKnowledge")
+			.mockRejectedValueOnce(
+				Object.assign(new Error("Too Many Requests"), { statusCode: 429 }),
+			)
+			.mockRejectedValueOnce(
+				Object.assign(new Error("invalid request"), { statusCode: 400 }),
+			);
+		const synth = spyOn(
+			ConsolidationLLM.prototype,
+			"synthesizePrinciple",
+		).mockResolvedValue([]);
+		spyOn(console, "warn").mockImplementation(() => {});
+
+		let drain: Awaited<ReturnType<typeof drainConsolidation>>;
+		try {
+			drain = await drainConsolidation(engine);
+		} finally {
+			config.consolidation.maxSessionsPerRun = savedMax;
+		}
+		expect(drain.providerFailed).toBe(true);
+		await runSynthesisPass(engine, drain.providerFailed);
+		expect(synth).not.toHaveBeenCalled();
+	});
+});
+
+describe("writableStores default with a domain router", () => {
+	const CLUSTER_VEC = new Array<number>(384).fill(0);
+	CLUSTER_VEC[0] = 1;
+
+	/** Five identical unit vectors in `store`: one ripe cluster. */
+	async function insertRipe(store: IKnowledgeStore, prefix: string) {
+		for (let i = 0; i < 5; i++) {
+			await store.insertEntry(
+				makeEntry({
+					id: `${prefix}-${i}`,
+					content: `${prefix} content ${i}`,
+					embedding: CLUSTER_VEC,
+				}),
+			);
+		}
+	}
+
+	/** A router over `stores`, routing only to the domains in `domainStoreIds`. */
+	function routerFor(
+		stores: Map<string, IKnowledgeStore>,
+		domainStoreIds: string[],
+	): DomainRouter {
+		const routedConfig = {
+			userId: "alice",
+			stores: [...stores.keys()].map((id) => ({
+				id,
+				kind: "sqlite",
+				writable: domainStoreIds.includes(id),
+			})),
+			domains: domainStoreIds.map((id) => ({
+				id,
+				description: id,
+				store: id,
+			})),
+			projects: [],
+		} as unknown as KnowledgeServerConfig;
+		return new DomainRouter(routedConfig, stores, db);
+	}
+
+	it("never synthesizes into a read-only store the router knows about", async () => {
+		const teamDb = new KnowledgeDB(join(tempDir, "team.db"));
+		try {
+			const stores = new Map<string, IKnowledgeStore>([
+				["personal", db],
+				["team", teamDb],
+			]);
+			const routedEngine = new ConsolidationEngine(
+				db,
+				state,
+				new ActivationEngine(db),
+				[],
+				routerFor(stores, ["personal"]),
+			);
+			await insertRipe(db, "ripe");
+			await insertRipe(teamDb, "team");
+			const synth = spyOn(
+				ConsolidationLLM.prototype,
+				"synthesizePrinciple",
+			).mockResolvedValue([]);
+
+			await routedEngine.runSynthesis();
+
+			// Only the primary store's cluster is synthesized: one call in total.
+			expect(synth).toHaveBeenCalledTimes(1);
+		} finally {
+			await teamDb.close();
+		}
+	});
+
+	it("synthesizes into the domain stores the router writes to", async () => {
+		const workDb = new KnowledgeDB(join(tempDir, "work.db"));
+		try {
+			const stores = new Map<string, IKnowledgeStore>([
+				["personal", db],
+				["work", workDb],
+			]);
+			const routedEngine = new ConsolidationEngine(
+				db,
+				state,
+				new ActivationEngine(db),
+				[],
+				routerFor(stores, ["personal", "work"]),
+			);
+			await insertRipe(db, "ripe");
+			await insertRipe(workDb, "work");
+			const synth = spyOn(
+				ConsolidationLLM.prototype,
+				"synthesizePrinciple",
+			).mockResolvedValue([]);
+
+			await routedEngine.runSynthesis();
+
+			expect(synth).toHaveBeenCalledTimes(2);
+		} finally {
+			await workDb.close();
+		}
 	});
 });

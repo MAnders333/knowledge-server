@@ -77,10 +77,31 @@ export class KnowledgeDB implements IKnowledgeStore {
 	 *               Always pass an explicit path — the default exists only as a
 	 *               safety net; production paths are resolved by StoreRegistry
 	 *               via resolveSqlitePath().
+	 * @param options.readOnly Open an existing DB for queries only - no directory
+	 *               creation, no journal/synchronous/foreign_keys pragmas, no
+	 *               migrations/schema init, and `PRAGMA query_only = ON` so any
+	 *               write throws, and the SQLITE_BUSY_TIMEOUT_MS busy timeout so a
+	 *               read during the server's WAL checkpoint or recovery waits instead
+	 *               of failing with SQLITE_BUSY. Used by `calibrate --clusters`.
+	 *               Caveat: closing the last connection to a WAL database checkpoints
+	 *               the WAL into the main file (data is unchanged, but the file mtime
+	 *               and size can change).
 	 */
-	constructor(dbPath?: string) {
+	constructor(dbPath?: string, options: { readOnly?: boolean } = {}) {
 		const path = dbPath ?? defaultSqlitePath();
 		this.dbPath = path;
+		if (options.readOnly) {
+			// Never create the file or directory, set no journal pragmas, run no migrations.
+			// readwrite (not readonly) so a WAL reader can use the -shm file; query_only makes
+			// every write throw. Used by `calibrate --clusters`.
+			if (!existsSync(path)) {
+				throw new Error("SQLite store file does not exist");
+			}
+			this.db = new Database(path, { readwrite: true, create: false });
+			this.db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+			this.db.exec("PRAGMA query_only = ON");
+			return;
+		}
 		const dir = dirname(path);
 		if (!existsSync(dir)) {
 			mkdirSync(dir, { recursive: true });
@@ -1120,8 +1141,10 @@ export class KnowledgeDB implements IKnowledgeStore {
 	 * Persist the full cluster state produced by a single clustering pass.
 	 *
 	 * Replaces cluster membership atomically:
-	 * - Upserts each cluster row (insert new, update centroid/count/timestamps for existing).
-	 * - Replaces membership rows for each cluster with the new member set.
+	 * - Upserts each cluster row (insert new, update centroid/timestamps for existing;
+	 *   member_count is recomputed from the membership rows).
+	 * - Syncs membership rows: drops members that left, keeps joined_at for members that
+	 *   stayed, adds new members. Clusters with unchanged membership keep their rows.
 	 * - Deletes cluster rows that are no longer present (entries have dispersed).
 	 *
 	 * @param clusters  New cluster state from the clustering pass.
@@ -1166,26 +1189,31 @@ export class KnowledgeDB implements IKnowledgeStore {
                (id, centroid, member_count, last_synthesized_at, last_membership_changed_at, created_at)
                VALUES (?, ?, ?, NULL, ?, ?)`,
 						)
-						.run(cluster.id, centroidBlob, cluster.memberIds.length, now, now);
+						// member_count is set by the recompute below.
+						.run(cluster.id, centroidBlob, 0, now, now);
 				} else {
-					// Update centroid and member count; bump last_membership_changed_at only
-					// if membership actually changed.
+					// Update centroid; bump last_membership_changed_at only if membership changed.
 					if (cluster.membershipChanged) {
 						this.db
 							.prepare(
 								`UPDATE knowledge_cluster
-                 SET centroid = ?, member_count = ?, last_membership_changed_at = ?
+                 SET centroid = ?, last_membership_changed_at = ?
                  WHERE id = ?`,
 							)
-							.run(centroidBlob, cluster.memberIds.length, now, cluster.id);
+							.run(centroidBlob, now, cluster.id);
 					} else {
+						// Stable membership: member rows are not rewritten; member_count is
+						// recomputed because a hard delete cascades a member row away without a
+						// membership change.
 						this.db
 							.prepare(
 								`UPDATE knowledge_cluster
-                 SET centroid = ?, member_count = ?
+                 SET centroid = ?,
+                     member_count = (SELECT count(*) FROM knowledge_cluster_member WHERE cluster_id = ?)
                  WHERE id = ?`,
 							)
-							.run(centroidBlob, cluster.memberIds.length, cluster.id);
+							.run(centroidBlob, cluster.id, cluster.id);
+						continue;
 					}
 				}
 
@@ -1200,14 +1228,25 @@ export class KnowledgeDB implements IKnowledgeStore {
 					)
 					.run(cluster.id, JSON.stringify(cluster.memberIds));
 
+				// WHERE EXISTS: a member deleted after the clustering snapshot was taken
+				// (the yield window) is skipped instead of violating the entry_id foreign
+				// key, which OR IGNORE does not cover. Atomic with the insert.
 				for (const entryId of cluster.memberIds) {
 					this.db
 						.prepare(
 							`INSERT OR IGNORE INTO knowledge_cluster_member (cluster_id, entry_id, joined_at)
-               VALUES (?, ?, ?)`,
+               SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM knowledge_entry WHERE id = ?)`,
 						)
-						.run(cluster.id, entryId, now);
+						.run(cluster.id, entryId, now, entryId);
 				}
+				// Skipped members (deleted in the yield window) must not be counted.
+				this.db
+					.prepare(
+						`UPDATE knowledge_cluster
+             SET member_count = (SELECT count(*) FROM knowledge_cluster_member WHERE cluster_id = ?)
+             WHERE id = ?`,
+					)
+					.run(cluster.id, cluster.id);
 			}
 		})();
 	}

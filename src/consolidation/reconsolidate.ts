@@ -7,11 +7,23 @@ import {
 import { config } from "../config.js";
 import type { IKnowledgeStore } from "../db/index.js";
 import { computeStrength } from "../domain/strength.js";
-import { approxTokens } from "../domain/tokens.js";
 import { logger } from "../logger.js";
 import { redactSecrets } from "../redact.js";
 import { clampKnowledgeType } from "../types.js";
 import type { KnowledgeEntry } from "../types.js";
+import {
+	CLUSTER_YIELD_WORK_BUDGET,
+	SKEW_MIN_ENTRIES,
+	SKEW_PEER_MULTIPLE,
+	SKEW_TOP_SHARE,
+	cosineWithNorms,
+	estimateSynthesisPeerTokens,
+	findClusterSkew,
+	findDominantCluster,
+	greedyClusterAsync,
+	norm,
+	yieldToEventLoop,
+} from "./cluster.js";
 import type { ConsolidationLLM, ExtractedKnowledge } from "./llm.js";
 
 /**
@@ -22,11 +34,21 @@ import type { ConsolidationLLM, ExtractedKnowledge } from "./llm.js";
 const CLUSTER_IDENTITY_THRESHOLD = 0.9;
 
 /**
+ * Member-overlap (Jaccard) fallback for identity reconciliation. In seed mode a
+ * cluster's persisted centroid is its seed's embedding, which changes whenever the
+ * seed changes, so the centroid match can fail for a cluster that is otherwise the
+ * same. Persisted and in-memory clusters with Jaccard >= this value are the same
+ * cluster and keep the persisted ID.
+ */
+const CLUSTER_IDENTITY_OVERLAP_THRESHOLD = 0.5;
+
+/**
  * Cosine similarity threshold for assigning an entry to an existing cluster
  * during greedy clustering. Below this threshold a new cluster is started.
- * Kept broad by default — heterogeneous cluster members give the LLM more
- * cross-domain material to generalize from. Synthesis quality is instead
- * governed by CLUSTER_MIN_MEMBERS (minimum size before synthesis fires).
+ * Model-dependent: must sit above the embedding model's noise floor or every
+ * entry joins the first cluster. Calibrate with `knowledge-server calibrate --clusters`.
+ * Synthesis quality is instead governed by CLUSTER_MIN_MEMBERS (minimum size
+ * before synthesis fires).
  * Configurable via CLUSTER_ASSIGNMENT_THRESHOLD env var (see config.ts).
  */
 const CLUSTER_ASSIGNMENT_THRESHOLD =
@@ -39,6 +61,15 @@ const CLUSTER_ASSIGNMENT_THRESHOLD =
  * Configurable via CLUSTER_MIN_MEMBERS env var (see config.ts).
  */
 const CLUSTER_MIN_MEMBERS = config.consolidation.clusterMinMembers;
+
+/**
+ * Shared, mutable synthesis-call budget for one consolidation run. Created by
+ * ConsolidationEngine.runSynthesis() and passed to every runKBSynthesis() call
+ * so CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN spans all stores.
+ */
+export interface SynthesisCallBudget {
+	remaining: number;
+}
 
 /**
  * Choose the cluster members sent to synthesizePrinciple for one call.
@@ -60,7 +91,7 @@ function selectSynthesisPeers(
 	let tokens = 0;
 	for (const { peer } of ranked) {
 		if (selected.length >= synthesisMaxPeers) break;
-		const peerTokens = approxTokens(`${peer.content} ${peer.topics.join(" ")}`);
+		const peerTokens = estimateSynthesisPeerTokens(peer);
 		if (selected.length > 0 && tokens + peerTokens > synthesisMaxPromptTokens)
 			break;
 		selected.push(peer);
@@ -374,15 +405,21 @@ export class Reconsolidator {
 	 * have embeddings.
 	 *
 	 * Algorithm:
-	 * 1. CLUSTER FORMATION (in-memory, O(n×k)):
-	 *    - Sort all active entries by observationCount desc (most-evidenced entries seed clusters first).
+	 * 1. CLUSTER FORMATION (in-memory, O(n×k), via greedyClusterAsync in ./cluster.ts):
+	 *    - Entries visited by observationCount desc, then id asc (most-evidenced entries
+	 *      seed clusters first; the id tie-break keeps the order stable across runs).
 	 *    - Greedy assign each entry to nearest existing cluster if centroid similarity
 	 *      ≥ CLUSTER_ASSIGNMENT_THRESHOLD (env: CLUSTER_ASSIGNMENT_THRESHOLD), else start a new cluster.
-	 *    - Update centroid as running average after each assignment.
+	 *    - CLUSTER_CENTROID_MODE "running": centroid is the running average of members.
+	 *      "seed": centroid is the seed entry's embedding and never moves.
+	 *    - The compared centroid is what is persisted for identity reconciliation.
 	 *
 	 * 2. CLUSTER IDENTITY RECONCILIATION (against DB):
 	 *    - Match each in-memory cluster to persisted cluster by centroid similarity
 	 *      ≥ CLUSTER_IDENTITY_THRESHOLD (0.9) → reuse ID.
+	 *    - Unmatched persisted clusters then match an unmatched in-memory cluster by
+	 *      member overlap (Jaccard ≥ CLUSTER_IDENTITY_OVERLAP_THRESHOLD, 0.5); this
+	 *      covers seed-mode centroid drift (a new seed re-keys the cluster otherwise).
 	 *    - No match → new cluster ID.
 	 *    - Persisted clusters with no match → deleted (entries dispersed).
 	 *
@@ -392,13 +429,31 @@ export class Reconsolidator {
 	 *      SYNTHESIS_MIN_NEW_MEMBERS members (or SYNTHESIS_MIN_NEW_FRACTION of members)
 	 *      joined after last_synthesized_at (see hasMaterialChange).
 	 *
+	 * 3b. ORDER + CAP:
+	 *    - The dominant cluster (findDominantCluster: >= 100 members and > 50% of all
+	 *      entries, i.e. CLUSTER_ASSIGNMENT_THRESHOLD is below the noise floor) is
+	 *      never ripe: no LLM call, no budget spend, not marked. It is logged on
+	 *      every run; recalibrate with `knowledge-server calibrate --clusters`.
+	 *    - Ripe clusters: never-synthesized first, then oldest last_synthesized_at;
+	 *      ties by member count desc, then seed id asc.
+	 *    - Each synthesis call consumes one unit of `budget` (CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN,
+	 *      shared across stores in one run). Ripe clusters beyond the budget are
+	 *      deferred: not marked synthesized, so they stay ripe for the next run. Their
+	 *      members keep their joined_at (persistClusters keeps member rows), so the
+	 *      material-change check still sees members that joined after the last synthesis.
+	 *      Ordering is starvation-free only across runs in which fewer new clusters
+	 *      appear than the budget: a never-synthesized cluster always goes first, so
+	 *      if at least CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN new clusters appear every
+	 *      run, older ripe clusters are deferred each run.
+	 *
 	 * 4. SYNTHESIS (per ripe cluster):
 	 *    - All members are candidate peers (no anchor/neighbor distinction), but the
 	 *      prompt carries at most SYNTHESIS_MAX_PEERS, closest to centroid first, within
 	 *      SYNTHESIS_MAX_PROMPT_TOKENS (see selectSynthesisPeers).
 	 *    - LLM returns array of zero or more principles.
 	 *    - Each result routed through reconsolidate() for deduplication.
-	 *    - Write last_synthesized_at on cluster after successful synthesis attempt.
+	 *    - Write last_synthesized_at on cluster after a synthesis attempt. Any
+	 *      synthesizePrinciple error marks the cluster and the loop continues.
 	 *
 	 * Returns the number of synthesis calls that produced at least one principle.
 	 *
@@ -406,79 +461,68 @@ export class Reconsolidator {
 	 * synthesised independently. Pass the target store explicitly — the caller
 	 * is responsible for iterating over each store that received writes this run.
 	 * Defaults to this.db for single-store / backwards-compatible callers.
+	 *
+	 * `budget` is the synthesis-call budget shared by all stores in one run; it is
+	 * decremented once per synthesis call. Defaults to a fresh budget of
+	 * CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN.
 	 */
-	async runKBSynthesis(db: IKnowledgeStore = this.db): Promise<number> {
+	async runKBSynthesis(
+		db: IKnowledgeStore = this.db,
+		budget: SynthesisCallBudget = {
+			remaining: config.consolidation.clusterSynthesisMaxCallsPerRun,
+		},
+	): Promise<number> {
 		// Load all active entries with embeddings (ensureEmbeddings just ran).
 		const allEntries = await db.getActiveEntriesWithEmbeddings();
 		if (allEntries.length < CLUSTER_MIN_MEMBERS) return 0;
 
 		// ── Step 1: Greedy clustering ──────────────────────────────────────────────
 
-		// Sort descending by observationCount so well-evidenced entries form cluster
-		// seeds first.
-		const sorted = [...allEntries].sort(
-			(a, b) => b.observationCount - a.observationCount,
-		);
-
-		// In-memory clusters: { centroid, memberIds }
-		const inMemoryClusters: Array<{
-			centroid: number[];
-			memberIds: string[];
-		}> = [];
-
-		for (const entry of sorted) {
-			// Find nearest cluster
-			let nearestIdx = -1;
-			let nearestSim = -1;
-			for (let i = 0; i < inMemoryClusters.length; i++) {
-				const sim = cosineSimilarity(
-					entry.embedding,
-					inMemoryClusters[i].centroid,
-				);
-				if (sim > nearestSim) {
-					nearestSim = sim;
-					nearestIdx = i;
-				}
-			}
-
-			if (nearestIdx >= 0 && nearestSim >= CLUSTER_ASSIGNMENT_THRESHOLD) {
-				// Assign to existing cluster, update centroid as running average
-				const cluster = inMemoryClusters[nearestIdx];
-				const n = cluster.memberIds.length;
-				cluster.centroid = cluster.centroid.map(
-					(v, i) => (v * n + entry.embedding[i]) / (n + 1),
-				);
-				cluster.memberIds.push(entry.id);
-			} else {
-				// Start a new cluster seeded by this entry
-				inMemoryClusters.push({
-					centroid: [...entry.embedding],
-					memberIds: [entry.id],
-				});
-			}
-		}
-
+		// Read at call time (not a module constant) so tests and a reloaded config take effect.
+		const centroidMode = config.consolidation.clusterCentroidMode;
+		// O(n × k × dim). greedyClusterAsync yields to the event loop between chunks so the
+		// HTTP/MCP server stays responsive; the duration makes a slow pass visible in the log.
+		const clusteringStartedAt = Date.now();
+		const inMemoryClusters = await greedyClusterAsync(allEntries, {
+			threshold: CLUSTER_ASSIGNMENT_THRESHOLD,
+			centroidMode,
+		});
 		logger.log(
-			`[synthesis] Formed ${inMemoryClusters.length} clusters from ${allEntries.length} entries.`,
+			`[synthesis] Formed ${inMemoryClusters.length} clusters from ${allEntries.length} entries (threshold ${CLUSTER_ASSIGNMENT_THRESHOLD}, centroid mode ${centroidMode}) in ${Date.now() - clusteringStartedAt} ms.`,
 		);
+		const dominant = findDominantCluster(inMemoryClusters, allEntries.length);
 
 		// ── Step 2: Identity reconciliation ───────────────────────────────────────
 
 		const persistedClusters = await db.getClustersWithMembers();
+		// Norms are precomputed so each centroid pair costs one dot product.
+		const persistedNorms = persistedClusters.map((p) => norm(p.centroid));
+		const inMemoryNorms = inMemoryClusters.map((c) => norm(c.centroid));
 
 		// Build a lookup: persisted cluster ID → matched in-memory cluster index
 		const persistedToInMemory = new Map<string, number>();
 		// Track which in-memory clusters have been matched to avoid double-matching
 		const inMemoryMatched = new Set<number>();
 
-		for (const persisted of persistedClusters) {
+		const identityStartedAt = Date.now();
+		let identityWork = 0;
+		for (const [pIdx, persisted] of persistedClusters.entries()) {
+			// Yield every CLUSTER_YIELD_WORK_BUDGET multiply-adds (same bound as the
+			// clustering pass) so a large store does not freeze the server here either.
+			identityWork += (inMemoryClusters.length + 1) * persisted.centroid.length;
+			if (identityWork >= CLUSTER_YIELD_WORK_BUDGET) {
+				identityWork = 0;
+				await yieldToEventLoop();
+			}
 			let bestIdx = -1;
 			let bestSim = -1;
 			for (let i = 0; i < inMemoryClusters.length; i++) {
 				if (inMemoryMatched.has(i)) continue;
-				const sim = cosineSimilarity(
+				const sim = cosineWithNorms(
 					persisted.centroid,
+					persistedNorms[pIdx],
 					inMemoryClusters[i].centroid,
+					inMemoryNorms[i],
 				);
 				if (sim > bestSim) {
 					bestSim = sim;
@@ -491,6 +535,55 @@ export class Reconsolidator {
 			}
 		}
 
+		// Overlap fallback (see CLUSTER_IDENTITY_OVERLAP_THRESHOLD). Uses an inverted
+		// index member → unmatched in-memory cluster, so the cost is the total
+		// membership size rather than persisted × in-memory.
+		const unmatchedMemberToInMemory = new Map<string, number>();
+		for (let i = 0; i < inMemoryClusters.length; i++) {
+			if (inMemoryMatched.has(i)) continue;
+			for (const memberId of inMemoryClusters[i].memberIds) {
+				unmatchedMemberToInMemory.set(memberId, i);
+			}
+		}
+		for (const persisted of persistedClusters) {
+			if (persistedToInMemory.has(persisted.id)) continue;
+			const overlap = new Map<number, number>();
+			for (const memberId of persisted.memberIds) {
+				const idx = unmatchedMemberToInMemory.get(memberId);
+				if (idx !== undefined) overlap.set(idx, (overlap.get(idx) ?? 0) + 1);
+			}
+			let bestIdx = -1;
+			let bestJaccard = 0;
+			for (const [idx, shared] of overlap) {
+				if (inMemoryMatched.has(idx)) continue;
+				const union =
+					persisted.memberIds.length +
+					inMemoryClusters[idx].memberIds.length -
+					shared;
+				const jaccard = shared / union;
+				if (jaccard > bestJaccard) {
+					bestJaccard = jaccard;
+					bestIdx = idx;
+				}
+			}
+			if (bestIdx >= 0 && bestJaccard >= CLUSTER_IDENTITY_OVERLAP_THRESHOLD) {
+				persistedToInMemory.set(persisted.id, bestIdx);
+				inMemoryMatched.add(bestIdx);
+			}
+		}
+
+		logger.log(
+			`[synthesis] Matched ${persistedClusters.length} persisted clusters against ${inMemoryClusters.length} in-memory clusters in ${Date.now() - identityStartedAt} ms.`,
+		);
+
+		// O(1) lookups for the resolution below. persistedToInMemory is one-to-one, so
+		// its inverse is a plain map (in-memory index → persisted ID).
+		const inMemoryToPersisted = new Map<number, string>();
+		for (const [persistedId, inMemIdx] of persistedToInMemory) {
+			inMemoryToPersisted.set(inMemIdx, persistedId);
+		}
+		const persistedById = new Map(persistedClusters.map((p) => [p.id, p]));
+
 		// Map in-memory cluster index → resolved ID + membership-changed flag
 		const resolvedClusters: Array<{
 			id: string;
@@ -502,25 +595,10 @@ export class Reconsolidator {
 			joinedAt: Map<string, number>;
 		}> = inMemoryClusters.map((cluster, idx) => {
 			// Find the persisted cluster that matched this in-memory cluster (if any)
-			let matchedId: string | null = null;
-			let lastSynthesizedAt: number | null = null;
-			let previousMemberIds: string[] = [];
-			let previousJoinedAt = new Map<string, number>();
-
-			for (const [persistedId, inMemIdx] of persistedToInMemory) {
-				if (inMemIdx === idx) {
-					matchedId = persistedId;
-					const persistedCluster = persistedClusters.find(
-						(p) => p.id === persistedId,
-					);
-					if (persistedCluster) {
-						lastSynthesizedAt = persistedCluster.lastSynthesizedAt;
-						previousMemberIds = persistedCluster.memberIds;
-						previousJoinedAt = persistedCluster.memberJoinedAt;
-					}
-					break;
-				}
-			}
+			const matchedId = inMemoryToPersisted.get(idx) ?? null;
+			const persistedCluster =
+				matchedId !== null ? persistedById.get(matchedId) : undefined;
+			const previousMemberIds = persistedCluster?.memberIds ?? [];
 
 			const id = matchedId ?? randomUUID();
 			const isNew = matchedId === null;
@@ -538,8 +616,10 @@ export class Reconsolidator {
 				memberIds: cluster.memberIds,
 				isNew,
 				membershipChanged,
-				lastSynthesizedAt: isNew ? null : lastSynthesizedAt,
-				joinedAt: previousJoinedAt,
+				lastSynthesizedAt: isNew
+					? null
+					: (persistedCluster?.lastSynthesizedAt ?? null),
+				joinedAt: persistedCluster?.memberJoinedAt ?? new Map(),
 			};
 		});
 
@@ -561,21 +641,67 @@ export class Reconsolidator {
 		const entriesMap = new Map(allEntries.map((e) => [e.id, e]));
 
 		let synthesized = 0;
+		let deferred = 0;
 
-		for (const cluster of resolvedClusters) {
-			// Ripeness: never synthesized, or materially changed since last synthesis,
-			// AND meets minimum member count.
-			const isRipe =
-				cluster.memberIds.length >= CLUSTER_MIN_MEMBERS &&
-				(cluster.lastSynthesizedAt === null ||
-					hasMaterialChange(
-						cluster.memberIds,
-						cluster.joinedAt,
-						cluster.lastSynthesizedAt,
-					));
+		// Dominant cluster (findDominantCluster: >= 100 members and > 50% of all entries): the
+		// assignment threshold is below the embedding model's noise floor. Never synthesized:
+		// no LLM call, no budget spend, not marked. resolvedClusters keeps the in-memory order,
+		// so the index locates it.
+		const dominantClusterId =
+			dominant !== null ? resolvedClusters[dominant.index].id : null;
+		if (dominant !== null && dominantClusterId !== null) {
+			logger.warn(
+				`[synthesis] Skipping synthesis for dominant cluster ${dominantClusterId}: ${dominant.size}/${allEntries.length} entries (${Math.round(dominant.share * 100)}%) in one cluster, no LLM call, not marked synthesized. CLUSTER_ASSIGNMENT_THRESHOLD=${CLUSTER_ASSIGNMENT_THRESHOLD} (CLUSTER_CENTROID_MODE=${centroidMode}) is likely below the embedding model's noise floor. Recalibrate with \`knowledge-server calibrate --clusters\`.`,
+			);
+		}
 
-			if (!isRipe) continue;
+		// Skew warning only: unlike the dominant guard above, nothing is skipped here.
+		const skew = findClusterSkew(inMemoryClusters, allEntries.length, {
+			minMembers: CLUSTER_MIN_MEMBERS,
+			maxPeers: config.consolidation.synthesisMaxPeers,
+		});
+		if (skew !== null) {
+			const reasons: string[] = [];
+			if (skew.topShareExceeded) {
+				reasons.push(
+					`the three largest clusters hold ${skew.topThreeSize} of ${allEntries.length} entries (over ${SKEW_TOP_SHARE * 100}%, checked from ${SKEW_MIN_ENTRIES} entries)`,
+				);
+			}
+			if (skew.oversized) {
+				reasons.push(
+					`the largest cluster has ${skew.largestSize} members (over ${SKEW_PEER_MULTIPLE}x SYNTHESIS_MAX_PEERS=${config.consolidation.synthesisMaxPeers})`,
+				);
+			}
+			logger.warn(
+				`[synthesis] Cluster skew in store "${db.id}": ${reasons.join("; ")}. CLUSTER_ASSIGNMENT_THRESHOLD=${CLUSTER_ASSIGNMENT_THRESHOLD} (CLUSTER_CENTROID_MODE=${centroidMode}). Synthesis still runs. Run \`knowledge-server calibrate --clusters\` to choose a threshold.`,
+			);
+		}
 
+		// Ripeness: never synthesized, or materially changed since last synthesis, AND meets
+		// minimum member count.
+		const ripe = resolvedClusters.filter(
+			(c) =>
+				c.id !== dominantClusterId &&
+				c.memberIds.length >= CLUSTER_MIN_MEMBERS &&
+				(c.lastSynthesizedAt === null ||
+					hasMaterialChange(c.memberIds, c.joinedAt, c.lastSynthesizedAt)),
+		);
+
+		// Order under the cap: never-synthesized first, then oldest lastSynthesizedAt; ties by
+		// member count desc, then seed id asc.
+		ripe.sort((a, b) => {
+			const aT = a.lastSynthesizedAt ?? -1;
+			const bT = b.lastSynthesizedAt ?? -1;
+			if (aT !== bT) return aT - bT;
+			if (a.memberIds.length !== b.memberIds.length) {
+				return b.memberIds.length - a.memberIds.length;
+			}
+			const aSeed = a.memberIds[0];
+			const bSeed = b.memberIds[0];
+			return aSeed < bSeed ? -1 : aSeed > bSeed ? 1 : 0;
+		});
+
+		for (const cluster of ripe) {
 			// Collect peer entries for this cluster
 			const peers = cluster.memberIds
 				.map((id) => entriesMap.get(id))
@@ -584,6 +710,14 @@ export class Reconsolidator {
 				);
 
 			if (peers.length < CLUSTER_MIN_MEMBERS) continue;
+
+			// Per-run cap: deferred clusters are not marked, so they stay ripe (never synthesized,
+			// or their new members keep joined_at > last_synthesized_at).
+			if (budget.remaining <= 0) {
+				deferred++;
+				continue;
+			}
+			budget.remaining--;
 
 			logger.log(
 				`[synthesis] Attempting synthesis for cluster ${cluster.id} (${peers.length} peers).`,
@@ -754,6 +888,12 @@ export class Reconsolidator {
 					`[synthesis] All ${results.length} result(s) for cluster ${cluster.id} failed reconsolidation — cluster marked synthesized but nothing persisted.`,
 				);
 			}
+		}
+
+		if (deferred > 0) {
+			logger.log(
+				`[synthesis] Deferred ${deferred} ripe cluster(s) in store "${db.id}" to the next run: per-run cap CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN=${config.consolidation.clusterSynthesisMaxCallsPerRun} reached.`,
+			);
 		}
 
 		if (synthesized > 0) {

@@ -105,6 +105,14 @@ function makeConsolidation(
 			return result;
 		},
 
+		lastRunProviderFailed(): boolean {
+			return false;
+		},
+
+		lastRunGaveProviderSignal(): boolean {
+			return false;
+		},
+
 		async runSynthesis(): Promise<number> {
 			synthesisCalled++;
 			return 0;
@@ -266,6 +274,9 @@ describe("drainConsolidation", () => {
 			},
 			async consolidate(): Promise<never> {
 				throw new Error("consolidate exploded");
+			},
+			lastRunGaveProviderSignal(): boolean {
+				return false;
 			},
 			async runSynthesis(): Promise<number> {
 				return 0;

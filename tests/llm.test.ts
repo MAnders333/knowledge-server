@@ -12,7 +12,9 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { fileURLToPath } from "node:url";
 import * as aiModule from "ai";
+import { APICallError } from "ai";
 import { config } from "../src/config";
+import { isNonRetryableLlmError } from "../src/consolidation/errors";
 import {
 	ConsolidationLLM,
 	LlmCallError,
@@ -993,9 +995,188 @@ describe("ConsolidationLLM timeout and retry policy", () => {
 		expect(spy).toHaveBeenCalledTimes(3);
 	});
 
+	it("does not retry a 503-wrapped context_length_exceeded", async () => {
+		const spy = generateTextMock();
+		spy.mockRejectedValue(apiError(503, CONTEXT_LENGTH_BODY));
+		const logSpy = spyOn(logger, "info").mockImplementation(() => {});
+		const warnSpy = spyOn(logger, "warn").mockImplementation(() => {});
+		const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+		try {
+			await expect(llm.decideMerge(existing, extracted)).rejects.toThrow(
+				LlmCallError,
+			);
+			expect(spy).toHaveBeenCalledTimes(1);
+			// The provider body reaches only the debug log, never the info/warn/error logs.
+			const shown = [logSpy, warnSpy, errorSpy]
+				.flatMap((m) => m.mock.calls)
+				.map((c) => String(c[0]))
+				.join("\n");
+			expect(shown).not.toContain("maximum context length is 200000");
+		} finally {
+			logSpy.mockRestore();
+			warnSpy.mockRestore();
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("retries a 429 whose body says invalid_request_error", async () => {
+		const spy = generateTextMock();
+		spy.mockRejectedValue(
+			apiError(
+				429,
+				JSON.stringify({ error: { type: "invalid_request_error" } }),
+			),
+		);
+		await expect(llm.decideMerge(existing, extracted)).rejects.toThrow();
+		expect(spy).toHaveBeenCalledTimes(3);
+	});
+
+	it("does not retry a 401", async () => {
+		const spy = generateTextMock();
+		spy.mockRejectedValue(apiError(401));
+		await expect(llm.decideMerge(existing, extracted)).rejects.toThrow();
+		expect(spy).toHaveBeenCalledTimes(1);
+	});
+
 	it("passes maxRetries: 0 to generateText so the SDK never retries inside an attempt", async () => {
 		const spy = mockGenerateText(JSON.stringify({ action: "keep" }));
 		await llm.decideMerge(existing, extracted);
 		expect(spy.mock.calls[0]?.[0]).toMatchObject({ maxRetries: 0 });
+	});
+});
+
+// ── isNonRetryableLlmError ────────────────────────────────────────────────────
+
+function apiError(
+	statusCode: number,
+	responseBody?: string,
+	message = "Upstream error",
+): APICallError {
+	return new APICallError({
+		message,
+		url: "https://example.invalid",
+		requestBodyValues: {},
+		statusCode,
+		responseBody,
+	});
+}
+
+const CONTEXT_LENGTH_BODY = JSON.stringify({
+	error: {
+		message: "This model's maximum context length is 200000 tokens.",
+		type: "invalid_request_error",
+		code: "context_length_exceeded",
+	},
+});
+
+describe("isNonRetryableLlmError", () => {
+	it("treats a 503-wrapped context_length_exceeded as permanent", () => {
+		expect(isNonRetryableLlmError(apiError(503, CONTEXT_LENGTH_BODY))).toBe(
+			true,
+		);
+	});
+
+	it("treats a plain 503 overload as transient", () => {
+		expect(isNonRetryableLlmError(apiError(503, "upstream overloaded"))).toBe(
+			false,
+		);
+	});
+
+	it("treats a 500 without body as transient", () => {
+		expect(isNonRetryableLlmError(apiError(500))).toBe(false);
+	});
+
+	it("treats 400, 401 and 404 as permanent", () => {
+		expect(isNonRetryableLlmError(apiError(400))).toBe(true);
+		expect(isNonRetryableLlmError(apiError(401))).toBe(true);
+		expect(isNonRetryableLlmError(apiError(404))).toBe(true);
+	});
+
+	it("keeps a 429 retryable when a 503 gateway wraps it with invalid_request_error", () => {
+		const body = '{"status":429,"error":{"type":"invalid_request_error"}}';
+		expect(isNonRetryableLlmError(apiError(503, body))).toBe(false);
+		expect(isNonRetryableLlmError(apiError(502, body))).toBe(false);
+	});
+
+	it("keeps 408, 409 and 429 retryable", () => {
+		expect(isNonRetryableLlmError(apiError(408))).toBe(false);
+		expect(isNonRetryableLlmError(apiError(409))).toBe(false);
+		expect(isNonRetryableLlmError(apiError(429))).toBe(false);
+	});
+
+	it("treats 429 with insufficient_quota as permanent", () => {
+		expect(
+			isNonRetryableLlmError(
+				apiError(429, '{"error":{"code":"insufficient_quota"}}'),
+			),
+		).toBe(true);
+	});
+
+	it("keeps a 429 retryable even when its body says invalid_request_error", () => {
+		// Some gateways label rate limits invalid_request_error.
+		const body = JSON.stringify({
+			error: { type: "invalid_request_error", message: "rate limited" },
+		});
+		expect(isNonRetryableLlmError(apiError(429, body))).toBe(false);
+		expect(
+			isNonRetryableLlmError(apiError(429, '{"code":"invalid_argument"}')),
+		).toBe(false);
+		expect(isNonRetryableLlmError(apiError(408, body))).toBe(false);
+	});
+
+	it("treats a 5xx whose body says invalid_request_error as permanent", () => {
+		const body = JSON.stringify({
+			error: { type: "invalid_request_error", message: "bad" },
+		});
+		expect(isNonRetryableLlmError(apiError(502, body))).toBe(true);
+	});
+
+	it("recognises the production gateway message shape with the JSON only in message", () => {
+		// Exact shape of the 503-wrapped 400 seen in production: the upstream JSON is
+		// embedded in the message with a vendor prefix and no responseBody.
+		const message = `[OpenAI Vendor Group Key StatusCode: BadRequest] ${CONTEXT_LENGTH_BODY}`;
+		expect(isNonRetryableLlmError(apiError(503, undefined, message))).toBe(
+			true,
+		);
+	});
+
+	it("recognises the same production shape when it arrives as the body", () => {
+		const body = `[OpenAI Vendor Group Key StatusCode: BadRequest] ${CONTEXT_LENGTH_BODY}`;
+		expect(isNonRetryableLlmError(apiError(503, body))).toBe(true);
+	});
+
+	it("reads a status embedded in the body of a 502", () => {
+		expect(
+			isNonRetryableLlmError(apiError(502, '{"status": 400, "detail": "bad"}')),
+		).toBe(true);
+		expect(isNonRetryableLlmError(apiError(502, '{"status": 429}'))).toBe(
+			false,
+		);
+	});
+
+	it("unwraps lastError from a retry wrapper", () => {
+		const wrapper = Object.assign(new Error("Failed after 3 attempts"), {
+			lastError: apiError(503, CONTEXT_LENGTH_BODY),
+		});
+		expect(isNonRetryableLlmError(wrapper)).toBe(true);
+	});
+
+	it("classifies through an LlmCallError wrapper", () => {
+		expect(
+			isNonRetryableLlmError(
+				new LlmCallError(apiError(503, CONTEXT_LENGTH_BODY)),
+			),
+		).toBe(true);
+	});
+
+	it("never treats aborts, network errors, or unknown errors as permanent", () => {
+		expect(
+			isNonRetryableLlmError(
+				Object.assign(new Error("aborted"), { name: "AbortError" }),
+			),
+		).toBe(false);
+		expect(isNonRetryableLlmError(new TypeError("fetch failed"))).toBe(false);
+		expect(isNonRetryableLlmError(new Error("boom"))).toBe(false);
+		expect(isNonRetryableLlmError("x")).toBe(false);
 	});
 });

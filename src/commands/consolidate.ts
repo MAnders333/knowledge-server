@@ -39,7 +39,10 @@ export async function runConsolidate(
 		activation,
 		[new PendingEpisodesReader(serverStateDb)],
 		registry.domainRouter,
-		{ lockPath: consolidationLockPath(resolveDataDir()) },
+		{
+			lockPath: consolidationLockPath(resolveDataDir()),
+			writableStores: registry.writableStores(),
+		},
 	);
 
 	try {
@@ -65,14 +68,14 @@ export async function runConsolidate(
 			);
 		}
 
-		const { totalSessions, totalCreated, totalUpdated } =
+		const { totalSessions, totalCreated, totalUpdated, providerFailed } =
 			await drainConsolidation(consolidation);
 
 		// Run KB synthesis once after all batches, same as the server-side drain.
 		// Runs unconditionally — existing entries may still be ripe even when no
 		// new sessions were processed (e.g. after a re-embedding pass).
 		console.log("\nRunning KB synthesis pass...");
-		await runSynthesisPass(consolidation);
+		await runSynthesisPass(consolidation, providerFailed);
 
 		console.log("");
 		console.log("Consolidation complete.");

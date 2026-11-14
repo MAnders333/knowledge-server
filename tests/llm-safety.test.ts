@@ -518,6 +518,20 @@ describe("provider failures through LlmCallError", () => {
 		expect(isDeterministicFailure(err)).toBe(true);
 	});
 
+	it("a context-length rejection wrapped in a 503 stays deterministic", async () => {
+		const err = await extractionErrorFor(
+			providerError("Upstream error", 503, {
+				error: {
+					message: "This model's maximum context length is 200000 tokens.",
+					type: "invalid_request_error",
+					code: "context_length_exceeded",
+				},
+			}),
+		);
+		expect(err).toBeInstanceOf(LlmCallError);
+		expect(isDeterministicFailure(err)).toBe(true);
+	});
+
 	it("a rate limit (429) is transient and classed by its status", async () => {
 		const err = await extractionErrorFor(
 			providerError("slow down", 429, { error: { type: "rate_limit" } }),

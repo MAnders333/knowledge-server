@@ -19,10 +19,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ActivationEngine } from "../src/activation/activate";
+import { config } from "../src/config";
 import { ConsolidationEngine } from "../src/consolidation/consolidate";
 import { ConsolidationLLM } from "../src/consolidation/llm";
+import { Reconsolidator } from "../src/consolidation/reconsolidate";
 import { KnowledgeDB } from "../src/db/sqlite/index";
 import { ServerStateDB } from "../src/db/state/index";
+import { logger } from "../src/logger";
 import type { Episode, IEpisodeReader } from "../src/types";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -1809,5 +1812,183 @@ describe("ConsolidationLLM.batchDecideMerge()", () => {
 		expect(batchSpy).toHaveBeenCalledTimes(1);
 		const call = batchSpy.mock.calls[0][0];
 		expect(call).toHaveLength(2);
+	});
+});
+
+describe("ConsolidationEngine.runSynthesis - shared budget and per-store isolation", () => {
+	const DIM = 8;
+	function axisVec(axis: number, dim = DIM): number[] {
+		const v = new Array<number>(dim).fill(0);
+		v[axis] = 1;
+		return v;
+	}
+
+	it("shares one synthesis-call budget across stores", async () => {
+		for (let i = 0; i < 5; i++) {
+			await db.insertEntry(
+				makeEntry({
+					id: `a${i}`,
+					content: `a content ${i}`,
+					embedding: axisVec(0),
+				}),
+			);
+		}
+		const db2 = new KnowledgeDB(join(tempDir, "second.db"));
+		try {
+			for (let i = 0; i < 5; i++) {
+				await db2.insertEntry(
+					makeEntry({
+						id: `b${i}`,
+						content: `b content ${i}`,
+						embedding: axisVec(2),
+					}),
+				);
+			}
+			const synthSpy = spyOn(
+				ConsolidationLLM.prototype,
+				"synthesizePrinciple",
+			).mockResolvedValue([]);
+			const reconsolidator = new Reconsolidator(
+				db,
+				activation.embeddings,
+				new ConsolidationLLM(),
+			);
+			const budget = { remaining: 1 };
+
+			await reconsolidator.runKBSynthesis(db, budget);
+			await reconsolidator.runKBSynthesis(db2, budget);
+
+			expect(synthSpy).toHaveBeenCalledTimes(1);
+			expect(budget.remaining).toBe(0);
+		} finally {
+			await db2.close();
+		}
+	});
+
+	/** Inserts five identical entries into `store`: one ripe cluster on `axis`. */
+	async function insertRipeCluster(
+		store: KnowledgeDB,
+		axis: number,
+		prefix: string,
+	): Promise<void> {
+		for (let i = 0; i < 5; i++) {
+			await store.insertEntry(
+				makeEntry({
+					id: `${prefix}${i}`,
+					content: `${prefix} content ${i}`,
+					embedding: axisVec(axis),
+				}),
+			);
+		}
+	}
+
+	it("continues with the next store when one store's synthesis throws", async () => {
+		const failingDb = new KnowledgeDB(join(tempDir, "failing.db"));
+		failingDb.id = "failing-store";
+		const okDb = new KnowledgeDB(join(tempDir, "ok.db"));
+		try {
+			await insertRipeCluster(failingDb, 0, "pf");
+			await insertRipeCluster(okDb, 2, "po");
+			// Its persist throws before any LLM call; okDb comes after it in the list.
+			spyOn(failingDb, "persistClusters").mockRejectedValue(
+				new Error("simulated store failure"),
+			);
+			const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+			const synthSpy = spyOn(
+				ConsolidationLLM.prototype,
+				"synthesizePrinciple",
+			).mockResolvedValue([]);
+			const multi = new ConsolidationEngine(
+				db,
+				serverStateDb,
+				activation,
+				[mockReader],
+				null,
+				{ writableStores: [failingDb, okDb] },
+			);
+
+			try {
+				await multi.runSynthesis();
+
+				expect(synthSpy).toHaveBeenCalledTimes(1);
+				expect(
+					errorSpy.mock.calls.some((c) =>
+						String(c[0]).includes('store "failing-store"'),
+					),
+				).toBe(true);
+			} finally {
+				errorSpy.mockRestore();
+			}
+		} finally {
+			await failingDb.close();
+			await okDb.close();
+		}
+	});
+
+	it("a store that fails before its LLM call does not consume the synthesis budget", async () => {
+		const failingDb = new KnowledgeDB(join(tempDir, "failing-budget.db"));
+		const okDb = new KnowledgeDB(join(tempDir, "ok-budget.db"));
+		const savedCap = config.consolidation.clusterSynthesisMaxCallsPerRun;
+		try {
+			await insertRipeCluster(failingDb, 0, "qf");
+			await insertRipeCluster(okDb, 2, "qo");
+			// Cap of 1: if the failing store consumed the budget, okDb would get no call.
+			config.consolidation.clusterSynthesisMaxCallsPerRun = 1;
+			spyOn(failingDb, "persistClusters").mockRejectedValue(
+				new Error("simulated store failure"),
+			);
+			const errorSpy = spyOn(logger, "error").mockImplementation(() => {});
+			const synthSpy = spyOn(
+				ConsolidationLLM.prototype,
+				"synthesizePrinciple",
+			).mockResolvedValue([]);
+			const multi = new ConsolidationEngine(
+				db,
+				serverStateDb,
+				activation,
+				[mockReader],
+				null,
+				{ writableStores: [failingDb, okDb] },
+			);
+
+			try {
+				await multi.runSynthesis();
+
+				expect(synthSpy).toHaveBeenCalledTimes(1);
+			} finally {
+				errorSpy.mockRestore();
+			}
+		} finally {
+			config.consolidation.clusterSynthesisMaxCallsPerRun = savedCap;
+			await failingDb.close();
+			await okDb.close();
+		}
+	});
+
+	it("synthesizes a writable store that received no writes this run", async () => {
+		// No consolidate() ran, so nothing was written to either store: the second
+		// store's ripe cluster must still be found, not skipped as "untouched".
+		const secondDb = new KnowledgeDB(join(tempDir, "second-writable.db"));
+		try {
+			await insertRipeCluster(secondDb, 2, "sw");
+			const synthSpy = spyOn(
+				ConsolidationLLM.prototype,
+				"synthesizePrinciple",
+			).mockResolvedValue([]);
+			const multi = new ConsolidationEngine(
+				db,
+				serverStateDb,
+				activation,
+				[mockReader],
+				null,
+				{ writableStores: [db, secondDb] },
+			);
+
+			await multi.runSynthesis();
+
+			expect(synthSpy).toHaveBeenCalledTimes(1);
+		} finally {
+			await secondDb.close();
+		}
 	});
 });
