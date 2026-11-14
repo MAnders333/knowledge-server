@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.12.0](https://github.com/MAnders333/knowledge-server/compare/v3.11.0...v3.12.0) (2026-11-14)
+
+
+### Features
+
+* **synthesis:** stop cluster collapse after an embedding model switch ([#125](https://github.com/MAnders333/knowledge-server/issues/125)) ([f8df837](https://github.com/MAnders333/knowledge-server/commit/f8df8377e3954e7cf7c9265ee58a17c660d94b87))
+
 ## [3.11.0](https://github.com/MAnders333/knowledge-server/compare/v3.10.3...v3.11.0) (2026-11-13)
 
 
