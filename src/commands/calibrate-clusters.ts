@@ -172,6 +172,40 @@ function describeOpenError(e: unknown): string {
 	return errCode(e) ?? (e instanceof Error ? e.name : "error");
 }
 
+/**
+ * Bounds one store's open and read by config.storeInitTimeoutMs, as StoreRegistry does
+ * at startup. A store that accepts connections but never answers rejects with code
+ * TIMEOUT, which is reported as unavailable.
+ */
+function withStoreTimeout<T>(work: Promise<T>): Promise<T> {
+	const { promise: timeout, reject } = Promise.withResolvers<never>();
+	const timer = setTimeout(
+		() =>
+			reject(
+				Object.assign(
+					new Error(
+						`store did not respond within ${config.storeInitTimeoutMs}ms`,
+					),
+					{ code: "TIMEOUT" },
+				),
+			),
+		config.storeInitTimeoutMs,
+	);
+	return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Open a store read-only and read its active entries. `handle.db` is set as soon as
+ * the store is open, so the caller can close it.
+ */
+async function readStore(
+	store: StoreConfig,
+	handle: { db?: IKnowledgeStore },
+): Promise<SimEntry[]> {
+	handle.db = await openStoreReadOnly(store);
+	return (await handle.db.getActiveEntriesWithEmbeddings()) as SimEntry[];
+}
+
 function requireValue(args: string[], flag: string): string {
 	const idx = args.indexOf(flag);
 	const value = args[idx + 1];
@@ -194,7 +228,12 @@ function pad(
 }
 
 function snippet(content: string): string {
-	const flat = content.replace(/\s+/g, " ").trim();
+	// Control characters (escape sequences, BEL, C1 controls) are dropped, so a sample cannot drive the terminal.
+	const flat = content
+		.replace(/\s+/g, " ")
+		// biome-ignore lint/suspicious/noControlCharactersInRegex: intentional, so a sample cannot drive the terminal
+		.replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
+		.trim();
 	return flat.length > SNIPPET_CHARS
 		? `${flat.slice(0, SNIPPET_CHARS)}...`
 		: flat;
@@ -231,7 +270,7 @@ function printSamples(
 export async function runCalibrateClusters(
 	args: string[],
 	configPath: string = defaultConfigPath(),
-): Promise<void> {
+): Promise<boolean> {
 	// The current threshold is always in the default sweep so the "<- current" row
 	// (the incident's threshold, if it is still configured) is shown.
 	let thresholds = [
@@ -298,17 +337,23 @@ export async function runCalibrateClusters(
 	const stores = fileConfig.stores.filter((s) => s.writable);
 	const header = `  ${"mode".padEnd(8)}${"thresh".padStart(7)}${"clusters".padStart(10)}${"singletons".padStart(12)}${"p50".padStart(6)}${"p90".padStart(6)}${"max".padStart(7)}${"max%".padStart(7)}${"max~tok".padStart(10)}${"eligible".padStart(10)}${"capped".padStart(8)}${"time".padStart(8)}`;
 
+	// A store is analysed when its sweep ran; the summary and exit status use these counts.
+	let analysed = 0;
+	let skipped = 0;
+	let failed = 0;
+
 	for (const store of stores) {
-		let db: IKnowledgeStore | undefined;
+		let timedOut = false;
+		const handle: { db?: IKnowledgeStore } = {};
 		try {
-			db = await openStoreReadOnly(store);
-			const entries = (await db.getActiveEntriesWithEmbeddings()) as SimEntry[];
+			const entries = await withStoreTimeout(readStore(store, handle));
 			console.log(
 				`Store "${store.id}" (${store.kind}): ${entries.length} active/conflicted entries with embeddings`,
 			);
 			if (entries.length < minMembers) {
 				console.log("  too few entries for synthesis - skipped");
 				console.log("");
+				skipped++;
 				continue;
 			}
 
@@ -356,6 +401,7 @@ export async function runCalibrateClusters(
 					printSamples(entries, clusters, mode, sampleThreshold);
 				}
 			}
+			analysed++;
 		} catch (e) {
 			// greedyClusterAsync throws this for mixed-dimension embeddings (e.g. a re-embed
 			// in progress). The message carries only the two dimensions, no store data.
@@ -366,19 +412,33 @@ export async function runCalibrateClusters(
 				console.log(
 					`  Store "${store.id}": embeddings have mixed dimensions (re-embed in progress?) - skipped`,
 				);
+				skipped++;
 			} else {
+				timedOut = errCode(e) === "TIMEOUT";
 				console.log(
 					`  Store "${store.id}" (${store.kind}): unavailable - skipped (${describeOpenError(e)})`,
 				);
+				failed++;
 			}
 			console.log("");
 		} finally {
-			if (db) await db.close();
+			// A timed-out read may still be pending, and close() waits for it, so the handle
+			// is left for process exit.
+			if (handle.db && !timedOut) await handle.db.close();
 		}
 	}
 
+	const ok = analysed > 0 && failed === 0;
 	console.log(
-		"Pick the lowest threshold where max% is small (no cluster dominates; synthesis skips a cluster holding more than 50% of entries and at least 100) and eligible is reasonable, then set CLUSTER_ASSIGNMENT_THRESHOLD (and optionally CLUSTER_CENTROID_MODE) in .env. Changing the threshold re-keys most clusters: they all become ripe once, and CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN throttles that backlog over several runs. Switching the centroid mode keeps most cluster IDs via member overlap.",
+		`Stores: ${analysed} analysed, ${skipped} skipped, ${failed} unavailable.`,
 	);
-	console.log("Nothing was written; no LLM or embedding calls were made.");
+	if (analysed > 0) {
+		console.log(
+			"Pick the lowest threshold where max% is small (no cluster dominates; synthesis skips a cluster holding more than 50% of entries and at least 100) and eligible is reasonable, then set CLUSTER_ASSIGNMENT_THRESHOLD (and optionally CLUSTER_CENTROID_MODE) in .env. Changing the threshold re-keys most clusters: they all become ripe once, and CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN throttles that backlog over several runs. Clusters that overlap by at least half keep their ID when the centroid mode changes.",
+		);
+	}
+	console.log(
+		"No entries or clusters were modified; no LLM or embedding calls were made.",
+	);
+	return ok;
 }

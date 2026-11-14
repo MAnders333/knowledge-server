@@ -13,6 +13,7 @@ import {
 	runCalibrateClusters,
 	summarizeClusters,
 } from "../src/commands/calibrate-clusters";
+import { config } from "../src/config";
 import type { GreedyCluster } from "../src/consolidation/cluster";
 import { PostgresKnowledgeDB } from "../src/db/postgres/index";
 import { KnowledgeDB } from "../src/db/sqlite/index";
@@ -20,6 +21,14 @@ import { fakeEmbedding, makeEntry } from "./fixtures";
 
 function simEntry(id: string): SimEntry {
 	return { ...makeEntry({ id, content: `content ${id}` }), embedding: [1, 0] };
+}
+
+/** Eight-dimensional vectors that point the same way, so they form one cluster. */
+function nearAxisVec(i: number): number[] {
+	const v = new Array<number>(8).fill(0);
+	v[0] = 1;
+	v[1] = 0.05 * i;
+	return v;
 }
 
 describe("parseThresholdList", () => {
@@ -227,23 +236,24 @@ describe("runCalibrateClusters (end-to-end, temp store)", () => {
 		return configPath;
 	}
 
-	it("prints no paths, and leaves entries and cluster rows unchanged", async () => {
+	it("runs the simulation, prints no paths, and leaves entries and cluster rows unchanged", async () => {
 		dir = mkdtempSync(join(tmpdir(), "ks-calibrate-e2e-"));
 		const storePath = join(dir, "store.db");
+		// Seven entries clear CLUSTER_MIN_MEMBERS (5), so the sweep runs. Their control
+		// characters must not reach the output.
+		const ids = ["a", "b", "c", "d", "e", "f", "g"];
 		const writer = new KnowledgeDB(storePath);
-		await writer.insertEntry({
-			...makeEntry({ id: "a", content: "alpha" }),
-			embedding: fakeEmbedding("alpha"),
-		});
-		await writer.insertEntry({
-			...makeEntry({ id: "b", content: "beta" }),
-			embedding: fakeEmbedding("beta"),
-		});
+		for (const [i, id] of ids.entries()) {
+			await writer.insertEntry({
+				...makeEntry({ id, content: `entry ${id}\u001b[31m red\u0007 text` }),
+				embedding: nearAxisVec(i),
+			});
+		}
 		await writer.persistClusters([
 			{
 				id: "c1",
-				centroid: [1, 0],
-				memberIds: ["a", "b"],
+				centroid: nearAxisVec(0),
+				memberIds: ids,
 				isNew: true,
 				membershipChanged: true,
 			},
@@ -254,28 +264,50 @@ describe("runCalibrateClusters (end-to-end, temp store)", () => {
 		const snapshot = async () => {
 			const r = new KnowledgeDB(storePath, { readOnly: true });
 			try {
-				return JSON.stringify({
+				const clusters = await r.getClustersWithMembers();
+				return {
 					entries: (await r.getActiveEntriesWithEmbeddings()).map((e) => e.id),
-					clusters: await r.getClustersWithMembers(),
-				});
+					clusters: clusters.map((c) => ({
+						...c,
+						memberJoinedAt: [...c.memberJoinedAt.entries()],
+					})),
+				};
 			} finally {
 				await r.close();
 			}
 		};
 		const before = await snapshot();
 
+		const savedThreshold = config.consolidation.clusterAssignmentThreshold;
+		config.consolidation.clusterAssignmentThreshold = 0.5;
 		const out = captureOutput();
-		await runCalibrateClusters(["--thresholds", "0.6,0.7"], configPath);
+		let ok = false;
+		try {
+			ok = await runCalibrateClusters(
+				["--thresholds", "0.5,0.7", "--samples", "0.5"],
+				configPath,
+			);
+		} finally {
+			config.consolidation.clusterAssignmentThreshold = savedThreshold;
+		}
 
 		const text = out.lines();
+		expect(ok).toBe(true);
 		expect(text).toContain(
-			'Store "test" (sqlite): 2 active/conflicted entries',
+			'Store "test" (sqlite): 7 active/conflicted entries',
 		);
+		// One cluster of all seven at threshold 0.50, marked as the current setting.
+		expect(text).toMatch(
+			/^\s*running\s+0\.50\s+1\s+0\s+7\s+7\s+7\s+100\.0%.*<- current$/m,
+		);
+		expect(text).toContain("red text");
+		expect(text).not.toContain("\u001b");
+		expect(text).not.toContain("\u0007");
 		expect(text).not.toContain(dir);
 		expect(text).not.toContain(storePath);
 		expect(text).not.toContain("store.db");
 		expect(text).not.toContain("config.jsonc");
-		expect(await snapshot()).toBe(before);
+		expect(await snapshot()).toEqual(before);
 	});
 
 	it("reports an unreadable config without printing its path", async () => {
@@ -301,10 +333,81 @@ describe("runCalibrateClusters (end-to-end, temp store)", () => {
 		const configPath = writeConfig(storePath);
 		const out = captureOutput();
 
-		await runCalibrateClusters(["--thresholds", "0.6"], configPath);
+		expect(
+			await runCalibrateClusters(["--thresholds", "0.6"], configPath),
+		).toBe(false);
 
 		expect(out.lines()).toContain('Store "test" (sqlite): unavailable');
+		expect(out.lines()).toContain(
+			"Stores: 0 analysed, 0 skipped, 1 unavailable.",
+		);
+		expect(out.lines()).not.toContain("Pick the lowest threshold");
 		expect(out.lines()).not.toContain(dir);
 		expect(existsSync(storePath)).toBe(false);
+	});
+
+	it("returns false and gives no threshold advice when no store has enough entries", async () => {
+		dir = mkdtempSync(join(tmpdir(), "ks-calibrate-e2e-"));
+		const storePath = join(dir, "store.db");
+		const writer = new KnowledgeDB(storePath);
+		for (const id of ["a", "b"]) {
+			await writer.insertEntry({
+				...makeEntry({ id, content: id }),
+				embedding: nearAxisVec(0),
+			});
+		}
+		await writer.close();
+		const configPath = writeConfig(storePath);
+		const out = captureOutput();
+
+		expect(
+			await runCalibrateClusters(["--thresholds", "0.6"], configPath),
+		).toBe(false);
+
+		expect(out.lines()).toContain("too few entries for synthesis - skipped");
+		expect(out.lines()).toContain(
+			"Stores: 0 analysed, 1 skipped, 0 unavailable.",
+		);
+		expect(out.lines()).not.toContain("Pick the lowest threshold");
+	});
+
+	it("reports a store that never answers as unavailable (TIMEOUT)", async () => {
+		dir = mkdtempSync(join(tmpdir(), "ks-calibrate-e2e-"));
+		const configPath = join(dir, "config.jsonc");
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				stores: [
+					{
+						id: "test",
+						kind: "postgres",
+						uri: "postgres://localhost:1/none",
+						writable: true,
+					},
+				],
+				domains: [],
+				projects: [],
+				stateDb: { kind: "sqlite" },
+			}),
+		);
+		// The read never settles, so only the store timeout can end it.
+		const readSpy = spyOn(
+			PostgresKnowledgeDB.prototype,
+			"getActiveEntriesWithEmbeddings",
+		).mockImplementation(() => new Promise<never>(() => {}));
+		const savedTimeout = config.storeInitTimeoutMs;
+		config.storeInitTimeoutMs = 10;
+		const out = captureOutput();
+		try {
+			expect(
+				await runCalibrateClusters(["--thresholds", "0.6"], configPath),
+			).toBe(false);
+		} finally {
+			config.storeInitTimeoutMs = savedTimeout;
+			readSpy.mockRestore();
+		}
+		expect(out.lines()).toContain(
+			'Store "test" (postgres): unavailable - skipped (TIMEOUT)',
+		);
 	});
 });

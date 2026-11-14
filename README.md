@@ -508,12 +508,27 @@ All sources are auto-detected. Override paths or disable sources via environment
 | `CONTRADICTION_MAX_CANDIDATES` | unset (no cap) | Most candidates checked per entry and scan path, highest similarity first; checked in batches of 10 |
 | `CONTRADICTION_MIN_TOP_SIMILARITY` | unset | Skip an entry whose best candidate is below this similarity (unset = no floor) |
 | `CONTRADICTION_CONFLICTS_ONLY` | `false` | Opt-in: reply lists conflicts only (about 65% fewer output tokens per call). Recall is not validated; enable only after an online spot-check |
-| `CLUSTER_ASSIGNMENT_THRESHOLD` | `0.5` | Cosine similarity to join a synthesis cluster. Model-dependent: recalibrate with `knowledge-server calibrate --clusters` when switching embedding models. A cluster holding at least 100 entries and more than half of all entries is skipped for synthesis (no LLM call, not marked) with a warning to recalibrate |
-| `CLUSTER_CENTROID_MODE` | `running` | `running` (compare to the drifting member mean) or `seed` (compare to the cluster's fixed seed entry). Switching keeps most cluster IDs via member overlap |
+| `CLUSTER_ASSIGNMENT_THRESHOLD` | `0.5` | Cosine similarity to join a synthesis cluster. Model-dependent: recalibrate with `knowledge-server calibrate --clusters` when switching embedding models. A cluster holding at least 100 entries and more than half of all entries is skipped for synthesis (no LLM call, not marked) with a warning to recalibrate. A separate warning, which skips nothing, fires when the three largest clusters hold more than half of 100+ entries, or a cluster has more than 10x `SYNTHESIS_MAX_PEERS` members |
+| `CLUSTER_CENTROID_MODE` | `running` | `running` (compare to the drifting member mean) or `seed` (compare to the cluster's fixed seed entry). Clusters that overlap by at least half keep their ID when the mode changes |
 | `CLUSTER_MIN_MEMBERS` | `5` | Minimum cluster size before synthesis |
 | `CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN` | `20` | Synthesis LLM calls per consolidation run across all stores; `0` disables them. Deferred clusters stay ripe; never-synthesized and oldest clusters go first |
 
-**Rollout and rollback.** Changing `CLUSTER_ASSIGNMENT_THRESHOLD` or `CLUSTER_CENTROID_MODE` re-keys clusters, so the next run finds a backlog of never-synthesized clusters. For a safe first boot, set the new threshold and mode together with `CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN=0` in one restart. Clusters are rebuilt and saved with no LLM calls. Check the `Formed N clusters` log line and that no dominant-cluster warning appears, then raise the cap. Older releases ignore `CLUSTER_CENTROID_MODE` and `CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN`, but they honor `CLUSTER_MIN_MEMBERS` and `CLUSTER_ASSIGNMENT_THRESHOLD`. On an older release, clustering falls back to the running centroid with no per-run cap, and the prompt stays bounded only by `SYNTHESIS_MAX_PEERS` / `SYNTHESIS_MAX_PROMPT_TOKENS`. **Mandatory rollback step:** set `CLUSTER_MIN_MEMBERS=1000000` in `.env` and restart on the current version. Restart first so the current version also stops synthesizing until you roll back: a running process keeps the value it started with. The older release reads `.env` when it starts, so its safety does not depend on this restart. Synthesis is then paused, so the older release cannot work through the re-keyed backlog without a cap. Then roll back. No schema change is involved. **Undoing the pause:** on the older release, lower `CLUSTER_MIN_MEMBERS` back to a normal value (default `5`). The older release then works through the whole backlog with no per-run cap, so do this only when that is acceptable. Re-upgrading to the current version keeps the pause until `CLUSTER_MIN_MEMBERS` is lowered, which is safe there because `CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN` caps each run.
+**Rollout and rollback.** Changing `CLUSTER_ASSIGNMENT_THRESHOLD` or `CLUSTER_CENTROID_MODE` re-keys clusters, so the next run finds a backlog of never-synthesized clusters. Synthesis visits every writable store, including shared Postgres stores, so the cap and the pause below apply to all of them.
+
+A variable set in the process environment (for example in a launchd plist or systemd unit) overrides `.env`, so editing `.env` has no effect while that variable is set. A running process keeps the values it started with, so restart after each change.
+
+Safe first boot:
+
+1. Set the new threshold and mode together with `CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN=0`, then restart. Clusters are rebuilt and saved with no LLM calls.
+2. Check the `Formed N clusters` log line and that no dominant-cluster warning appears.
+3. Raise `CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN` and restart. The cap spreads the backlog over several runs.
+
+Pausing synthesis works on v2.7.0 or later only, the first release that honours `CLUSTER_MIN_MEMBERS` and `CLUSTER_ASSIGNMENT_THRESHOLD`. Older releases cannot be paused this way.
+
+1. Set `CLUSTER_MIN_MEMBERS=1000000` and restart the current version, so it stops synthesizing before you roll back.
+2. Roll back. Older releases also ignore `CLUSTER_CENTROID_MODE` and `CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN`, so they cluster with the running centroid and no per-run cap, and bound the prompt only by `SYNTHESIS_MAX_PEERS` / `SYNTHESIS_MAX_PROMPT_TOKENS`. They work through the whole backlog, so roll back only when that is acceptable. No schema change is involved.
+
+**Undoing the pause:** on v2.7.0 or later, set `CLUSTER_MIN_MEMBERS` back to `5` (its default) and restart. The per-run cap applies again.
 
 ### Decay
 
@@ -652,6 +667,8 @@ knowledge-server calibrate --clusters --thresholds 0.70,0.72,0.74 --samples 0.72
 ```
 
 Simulates the synthesis clustering on your real entries (read-only; no LLM or embedding calls) for a sweep of `CLUSTER_ASSIGNMENT_THRESHOLD` values (the default sweep 0.60-0.92 in steps of 0.04, plus the current threshold) and both centroid modes, and reports cluster counts, size distribution, the largest cluster and how many eligible clusters the synthesis prompt cap (`SYNTHESIS_MAX_PEERS` / `SYNTHESIS_MAX_PROMPT_TOKENS`) would trim. Run this when switching embedding models: a threshold below the model's noise floor collapses the whole knowledge base into one cluster. Each run is O(n² × dim) and takes roughly a minute at 10k entries, so the default sweep can take 15-30 minutes; use `--thresholds` for a narrower sweep.
+
+`--samples <t>` also prints up to five entry texts from each of the three largest clusters at that threshold. That output contains your entries' text, with control characters removed, so review it before sharing it.
 
 ### Review knowledge entries
 

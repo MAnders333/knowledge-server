@@ -24,7 +24,12 @@ import { runStatus } from "./commands/status.js";
 import { runStop } from "./commands/stop.js";
 import { downloadAndInstallDaemon, runUpdate } from "./commands/update.js";
 import { resolveDataDir } from "./config-file.js";
-import { config, spawnedDaemonIntervalArgs, validateConfig } from "./config.js";
+import {
+	config,
+	configEnvIssues,
+	spawnedDaemonIntervalArgs,
+	validateConfig,
+} from "./config.js";
 import { ConsolidationEngine } from "./consolidation/consolidate.js";
 import { runDecayTick, runPollTick } from "./consolidation/poll.js";
 import { PendingEpisodesReader } from "./consolidation/readers/pending.js";
@@ -169,16 +174,18 @@ async function main() {
 
 	// `knowledge-server calibrate [--clusters [--thresholds <list>] [--samples <t>]]`
 	if (subcommand === "calibrate") {
-		const errors = validateConfig();
+		const clusters = subcommandArgs.includes("--clusters");
+		// The cluster simulation makes no LLM or embedding calls, so it checks only the
+		// config.env issues and not LLM credentials.
+		const errors = clusters ? configEnvIssues() : validateConfig();
 		if (errors.length > 0) {
 			for (const err of errors) console.error(`  ✗ ${err}`);
 			process.exit(1);
 		}
-		if (subcommandArgs.includes("--clusters")) {
-			await runCalibrateClusters(subcommandArgs);
-		} else {
-			await runCalibrate();
+		if (clusters) {
+			process.exit((await runCalibrateClusters(subcommandArgs)) ? 0 : 1);
 		}
+		await runCalibrate();
 		process.exit(0);
 	}
 
