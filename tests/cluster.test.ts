@@ -8,6 +8,7 @@ import {
 	type ClusterableEntry,
 	cosineWithNorms,
 	estimateSynthesisPeerTokens,
+	findClusterSkew,
 	findDominantCluster,
 	greedyCluster,
 	greedyClusterAsync,
@@ -283,6 +284,76 @@ describe("findDominantCluster", () => {
 		const result = findDominantCluster([cluster(10), cluster(101)], 150);
 		expect(result?.index).toBe(1);
 		expect(result?.size).toBe(101);
+	});
+});
+
+describe("findClusterSkew", () => {
+	const cluster = (size: number, prefix = "m") => ({
+		centroid: [1],
+		memberIds: Array.from({ length: size }, (_, i) => `${prefix}${i}`),
+	});
+	const singletons = (count: number) =>
+		Array.from({ length: count }, (_, i) => cluster(1, `s${i}-`));
+	const opts = { minMembers: 5, maxPeers: 50 };
+
+	it("flags the top three holding more than half of 100+ entries", () => {
+		const clusters = [
+			cluster(60, "a"),
+			cluster(40, "b"),
+			cluster(20, "c"),
+			...singletons(80),
+		];
+		expect(findClusterSkew(clusters, 200, opts)).toEqual({
+			topThreeSize: 120,
+			largestSize: 60,
+			topShareExceeded: true,
+			oversized: false,
+		});
+	});
+
+	it("does not flag a top-three share of exactly half", () => {
+		const clusters = [
+			cluster(50),
+			cluster(30),
+			cluster(20),
+			...singletons(100),
+		];
+		expect(findClusterSkew(clusters, 200, opts)).toBeNull();
+	});
+
+	it("does not check the top-three share under 100 entries", () => {
+		const clusters = [cluster(30), cluster(30), cluster(30)];
+		expect(findClusterSkew(clusters, 90, opts)).toBeNull();
+	});
+
+	it("flags an eligible cluster above 10x SYNTHESIS_MAX_PEERS", () => {
+		const clusters = [cluster(51), ...singletons(949)];
+		expect(
+			findClusterSkew(clusters, 1000, { minMembers: 5, maxPeers: 5 }),
+		).toEqual({
+			topThreeSize: 53,
+			largestSize: 51,
+			topShareExceeded: false,
+			oversized: true,
+		});
+	});
+
+	it("does not flag a cluster of exactly 10x SYNTHESIS_MAX_PEERS", () => {
+		const clusters = [cluster(50), ...singletons(950)];
+		expect(
+			findClusterSkew(clusters, 1000, { minMembers: 5, maxPeers: 5 }),
+		).toBeNull();
+	});
+
+	it("ignores an oversized cluster below minMembers", () => {
+		const clusters = [cluster(20), ...singletons(980)];
+		expect(
+			findClusterSkew(clusters, 1000, { minMembers: 30, maxPeers: 1 }),
+		).toBeNull();
+	});
+
+	it("returns null without clusters", () => {
+		expect(findClusterSkew([], 0, opts)).toBeNull();
 	});
 });
 

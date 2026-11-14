@@ -1,4 +1,4 @@
-import { config } from "../config.js";
+import { DEFAULT_CLUSTER_ASSIGNMENT_THRESHOLD, config } from "../config.js";
 import type { IKnowledgeStore } from "../db/index.js";
 import { logger } from "../logger.js";
 import type {
@@ -1091,6 +1091,15 @@ export class ActivationEngine {
 		//   model that some rows do not yet match.
 		logger.log(
 			`[embedding] Model change detected: "${stored.model}" → "${configuredModel}".`,
+		);
+		// Similarity thresholds are tuned to one model, so the configured ones may not fit this one.
+		const defaultNote =
+			config.consolidation.clusterAssignmentThreshold ===
+			DEFAULT_CLUSTER_ASSIGNMENT_THRESHOLD
+				? ` CLUSTER_ASSIGNMENT_THRESHOLD is still the default ${DEFAULT_CLUSTER_ASSIGNMENT_THRESHOLD}.`
+				: "";
+		logger.warn(
+			`[embedding] Similarity thresholds are model-specific. Run \`knowledge-server calibrate\` and \`knowledge-server calibrate --clusters\` before relying on them.${defaultNote}`,
 		);
 
 		const cleared = await db.clearTombstonedEmbeddings();

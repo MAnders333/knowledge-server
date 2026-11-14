@@ -425,8 +425,9 @@ describe("runKBSynthesis - call cap, ordering, dominant cluster and centroid mod
 	const flush = () => new Promise((resolve) => setTimeout(resolve, 10));
 
 	it("caps calls per run; a deferred never-synthesized cluster stays ripe and goes next", async () => {
-		await insertAxis(0, 6, "x");
-		await insertAxis(1, 5, "y");
+		// Larger cluster has the larger seed id ("b" > "a"): id order alone picks the smaller one.
+		await insertAxis(0, 5, "a");
+		await insertAxis(1, 6, "b");
 		const { rec, synthesizePrinciple } = makeReconsolidator();
 
 		await rec.runKBSynthesis(db, { remaining: 1 });
@@ -487,11 +488,12 @@ describe("runKBSynthesis - call cap, ordering, dominant cluster and centroid mod
 	});
 
 	it("orders previously-synthesized ripe clusters oldest lastSynthesizedAt first", async () => {
+		// Y is the larger cluster and is synthesized first; X sorts first by id.
 		await insertAxis(0, 5, "x");
-		await insertAxis(1, 5, "y");
+		await insertAxis(1, 6, "y");
 		const { rec, synthesizePrinciple } = makeReconsolidator();
 
-		// Synthesize X first, then Y, one per run.
+		// Synthesize Y first, then X, one per run.
 		await rec.runKBSynthesis(db, { remaining: 1 });
 		await flush();
 		await rec.runKBSynthesis(db, { remaining: 1 });
@@ -517,7 +519,7 @@ describe("runKBSynthesis - call cap, ordering, dominant cluster and centroid mod
 		await rec.runKBSynthesis(db, { remaining: 1 });
 		expect(synthesizePrinciple).toHaveBeenCalledTimes(3);
 		const peers = synthesizePrinciple.mock.calls[2][0];
-		expect(peers.every((p) => p.id.startsWith("x"))).toBe(true);
+		expect(peers.every((p) => p.id.startsWith("y"))).toBe(true);
 	});
 
 	it("skips the dominant cluster: no LLM call, no budget spend, not marked, warns", async () => {

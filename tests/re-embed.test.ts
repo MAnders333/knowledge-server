@@ -16,8 +16,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ActivationEngine } from "../src/activation/activate";
 import { bulkEmbedOptions } from "../src/activation/embeddings";
-import { config } from "../src/config";
+import { DEFAULT_CLUSTER_ASSIGNMENT_THRESHOLD, config } from "../src/config";
 import { KnowledgeDB } from "../src/db/sqlite/index";
+import { logger } from "../src/logger";
 import { fakeEmbedding, makeEntry } from "./fixtures";
 
 describe("checkAndReEmbed", () => {
@@ -143,6 +144,40 @@ describe("checkAndReEmbed", () => {
 			expect(entry.embedding).toBeDefined();
 			expect(entry.embedding.length).toBe(newEmb.length);
 		}
+	});
+
+	describe("similarity threshold warning", () => {
+		/** Runs a model change at the given cluster threshold; returns the warn messages. */
+		async function modelChangeWarnings(threshold: number): Promise<string> {
+			await db.setEmbeddingMetadata("old-model", 8);
+			config.embedding.model = "new-model";
+			const savedThreshold = config.consolidation.clusterAssignmentThreshold;
+			config.consolidation.clusterAssignmentThreshold = threshold;
+			const warn = spyOn(logger, "warn").mockImplementation(() => {});
+			try {
+				await activation.checkAndReEmbed();
+				return warn.mock.calls.map((c) => String(c[0])).join("\n");
+			} finally {
+				config.consolidation.clusterAssignmentThreshold = savedThreshold;
+			}
+		}
+
+		it("tells the operator to recalibrate, naming the default threshold", async () => {
+			const text = await modelChangeWarnings(
+				DEFAULT_CLUSTER_ASSIGNMENT_THRESHOLD,
+			);
+			expect(text).toContain("knowledge-server calibrate`");
+			expect(text).toContain("knowledge-server calibrate --clusters");
+			expect(text).toContain(
+				`CLUSTER_ASSIGNMENT_THRESHOLD is still the default ${DEFAULT_CLUSTER_ASSIGNMENT_THRESHOLD}`,
+			);
+		});
+
+		it("does not name CLUSTER_ASSIGNMENT_THRESHOLD once it has been changed", async () => {
+			const text = await modelChangeWarnings(0.7);
+			expect(text).toContain("knowledge-server calibrate --clusters");
+			expect(text).not.toContain("CLUSTER_ASSIGNMENT_THRESHOLD");
+		});
 	});
 
 	it("passes bulk embed options to embedBatch", async () => {

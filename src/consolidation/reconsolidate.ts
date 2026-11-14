@@ -13,8 +13,12 @@ import { clampKnowledgeType } from "../types.js";
 import type { KnowledgeEntry } from "../types.js";
 import {
 	CLUSTER_YIELD_WORK_BUDGET,
+	SKEW_MIN_ENTRIES,
+	SKEW_PEER_MULTIPLE,
+	SKEW_TOP_SHARE,
 	cosineWithNorms,
 	estimateSynthesisPeerTokens,
+	findClusterSkew,
 	findDominantCluster,
 	greedyClusterAsync,
 	norm,
@@ -648,6 +652,28 @@ export class Reconsolidator {
 		if (dominant !== null && dominantClusterId !== null) {
 			logger.warn(
 				`[synthesis] Skipping synthesis for dominant cluster ${dominantClusterId}: ${dominant.size}/${allEntries.length} entries (${Math.round(dominant.share * 100)}%) in one cluster, no LLM call, not marked synthesized. CLUSTER_ASSIGNMENT_THRESHOLD=${CLUSTER_ASSIGNMENT_THRESHOLD} (CLUSTER_CENTROID_MODE=${centroidMode}) is likely below the embedding model's noise floor. Recalibrate with \`knowledge-server calibrate --clusters\`.`,
+			);
+		}
+
+		// Skew warning only: unlike the dominant guard above, nothing is skipped here.
+		const skew = findClusterSkew(inMemoryClusters, allEntries.length, {
+			minMembers: CLUSTER_MIN_MEMBERS,
+			maxPeers: config.consolidation.synthesisMaxPeers,
+		});
+		if (skew !== null) {
+			const reasons: string[] = [];
+			if (skew.topShareExceeded) {
+				reasons.push(
+					`the three largest clusters hold ${skew.topThreeSize} of ${allEntries.length} entries (over ${SKEW_TOP_SHARE * 100}%, checked from ${SKEW_MIN_ENTRIES} entries)`,
+				);
+			}
+			if (skew.oversized) {
+				reasons.push(
+					`the largest cluster has ${skew.largestSize} members (over ${SKEW_PEER_MULTIPLE}x SYNTHESIS_MAX_PEERS=${config.consolidation.synthesisMaxPeers})`,
+				);
+			}
+			logger.warn(
+				`[synthesis] Cluster skew in store "${db.id}": ${reasons.join("; ")}. CLUSTER_ASSIGNMENT_THRESHOLD=${CLUSTER_ASSIGNMENT_THRESHOLD} (CLUSTER_CENTROID_MODE=${centroidMode}). Synthesis still runs. Run \`knowledge-server calibrate --clusters\` to choose a threshold.`,
 			);
 		}
 

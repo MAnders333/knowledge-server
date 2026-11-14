@@ -213,6 +213,44 @@ export function findDominantCluster(
 	return null;
 }
 
+/** Skew warning limits; see findClusterSkew. */
+export const SKEW_TOP_SHARE = 0.5;
+export const SKEW_MIN_ENTRIES = 100;
+export const SKEW_PEER_MULTIPLE = 10;
+
+/** Which skew limits a clustering pass exceeds. */
+export interface ClusterSkew {
+	topThreeSize: number;
+	largestSize: number;
+	topShareExceeded: boolean;
+	oversized: boolean;
+}
+
+/**
+ * Warning-only skew check for a clustering pass. Flags when the three largest clusters
+ * together hold more than SKEW_TOP_SHARE of the entries (checked from SKEW_MIN_ENTRIES
+ * on), or when the largest eligible cluster (at least minMembers) has more than
+ * SKEW_PEER_MULTIPLE x maxPeers members. Returns null when neither holds. Nothing is
+ * skipped on this signal; the dominant-cluster guard is separate.
+ */
+export function findClusterSkew(
+	clusters: ReadonlyArray<GreedyCluster>,
+	totalEntries: number,
+	opts: { minMembers: number; maxPeers: number },
+): ClusterSkew | null {
+	const sizes = clusters.map((c) => c.memberIds.length).sort((a, b) => b - a);
+	const topThreeSize = sizes.slice(0, 3).reduce((sum, n) => sum + n, 0);
+	const largestSize = sizes[0] ?? 0;
+	const topShareExceeded =
+		totalEntries >= SKEW_MIN_ENTRIES &&
+		topThreeSize / totalEntries > SKEW_TOP_SHARE;
+	const oversized =
+		largestSize >= opts.minMembers &&
+		largestSize > SKEW_PEER_MULTIPLE * opts.maxPeers;
+	if (!topShareExceeded && !oversized) return null;
+	return { topThreeSize, largestSize, topShareExceeded, oversized };
+}
+
 /**
  * Approximate prompt tokens of one synthesis peer (content plus topics). Shared by
  * selectSynthesisPeers (reconsolidate.ts) and `calibrate --clusters` so both use the

@@ -256,7 +256,7 @@ const DEFAULT_TOKEN_BUDGET = 1500;
  * entry joins one cluster. Recalibrate with `knowledge-server calibrate --clusters`
  * when switching embedding models.
  */
-const DEFAULT_CLUSTER_ASSIGNMENT_THRESHOLD = 0.5;
+export const DEFAULT_CLUSTER_ASSIGNMENT_THRESHOLD = 0.5;
 /**
  * Minimum cluster size required before synthesis is attempted.
  * Requires enough distinct observations that a structural invariant is likely
