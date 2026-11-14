@@ -36,6 +36,7 @@ import { isDeterministicFailure, providerFailureClass } from "./errors.js";
 import { ConsolidationLLM, formatEpisodes } from "./llm.js";
 import type { ExtractedKnowledge } from "./llm.js";
 import { Reconsolidator } from "./reconsolidate.js";
+import type { SynthesisCallBudget } from "./reconsolidate.js";
 
 /**
  * Maximum tokens for the episode content portion of an extractKnowledge prompt.
@@ -80,7 +81,6 @@ interface ChunkResult {
 	updated: number;
 	conflictsDetected: number;
 	conflictsResolved: number;
-	touchedStores: Set<IKnowledgeStore>;
 }
 
 /** Thrown when another process holds a store's consolidation lock. The chunk is blocked, not failed. */
@@ -157,18 +157,12 @@ export class ConsolidationEngine {
 	private domainRouter: DomainRouter | null;
 
 	/**
-	 * Stores that received inserts or content-changing updates during the most
-	 * recent consolidation run. Accumulated across all batches in a drain loop.
-	 * Reset at the start of each new consolidation run (_consolidate resets it).
-	 * Used by runSynthesis() to limit synthesis to stores that had new knowledge.
-	 * runSynthesis() iterates this set ∪ {this.db} and calls runKBSynthesis() per store.
-	 *
-	 * Invariant: if _consolidate() throws mid-run, this set is partial (only stores
-	 * from completed readers). The exception propagates to the caller who must not
-	 * call runSynthesis() after a failed consolidate(). The set is reset on the
-	 * next run so partial state does not persist across runs.
+	 * The stores runSynthesis() visits, from `writableStores`. Production passes every
+	 * writable store, primary first then config order; the default is the primary plus
+	 * the domain targets. Ripe clusters from earlier runs can sit in any of them, so all
+	 * of them are visited, not only the stores written to in the latest run.
 	 */
-	private _lastTouchedStores = new Set<IKnowledgeStore>();
+	private readonly writableStores: IKnowledgeStore[];
 
 	/** Secret redactions applied during the current run, by kind (counts only). */
 	private _runRedactions: Record<string, number> = {};
@@ -176,6 +170,7 @@ export class ConsolidationEngine {
 	private _runProgress = {
 		completedChunks: 0,
 		transientChunks: 0,
+		trailingTransientChunks: 0,
 		providerFailure: undefined as string | undefined,
 	};
 
@@ -252,6 +247,12 @@ export class ConsolidationEngine {
 	 * @param options.lockPath  Cross-process consolidation lock file. Production passes
 	 *                      consolidationLockPath(dataDir) so the server and the CLI never
 	 *                      consolidate at the same time. Omit only in tests.
+	 * @param options.writableStores  Every writable store visited by runSynthesis(). Production
+	 *                      passes registry.writableStores(). Defaults to the primary store plus
+	 *                      the domain router's domainStores() (the domain targets, which are
+	 *                      writable by config validation), so a caller that only passes a router
+	 *                      still synthesizes the domain stores it writes to, and never a read-only
+	 *                      store the router merely knows about.
 	 */
 	constructor(
 		db: IKnowledgeStore,
@@ -259,7 +260,7 @@ export class ConsolidationEngine {
 		activation: ActivationEngine,
 		readers: IEpisodeReader[] = [],
 		domainRouter: DomainRouter | null = null,
-		options: { lockPath?: string } = {},
+		options: { lockPath?: string; writableStores?: IKnowledgeStore[] } = {},
 	) {
 		this.lockPath = options.lockPath;
 		this.db = db;
@@ -267,6 +268,9 @@ export class ConsolidationEngine {
 		this.activation = activation;
 		this.readers = readers;
 		this.domainRouter = domainRouter;
+		this.writableStores = options.writableStores ?? [
+			...new Set([db, ...(domainRouter?.domainStores() ?? [])]),
+		];
 		this.llm = new ConsolidationLLM();
 		this.reconsolidator = new Reconsolidator(
 			db,
@@ -322,6 +326,15 @@ export class ConsolidationEngine {
 	async consolidate(
 		options: { attempted?: Set<string> } = {},
 	): Promise<ConsolidationResult> {
+		// Reset before the first await, so a throw from the state DB below cannot leave the
+		// previous run's progress visible to the drain's finally block.
+		this._runRedactions = {};
+		this._runProgress = {
+			completedChunks: 0,
+			transientChunks: 0,
+			trailingTransientChunks: 0,
+			providerFailure: undefined,
+		};
 		try {
 			const result = await this._consolidate(options.attempted ?? new Set());
 			this.outcome.consecutiveFailures = 0;
@@ -354,6 +367,32 @@ export class ConsolidationEngine {
 	}
 
 	/**
+	 * True when the most recent consolidate() call ends in a streak of transient provider
+	 * errors: at least one chunk hit one after the last completed chunk. A run that
+	 * completes a chunk after the errors clears it. Drains skip the synthesis pass then:
+	 * a synthesis call that fails during a provider outage still marks its cluster
+	 * as synthesized, which would burn the backlog without producing anything.
+	 *
+	 * A run without a provider signal (empty, or only deterministic failures and blocked
+	 * chunks) reports false, so drains must check lastRunGaveProviderSignal() before
+	 * taking this value over an earlier batch's result.
+	 */
+	lastRunProviderFailed(): boolean {
+		return this._runProgress.trailingTransientChunks > 0;
+	}
+
+	/**
+	 * True when the most recent consolidate() call got a signal from the provider: at
+	 * least one chunk completed or hit a transient provider error. Deterministic failures
+	 * and blocked chunks give no signal. False for an empty run.
+	 */
+	lastRunGaveProviderSignal(): boolean {
+		return (
+			this._runProgress.completedChunks + this._runProgress.transientChunks > 0
+		);
+	}
+
+	/**
 	 * Core consolidation logic. Called from consolidate().
 	 *
 	 * Per-source per-run steps:
@@ -377,15 +416,7 @@ export class ConsolidationEngine {
 			`[consolidation] Starting. Last run: ${state.lastConsolidatedAt ? new Date(state.lastConsolidatedAt).toISOString() : "never"}`,
 		);
 
-		// Reset touched stores for this run — accumulates across all source batches.
-		this._lastTouchedStores = new Set();
 		const entryCache = new StoreEntryCache();
-		this._runRedactions = {};
-		this._runProgress = {
-			completedChunks: 0,
-			transientChunks: 0,
-			providerFailure: undefined,
-		};
 
 		let totalSessionsProcessed = 0;
 		let totalSegmentsProcessed = 0;
@@ -407,8 +438,6 @@ export class ConsolidationEngine {
 			totalUpdated += sourceTotals.entriesUpdated;
 			totalConflictsDetected += sourceTotals.conflictsDetected;
 			totalConflictsResolved += sourceTotals.conflictsResolved;
-			for (const s of sourceTotals.touchedStores)
-				this._lastTouchedStores.add(s);
 		}
 
 		const redactedTotal = totalRedactions(this._runRedactions);
@@ -491,7 +520,6 @@ export class ConsolidationEngine {
 		entriesUpdated: number;
 		conflictsDetected: number;
 		conflictsResolved: number;
-		touchedStores: Set<IKnowledgeStore>;
 	}> {
 		// pending_episodes is self-draining — pass 0 so all remaining rows are candidates.
 		const afterMessageTimeCreated = 0;
@@ -520,7 +548,6 @@ export class ConsolidationEngine {
 					entriesUpdated: 0,
 					conflictsDetected: 0,
 					conflictsResolved: 0,
-					touchedStores: new Set(),
 				};
 			}
 		}
@@ -541,7 +568,6 @@ export class ConsolidationEngine {
 				entriesUpdated: 0,
 				conflictsDetected: 0,
 				conflictsResolved: 0,
-				touchedStores: new Set(),
 			};
 		}
 
@@ -569,7 +595,6 @@ export class ConsolidationEngine {
 				entriesUpdated: 0,
 				conflictsDetected: 0,
 				conflictsResolved: 0,
-				touchedStores: new Set(),
 			};
 		}
 
@@ -599,7 +624,6 @@ export class ConsolidationEngine {
 		let totalUpdated = 0;
 		let totalConflictsDetected = 0;
 		let totalConflictsResolved = 0;
-		const sourceTouchedStores = new Set<IKnowledgeStore>();
 
 		const outcome: EpisodeOutcome = { completed: [], failed: [] };
 
@@ -674,7 +698,6 @@ export class ConsolidationEngine {
 				totalUpdated += result.updated;
 				totalConflictsDetected += result.conflictsDetected;
 				totalConflictsResolved += result.conflictsResolved;
-				for (const s of result.touchedStores) sourceTouchedStores.add(s);
 
 				const keys: EpisodeKey[] = episodes.map((ep) => ({
 					source: ep.source,
@@ -689,6 +712,7 @@ export class ConsolidationEngine {
 				// deferral before extraction (store locked or unavailable) stays eligible.
 				if (result.outcome === "completed") {
 					this._runProgress.completedChunks++;
+					this._runProgress.trailingTransientChunks = 0;
 					outcome.completed.push(...keys);
 					for (const ep of episodes) completedSessionIds.add(ep.sessionId);
 				} else if (result.outcome === "failed") {
@@ -699,6 +723,7 @@ export class ConsolidationEngine {
 					for (const key of keys) attempted.add(episodeKeyId(key));
 					if (result.providerFailure !== undefined) {
 						this._runProgress.transientChunks++;
+						this._runProgress.trailingTransientChunks++;
 						this._runProgress.providerFailure = result.providerFailure;
 					}
 				} else if (result.outcome === "blocked") {
@@ -736,7 +761,6 @@ export class ConsolidationEngine {
 			entriesUpdated: totalUpdated,
 			conflictsDetected: totalConflictsDetected,
 			conflictsResolved: totalConflictsResolved,
-			touchedStores: sourceTouchedStores,
 		};
 	}
 
@@ -768,8 +792,7 @@ export class ConsolidationEngine {
 	 * episodes are retried one at a time, so one bad episode cannot dead-letter its
 	 * healthy neighbours. Only an episode that also fails alone is reported as
 	 * failed. The multi-episode pass is reported with no episodes and zero counts:
-	 * the single-episode runs redo its work (reconsolidate dedups), but its touched
-	 * stores are still returned.
+	 * the single-episode runs redo its work (reconsolidate dedups).
 	 */
 	private async processChunkIsolatingFailures(
 		source: string,
@@ -838,7 +861,6 @@ export class ConsolidationEngine {
 			updated: 0,
 			conflictsDetected: 0,
 			conflictsResolved: 0,
-			touchedStores: new Set<IKnowledgeStore>(),
 		};
 		if (chunk.length === 0) return { outcome: "completed", ...none };
 
@@ -935,7 +957,7 @@ export class ConsolidationEngine {
 					sessionIds,
 					chunkSessionTimestamp,
 					entryCache,
-				).then((counts) => ({ store, counts })),
+				).then((counts) => ({ counts })),
 			),
 		);
 
@@ -943,19 +965,17 @@ export class ConsolidationEngine {
 		let chunkUpdated = 0;
 		let chunkConflictsDetected = 0;
 		let chunkConflictsResolved = 0;
-		const touchedStores = new Set<IKnowledgeStore>();
 		let deferred = false;
 		let failure: string | undefined;
 		let transientFailure: string | undefined;
 
 		for (const result of settled) {
 			if (result.status === "fulfilled") {
-				const { store, counts } = result.value;
+				const { counts } = result.value;
 				chunkCreated += counts.created;
 				chunkUpdated += counts.updated;
 				chunkConflictsDetected += counts.conflictsDetected;
 				chunkConflictsResolved += counts.conflictsResolved;
-				if (counts.created > 0 || counts.updated > 0) touchedStores.add(store);
 			} else if (result.reason instanceof StoreLockHeldError) {
 				deferred = true;
 			} else {
@@ -1005,7 +1025,6 @@ export class ConsolidationEngine {
 			updated: chunkUpdated,
 			conflictsDetected: chunkConflictsDetected,
 			conflictsResolved: chunkConflictsResolved,
-			touchedStores,
 		};
 	}
 
@@ -1510,23 +1529,38 @@ export class ConsolidationEngine {
 	 * batches first and then synthesize once — rather than synthesizing after every
 	 * batch, which re-clusters and re-synthesizes an ever-growing KB on each pass.
 	 *
-	 * Runs once per store that received inserts or content-changing updates during
-	 * the most recent consolidate() call (_lastTouchedStores). Falls back to this.db
-	 * if no stores were touched (e.g. no new entries, or called before consolidate()).
-	 * The primary store (this.db) is always included in synthesis even when not
-	 * explicitly touched — ripe clusters from prior runs may need synthesis.
+	 * Runs once per store in `writableStores` (production: every writable store, primary
+	 * first then config order; the default: the primary plus the domain targets), whether or not
+	 * the latest consolidate() wrote to it: ripe clusters from prior runs may need
+	 * synthesis anywhere, and a store with no pending sessions still needs its
+	 * first clustering pass. Read-only stores are never visited by default (see the
+	 * writableStores option of the constructor).
 	 *
 	 * Must be called after ensureEmbeddings() has run (i.e. after consolidate()) so
 	 * all entries have embeddings. Returns the total number of principles synthesized.
+	 *
+	 * A single CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN budget is shared across all stores in
+	 * this call, so earlier stores may consume the whole budget.
 	 */
 	async runSynthesis(): Promise<number> {
-		const touched = this._lastTouchedStores;
-		// Always include this.db — ripe clusters from prior runs may need synthesis
-		// even when nothing was written to the primary store this run.
-		const stores = new Set([...touched, this.db]);
+		const stores = new Set([this.db, ...this.writableStores]);
+		const budget: SynthesisCallBudget = {
+			remaining: config.consolidation.clusterSynthesisMaxCallsPerRun,
+		};
 		let total = 0;
 		for (const store of stores) {
-			total += await this.reconsolidator.runKBSynthesis(store);
+			// One store failing (e.g. a DB error during persist) must not skip the rest. The
+			// budget is decremented only right before an LLM call, so a store that throws
+			// before synthesizing leaves it untouched.
+			try {
+				total += await this.reconsolidator.runKBSynthesis(store, budget);
+			} catch (err) {
+				// Store id is the config.jsonc identifier, never a URI or path.
+				logger.error(
+					`[synthesis] runKBSynthesis failed for store "${store.id}" - continuing with the next store:`,
+					err,
+				);
+			}
 		}
 		return total;
 	}

@@ -11,6 +11,7 @@ import { ActivationEventRecorder } from "./activation/events.js";
 import { createRerankerFromConfig } from "./activation/rerank.js";
 import { createApp } from "./api/server.js";
 import { runActivate } from "./commands/activate.js";
+import { runCalibrateClusters } from "./commands/calibrate-clusters.js";
 import { runCalibrate } from "./commands/calibrate.js";
 import { runClaudeAuth } from "./commands/claude-auth.js";
 import { runConsolidate } from "./commands/consolidate.js";
@@ -166,14 +167,18 @@ async function main() {
 		process.exit(0);
 	}
 
-	// `knowledge-server calibrate`
+	// `knowledge-server calibrate [--clusters [--thresholds <list>] [--samples <t>]]`
 	if (subcommand === "calibrate") {
 		const errors = validateConfig();
 		if (errors.length > 0) {
 			for (const err of errors) console.error(`  ✗ ${err}`);
 			process.exit(1);
 		}
-		await runCalibrate();
+		if (subcommandArgs.includes("--clusters")) {
+			await runCalibrateClusters(subcommandArgs);
+		} else {
+			await runCalibrate();
+		}
 		process.exit(0);
 	}
 
@@ -216,6 +221,7 @@ Commands:
   activate <query>          Test knowledge activation for a query
   review [--filter <f>]     Interactively review entries (filter: conflicted|stale|all)
   calibrate                 Recommend similarity thresholds for the active embedding model
+  calibrate --clusters      Simulate synthesis clustering on your KB (read-only; --thresholds, --samples)
   reinitialize              Reset daemon cursor, state, or store entries (see --reset-state, --reset-store)
   setup-tool <tool>         Set up integration: opencode|claude-code|cursor|codex|vscode,
                             pi|oh-my-pi (extensions), daemon (background service)
@@ -293,7 +299,10 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		activation,
 		[new PendingEpisodesReader(serverStateDb)],
 		registry.domainRouter,
-		{ lockPath: consolidationLockPath(dataDir) },
+		{
+			lockPath: consolidationLockPath(dataDir),
+			writableStores: registry.writableStores(),
+		},
 	);
 
 	// Check if this is a first run (no knowledge yet, but episodes exist)
@@ -692,6 +701,9 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		let consecutiveErrors = 0;
 		const MAX_CONSECUTIVE_ERRORS = 3;
 		const BASE_RETRY_DELAY_MS = 5_000;
+		// Set from the last batch that reached extraction and gave a provider signal. A drain
+		// that never reached consolidate() (nothing pending) leaves it false, so its synthesis still runs.
+		let providerFailed = false;
 
 		while (!shutdownRequested) {
 			try {
@@ -711,6 +723,11 @@ Run \`knowledge-server help-advanced\` for additional commands.
 				try {
 					result = await consolidation.consolidate({ attempted });
 				} finally {
+					// Also on a throw: the run may have hit provider errors before it failed.
+					// An empty run must not clear a flag set by an earlier batch.
+					if (consolidation.lastRunGaveProviderSignal()) {
+						providerFailed = consolidation.lastRunProviderFailed();
+					}
 					consolidation.unlock();
 				}
 				consecutiveErrors = 0;
@@ -747,21 +764,27 @@ Run \`knowledge-server help-advanced\` for additional commands.
 		// Runs even if no new sessions were processed this drain: cluster membership
 		// can change from a previous drain, and synthesis should catch up regardless.
 		if (!shutdownRequested) {
-			logger.log(`[${label}] Running KB synthesis pass...`);
-			try {
-				if (consolidation.tryLock()) {
-					try {
-						await consolidation.runSynthesis();
-					} finally {
-						consolidation.unlock();
+			if (providerFailed) {
+				logger.warn(
+					`[${label}] skipping synthesis: provider failures in this drain.`,
+				);
+			} else {
+				logger.log(`[${label}] Running KB synthesis pass...`);
+				try {
+					if (consolidation.tryLock()) {
+						try {
+							await consolidation.runSynthesis();
+						} finally {
+							consolidation.unlock();
+						}
+					} else {
+						logger.error(
+							`[${label}] Could not acquire lock for synthesis — skipping.`,
+						);
 					}
-				} else {
-					logger.error(
-						`[${label}] Could not acquire lock for synthesis — skipping.`,
-					);
+				} catch (err) {
+					logger.error(`[${label}] KB synthesis failed:`, err);
 				}
-			} catch (err) {
-				logger.error(`[${label}] KB synthesis failed:`, err);
 			}
 		}
 	}

@@ -68,6 +68,22 @@ export class DomainRouter {
 	private fallbackStoreId: string;
 
 	/**
+	 * The stores that configured domains write to, excluding unavailable ones. Config
+	 * validation requires every domain to target a writable store, so read-only stores
+	 * are never included here (unlike allStores(), which returns every registered store).
+	 */
+	domainStores(): IKnowledgeStore[] {
+		const targetIds = new Set(this.domains.map((d) => d.store));
+		return [...targetIds]
+			.filter((id) => !this.unavailableStoreIds.has(id))
+			.flatMap((id) => {
+				const store = this.stores.get(id);
+				return store ? [store] : [];
+			})
+			.filter((store, idx, arr) => arr.indexOf(store) === idx); // deduplicate by reference
+	}
+
+	/**
 	 * All available (non-unavailable) stores registered with this router.
 	 * Excludes stores that failed to connect at startup so callers like applyDecay()
 	 * don't attempt writes to unreachable stores.

@@ -21,6 +21,8 @@ interface DrainResult {
 	totalSessions: number;
 	totalCreated: number;
 	totalUpdated: number;
+	/** The last batch that reached extraction ended in a streak of transient provider errors (see lastRunProviderFailed). */
+	providerFailed: boolean;
 }
 
 /**
@@ -85,6 +87,7 @@ export async function drainConsolidation(
 	let totalSessions = 0;
 	let totalCreated = 0;
 	let totalUpdated = 0;
+	let providerFailed = false;
 
 	while (true) {
 		// Nothing pending: stop without starting a batch. An empty batch still scans
@@ -122,22 +125,35 @@ export async function drainConsolidation(
 			);
 			break;
 		} finally {
+			// Also on a throw: the run may have hit provider errors before it failed.
+			// An empty run must not clear a flag set by an earlier batch.
+			if (consolidation.lastRunGaveProviderSignal()) {
+				providerFailed = consolidation.lastRunProviderFailed();
+			}
 			consolidation.unlock();
 		}
 	}
 
-	return { totalSessions, totalCreated, totalUpdated };
+	return { totalSessions, totalCreated, totalUpdated, providerFailed };
 }
 
 /**
  * Run KB synthesis under the consolidation lock.
  *
  * Non-fatal — logs a warning and continues if the lock can't be acquired or
- * synthesis fails.
+ * synthesis fails. Skipped when `providerFailed` is set (the last batch that
+ * reached extraction ended in a streak of transient provider errors), so a provider outage does not burn the cluster backlog.
  */
 export async function runSynthesisPass(
 	consolidation: ConsolidationEngine,
+	providerFailed = false,
 ): Promise<void> {
+	if (providerFailed) {
+		console.warn(
+			"Warning: skipping synthesis: provider failures in this drain.",
+		);
+		return;
+	}
 	try {
 		if (consolidation.tryLock()) {
 			try {

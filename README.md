@@ -415,7 +415,7 @@ Provider-specific credentials take precedence over the unified endpoint.
 | `LLM_TIMEOUT_EXTRACTION_MS` | `300000` | Per-attempt timeout for knowledge extraction |
 | `LLM_TIMEOUT_SYNTHESIS_MS` | `300000` | Per-attempt timeout for principle synthesis |
 | `LLM_TIMEOUT_MS` | *(per-type defaults)* | Fallback per-attempt timeout in ms for any call type without its own `LLM_TIMEOUT_<TYPE>_MS` |
-| `LLM_MAX_RETRIES` | `2` | Retry attempts on transient errors (a timed-out call is not retried) |
+| `LLM_MAX_RETRIES` | `2` | Retry attempts on transient errors. A timed-out call is not retried, and neither are permanent errors (4xx other than 408/409/429, context length exceeded, also when a gateway wraps it in a 5xx) |
 | `OPENAI_MAX_TOKENS_PARAM` | `max_tokens` | Token-limit parameter sent on OpenAI-compatible calls. Set to `max_completion_tokens` for newer OpenAI models (gpt-5.x, o-series) that reject `max_tokens` |
 | `OPENAI_DROP_PARAMS` | *(none)* | Comma-separated request parameters to omit from OpenAI-compatible calls (e.g. `temperature` for gpt-5.x/o-series models that only accept the default value) |
 
@@ -508,6 +508,12 @@ All sources are auto-detected. Override paths or disable sources via environment
 | `CONTRADICTION_MAX_CANDIDATES` | unset (no cap) | Most candidates checked per entry and scan path, highest similarity first; checked in batches of 10 |
 | `CONTRADICTION_MIN_TOP_SIMILARITY` | unset | Skip an entry whose best candidate is below this similarity (unset = no floor) |
 | `CONTRADICTION_CONFLICTS_ONLY` | `false` | Opt-in: reply lists conflicts only (about 65% fewer output tokens per call). Recall is not validated; enable only after an online spot-check |
+| `CLUSTER_ASSIGNMENT_THRESHOLD` | `0.5` | Cosine similarity to join a synthesis cluster. Model-dependent: recalibrate with `knowledge-server calibrate --clusters` when switching embedding models. A cluster holding at least 100 entries and more than half of all entries is skipped for synthesis (no LLM call, not marked) with a warning to recalibrate |
+| `CLUSTER_CENTROID_MODE` | `running` | `running` (compare to the drifting member mean) or `seed` (compare to the cluster's fixed seed entry). Switching keeps most cluster IDs via member overlap |
+| `CLUSTER_MIN_MEMBERS` | `5` | Minimum cluster size before synthesis |
+| `CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN` | `20` | Synthesis LLM calls per consolidation run across all stores; `0` disables them. Deferred clusters stay ripe; never-synthesized and oldest clusters go first |
+
+**Rollout and rollback.** Changing `CLUSTER_ASSIGNMENT_THRESHOLD` or `CLUSTER_CENTROID_MODE` re-keys clusters, so the next run finds a backlog of never-synthesized clusters. For a safe first boot, set the new threshold and mode together with `CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN=0` in one restart. Clusters are rebuilt and saved with no LLM calls. Check the `Formed N clusters` log line and that no dominant-cluster warning appears, then raise the cap. Older releases ignore `CLUSTER_CENTROID_MODE` and `CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN`, but they honor `CLUSTER_MIN_MEMBERS` and `CLUSTER_ASSIGNMENT_THRESHOLD`. On an older release, clustering falls back to the running centroid with no per-run cap, and the prompt stays bounded only by `SYNTHESIS_MAX_PEERS` / `SYNTHESIS_MAX_PROMPT_TOKENS`. **Mandatory rollback step:** set `CLUSTER_MIN_MEMBERS=1000000` in `.env` and restart on the current version. Restart first so the current version also stops synthesizing until you roll back: a running process keeps the value it started with. The older release reads `.env` when it starts, so its safety does not depend on this restart. Synthesis is then paused, so the older release cannot work through the re-keyed backlog without a cap. Then roll back. No schema change is involved. **Undoing the pause:** on the older release, lower `CLUSTER_MIN_MEMBERS` back to a normal value (default `5`). The older release then works through the whole backlog with no per-run cap, so do this only when that is acceptable. Re-upgrading to the current version keeps the pause until `CLUSTER_MIN_MEMBERS` is lowered, which is safe there because `CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN` caps each run.
 
 ### Decay
 
@@ -639,6 +645,13 @@ knowledge-server calibrate
 ```
 
 Derives recommended threshold values for your embedding model. Run this when switching models.
+
+```bash
+knowledge-server calibrate --clusters
+knowledge-server calibrate --clusters --thresholds 0.70,0.72,0.74 --samples 0.72
+```
+
+Simulates the synthesis clustering on your real entries (read-only; no LLM or embedding calls) for a sweep of `CLUSTER_ASSIGNMENT_THRESHOLD` values (the default sweep 0.60-0.92 in steps of 0.04, plus the current threshold) and both centroid modes, and reports cluster counts, size distribution, the largest cluster and how many eligible clusters the synthesis prompt cap (`SYNTHESIS_MAX_PEERS` / `SYNTHESIS_MAX_PROMPT_TOKENS`) would trim. Run this when switching embedding models: a threshold below the model's noise floor collapses the whole knowledge base into one cluster. Each run is O(n² × dim) and takes roughly a minute at 10k entries, so the default sweep can take 15-30 minutes; use `--thresholds` for a narrower sweep.
 
 ### Review knowledge entries
 

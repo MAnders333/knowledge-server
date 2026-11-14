@@ -520,3 +520,40 @@ describe("loadConfigFile — DAEMON_AUTO_SPAWN spellings", () => {
 		expect(loadConfigFile(configPath).daemonAutoSpawn).toBe(true);
 	});
 });
+
+describe("parseEnv - cluster synthesis settings", () => {
+	it("defaults to running centroids, 20 calls per run and threshold 0.5", () => {
+		const { config: c, issues } = parse({});
+		expect(issues).toHaveLength(0);
+		expect(c.consolidation.clusterCentroidMode).toBe("running");
+		expect(c.consolidation.clusterSynthesisMaxCallsPerRun).toBe(20);
+		expect(c.consolidation.clusterAssignmentThreshold).toBe(0.5);
+	});
+
+	it("parses CLUSTER_CENTROID_MODE=seed", () => {
+		const parsed = parse({ CLUSTER_CENTROID_MODE: "seed" });
+		expect(parsed.issues).toHaveLength(0);
+		expect(parsed.config.consolidation.clusterCentroidMode).toBe("seed");
+	});
+
+	it("rejects an unknown CLUSTER_CENTROID_MODE and falls back to running", () => {
+		const parsed = parse({ CLUSTER_CENTROID_MODE: "drift" });
+		expect(parsed.issues).toHaveLength(1);
+		expect(parsed.issues[0]).toContain("CLUSTER_CENTROID_MODE");
+		expect(parsed.config.consolidation.clusterCentroidMode).toBe("running");
+	});
+
+	it("accepts CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN=0 as the dry run", () => {
+		const parsed = parse({ CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN: "0" });
+		expect(parsed.issues).toHaveLength(0);
+		expect(parsed.config.consolidation.clusterSynthesisMaxCallsPerRun).toBe(0);
+	});
+
+	it("rejects a negative CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN", () => {
+		const parsed = parse({ CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN: "-1" });
+		expect(parsed.issues).toHaveLength(1);
+		expect(parsed.issues[0]).toContain(
+			"CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN must be an integer ≥ 0",
+		);
+	});
+});

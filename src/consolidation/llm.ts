@@ -21,6 +21,7 @@ import {
 import { logger } from "../logger.js";
 import { providerErrorSuffix } from "../provider-error.js";
 import type { Episode, KnowledgeType } from "../types.js";
+import { isNonRetryableLlmError } from "./errors.js";
 import {
 	type ContradictionConflict,
 	type ContradictionReplyFormat,
@@ -309,6 +310,9 @@ export class LlmCallError extends Error {
  *   (config.llm.timeoutsMs). The timeout is logged with the call type and budget.
  * - A timed-out attempt is NOT retried: a call that exhausted its budget is treated
  *   as hung, so one hang costs one timeout.
+ * - Permanent errors (isNonRetryableLlmError in errors.ts: 4xx other than 408/409/429,
+ *   context_length_exceeded / invalid_request_error / insufficient_quota even inside a 5xx)
+ *   are thrown at once, without retry.
  * - Other errors are retried with exponential backoff (config.llm.maxRetries, default 2),
  *   so a transient upstream stall doesn't fail the whole consolidation chunk.
  *   The AI SDK's own retries are disabled (maxRetries: 0) so attempts never multiply.
@@ -355,6 +359,16 @@ async function complete(
 				// A call that exhausted its budget is treated as hung: no retry.
 				logger.error(
 					`[llm] ${callType} call to ${modelString} exceeded ${budget} timeout (attempt ${attempt}/${maxAttempts}) — not retrying`,
+				);
+				throw new LlmCallError(err);
+			}
+			if (isNonRetryableLlmError(err)) {
+				// Retrying cannot succeed (e.g. context_length_exceeded, also when a gateway wraps it in a 5xx).
+				logger.error(
+					`[llm] ${callType} call to ${modelString} failed with a non-retryable error (attempt ${attempt}/${maxAttempts}) - not retrying. Error: ${formatLlmError(err)}`,
+				);
+				logger.debug(
+					`[llm] ${callType} call to ${modelString} attempt ${attempt} detail: ${llmErrorDetail(err)}`,
 				);
 				throw new LlmCallError(err);
 			}

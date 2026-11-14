@@ -1082,6 +1082,73 @@ for (const backend of BACKENDS) {
 			expect(second.memberJoinedAt).toEqual(first.memberJoinedAt);
 		});
 
+		it("persistClusters skips members whose entry no longer exists and counts only stored members", async () => {
+			for (const id of ["k-a", "k-b"]) {
+				await store.insertEntry(entry({ id }));
+			}
+			await store.persistClusters([
+				{
+					id: "c1",
+					centroid: [1, 0, 0],
+					memberIds: ["k-a", "k-b", "ghost"],
+					isNew: true,
+					membershipChanged: true,
+				},
+			]);
+			const [created] = await store.getClustersWithMembers();
+			expect([...created.memberIds].sort()).toEqual(["k-a", "k-b"]);
+			expect(created.memberCount).toBe(2);
+
+			await store.persistClusters([
+				{
+					id: "c1",
+					centroid: [1, 0, 0],
+					memberIds: ["k-a", "ghost-2"],
+					isNew: false,
+					membershipChanged: true,
+				},
+			]);
+			const [changed] = await store.getClustersWithMembers();
+			expect(changed.memberIds).toEqual(["k-a"]);
+			expect(changed.memberCount).toBe(1);
+		});
+
+		it("persistClusters without a membership change leaves member rows alone and recomputes memberCount", async () => {
+			for (const id of ["k-a", "k-b"]) {
+				await store.insertEntry(entry({ id }));
+			}
+			await store.persistClusters([
+				{
+					id: "c1",
+					centroid: [1, 0, 0],
+					memberIds: ["k-a", "k-b"],
+					isNew: true,
+					membershipChanged: true,
+				},
+			]);
+			const [first] = await store.getClustersWithMembers();
+			await store.deleteEntry("k-b");
+
+			// A stale snapshot that still lists k-b: must not re-insert the deleted member.
+			await store.persistClusters([
+				{
+					id: "c1",
+					centroid: [0, 1, 0],
+					memberIds: ["k-a", "k-b"],
+					isNew: false,
+					membershipChanged: false,
+				},
+			]);
+
+			const [second] = await store.getClustersWithMembers();
+			expect(second.memberIds).toEqual(["k-a"]);
+			expect(second.memberCount).toBe(1);
+			expect(second.centroid).toEqual([0, 1, 0]);
+			expect(second.memberJoinedAt.get("k-a")).toBe(
+				first.memberJoinedAt.get("k-a"),
+			);
+		});
+
 		it("persistClusters removes clusters that are no longer in the pass", async () => {
 			await store.insertEntry(entry({ id: "k-a" }));
 			await store.insertEntry(entry({ id: "k-b" }));

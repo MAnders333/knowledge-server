@@ -106,7 +106,10 @@ export async function runProcessInbox(args: string[]): Promise<void> {
 		activation,
 		[new PendingEpisodesReader(serverStateDb)],
 		registry.domainRouter,
-		{ lockPath: consolidationLockPath(resolveDataDir()) },
+		{
+			lockPath: consolidationLockPath(resolveDataDir()),
+			writableStores: registry.writableStores(),
+		},
 	);
 
 	try {
@@ -122,12 +125,12 @@ export async function runProcessInbox(args: string[]): Promise<void> {
 			console.log("  No pending sessions. Running KB synthesis pass only...");
 		}
 
-		const { totalSessions, totalCreated, totalUpdated } =
+		const { totalSessions, totalCreated, totalUpdated, providerFailed } =
 			await drainConsolidation(consolidation);
 
 		// ── Phase 3: KB Synthesis ────────────────────────────────────────────
 		console.log("\n── Phase 3: KB Synthesis ──");
-		await runSynthesisPass(consolidation);
+		await runSynthesisPass(consolidation, providerFailed);
 
 		// ── Summary ──────────────────────────────────────────────────────────
 		console.log("");

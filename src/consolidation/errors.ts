@@ -58,6 +58,59 @@ export function providerFailureClass(err: unknown): string {
 	return "provider unreachable";
 }
 
+/** Message/body markers of a request that will fail the same way on retry. */
+const NON_RETRYABLE_MARKERS = [
+	"context_length_exceeded",
+	"invalid_request_error",
+	"insufficient_quota",
+	"invalid_argument",
+	"maximum context length",
+	"prompt is too long",
+] as const;
+
+/** 4xx statuses that are transient (timeout, conflict, rate limit). */
+const TRANSIENT_4XX = new Set([408, 409, 429]);
+
+/**
+ * Whether a failed model call cannot succeed on an immediate retry, for complete()'s
+ * retry loop. Separate from isDeterministicFailure (dead-lettering): a 401 or a billing
+ * 400 is pointless to retry within seconds, but may succeed on a later run.
+ *
+ * Permanent: a 4xx other than 408/409/429, and any error whose message or response body
+ * carries a NON_RETRYABLE_MARKERS entry, also under a 5xx status (gateways wrap an
+ * upstream 400 context_length_exceeded as 503). A 408/409/429, given directly or
+ * embedded in a 5xx body (e.g. {"status":429}), stays retryable unless the text says
+ * insufficient_quota. Aborts, timeouts, network errors and unknown errors are retryable.
+ * The provider text is only matched, never stored or shown.
+ */
+export function isNonRetryableLlmError(err: unknown): boolean {
+	const chain = errorChain(err);
+	if (chain.length === 0) return false;
+	if (
+		chain.some(
+			(e) =>
+				e instanceof Error &&
+				(e.name === "AbortError" || e.name === "TimeoutError"),
+		)
+	) {
+		return false;
+	}
+	const body = responseBodyOf(err);
+	const text = `${messageOf(err)}\n${body}`.toLowerCase();
+	const status = httpStatusOf(err);
+	const embedded =
+		/"(?:status|statusCode|status_code|code)"\s*:\s*"?(4\d{2})\b/.exec(body);
+	const embeddedStatus = embedded ? Number(embedded[1]) : undefined;
+	const effectiveStatus =
+		status !== undefined && status < 500 ? status : embeddedStatus;
+	if (effectiveStatus !== undefined && TRANSIENT_4XX.has(effectiveStatus)) {
+		return text.includes("insufficient_quota");
+	}
+	if (status !== undefined && status >= 400 && status < 500) return true;
+	if (NON_RETRYABLE_MARKERS.some((m) => text.includes(m))) return true;
+	return embeddedStatus !== undefined;
+}
+
 /**
  * The error and the errors it wraps, outermost first: the AI SDK's lastError, then
  * cause. Depth-limited.
@@ -95,4 +148,16 @@ function messageOf(err: unknown): string {
 		.filter((e): e is Error => e instanceof Error)
 		.map((e) => e.message)
 		.join(" ");
+}
+
+/** The provider response bodies down the chain, for matching only. */
+function responseBodyOf(err: unknown): string {
+	return errorChain(err)
+		.map((e) =>
+			"responseBody" in e && typeof e.responseBody === "string"
+				? e.responseBody
+				: "",
+		)
+		.filter(Boolean)
+		.join("\n");
 }

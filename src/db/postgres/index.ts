@@ -206,13 +206,28 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	/** TLS-resolved connection settings, reused for the dedicated schema-lock connection. */
 	private readonly tls: PostgresTlsConfig;
 
+	/** See the `readOnly` constructor option. */
+	private readonly readOnly: boolean;
+
 	/**
 	 * @param connectionUri  Full postgres:// connection string.
 	 * @param poolMax        Maximum pool connections. Defaults to config.postgres.poolMax
 	 *                       (POSTGRES_POOL_MAX, otherwise 10). Useful for hosted services
 	 *                       with tight connection limits (Supabase free, Railway, Neon).
+	 * @param options.readOnly Reads run in `BEGIN READ ONLY` transactions, so the
+	 *                       server rejects writes made inside them. Used by
+	 *                       `calibrate --clusters`, which only calls
+	 *                       getActiveEntriesWithEmbeddings(); other methods are not
+	 *                       guarded. Per-transaction rather than a startup parameter
+	 *                       because poolers such as PgBouncer reject unknown startup
+	 *                       parameters.
 	 */
-	constructor(connectionUri: string, poolMax = config.postgres.poolMax) {
+	constructor(
+		connectionUri: string,
+		poolMax = config.postgres.poolMax,
+		options: { readOnly?: boolean } = {},
+	) {
+		this.readOnly = options.readOnly === true;
 		const tls = resolvePostgresTls(connectionUri);
 		warnNoTlsOnce(tls.warnNoTls);
 		this.tls = tls;
@@ -230,6 +245,18 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			idle_timeout: 0,
 			connect_timeout: 10, // seconds — surface cold-start failures early
 		});
+	}
+
+	/**
+	 * Runs a read. In readOnly mode the read is wrapped in `BEGIN READ ONLY`, which
+	 * is set per transaction and so survives transaction-pooling poolers.
+	 */
+	private readScope<T>(fn: (sql: TxSql) => Promise<T>): Promise<T> {
+		// postgres.js types begin() as UnwrapPromiseArray<T>; for a query result it resolves to
+		// the same value, so the cast only restores the generic.
+		return this.readOnly
+			? (this.sql.begin("read only", fn) as Promise<T>)
+			: fn(this.sql);
 	}
 
 	/**
@@ -835,10 +862,12 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 	async getActiveEntriesWithEmbeddings(): Promise<
 		Array<KnowledgeEntry & { embedding: number[] }>
 	> {
-		const rows = await this.sql.unsafe(
-			`SELECT ${ENTRY_COLUMNS}, embedding FROM knowledge_entry
+		const rows = await this.readScope((sql: TxSql) =>
+			sql.unsafe(
+				`SELECT ${ENTRY_COLUMNS}, embedding FROM knowledge_entry
 			WHERE status IN ('active', 'conflicted') AND embedding IS NOT NULL
 			ORDER BY strength DESC`,
+			),
 		);
 		return (rows as unknown as RawEntryRow[])
 			.map((r) => this.rowToEntry(r))
@@ -1468,25 +1497,30 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 			for (const cluster of clusters) {
 				const centroidBuf = floatsToBuffer(cluster.centroid);
 
+				// member_count is set by the recompute below.
 				if (cluster.isNew) {
 					await sql`
 						INSERT INTO knowledge_cluster
 						(id, centroid, member_count, last_synthesized_at, last_membership_changed_at, created_at)
-						VALUES (${cluster.id}, ${centroidBuf}, ${cluster.memberIds.length}, NULL, ${now}, ${now})
+						VALUES (${cluster.id}, ${centroidBuf}, 0, NULL, ${now}, ${now})
 					`;
 				} else if (cluster.membershipChanged) {
 					await sql`
 						UPDATE knowledge_cluster
-						SET centroid = ${centroidBuf}, member_count = ${cluster.memberIds.length},
-						    last_membership_changed_at = ${now}
+						SET centroid = ${centroidBuf}, last_membership_changed_at = ${now}
 						WHERE id = ${cluster.id}
 					`;
 				} else {
+					// Stable membership: member rows are not rewritten; member_count is
+					// recomputed because a hard delete cascades a member row away without a
+					// membership change.
 					await sql`
 						UPDATE knowledge_cluster
-						SET centroid = ${centroidBuf}, member_count = ${cluster.memberIds.length}
+						SET centroid = ${centroidBuf},
+						    member_count = (SELECT count(*) FROM knowledge_cluster_member WHERE cluster_id = ${cluster.id})
 						WHERE id = ${cluster.id}
 					`;
+					continue;
 				}
 
 				// Sync membership: drop members that left; members that stayed keep their
@@ -1496,13 +1530,28 @@ export class PostgresKnowledgeDB implements IKnowledgeStore {
 					WHERE cluster_id = ${cluster.id}
 					  AND NOT (entry_id = ANY(${memberArrays.get(cluster.id) ?? this.sql.array([], 25)}))
 				`;
+				// WHERE EXISTS: a member deleted after the clustering snapshot was taken
+				// (the yield window) is skipped instead of violating the entry_id foreign
+				// key, which ON CONFLICT does not cover. Narrows, but does not close, the
+				// race under READ COMMITTED: a delete that commits during this statement
+				// can still fail the FK check. That failure is contained by the per-store
+				// catch in runSynthesis.
 				for (const entryId of cluster.memberIds) {
 					await sql`
 						INSERT INTO knowledge_cluster_member (cluster_id, entry_id, joined_at)
-						VALUES (${cluster.id}, ${entryId}, ${now})
+						SELECT ${cluster.id}::text, ${entryId}::text, ${now}::bigint
+						WHERE EXISTS (SELECT 1 FROM knowledge_entry WHERE id = ${entryId})
 						ON CONFLICT DO NOTHING
 					`;
 				}
+				// Skipped members (deleted in the yield window) must not be counted.
+				await sql`
+					UPDATE knowledge_cluster
+					SET member_count = (
+						SELECT count(*) FROM knowledge_cluster_member WHERE cluster_id = ${cluster.id}
+					)
+					WHERE id = ${cluster.id}
+				`;
 			}
 		});
 	}

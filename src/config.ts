@@ -252,9 +252,9 @@ const DEFAULT_TOKEN_BUDGET = 1500;
 /**
  * Cosine similarity threshold for assigning an entry to an existing cluster
  * during greedy clustering. Below this threshold a new cluster is started.
- * Kept broad (0.5) — heterogeneous cluster members give the LLM more
- * cross-domain material to generalize from. Synthesis quality is instead
- * governed by CLUSTER_MIN_MEMBERS (minimum size before synthesis fires).
+ * Model-dependent: must sit above the embedding model's noise floor, or every
+ * entry joins one cluster. Recalibrate with `knowledge-server calibrate --clusters`
+ * when switching embedding models.
  */
 const DEFAULT_CLUSTER_ASSIGNMENT_THRESHOLD = 0.5;
 /**
@@ -753,8 +753,9 @@ export function parseEnv(env: Env, configPath = defaultConfigPath()) {
 				1,
 			),
 			// Cosine similarity threshold for assigning an entry to an existing cluster
-			// during greedy clustering. Kept broad by default — heterogeneous members give
-			// the LLM more cross-domain material to generalize from.
+			// during greedy clustering. Model-dependent: must sit above the embedding
+			// model's noise floor, or every entry joins one cluster. Recalibrate with
+			// `knowledge-server calibrate --clusters` when switching embedding models.
 			clusterAssignmentThreshold: r.float(
 				"CLUSTER_ASSIGNMENT_THRESHOLD",
 				DEFAULT_CLUSTER_ASSIGNMENT_THRESHOLD,
@@ -768,6 +769,14 @@ export function parseEnv(env: Env, configPath = defaultConfigPath()) {
 				"CLUSTER_MIN_MEMBERS",
 				DEFAULT_CLUSTER_MIN_MEMBERS,
 				2,
+			),
+			// Centroid used during greedy clustering: "running" compares each entry to the running
+			// mean of the cluster's members (drifts toward the corpus mean), "seed" to the
+			// cluster's fixed seed entry. See `knowledge-server calibrate --clusters`.
+			clusterCentroidMode: r.choice(
+				"CLUSTER_CENTROID_MODE",
+				["running", "seed"] as const,
+				"running",
 			),
 			// Maximum cluster members sent to synthesizePrinciple per call. Members are
 			// chosen closest-to-centroid first.
@@ -785,6 +794,14 @@ export function parseEnv(env: Env, configPath = defaultConfigPath()) {
 			// cumulative across clustering passes until the cluster synthesizes.
 			synthesisMinNewMembers: r.int("SYNTHESIS_MIN_NEW_MEMBERS", 3, 1),
 			synthesisMinNewFraction: r.float("SYNTHESIS_MIN_NEW_FRACTION", 0.2, 0, 1),
+			// Synthesis LLM calls per consolidation run, shared by all stores. Ripe clusters beyond
+			// the cap stay ripe for the next run. 0 disables synthesis calls (clusters are still
+			// rebuilt and persisted), the rollout dry run.
+			clusterSynthesisMaxCallsPerRun: r.int(
+				"CLUSTER_SYNTHESIS_MAX_CALLS_PER_RUN",
+				20,
+				0,
+			),
 			// Polling interval for background auto-consolidation while the server is running.
 			// Default: 8 hours (28_800_000 ms). Only triggers when pending sessions exist,
 			// so a quiet period costs nothing. Matches the sleep-consolidation metaphor —
