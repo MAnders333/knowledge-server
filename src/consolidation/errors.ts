@@ -2,12 +2,13 @@
  * Classify a per-chunk failure for the attempt limit.
  *
  * Deterministic failures recur for the same episodes, so they count toward
- * dead-lettering: a rejected request (HTTP 400/413/422, e.g. an over-long prompt)
- * and data a store refuses (Postgres SQLSTATE class 22, e.g. NUL bytes). Malformed
- * model output (SyntaxError) is deterministic too. Everything else is transient:
- * rate limits, timeouts, dropped connections, expired credentials and provider
- * outages. Transient failures never dead-letter an episode; the chunk is retried
- * on a later run.
+ * dead-lettering: a rejected request (HTTP 400/413/422, e.g. an over-long prompt),
+ * a context-length rejection under any status (gateways wrap it in a 503), and data
+ * a store refuses (Postgres SQLSTATE class 22, e.g. NUL bytes). Malformed model
+ * output (SyntaxError) is deterministic too. Everything else is transient: rate
+ * limits, timeouts, dropped connections, expired credentials and provider outages.
+ * Transient failures never dead-letter an episode; the chunk is retried on a later
+ * run.
  *
  * A failed model call arrives as LlmCallError, whose message is sanitized. The
  * provider's own error is on its cause chain, and these functions read it there.
@@ -24,6 +25,8 @@ export function isDeterministicFailure(err: unknown): boolean {
 	) {
 		return true;
 	}
+	// A context-length rejection recurs for the same episode, whatever status a gateway wraps it in.
+	if (hasMarker(err, CONTEXT_LENGTH_MARKERS)) return true;
 	const status = httpStatusOf(err);
 	if (status === 400 || status === 413 || status === 422) {
 		// Billing and quota rejections also come back as 400; they say nothing about the content.
@@ -58,14 +61,19 @@ export function providerFailureClass(err: unknown): string {
 	return "provider unreachable";
 }
 
+/** Message/body markers of a request that exceeds the model's context window. */
+const CONTEXT_LENGTH_MARKERS = [
+	"context_length_exceeded",
+	"maximum context length",
+	"prompt is too long",
+] as const;
+
 /** Message/body markers of a request that will fail the same way on retry. */
 const NON_RETRYABLE_MARKERS = [
-	"context_length_exceeded",
+	...CONTEXT_LENGTH_MARKERS,
 	"invalid_request_error",
 	"insufficient_quota",
 	"invalid_argument",
-	"maximum context length",
-	"prompt is too long",
 ] as const;
 
 /** 4xx statuses that are transient (timeout, conflict, rate limit). */
@@ -96,7 +104,6 @@ export function isNonRetryableLlmError(err: unknown): boolean {
 		return false;
 	}
 	const body = responseBodyOf(err);
-	const text = `${messageOf(err)}\n${body}`.toLowerCase();
 	const status = httpStatusOf(err);
 	const embedded =
 		/"(?:status|statusCode|status_code|code)"\s*:\s*"?(4\d{2})\b/.exec(body);
@@ -104,10 +111,10 @@ export function isNonRetryableLlmError(err: unknown): boolean {
 	const effectiveStatus =
 		status !== undefined && status < 500 ? status : embeddedStatus;
 	if (effectiveStatus !== undefined && TRANSIENT_4XX.has(effectiveStatus)) {
-		return text.includes("insufficient_quota");
+		return hasMarker(err, ["insufficient_quota"]);
 	}
 	if (status !== undefined && status >= 400 && status < 500) return true;
-	if (NON_RETRYABLE_MARKERS.some((m) => text.includes(m))) return true;
+	if (hasMarker(err, NON_RETRYABLE_MARKERS)) return true;
 	return embeddedStatus !== undefined;
 }
 
@@ -160,4 +167,10 @@ function responseBodyOf(err: unknown): string {
 		)
 		.filter(Boolean)
 		.join("\n");
+}
+
+/** Whether the error or the errors it wraps carry a marker, in message or response body. */
+function hasMarker(err: unknown, markers: readonly string[]): boolean {
+	const text = `${messageOf(err)}\n${responseBodyOf(err)}`.toLowerCase();
+	return markers.some((m) => text.includes(m));
 }

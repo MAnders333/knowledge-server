@@ -1219,6 +1219,41 @@ describe("synthesis after a drain with provider failures", () => {
 		expect(synth).toHaveBeenCalledTimes(1);
 	});
 
+	it("a context-length rejection wrapped in a 503 is dead-lettered and does not trip the breaker", async () => {
+		await insertRipeCluster();
+		await state.insertPendingEpisode(
+			pendingRow({ id: "row-long", sessionId: "session-long" }),
+		);
+		spyOn(aiModule, "generateText").mockRejectedValue(
+			Object.assign(new Error("Upstream error"), {
+				name: "AI_APICallError",
+				statusCode: 503,
+				responseBody: JSON.stringify({
+					error: {
+						message: "This model's maximum context length is 200000 tokens.",
+						type: "invalid_request_error",
+						code: "context_length_exceeded",
+					},
+				}),
+			}),
+		);
+		const synth = spyOn(
+			ConsolidationLLM.prototype,
+			"synthesizePrinciple",
+		).mockResolvedValue([]);
+		spyOn(console, "error").mockImplementation(() => {});
+
+		for (let i = 0; i < PENDING_EPISODE_MAX_ATTEMPTS; i++) {
+			const drain = await drainConsolidation(engine);
+			expect(drain.providerFailed).toBe(false);
+			await runSynthesisPass(engine, drain.providerFailed);
+		}
+
+		expect(await state.getPendingEpisodes(0)).toEqual([]);
+		expect(await state.countDeadLetteredEpisodes()).toBe(1);
+		expect(synth).toHaveBeenCalled();
+	});
+
 	it("keeps the provider-failure flag when consolidate() throws after a 429", async () => {
 		await insertRipeCluster();
 		await state.insertPendingEpisode(
